@@ -18,6 +18,8 @@
 
 #include <sys/types.h>
 
+#include <string.h>
+
 #include "tmux.h"
 #include "plugin-host.h"
 #include "plugin-internal.h"
@@ -72,6 +74,18 @@ plugin_notify(const char *name, struct client *c, struct session *s,
 
 	if (!plugin_enabled())
 		return;
+
+	/*
+	 * Active-pane changes are announced per window, but the event is
+	 * really about the pane that became active: attach it so
+	 * pane-scoped instances receive their "you are now the active
+	 * pane" signal. (Focus events would carry this, but they only fire
+	 * when the focus-events option is on.)
+	 */
+	if (wp == NULL && w != NULL && w->active != NULL &&
+	    (strcmp(name, "window-pane-changed") == 0 ||
+	    strcmp(name, "session-window-changed") == 0))
+		wp = w->active;
 
 	pj = plugin_json_create();
 	plugin_json_obj_start(pj, NULL);

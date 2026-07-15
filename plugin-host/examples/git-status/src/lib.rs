@@ -11,10 +11,13 @@
 //!    finished in this pane -> refresh immediately. Enable by making the
 //!    shell emit the mark, e.g. in ~/.bashrc:
 //!      PROMPT_COMMAND='printf "\e]133;A\a"'"${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
-//!  - `pane-focus-in`: refresh now and poll every `interval_ms` (default
-//!    10000) while the pane stays focused.
-//!  - `pane-focus-out`: polling stops entirely (background panes cost
-//!    nothing; they are refreshed again the moment they regain focus).
+//!  - becoming the active pane (`window-pane-changed` /
+//!    `session-window-changed`, which fire on every pane/window switch,
+//!    plus `pane-focus-in` where the focus-events option is on): refresh
+//!    now and poll every `interval_ms` (default 10000).
+//!  - the poll loop exits by itself once the pane is no longer active
+//!    (and immediately on `pane-focus-out` when focus events are on), so
+//!    background panes do no git work.
 //!
 //! A slow `git status` can never pile up: refreshes are skipped while one
 //! is already in flight, and tmux itself never blocks (the probe runs as
@@ -73,12 +76,18 @@ impl GitStatus {
         let interval = self.interval;
         ctx.spawn(async move {
             loop {
-                refresh(pane, &in_flight).await;
+                // Exit once no longer this window's active pane; the
+                // become-active triggers start a fresh loop later.
+                let Ok(info) = resolve_pane(pane) else { return };
+                if info.get("active").and_then(|v| v.as_bool()) != Some(true) {
+                    return;
+                }
+                probe_and_publish(pane, info, &in_flight).await;
                 if sleep_ms(interval).await.is_err() {
                     return; // instance torn down
                 }
                 if epoch.get() != my_epoch {
-                    return; // unfocused (or superseded by a newer loop)
+                    return; // stopped or superseded by a newer loop
                 }
             }
         });
@@ -111,8 +120,14 @@ impl Plugin for GitStatus {
                 .ok_or("missing pane id in scope")? as u32,
         );
 
-        ctx.subscribe(&["pane-focus-in", "pane-focus-out", "pane-prompt"])
-            .map_err(|e| e.message.clone())?;
+        ctx.subscribe(&[
+            "window-pane-changed",   // became active pane (always fires)
+            "session-window-changed", // window switch made this pane visible
+            "pane-focus-in",         // only with focus-events on
+            "pane-focus-out",
+            "pane-prompt",           // command finished (OSC 133;A)
+        ])
+        .map_err(|e| e.message.clone())?;
 
         let plugin = Self {
             pane,
@@ -142,9 +157,12 @@ impl Plugin for GitStatus {
 
     fn on_event(&mut self, ctx: &Ctx, event: Event) {
         match event.event.as_str() {
-            // Focused: refresh now (loop's first iteration) + keep polling.
-            "pane-focus-in" => self.start_polling(ctx),
-            // Unfocused: stop polling entirely.
+            // This pane became the one on display: refresh now (loop's
+            // first iteration) + poll while it stays active.
+            "window-pane-changed" | "session-window-changed"
+            | "pane-focus-in" => self.start_polling(ctx),
+            // Only fires with focus-events on; the loop would also notice
+            // inactivity on its own at the next tick.
             "pane-focus-out" => self.stop_polling(),
             // A command just finished in this pane (OSC 133;A).
             "pane-prompt" => {
