@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["host", "abi-types", "sdk", "examples/hello-raw", "examples/ticker"]
+members = [
+    "host",
+    "abi-types",
+    "sdk",
+    "examples/hello-raw",
+    "examples/ticker",
+    "examples/git-status",
+]
 default-members = ["host"]
 
 [workspace.package]

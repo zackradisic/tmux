@@ -1,0 +1,10 @@
+# Capability manifest for git-status. Copy this next to git_status.wasm
+# (same directory, same stem) so users can see what the plugin needs;
+# effective capabilities are these requests intersected with the user's
+# `load-plugin -c` grants.
+
+[caps]
+requests = ["run-process", "write-options"]
+
+[caps.run-process]
+argv0 = ["git", "echo"]

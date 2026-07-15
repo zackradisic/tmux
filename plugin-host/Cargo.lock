@@ -445,6 +445,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "git-status"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tmux-plugin-sdk",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

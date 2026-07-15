@@ -107,6 +107,8 @@ plugin_vtable_emit_window(struct plugin_json *pj, struct window *w)
 static void
 plugin_vtable_emit_pane(struct plugin_json *pj, struct window_pane *wp)
 {
+	char	*cwd;
+
 	plugin_json_obj_start(pj, NULL);
 	plugin_json_num(pj, "id", wp->id);
 	plugin_json_num(pj, "window", wp->window->id);
@@ -116,6 +118,9 @@ plugin_vtable_emit_pane(struct plugin_json *pj, struct window_pane *wp)
 	plugin_json_bool(pj, "dead", (wp->flags & PANE_EXITED) != 0);
 	if (wp->shell != NULL)
 		plugin_json_str(pj, "shell", wp->shell);
+	/* Same source as #{pane_current_path}; buffer is static, not freed. */
+	if (wp->fd != -1 && (cwd = osdep_get_cwd(wp->fd)) != NULL)
+		plugin_json_str(pj, "cwd", cwd);
 	plugin_json_obj_end(pj);
 }
 
@@ -330,19 +335,43 @@ plugin_vtable_get_option(int kind, u_int id, const char *name, pgh_sink sink,
 /*
  * Set a user option (@-prefixed only in v1; real options go through
  * run_command). Returns 0, -1 dead target, -2 not a user option.
+ *
+ * When the value actually changes, attached clients get a status-line
+ * redraw: publishing state for #{@...} in the status line is the most
+ * common reason a plugin sets options, and unlike the set-option command
+ * this path does not redraw on its own. The changed-check keeps periodic
+ * writers from causing redraw churn.
  */
 int
 plugin_vtable_set_option(int kind, u_int id, const char *name,
     const char *value)
 {
-	struct options	*oo;
+	struct options		*oo;
+	struct options_entry	*o;
+	struct client		*c;
+	char			*cur;
+	int			 changed = 1;
 
 	oo = plugin_vtable_options(kind, id);
 	if (oo == NULL)
 		return (-1);
 	if (*name != '@')
 		return (-2);
+
+	o = options_get_only(oo, name);
+	if (o != NULL) {
+		cur = options_to_string(o, NULL, 0);
+		changed = (strcmp(cur, value) != 0);
+		free(cur);
+	}
+	if (!changed)
+		return (0);
+
 	options_set_string(oo, name, 0, "%s", value);
+	TAILQ_FOREACH(c, &clients, entry) {
+		if ((~c->flags & CLIENT_DEAD) && c->session != NULL)
+			c->flags |= CLIENT_REDRAWSTATUS;
+	}
 	return (0);
 }
 

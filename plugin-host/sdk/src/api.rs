@@ -128,15 +128,71 @@ pub fn capture_pane(
     Ok(v.get("text").and_then(Value::as_str).unwrap_or("").to_string())
 }
 
+/// Where an option lives.
+#[derive(Debug, Clone, Copy)]
+pub enum OptionTarget {
+    Server,
+    Session(crate::ids::SessionId),
+    Window(crate::ids::WindowId),
+    Pane(PaneId),
+}
+
+impl OptionTarget {
+    fn to_json(self) -> Value {
+        match self {
+            OptionTarget::Server => json!({ "type": "server" }),
+            OptionTarget::Session(id) => {
+                json!({ "type": "session", "id": id.0 })
+            }
+            OptionTarget::Window(id) => json!({ "type": "window", "id": id.0 }),
+            OptionTarget::Pane(id) => json!({ "type": "pane", "id": id.0 }),
+        }
+    }
+}
+
 /// Get an option (server/global scope) as a string.
 pub fn get_option(name: &str) -> Result<String, HostError> {
-    let v = host_call("get_option", json!({ "name": name }))?;
-    Ok(v.get("value").and_then(Value::as_str).unwrap_or("").to_string())
+    get_option_in(OptionTarget::Server, name)
 }
 
 /// Set a user (@-prefixed) option at server/global scope.
 pub fn set_option(name: &str, value: &str) -> Result<(), HostError> {
-    host_call("set_option", json!({ "name": name, "value": value })).map(|_| ())
+    set_option_in(OptionTarget::Server, name, value)
+}
+
+/// Get an option from a specific scope (inherits along the option tree).
+pub fn get_option_in(target: OptionTarget, name: &str) -> Result<String, HostError> {
+    let v = host_call(
+        "get_option",
+        json!({ "scope": target.to_json(), "name": name }),
+    )?;
+    Ok(v.get("value").and_then(Value::as_str).unwrap_or("").to_string())
+}
+
+/// Set a user (@-prefixed) option on a specific scope. Options published
+/// here are visible to status-line formats as #{@name} (pane options win
+/// for the active pane, then window, session, global).
+pub fn set_option_in(
+    target: OptionTarget,
+    name: &str,
+    value: &str,
+) -> Result<(), HostError> {
+    host_call(
+        "set_option",
+        json!({ "scope": target.to_json(), "name": name, "value": value }),
+    )
+    .map(|_| ())
+}
+
+/// Resolve a pane's live info: {id, window, width, height, active, dead,
+/// cwd?, shell?}. Errors with E_NO_SUCH_OBJECT once the pane is gone.
+pub fn resolve_pane(pane: PaneId) -> Result<Value, HostError> {
+    host_call("resolve", json!({ "kind": "pane", "id": pane.0 }))
+}
+
+/// This instance's identity: {plugin, scope: {type, id?}, generation}.
+pub fn self_info() -> Result<Value, HostError> {
+    host_call("self", json!({}))
 }
 
 /// Show a status-line message on all attached clients (and the message log).
