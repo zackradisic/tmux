@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["host", "abi-types", "sdk", "examples/hello-raw", "examples/ticker"]
+default-members = ["host"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+# The staticlib is always built with the release profile (wasmtime is far too
+# slow otherwise); keep debug info on so the tmux side stays debuggable.
+[profile.release]
+opt-level = 2
+lto = "thin"
+debug = true
+# panic=unwind is deliberate: every pgh_* export catches unwinds (ffi_guard!)
+# and poisons the plugin subsystem instead of killing the user's tmux server.
+panic = "unwind"

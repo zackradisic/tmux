@@ -207,6 +207,10 @@ session_destroy(struct session *s, int notify, const char *from)
 	RB_REMOVE(sessions, &sessions, s);
 	if (notify)
 		notify_session("session-closed", s);
+#ifdef ENABLE_PLUGINS
+	/* Authoritative death signal, regardless of the notify flag. */
+	plugin_object_destroyed(PLUGIN_OBJ_SESSION, s->id);
+#endif
 
 	free(s->tio);
 

@@ -1,0 +1,23 @@
+[package]
+name = "plugin-host"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "plugin_host"
+# rlib so integration tests (tests/) can link against the crate.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+tmux-plugin-abi = { path = "../abi-types" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Exact-pinned LTS line; all wasmtime API usage is confined to engine.rs and
+# (later) abi.rs so version bumps stay a two-file change.
+wasmtime = { version = "=36.0.12", default-features = false, features = ["runtime", "cranelift", "parallel-compilation", "cache", "std"] }
+slab = "0.4.12"
+blake3 = "1.8.5"
+toml = "1.1.2"
+
+[dev-dependencies]
+wat = "1"

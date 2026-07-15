@@ -249,10 +249,16 @@ server_start(struct tmuxproc *client, uint64_t flags, struct event_base *base,
 	evtimer_add(&server_ev_tidy, &tv);
 
 	server_acl_init();
+#ifdef ENABLE_PLUGINS
+	plugin_init();
+#endif
 
 	server_add_accept(0);
 	proc_loop(server_proc, server_loop);
 
+#ifdef ENABLE_PLUGINS
+	plugin_shutdown();
+#endif
 	job_kill_all();
 	prompt_save_history();
 

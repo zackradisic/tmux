@@ -371,6 +371,17 @@ notify_add(const char *name, struct cmd_find_state *fs, struct client *c,
 	struct notify_entry	*ne;
 	struct cmdq_item	*item;
 
+#ifdef ENABLE_PLUGINS
+	/*
+	 * Plugins observe every notification, snapshotted while the objects
+	 * are live. Deliberately before the NOHOOKS check: that suppression
+	 * exists to stop hook recursion, but plugin delivery is deferred to
+	 * the drain safe point and plugin-initiated commands run with
+	 * NOHOOKS themselves, so there is no recursion hazard.
+	 */
+	plugin_notify(name, c, s, w, wp, pbname);
+#endif
+
 	item = cmdq_running(NULL);
 	if (item != NULL && (cmdq_get_flags(item) & CMDQ_STATE_NOHOOKS))
 		return;

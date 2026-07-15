@@ -52,6 +52,13 @@ static void	server_client_update_scrollbar_hover(struct client *, int, int,
 		    int);
 static void	server_client_report_theme(struct client *, enum client_theme);
 
+/*
+ * Client identifier: monotonic and never reused, like session, window and
+ * pane ids, so it is usable as a weak handle (client names are ttyname-based
+ * and can recur across connections).
+ */
+static u_int	next_client_id;
+
 /* Compare client windows. */
 static int
 server_client_window_cmp(struct client_window *cw1,
@@ -294,6 +301,7 @@ server_client_create(int fd)
 	setblocking(fd, 0);
 
 	c = xcalloc(1, sizeof *c);
+	c->id = next_client_id++;
 	c->references = 1;
 	c->peer = proc_add_peer(server_proc, fd, server_client_dispatch, c);
 
@@ -445,6 +453,9 @@ server_client_lost(struct client *c)
 	struct client_window	*cw, *cw1;
 
 	c->flags |= CLIENT_DEAD;
+#ifdef ENABLE_PLUGINS
+	plugin_object_destroyed(PLUGIN_OBJ_CLIENT, c->id);
+#endif
 
 	server_client_clear_overlay(c);
 	status_prompt_clear(c);

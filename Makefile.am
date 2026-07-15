@@ -249,6 +249,37 @@ if ENABLE_SIXEL
 dist_tmux_SOURCES += image.c image-sixel.c
 endif
 
+# Enable Wasm plugin support. PLUGIN_HOST_LIB is empty when disabled so
+# tmux_LDADD/tmux_DEPENDENCIES can be defined unconditionally (an LDADD
+# defined only inside a conditional would be empty, not fall back to LDADD,
+# in the other branch).
+PLUGIN_HOST_LIB =
+if ENABLE_PLUGINS
+dist_tmux_SOURCES += \
+	cmd-plugin.c \
+	plugin-async.c \
+	plugin-events.c \
+	plugin-internal.h \
+	plugin-json.c \
+	plugin-vtable.c \
+	plugin.c
+PLUGIN_HOST_LIB += plugin-host/target/@CARGO_TARGET_DIR@/libplugin_host.a
+plugin-host/target/@CARGO_TARGET_DIR@/libplugin_host.a: plugin-host-build
+plugin-host-build:
+	+cd $(srcdir)/plugin-host && @CARGO@ build --profile @CARGO_PROFILE@ -p plugin-host
+.PHONY: plugin-host-build
+AM_CPPFLAGS += -iquote$(srcdir)/plugin-host/include
+EXTRA_DIST += \
+	plugin-host/Cargo.toml plugin-host/Cargo.lock \
+	plugin-host/include/plugin-host.h \
+	plugin-host/host/Cargo.toml plugin-host/host/cbindgen.toml \
+	plugin-host/host/src/*.rs \
+	plugin-host/abi-types/Cargo.toml plugin-host/abi-types/src/*.rs \
+	plugin-host/sdk/Cargo.toml plugin-host/sdk/src/*.rs
+endif
+tmux_LDADD = $(LDADD) $(PLUGIN_HOST_LIB)
+tmux_DEPENDENCIES = $(LIBOBJS) $(PLUGIN_HOST_LIB)
+
 # Add bits for fuzzing if enabled.
 if NEED_FUZZING
 check_PROGRAMS = \

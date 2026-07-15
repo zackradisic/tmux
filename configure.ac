@@ -493,6 +493,26 @@ if test "x$enable_sixel" = xyes; then
 fi
 AM_CONDITIONAL(ENABLE_SIXEL, [test "x$enable_sixel" = xyes])
 
+# Enable Wasm plugin support.
+AC_ARG_ENABLE(
+	plugins,
+	AS_HELP_STRING(--enable-plugins, enable Wasm plugin support)
+)
+if test "x$enable_plugins" = xyes; then
+	AC_CHECK_PROG(CARGO, cargo, cargo, no)
+	if test "x$CARGO" = xno; then
+		AC_MSG_ERROR("cargo not found (required for --enable-plugins)")
+	fi
+	AC_DEFINE(ENABLE_PLUGINS)
+	LIBS="$LIBS -lpthread -ldl -lm"
+fi
+AM_CONDITIONAL(ENABLE_PLUGINS, [test "x$enable_plugins" = xyes])
+# Always build the plugin host crate with the release profile: debug-profile
+# wasmtime is far too slow. Debug info is enabled in the crate's release
+# profile instead.
+AC_SUBST(CARGO_PROFILE, release)
+AC_SUBST(CARGO_TARGET_DIR, release)
+
 # Check for b64_ntop. If we have b64_ntop, we assume b64_pton as well.
 AC_MSG_CHECKING(for b64_ntop)
 AC_LINK_IFELSE([AC_LANG_PROGRAM(

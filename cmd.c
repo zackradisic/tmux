@@ -106,6 +106,15 @@ extern const struct cmd_entry cmd_show_environment_entry;
 extern const struct cmd_entry cmd_show_hooks_entry;
 extern const struct cmd_entry cmd_show_messages_entry;
 extern const struct cmd_entry cmd_show_options_entry;
+#ifdef ENABLE_PLUGINS
+extern const struct cmd_entry cmd_disable_plugin_entry;
+extern const struct cmd_entry cmd_enable_plugin_entry;
+extern const struct cmd_entry cmd_load_plugin_entry;
+extern const struct cmd_entry cmd_plugin_log_entry;
+extern const struct cmd_entry cmd_reload_plugin_entry;
+extern const struct cmd_entry cmd_show_plugins_entry;
+extern const struct cmd_entry cmd_unload_plugin_entry;
+#endif
 extern const struct cmd_entry cmd_show_prompt_history_entry;
 extern const struct cmd_entry cmd_show_window_options_entry;
 extern const struct cmd_entry cmd_source_file_entry;
@@ -137,10 +146,16 @@ const struct cmd_entry *cmd_table[] = {
 	&cmd_customize_mode_entry,
 	&cmd_delete_buffer_entry,
 	&cmd_detach_client_entry,
+#ifdef ENABLE_PLUGINS
+	&cmd_disable_plugin_entry,
+#endif
 	&cmd_display_menu_entry,
 	&cmd_display_message_entry,
 	&cmd_display_popup_entry,
 	&cmd_display_panes_entry,
+#ifdef ENABLE_PLUGINS
+	&cmd_enable_plugin_entry,
+#endif
 	&cmd_find_window_entry,
 	&cmd_has_session_entry,
 	&cmd_if_shell_entry,
@@ -160,6 +175,9 @@ const struct cmd_entry *cmd_table[] = {
 	&cmd_list_sessions_entry,
 	&cmd_list_windows_entry,
 	&cmd_load_buffer_entry,
+#ifdef ENABLE_PLUGINS
+	&cmd_load_plugin_entry,
+#endif
 	&cmd_lock_client_entry,
 	&cmd_lock_server_entry,
 	&cmd_lock_session_entry,
@@ -171,10 +189,16 @@ const struct cmd_entry *cmd_table[] = {
 	&cmd_next_layout_entry,
 	&cmd_next_window_entry,
 	&cmd_paste_buffer_entry,
+#ifdef ENABLE_PLUGINS
+	&cmd_plugin_log_entry,
+#endif
 	&cmd_pipe_pane_entry,
 	&cmd_previous_layout_entry,
 	&cmd_previous_window_entry,
 	&cmd_refresh_client_entry,
+#ifdef ENABLE_PLUGINS
+	&cmd_reload_plugin_entry,
+#endif
 	&cmd_rename_session_entry,
 	&cmd_rename_window_entry,
 	&cmd_resize_pane_entry,
@@ -200,6 +224,9 @@ const struct cmd_entry *cmd_table[] = {
 	&cmd_show_hooks_entry,
 	&cmd_show_messages_entry,
 	&cmd_show_options_entry,
+#ifdef ENABLE_PLUGINS
+	&cmd_show_plugins_entry,
+#endif
 	&cmd_show_prompt_history_entry,
 	&cmd_show_window_options_entry,
 	&cmd_source_file_entry,
@@ -212,6 +239,9 @@ const struct cmd_entry *cmd_table[] = {
 	&cmd_switch_mode_entry,
 	&cmd_unbind_key_entry,
 	&cmd_unlink_window_entry,
+#ifdef ENABLE_PLUGINS
+	&cmd_unload_plugin_entry,
+#endif
 	&cmd_wait_for_entry,
 	NULL
 };

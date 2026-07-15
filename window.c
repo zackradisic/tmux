@@ -349,6 +349,9 @@ window_create(u_int sx, u_int sy, u_int xpixel, u_int ypixel)
 
 	log_debug("%s: @%u create %ux%u (%ux%u)", __func__, w->id, sx, sy,
 	    w->xpixel, w->ypixel);
+#ifdef ENABLE_PLUGINS
+	plugin_object_created(PLUGIN_OBJ_WINDOW, w->id);
+#endif
 	return (w);
 }
 
@@ -365,6 +368,10 @@ window_destroy(struct window *w)
 	free(w->old_layout);
 
 	window_destroy_panes(w);
+#ifdef ENABLE_PLUGINS
+	/* After the panes so plugin teardown order is children first. */
+	plugin_object_destroyed(PLUGIN_OBJ_WINDOW, w->id);
+#endif
 
 	if (event_initialized(&w->name_event))
 		evtimer_del(&w->name_event);
@@ -1109,6 +1116,9 @@ window_pane_create(struct window *w, u_int sx, u_int sy, u_int hlimit)
 
 	wp->id = next_window_pane_id++;
 	RB_INSERT(window_pane_tree, &all_window_panes, wp);
+#ifdef ENABLE_PLUGINS
+	plugin_object_created(PLUGIN_OBJ_PANE, wp->id);
+#endif
 
 	wp->fd = -1;
 
@@ -1227,6 +1237,14 @@ window_pane_scrollbar_redraw_visibility(struct window_pane *wp)
 static void
 window_pane_destroy(struct window_pane *wp)
 {
+#ifdef ENABLE_PLUGINS
+	/*
+	 * Before the pane leaves all_window_panes: this path covers every
+	 * destruction (unlike pane-exited/pane-died, which are skipped for
+	 * panes destroyed during window teardown).
+	 */
+	plugin_object_destroyed(PLUGIN_OBJ_PANE, wp->id);
+#endif
 	window_pane_wait_finish(wp);
 	spawn_editor_finish(wp);
 

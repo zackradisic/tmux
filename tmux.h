@@ -2155,6 +2155,7 @@ typedef void (*overlay_resize_cb)(struct client *, void *);
 /* Client connection. */
 struct client {
 	const char		*name;
+	u_int			 id;
 	struct tmuxpeer		*peer;
 	const char		*user;
 	struct cmdq_list	*queue;
@@ -4129,5 +4130,39 @@ struct hyperlinks	*hyperlinks_init(void);
 struct hyperlinks	*hyperlinks_copy(struct hyperlinks *);
 void			 hyperlinks_reset(struct hyperlinks *);
 void			 hyperlinks_free(struct hyperlinks *);
+
+#ifdef ENABLE_PLUGINS
+/* plugin.c */
+void	 plugin_init(void);
+void	 plugin_shutdown(void);
+int	 plugin_enabled(void);
+void	 plugin_schedule_drain(void);
+
+/* plugin-events.c */
+enum plugin_obj_kind {
+	PLUGIN_OBJ_SESSION,
+	PLUGIN_OBJ_WINDOW,
+	PLUGIN_OBJ_PANE,
+	PLUGIN_OBJ_CLIENT,
+};
+void	 plugin_notify(const char *, struct client *, struct session *,
+	     struct window *, struct window_pane *, const char *);
+void	 plugin_object_created(enum plugin_obj_kind, u_int);
+void	 plugin_object_destroyed(enum plugin_obj_kind, u_int);
+
+/* plugin-json.c */
+struct plugin_json;
+struct plugin_json	*plugin_json_create(void);
+void	 plugin_json_free(struct plugin_json *);
+const char		*plugin_json_string(struct plugin_json *);
+void	 plugin_json_obj_start(struct plugin_json *, const char *);
+void	 plugin_json_obj_end(struct plugin_json *);
+void	 plugin_json_arr_start(struct plugin_json *, const char *);
+void	 plugin_json_arr_end(struct plugin_json *);
+void	 plugin_json_str(struct plugin_json *, const char *, const char *);
+void	 plugin_json_num(struct plugin_json *, const char *, long long);
+void	 plugin_json_bool(struct plugin_json *, const char *, int);
+void	 plugin_json_null(struct plugin_json *, const char *);
+#endif
 
 #endif /* TMUX_H */
