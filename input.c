@@ -3181,6 +3181,16 @@ input_osc_133(struct input_ctx *ictx, const char *p)
 	switch (*p) {
 	case 'A':
 		gl->flags |= GRID_LINE_START_PROMPT;
+#ifdef ENABLE_PLUGINS
+		/*
+		 * A new prompt means the previous command finished: the
+		 * natural "something may have changed" trigger for plugins
+		 * watching a pane (enqueue-only; delivered at a safe point).
+		 */
+		if (ictx->wp != NULL)
+			plugin_notify("pane-prompt", NULL, NULL, NULL,
+			    ictx->wp, NULL);
+#endif
 		break;
 	case 'C':
 		gl->flags |= GRID_LINE_START_OUTPUT;

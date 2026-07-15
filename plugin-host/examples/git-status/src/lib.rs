@@ -6,15 +6,29 @@
 //! pane you are in and empties out in panes that are not inside a git
 //! repository.
 //!
+//! Refresh triggers:
+//!  - `pane-prompt` (OSC 133;A from shell integration): a command just
+//!    finished in this pane -> refresh immediately. Enable by making the
+//!    shell emit the mark, e.g. in ~/.bashrc:
+//!      PROMPT_COMMAND='printf "\e]133;A\a"'"${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+//!  - `pane-focus-in`: refresh now and poll every `interval_ms` (default
+//!    10000) while the pane stays focused.
+//!  - `pane-focus-out`: polling stops entirely (background panes cost
+//!    nothing; they are refreshed again the moment they regain focus).
+//!
+//! A slow `git status` can never pile up: refreshes are skipped while one
+//! is already in flight, and tmux itself never blocks (the probe runs as
+//! an async job).
+//!
 //! Load (tmux.conf):
 //!   load-plugin -s pane -c run-process -c write-options \
 //!       ~/.tmux/plugins/git_status.wasm
 //!   set -g status-right '#{@git_branch}#{?@git_dirty,*,} | %H:%M'
 //!
-//! Only the pane that is active in its window does git work; inactive
-//! panes just tick. `-o interval_ms=<n>` tunes the poll (default 5000).
-//!
 //! Build: cargo build -p git-status --target wasm32-unknown-unknown --release
+
+use std::cell::Cell;
+use std::rc::Rc;
 
 use serde::Deserialize;
 use tmux_plugin_sdk::prelude::*;
@@ -37,6 +51,42 @@ const GIT_PROBE: &str = concat!(
 
 struct GitStatus {
     pane: PaneId,
+    interval: u64,
+    /// Poll-loop generation: bumping it makes any live loop exit at its
+    /// next wakeup. Shared with the loop tasks via Rc (guest is
+    /// single-threaded).
+    epoch: Rc<Cell<u64>>,
+    /// Refresh-in-flight guard: prompt bursts and overlapping triggers
+    /// collapse into the probe already running.
+    in_flight: Rc<Cell<bool>>,
+}
+
+impl GitStatus {
+    /// Start (or restart) the focused-poll loop; any previous loop dies.
+    fn start_polling(&self, ctx: &Ctx) {
+        let my_epoch = self.epoch.get() + 1;
+        self.epoch.set(my_epoch);
+
+        let epoch = Rc::clone(&self.epoch);
+        let in_flight = Rc::clone(&self.in_flight);
+        let pane = self.pane;
+        let interval = self.interval;
+        ctx.spawn(async move {
+            loop {
+                refresh(pane, &in_flight).await;
+                if sleep_ms(interval).await.is_err() {
+                    return; // instance torn down
+                }
+                if epoch.get() != my_epoch {
+                    return; // unfocused (or superseded by a newer loop)
+                }
+            }
+        });
+    }
+
+    fn stop_polling(&self) {
+        self.epoch.set(self.epoch.get() + 1);
+    }
 }
 
 impl Plugin for GitStatus {
@@ -48,7 +98,7 @@ impl Plugin for GitStatus {
             .interval_ms
             .as_deref()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(5000)
+            .unwrap_or(10_000)
             .max(250);
 
         let me = self_info().map_err(|e| e.message.clone())?;
@@ -61,39 +111,78 @@ impl Plugin for GitStatus {
                 .ok_or("missing pane id in scope")? as u32,
         );
 
-        // Instant refresh when this pane gains focus; the poll loop covers
-        // everything else (cwd changes, commits, detached sessions).
-        ctx.subscribe(&["pane-focus-in"]).map_err(|e| e.message.clone())?;
+        ctx.subscribe(&["pane-focus-in", "pane-focus-out", "pane-prompt"])
+            .map_err(|e| e.message.clone())?;
 
-        ctx.spawn(async move {
-            loop {
-                refresh(pane).await;
-                if sleep_ms(interval).await.is_err() {
-                    return; // instance torn down
-                }
-            }
-        });
+        let plugin = Self {
+            pane,
+            interval,
+            epoch: Rc::new(Cell::new(0)),
+            in_flight: Rc::new(Cell::new(false)),
+        };
 
-        Ok(Self { pane })
+        // Focus events only fire on changes, so seed the initial state: if
+        // this pane is currently its window's active pane, poll until a
+        // focus-out says otherwise; either way publish once now.
+        let active = resolve_pane(pane)
+            .ok()
+            .and_then(|i| i.get("active").and_then(|v| v.as_bool()))
+            .unwrap_or(false);
+        if active {
+            plugin.start_polling(ctx); // first loop iteration refreshes
+        } else {
+            let in_flight = Rc::clone(&plugin.in_flight);
+            ctx.spawn(async move {
+                refresh_even_if_inactive(pane, &in_flight).await;
+            });
+        }
+
+        Ok(plugin)
     }
 
     fn on_event(&mut self, ctx: &Ctx, event: Event) {
-        if event.event == "pane-focus-in" {
-            let pane = self.pane;
-            ctx.spawn(async move {
-                refresh(pane).await;
-            });
+        match event.event.as_str() {
+            // Focused: refresh now (loop's first iteration) + keep polling.
+            "pane-focus-in" => self.start_polling(ctx),
+            // Unfocused: stop polling entirely.
+            "pane-focus-out" => self.stop_polling(),
+            // A command just finished in this pane (OSC 133;A).
+            "pane-prompt" => {
+                let pane = self.pane;
+                let in_flight = Rc::clone(&self.in_flight);
+                ctx.spawn(async move {
+                    refresh(pane, &in_flight).await;
+                });
+            }
+            _ => {}
         }
     }
 }
 
-async fn refresh(pane: PaneId) {
-    // Live pane info; bail quietly if the pane died under us.
+async fn refresh(pane: PaneId, in_flight: &Cell<bool>) {
+    // Background panes are not shown in the status line; they catch up on
+    // their next focus-in or prompt-after-focus.
     let Ok(info) = resolve_pane(pane) else { return };
-
-    // Only the active pane of the window does git work.
     if info.get("active").and_then(|v| v.as_bool()) != Some(true) {
         return;
+    }
+    probe_and_publish(pane, info, in_flight).await;
+}
+
+/// Used once at init so a freshly-loaded plugin publishes something even
+/// for panes that are not active right now.
+async fn refresh_even_if_inactive(pane: PaneId, in_flight: &Cell<bool>) {
+    let Ok(info) = resolve_pane(pane) else { return };
+    probe_and_publish(pane, info, in_flight).await;
+}
+
+async fn probe_and_publish(
+    pane: PaneId,
+    info: serde_json::Value,
+    in_flight: &Cell<bool>,
+) {
+    if in_flight.get() {
+        return; // a probe is already running; it will publish shortly
     }
     let Some(cwd) = info.get("cwd").and_then(|v| v.as_str()).map(String::from)
     else {
@@ -101,8 +190,11 @@ async fn refresh(pane: PaneId) {
         return;
     };
 
-    let Ok(out) = run_job(GIT_PROBE, Some(&cwd)).await else { return };
+    in_flight.set(true);
+    let result = run_job(GIT_PROBE, Some(&cwd)).await;
+    in_flight.set(false);
 
+    let Ok(out) = result else { return };
     let mut branch = "";
     let mut dirty = false;
     for line in out.output.lines() {
@@ -115,8 +207,8 @@ async fn refresh(pane: PaneId) {
     publish(pane, branch, dirty && !branch.is_empty());
 }
 
-/// The host skips the redraw when values are unchanged, so writing every
-/// poll is cheap.
+/// The host skips the status redraw when values are unchanged, so
+/// publishing every probe is cheap.
 fn publish(pane: PaneId, branch: &str, dirty: bool) {
     let _ = set_option_in(OptionTarget::Pane(pane), "@git_branch", branch);
     let _ = set_option_in(
