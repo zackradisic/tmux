@@ -6471,6 +6471,118 @@ shows the subscriptions installed with
 .Em set\-hook
 .Fl B .
 .El
+.Sh PLUGINS
+When built with plugin support
+.Pq Ql --enable-plugins ,
+.Nm
+can load plugins: WebAssembly modules that run inside the
+.Nm
+server with their own in-memory state.
+Plugins receive events (sessions, windows and panes being created,
+renamed, destroyed and so on), and act on
+.Nm
+through host APIs: sending keys, capturing panes, reading and setting
+options, showing messages, running commands and jobs, and timers.
+.Pp
+Plugins cannot block or freeze the server: each callback runs under a
+small CPU budget and is aborted if it exceeds it, all input/output is
+asynchronous, and a plugin that fails repeatedly is disabled.
+Plugins hold no references to
+.Nm
+objects, only ids; an operation on an object that no longer exists
+fails harmlessly.
+.Pp
+A plugin is loaded at one of four scopes given with
+.Fl s :
+a single instance for the whole server
+.Pq Ql server ,
+or one instance per session, window or pane.
+Scoped instances are created automatically when their object appears
+and destroyed when it is gone.
+By default an instance may only act on its own object (a pane-scoped
+plugin only on its pane, and so on).
+.Pp
+Operations beyond reading state, timers and status messages must be
+granted with
+.Fl c
+capabilities:
+.Ql write-options ,
+.Ql send-keys ,
+.Ql capture-pane ,
+.Ql run-process ,
+.Ql run-command ,
+.Ql cross-scope .
+A plugin may ship a TOML manifest next to the
+.Ql .wasm
+file declaring the capabilities it needs; the effective set is the
+intersection of what the manifest requests and what the user grants.
+.Pp
+The following commands are available:
+.Bl -tag -width Ds
+.It Xo Ic load-plugin
+.Op Fl n Ar name
+.Op Fl s Ar scope
+.Op Fl c Ar capability
+.Op Fl o Ar key Ns = Ns Ar value
+.Ar path
+.Xc
+Load the plugin at
+.Ar path .
+.Fl n
+sets the plugin name (default: the file name without
+.Ql .wasm ) ,
+.Fl s
+the scope (one of
+.Ql server ,
+.Ql session ,
+.Ql window
+or
+.Ql pane ) ,
+.Fl c
+grants a capability (may be repeated) and
+.Fl o
+passes configuration to the plugin (may be repeated).
+If a plugin with the same name is already loaded, the command
+reconciles instead of restarting: with unchanged code and
+configuration it does nothing, with changed code it performs a live
+reload preserving plugin state where supported, and with changed
+configuration it offers the new configuration to running instances.
+Loading the same plugins from the configuration file with
+.Ic source-file
+is therefore safe and does not disturb running instances.
+.It Ic unload-plugin Ar name
+Unload a plugin and destroy its instances.
+Plugins removed from the configuration file are not unloaded
+automatically; use this command.
+.It Xo Ic reload-plugin
+.Op Fl a
+.Op Ar name
+.Xc
+Reload a plugin (or all plugins with
+.Fl a )
+from disk, replacing each instance with a freshly built one.
+State is carried over where the plugin supports it; if the new code
+fails to load or refuses the old state, the old instance keeps
+running.
+.It Ic enable-plugin Ar name
+.It Ic disable-plugin Ar name
+Enable or disable a plugin without unloading it.
+A plugin is disabled automatically after repeated failures.
+.It Xo Ic show-plugins
+.Op Fl v
+.Xc
+List loaded plugins.
+With
+.Fl v ,
+also list each instance with its statistics and the granted
+capabilities.
+.It Xo Ic plugin-log
+.Op Fl n Ar lines
+.Op Ar name
+.Xc
+Show recent log messages from plugins and the plugin host, optionally
+limited to one plugin.
+.El
 .Sh MOUSE SUPPORT
 If the
 .Ic mouse

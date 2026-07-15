@@ -36,6 +36,25 @@ pub struct StoreData {
     limits: StoreLimits,
 }
 
+#[cfg(test)]
+impl StoreData {
+    /// Bare StoreData for dispatch tests (no live store behind it).
+    pub(crate) fn for_tests(
+        scope: crate::registry::ScopeId,
+        caps: crate::caps::EffectiveCaps,
+    ) -> Self {
+        Self {
+            plugin: "test".into(),
+            generation: 1,
+            scope,
+            caps,
+            subscriptions: HashSet::new(),
+            soft_warned: false,
+            limits: StoreLimitsBuilder::new().build(),
+        }
+    }
+}
+
 /// A live guest instance: store + bound exports.
 pub struct Guest {
     pub store: Store<StoreData>,

@@ -226,6 +226,92 @@ fn check_pane_target(data: &StoreData, pane_id: u32) -> Result<(), HostError> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::caps::EffectiveCaps;
+    use crate::registry::ScopeId;
+
+    /// xorshift64: deterministic, dependency-free byte soup.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+    }
+
+    /// dispatch/dispatch_async must never panic and must return structured
+    /// errors on garbage: raw bytes, truncated JSON, wrong param types.
+    /// Every panic here would poison the host in production.
+    #[test]
+    fn dispatch_survives_garbage() {
+        let data = StoreData::for_tests(
+            ScopeId::Pane(1),
+            EffectiveCaps { flags: u32::MAX, argv0_allow: vec![] },
+        );
+
+        let corpus: Vec<Vec<u8>> = vec![
+            b"".to_vec(),
+            b"{".to_vec(),
+            b"null".to_vec(),
+            b"[]".to_vec(),
+            b"\xff\xfe\x00garbage".to_vec(),
+            br#"{"method":"send_keys"}"#.to_vec(),
+            br#"{"method":"send_keys","params":{"pane":"nope"}}"#.to_vec(),
+            br#"{"method":"send_keys","params":{"pane":-1,"keys":5}}"#.to_vec(),
+            br#"{"method":"capture_pane","params":{"pane":1,"start":2147483647,"end":-2147483648}}"#.to_vec(),
+            br#"{"method":"get_option","params":{"scope":{"type":"pane"},"name":"x"}}"#.to_vec(),
+            br#"{"method":"subscribe","params":{"events":[null]}}"#.to_vec(),
+            br#"{"method":"run_job","params":{"cmd":"x y"}}"#.to_vec(),
+            br#"{"method":"timer_start","params":{"ms":18446744073709551615}}"#.to_vec(),
+            br#"{"method":"","params":{}}"#.to_vec(),
+        ];
+        for input in &corpus {
+            let _ = dispatch(&data, input);
+            let _ = dispatch_async(&data, input);
+        }
+
+        // Seeded random soup: raw bytes and JSON-shaped strings.
+        let methods = [
+            "subscribe", "send_keys", "capture_pane", "get_option",
+            "set_option", "display_message", "run_job", "run_command",
+            "timer_start", "timer_cancel", "resolve", "bogus",
+        ];
+        let mut rng = Rng(0x74_6d_75_78_32);
+        for _ in 0..5000 {
+            let mut bytes = Vec::new();
+            let len = (rng.next() % 64) as usize;
+            for _ in 0..len {
+                bytes.push((rng.next() & 0xff) as u8);
+            }
+            let _ = dispatch(&data, &bytes);
+            let _ = dispatch_async(&data, &bytes);
+
+            let m = methods[(rng.next() as usize) % methods.len()];
+            let v = rng.next();
+            let shaped = format!(
+                r#"{{"method":"{m}","params":{{"pane":{},"keys":"{}","name":"@x","value":"y","ms":{},"token":{},"events":["e{}"],"cmd":"true","command":"list-panes","start":{},"end":{}}}}}"#,
+                v % 100,
+                v,
+                v,
+                v % 7,
+                v % 3,
+                (v as i64) % 5000 - 2500,
+                (v as i64) % 5000,
+            );
+            let _ = dispatch(&data, shaped.as_bytes());
+            let _ = dispatch_async(&data, shaped.as_bytes());
+        }
+        // Applying whatever subscriptions accumulated must not panic
+        // either.
+        let mut data = data;
+        apply_pending_subscriptions(&mut data);
+    }
+}
+
 /// Dispatch one host_call request. `data` identifies the calling instance.
 pub fn dispatch(data: &StoreData, request: &[u8]) -> Result<Value, HostError> {
     let text = String::from_utf8_lossy(request);
