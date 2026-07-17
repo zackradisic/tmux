@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use tmux_plugin_abi::{ErrorCode, HostError, HostResponse};
 
 use crate::executor::{HostFuture, HostResult};
-use crate::ids::PaneId;
+use crate::ids::{PaneId, SessionId, WindowId};
 use crate::runtime;
 
 fn host_err(code: ErrorCode, message: impl Into<String>) -> HostError {
@@ -184,10 +184,22 @@ pub fn set_option_in(
     .map(|_| ())
 }
 
-/// Resolve a pane's live info: {id, window, width, height, active, dead,
-/// cwd?, shell?}. Errors with E_NO_SUCH_OBJECT once the pane is gone.
+/// Resolve a pane's live info: {id, window, width, height, active, floating,
+/// dead, cwd?, shell?}. Errors with E_NO_SUCH_OBJECT once the pane is gone.
 pub fn resolve_pane(pane: PaneId) -> Result<Value, HostError> {
     host_call("resolve", json!({ "kind": "pane", "id": pane.0 }))
+}
+
+/// Resolve a window's live info: {id, name, width, height, sessions, panes,
+/// active_pane?}. Errors with E_NO_SUCH_OBJECT once it is gone.
+pub fn resolve_window(window: WindowId) -> Result<Value, HostError> {
+    host_call("resolve", json!({ "kind": "window", "id": window.0 }))
+}
+
+/// Resolve a session's live info: {id, name, attached, current_window?,
+/// windows}. Errors with E_NO_SUCH_OBJECT once it is gone.
+pub fn resolve_session(session: SessionId) -> Result<Value, HostError> {
+    host_call("resolve", json!({ "kind": "session", "id": session.0 }))
 }
 
 /// This instance's identity: {plugin, scope: {type, id?}, generation}.

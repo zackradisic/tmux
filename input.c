@@ -174,6 +174,9 @@ static void	input_osc_110(struct input_ctx *, const char *);
 static void	input_osc_111(struct input_ctx *, const char *);
 static void	input_osc_112(struct input_ctx *, const char *);
 static void	input_osc_133(struct input_ctx *, const char *);
+#ifdef ENABLE_PLUGINS
+static void	input_osc_777(struct input_ctx *, const char *);
+#endif
 
 /* Transition entry/exit handlers. */
 static void	input_clear(struct input_ctx *);
@@ -2747,6 +2750,11 @@ input_exit_osc(struct input_ctx *ictx)
 	case 133:
 		input_osc_133(ictx, p);
 		break;
+#ifdef ENABLE_PLUGINS
+	case 777:
+		input_osc_777(ictx, p);
+		break;
+#endif
 	default:
 		log_debug("%s: unknown '%u'", __func__, option);
 		break;
@@ -3009,12 +3017,12 @@ input_osc_9(struct input_ctx *ictx, const char *p)
 	int			 progress = 0;
 
 	if (*pb++ != '4')
-		return;
+		goto notification;
 	if (*pb == '\0' || (*pb == ';' && pb[1] == '\0'))
 		return;
 
 	if (*pb++ != ';')
-		return;
+		goto notification;
 	if (*pb < '0' || *pb > '4')
 		goto bad;
 	state = *pb++ - '0';
@@ -3038,7 +3046,52 @@ input_osc_9(struct input_ctx *ictx, const char *p)
 
 bad:
 	log_debug("bad OSC 9;4 %s", p);
+	return;
+
+notification:
+	/*
+	 * Anything that is not a ConEmu-style progress report ("4;...") is
+	 * an iTerm2-style desktop notification: surface it to plugins as a
+	 * pane-notification event (enqueue-only; delivered at a safe point).
+	 */
+#ifdef ENABLE_PLUGINS
+	if (ictx->wp != NULL && *p != '\0' && strlen(p) <= 512 &&
+	    utf8_isvalid(p))
+		plugin_notify("pane-notification", NULL, NULL, NULL,
+		    ictx->wp, NULL, p);
+#endif
+	return;
 }
+
+#ifdef ENABLE_PLUGINS
+/*
+ * Handle the OSC 777 sequence (rxvt-unicode extensions); only the notify
+ * variant ("777;notify;title;body") is supported, as a pane-notification
+ * plugin event like OSC 9.
+ */
+static void
+input_osc_777(struct input_ctx *ictx, const char *p)
+{
+	const char	*body;
+	char		*text;
+
+	if (strncmp(p, "notify;", 7) != 0)
+		return;
+	p += 7;
+	if (ictx->wp == NULL || *p == '\0')
+		return;
+	body = strchr(p, ';');
+	if (body == NULL || body[1] == '\0') {
+		xasprintf(&text, "%.*s",
+		    body == NULL ? (int)strlen(p) : (int)(body - p), p);
+	} else
+		xasprintf(&text, "%.*s: %s", (int)(body - p), p, body + 1);
+	if (*text != '\0' && strlen(text) <= 512 && utf8_isvalid(text))
+		plugin_notify("pane-notification", NULL, NULL, NULL,
+		    ictx->wp, NULL, text);
+	free(text);
+}
+#endif
 
 /* Handle the OSC 10 sequence for setting and querying foreground colour. */
 static void
@@ -3189,7 +3242,7 @@ input_osc_133(struct input_ctx *ictx, const char *p)
 		 */
 		if (ictx->wp != NULL)
 			plugin_notify("pane-prompt", NULL, NULL, NULL,
-			    ictx->wp, NULL);
+			    ictx->wp, NULL, NULL);
 #endif
 		break;
 	case 'C':

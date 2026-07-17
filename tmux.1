@@ -6479,7 +6479,12 @@ can load plugins: WebAssembly modules that run inside the
 .Nm
 server with their own in-memory state.
 Plugins receive events (sessions, windows and panes being created,
-renamed, destroyed and so on), and act on
+renamed, destroyed and so on, plus escape sequences emitted by programs
+inside panes: OSC 133;A as
+.Ql pane-prompt
+and OSC 9 or OSC 777 notifications as
+.Ql pane-notification ) ,
+and act on
 .Nm
 through host APIs: sending keys, capturing panes, reading and setting
 options, showing messages, running commands and jobs, and timers.

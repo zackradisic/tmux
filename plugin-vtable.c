@@ -69,6 +69,8 @@ plugin_vtable_emit_session(struct plugin_json *pj, struct session *s)
 	plugin_json_num(pj, "id", s->id);
 	plugin_json_str(pj, "name", s->name);
 	plugin_json_bool(pj, "attached", s->attached != 0);
+	if (s->curw != NULL)
+		plugin_json_num(pj, "current_window", s->curw->window->id);
 	plugin_json_arr_start(pj, "windows");
 	RB_FOREACH(wl, winlinks, &s->windows) {
 		plugin_json_obj_start(pj, NULL);
@@ -115,6 +117,7 @@ plugin_vtable_emit_pane(struct plugin_json *pj, struct window_pane *wp)
 	plugin_json_num(pj, "width", wp->sx);
 	plugin_json_num(pj, "height", wp->sy);
 	plugin_json_bool(pj, "active", wp == wp->window->active);
+	plugin_json_bool(pj, "floating", window_pane_is_floating(wp));
 	plugin_json_bool(pj, "dead", (wp->flags & PANE_EXITED) != 0);
 	if (wp->shell != NULL)
 		plugin_json_str(pj, "shell", wp->shell);

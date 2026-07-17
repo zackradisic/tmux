@@ -187,6 +187,18 @@ Available via `ctx.subscribe(&[...])` — the bridged tmux notifications:
 `paste-buffer-changed`, `paste-buffer-deleted`, `alert-activity`,
 `alert-bell`, `alert-silence`.
 
+Two events originate from escape sequences a program emits inside a pane
+(scope carries the pane, and its window):
+
+- `pane-prompt` — OSC `133;A` (shell prompt shown, i.e. a command just
+  finished). Enable by making the shell emit the mark, e.g. in ~/.bashrc:
+  `PROMPT_COMMAND='printf "\e]133;A\a"'"${PROMPT_COMMAND:+;$PROMPT_COMMAND}"`
+- `pane-notification` — OSC `9;message` (iTerm2 style; `9;4;...` progress
+  reports are excluded) or OSC `777;notify;title;body` (rxvt style). The
+  message arrives as `event.data["text"]` (`title: body` for 777). Handy
+  for agents/build scripts: `printf '\e]9;done\a'` from any pane, however
+  deeply nested (ssh, make, ...), reaches a subscribed plugin.
+
 ## API reference (`tmux_plugin_sdk::prelude::*`)
 
 Sync (return immediately):
@@ -199,6 +211,12 @@ send_text(pane: PaneId, text: &str)                     // literal keystrokes
 send_key(pane: PaneId, key: &str)                       // "Enter", "C-c", "M-x"
 capture_pane(pane, start: Option<i32>, end: Option<i32>) -> Result<String, _>
     // rows relative to visible top; negative = history; caps: 2000 lines/256 KiB
+resolve_pane(PaneId) -> Result<Value, _>    // {id, window, width, height,
+                                            //  active, floating, dead, cwd?, shell?}
+resolve_window(WindowId) -> Result<Value, _> // {id, name, width, height,
+                                            //  sessions, panes, active_pane?}
+resolve_session(SessionId) -> Result<Value, _> // {id, name, attached,
+                                            //  current_window?, windows}
 get_option(name: &str) -> Result<String, _>             // any option
 set_option(name: &str, value: &str)                     // @-options only
 display_message(msg: &str)                              // status line + log

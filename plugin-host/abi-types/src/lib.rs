@@ -83,6 +83,9 @@ pub struct BridgeEvent {
     pub pane: Option<BridgeObjectRef>,
     #[serde(default)]
     pub pbname: Option<String>,
+    /// Free-form event payload (e.g. the message of a pane-notification).
+    #[serde(default)]
+    pub text: Option<String>,
 }
 
 impl BridgeEvent {
@@ -114,6 +117,9 @@ impl BridgeEvent {
         }
         if let Some(pbname) = self.pbname {
             data.insert("buffer_name".into(), pbname.into());
+        }
+        if let Some(text) = self.text {
+            data.insert("text".into(), text.into());
         }
 
         Event {

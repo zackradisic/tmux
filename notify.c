@@ -379,7 +379,7 @@ notify_add(const char *name, struct cmd_find_state *fs, struct client *c,
 	 * the drain safe point and plugin-initiated commands run with
 	 * NOHOOKS themselves, so there is no recursion hazard.
 	 */
-	plugin_notify(name, c, s, w, wp, pbname);
+	plugin_notify(name, c, s, w, wp, pbname, NULL);
 #endif
 
 	item = cmdq_running(NULL);

@@ -7,6 +7,7 @@ members = [
     "examples/hello-raw",
     "examples/ticker",
     "examples/git-status",
+    "examples/notify-toast",
 ]
 default-members = ["host"]
 

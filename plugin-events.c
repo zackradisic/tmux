@@ -68,7 +68,8 @@ static const int plugin_obj_pgh[] = {
 
 void
 plugin_notify(const char *name, struct client *c, struct session *s,
-    struct window *w, struct window_pane *wp, const char *pbname)
+    struct window *w, struct window_pane *wp, const char *pbname,
+    const char *text)
 {
 	struct plugin_json	*pj;
 
@@ -118,6 +119,8 @@ plugin_notify(const char *name, struct client *c, struct session *s,
 	}
 	if (pbname != NULL)
 		plugin_json_str(pj, "pbname", pbname);
+	if (text != NULL)
+		plugin_json_str(pj, "text", text);
 	plugin_json_obj_end(pj);
 
 	pgh_notify(plugin_json_string(pj));

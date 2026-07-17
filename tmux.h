@@ -4146,7 +4146,8 @@ enum plugin_obj_kind {
 	PLUGIN_OBJ_CLIENT,
 };
 void	 plugin_notify(const char *, struct client *, struct session *,
-	     struct window *, struct window_pane *, const char *);
+	     struct window *, struct window_pane *, const char *,
+	     const char *);
 void	 plugin_object_created(enum plugin_obj_kind, u_int);
 void	 plugin_object_destroyed(enum plugin_obj_kind, u_int);
 

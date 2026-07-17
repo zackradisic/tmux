@@ -111,7 +111,10 @@ instances receive everything. `*-created` / `*-destroyed` events (plus
 requires `subscribe`. All tmux notifications are bridged (session-created,
 window-linked/unlinked/renamed, pane-focus-in/out, ...), plus synthesized
 `window-created`, `pane-created`, `session-destroyed`, `window-destroyed`,
-`pane-destroyed`, `client-destroyed`.
+`pane-destroyed`, `client-destroyed`, and two escape-sequence events:
+`pane-prompt` (OSC 133;A) and `pane-notification` (OSC 9;message or OSC
+777;notify;title;body — the message travels in `data.text`, ≤512 bytes,
+valid UTF-8).
 
 ## Scopes, lifecycle, reload
 

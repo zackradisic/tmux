@@ -583,6 +583,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "notify-toast"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tmux-plugin-sdk",
+]
+
+[[package]]
 name = "object"
 version = "0.37.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
