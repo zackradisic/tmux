@@ -20,7 +20,10 @@
 //! Load (tmux.conf):
 //!   load-plugin -s server -c run-command ~/.tmux/plugins/notify_toast.wasm
 //!
-//! Options (-o): duration_ms (default 6000), width (default 44).
+//! Options (-o): duration_ms (default 6000), width (default 44),
+//! show_when_visible=1 (show even when the source window is on display -
+//! useful for testing; without it a notification from the window you are
+//! looking at is suppressed, and says so in `plugin-log`).
 //!
 //! Build: cargo build -p notify-toast --target wasm32-unknown-unknown --release
 
@@ -37,11 +40,15 @@ struct Config {
     duration_ms: Option<String>, // -o values arrive as strings
     #[serde(default)]
     width: Option<String>,
+    /// "1" disables the source-is-visible suppression (testing/demos).
+    #[serde(default)]
+    show_when_visible: Option<String>,
 }
 
 struct NotifyToast {
     duration_ms: u64,
     width: u64,
+    show_when_visible: bool,
     /// Live toast per window (window id -> toast pane id), so a newer
     /// notification replaces a stale toast instead of stacking under it.
     toasts: Rc<RefCell<HashMap<u64, u64>>>,
@@ -89,6 +96,8 @@ impl Plugin for NotifyToast {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(44)
                 .clamp(20, 120),
+            show_when_visible: config.show_when_visible.as_deref()
+                == Some("1"),
             toasts: Rc::new(RefCell::new(HashMap::new())),
         })
     }
@@ -113,12 +122,19 @@ impl Plugin for NotifyToast {
 
         let duration_ms = self.duration_ms;
         let width = self.width;
+        let show_when_visible = self.show_when_visible;
         let toasts = Rc::clone(&self.toasts);
         ctx.spawn(async move {
             let Ok(sessions) = list_sessions() else { return };
             let Some(sessions) = sessions.as_array().cloned() else { return };
+            let mut shown = 0u32;
             for s in sessions {
                 if s.get("attached").and_then(|v| v.as_bool()) != Some(true) {
+                    log(&format!(
+                        "notification from %{src_pane}: session ${} not \
+                         attached, skipped",
+                        s.get("id").and_then(|v| v.as_u64()).unwrap_or(0)
+                    ));
                     continue;
                 }
                 let (Some(sid), Some(curw)) = (
@@ -128,13 +144,25 @@ impl Plugin for NotifyToast {
                     continue;
                 };
                 // The user is already looking at the notifying window.
-                if src_window == Some(curw as u32) {
+                if !show_when_visible && src_window == Some(curw as u32) {
+                    log(&format!(
+                        "notification from %{src_pane}: source window is \
+                         visible in session ${sid}, suppressed (set -o \
+                         show_when_visible=1 to disable)"
+                    ));
                     continue;
                 }
                 show_toast(
                     &toasts, sid, curw, src_pane, &msg, width, duration_ms,
                 )
                 .await;
+                shown += 1;
+            }
+            if shown > 0 {
+                log(&format!(
+                    "notification from %{src_pane}: toast shown in {shown} \
+                     session(s)"
+                ));
             }
         });
     }
