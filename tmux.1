@@ -1,4 +1,4 @@
-.\" $OpenBSD$
+.\" $OpenBSD: tmux.1,v 1.1143 2026/07/17 12:42:51 nicm Exp $
 .\"
 .\" Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
 .\"
@@ -14,7 +14,7 @@
 .\" IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING
 .\" OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate$
+.Dd $Mdocdate: July 17 2026 $
 .Dt TMUX 1
 .Os
 .Sh NAME
@@ -850,6 +850,7 @@ Each has a single-character alternative form.
 .It Li "{next}" Ta "+" Ta "The next window by number"
 .It Li "{previous}" Ta "\-" Ta "The previous window by number"
 .It Li "{current}" Ta "@" Ta "The current window"
+.It Li "{mouse}" Ta "=" Ta "The window where the mouse event happened"
 .El
 .Pp
 .Ar target\-pane
@@ -883,6 +884,8 @@ The following special tokens are available for the pane index:
 .It Li "{left\-of}" Ta "" Ta "The pane to the left of the active pane"
 .It Li "{right\-of}" Ta "" Ta "The pane to the right of the active pane"
 .It Li "{active}" Ta "@" Ta "The active pane"
+.It Li "{marked}" Ta "~" Ta "The marked pane"
+.It Li "{mouse}" Ta "=" Ta "The pane where the mouse event happened"
 .El
 .Pp
 The tokens
@@ -1109,8 +1112,6 @@ detaching the client, typically causing it to exit.
 sets a comma-separated list of client flags.
 The flags are:
 .Bl -tag -width Ds
-.It active\-pane
-the client has an independent active pane
 .It ignore\-size
 the client does not affect the size of other clients
 .It no\-detach\-on\-destroy
@@ -1140,13 +1141,6 @@ When a client is read-only, only keys bound to the
 or
 .Ic switch\-client
 commands have any effect.
-A client with the
-.Ar active\-pane
-flag allows the active pane to be selected independently of the window's active
-pane used by clients without the flag.
-This only affects the cursor position and commands issued from the client;
-other features such as hooks and styles continue to use the window's active
-pane.
 .Pp
 If no server is started,
 .Ic attach\-session
@@ -2160,6 +2154,19 @@ before the target.
 .Xc
 Jump to the last mark.
 .It Xo
+.Ic line\-numbers\-on
+.Xc
+Show line numbers in copy mode.
+.It Xo
+.Ic line\-numbers\-off
+.Xc
+Hide line numbers in copy mode.
+.It Xo
+.Ic line\-numbers\-toggle
+(emacs: L)
+.Xc
+Toggle line numbers in copy mode.
+.It Xo
 .Ic middle\-line
 (vi: M)
 (emacs: M\-r)
@@ -3076,6 +3083,7 @@ The following keys may be used in customize mode:
 .It Li "w" Ta "Set window option value, if option is for pane and window"
 .It Li "d" Ta "Set an option or key to the default"
 .It Li "D" Ta "Set tagged options and tagged keys to the default"
+.It Li "e" Ta "Open the value in an editor"
 .It Li "u" Ta "Unset an option (set to default value if global) or unbind a key"
 .It Li "U" Ta "Unset tagged options and unbind tagged keys"
 .It Li "C\-s" Ta "Search by name"
@@ -3154,19 +3162,31 @@ option.
 .It Xo
 .Tg displayp
 .Ic display\-panes
-.Op Fl bN
+.Op Fl kNZ
 .Op Fl d Ar duration
-.Op Fl t Ar target\-client
+.Op Fl s Ar source\-window
+.Op Fl t Ar target\-pane
 .Op Ar template
 .Xc
 .D1 Pq alias: Ic displayp
-Display a visible indicator of each pane shown by
-.Ar target\-client .
+Put
+.Ar target\-pane
+into panes mode, which displays a preview of the window and a visible
+indicator of each pane.
+If
+.Fl s
+is given, the panes in
+.Ar source\-window
+are displayed instead of those in the window containing
+.Ar target\-pane .
 See the
-.Ic display\-panes\-colour
+.Ic display\-panes\-colour ,
+.Ic display\-panes\-active\-colour ,
+.Ic display\-panes\-border\-style ,
+.Ic display\-panes\-format
 and
-.Ic display\-panes\-active\-colour
-session options.
+.Ic display\-panes\-time
+window options.
 The indicator is closed when a key is pressed (unless
 .Fl N
 is given) or
@@ -3178,11 +3198,16 @@ is not given,
 .Ic display\-panes\-time
 is used.
 A duration of zero means the indicator stays until a key is pressed.
+The mode is zoomed by default;
+.Fl Z
+starts it unzoomed.
+.Fl k
+kills the pane when the mode is exited.
 While the indicator is on screen, a pane may be chosen with the
 .Ql 0
 to
 .Ql 9
-keys, which will cause
+keys or by clicking it with the mouse, which will cause
 .Ar template
 to be executed as a command with
 .Ql %%
@@ -3190,9 +3215,6 @@ substituted by the pane ID.
 The default
 .Ar template
 is "select\-pane \-t \[aq]%%\[aq]".
-With
-.Fl b ,
-other commands are not blocked from running until the indicator is closed.
 .Tg findw
 .It Xo Ic find\-window
 .Op Fl iCNrTZ
@@ -3616,7 +3638,7 @@ but a different format may be specified with
 .Fl F .
 .Tg newp
 .It Xo Ic new\-pane
-.Op Fl bdefhIkLPvWZ
+.Op Fl bdefhIkLMOPvWZ
 .Op Fl B Ar border\-lines
 .Op Fl c Ar start\-directory
 .Op Fl e Ar environment
@@ -3662,6 +3684,16 @@ to specify a percentage of the window size.
 .Fl B
 sets the pane border lines for floating panes; see
 .Ic pane\-border\-lines .
+.Fl M
+may be used when bound to a mouse drag key; the new floating pane is resized to
+follow the mouse drag.
+It has no effect with
+.Fl L .
+.Fl O
+creates a modal pane.
+A modal pane is always the active pane and prevents interaction with any other
+panes while it is active.
+A window can only have one modal pane and it must be a floating pane.
 .Pp
 The
 .Fl L
@@ -4018,6 +4050,7 @@ the command behaves like
 .Tg splitw
 .It Xo Ic split\-window
 .Op Fl bdefhIkPvZ
+.Op Fl B Ar border\-lines
 .Op Fl c Ar start\-directory
 .Op Fl e Ar environment
 .Op Fl F Ar format
@@ -4065,6 +4098,9 @@ may be followed by
 to specify a percentage of the available space.
 .Fl p
 is a shorthand option for this.
+.Fl B
+sets the pane border lines for floating panes; see
+.Ic pane\-border\-lines .
 The
 .Fl b
 option causes the new pane to be created to the left of or above
@@ -4076,6 +4112,21 @@ option creates a new pane spanning the full window height (with
 or full window width (with
 .Fl v ) ,
 instead of splitting the active pane.
+.Pp
+If
+.Ar target\-pane
+is floating, a new floating pane is created adjacent to
+.Ar target\-pane
+with equal sizes.
+The position is determined by the
+.Fl h ,
+.Fl v ,
+and
+.Fl b
+flags.
+If any of the new pane would not be visible on the screen,
+.Ar target\-pane
+and the new pane are resized to fit.
 .Pp
 .Fl k
 keeps the pane open after the optional
@@ -5192,24 +5243,6 @@ If
 or
 .Ic next ,
 the client is switched to the previous or next session in alphabetical order.
-.It Ic display\-panes\-active\-colour Ar colour
-Set the colour used by the
-.Ic display\-panes
-command to show the indicator for the active pane.
-.It Ic display\-panes\-colour Ar colour
-Set the colour used by the
-.Ic display\-panes
-command to show the indicators for inactive panes.
-.It Ic display\-panes\-format Ar format
-Set the
-.Ar format
-of the text shown by the
-.Ic display\-panes
-command, expanded for each pane.
-.It Ic display\-panes\-time Ar time
-Set the time in milliseconds for which the indicators shown by the
-.Ic display\-panes
-command appear.
 .It Ic display\-time Ar time
 Set the amount of time for which status line messages and other on-screen
 indicators are displayed.
@@ -5640,6 +5673,38 @@ Set clock colour.
 .Op Ic 12 | 24 | 12\-with\-seconds | 24\-with\-seconds
 .Xc
 Set clock hour format.
+.Pp
+.It Ic display\-panes\-active\-colour Ar colour
+Set the colour used by the
+.Ic display\-panes
+command to show the indicator for the active pane.
+.Pp
+.It Ic display\-panes\-border\-style Ar style
+Set the style of borders in panes mode used by the
+.Ic display\-panes
+command.
+For how to specify
+.Ar style ,
+see the
+.Sx STYLES
+section.
+.Pp
+.It Ic display\-panes\-colour Ar colour
+Set the colour used by the
+.Ic display\-panes
+command to show the indicators for inactive panes.
+.Pp
+.It Ic display\-panes\-format Ar format
+Set the
+.Ar format
+of the text shown by the
+.Ic display\-panes
+command, expanded for each pane.
+.Pp
+.It Ic display\-panes\-time Ar time
+Set the time in milliseconds for which the indicators shown by the
+.Ic display\-panes
+command appear.
 .Pp
 .It Ic fill\-character Ar character
 Set the character used to fill areas of the terminal unused by a window.
@@ -6325,11 +6390,7 @@ For example, this could be used to write to a log file:
 set\-hook \-g command\-error "run\-shell \\"echo 'a tmux command failed' >>/tmp/log\\""
 .Ed
 .Pp
-All the notifications listed in the
-.Sx CONTROL MODE
-section are hooks (without any arguments), except
-.Ic %exit .
-The following additional hooks are available:
+The following hooks are available in addition to after hooks:
 .Bl -tag -width "XXXXXXXXXXXXXXXXXXXXXX"
 .It alert\-activity
 Run when a window has activity.
@@ -6347,12 +6408,16 @@ See
 Run when a client becomes the latest active client of its session.
 .It client\-attached
 Run when a client is attached.
+.It client\-closed
+Run when a client is closed.
+.It client\-created
+Run when a client is created.
 .It client\-detached
-Run when a client is detached
+Run when a client is detached.
 .It client\-focus\-in
-Run when focus enters a client
+Run when focus enters a client.
 .It client\-focus\-out
-Run when focus exits a client
+Run when focus exits a client.
 .It client\-resized
 Run when a client is resized.
 .It client\-session\-changed
@@ -6363,6 +6428,18 @@ Run when a client switches to a light theme.
 Run when a client switches to a dark theme.
 .It command\-error
 Run when a command fails.
+.It marked\-pane\-changed
+Run when the marked pane is set or cleared.
+.It pane\-activity
+Run when there is new output in a pane.
+.It pane\-bell
+Run when a pane receives a bell.
+.It pane\-command\-finished
+Run when an OSC 133 command finishes in a pane.
+.It pane\-command\-started
+Run when an OSC 133 command starts in a pane.
+.It pane\-created
+Run when a pane is created or respawned.
 .It pane\-died
 Run when the program running in a pane exits, but
 .Ic remain\-on\-exit
@@ -6377,20 +6454,50 @@ option is on.
 Run when the focus exits a pane, if the
 .Ic focus\-events
 option is on.
+.It pane\-mode\-changed
+Run when a pane changes mode.
+.It pane\-mode\-entered
+Run when a pane enters a mode.
+.It pane\-mode\-exited
+Run when a pane exits a mode.
+.It pane\-moved
+Run when a pane is moved to another window.
+.It pane\-prompt\-closed
+Run when a prompt in a pane is closed.
+.It pane\-prompt\-opened
+Run when a prompt is opened in a pane.
+.It pane\-resized
+Run when a pane is resized.
 .It pane\-set\-clipboard
 Run when the terminal clipboard is set using the
 .Xr xterm 1
 escape sequence.
-.It session\-created
-Run when a new session created.
+.It pane\-shell\-prompt
+Run when an OSC 133 shell prompt starts in a pane.
+.It pane\-title\-changed
+Run when a pane title is changed.
 .It session\-closed
-Run when a session closed.
+Run when a session is closed.
+.It session\-created
+Run when a new session is created.
+.It session\-added\-to\-group
+Run when a session is added to a session group.
+.It session\-removed\-from\-group
+Run when a session is removed from a session group.
 .It session\-renamed
 Run when a session is renamed.
+.It session\-window\-changed
+Run when a session changes its active window.
+.It window\-closed
+Run when a window is closed.
+.It window\-created
+Run when a window is created.
 .It window\-layout\-changed
 Run when a window layout is changed.
 .It window\-linked
 Run when a window is linked into a session.
+.It window\-pane\-changed
+Run when a window changes its active pane.
 .It window\-renamed
 Run when a window is renamed.
 .It window\-resized
@@ -6398,6 +6505,10 @@ Run when a window is resized.
 This may be after the
 .Ar client\-resized
 hook is run.
+.It window\-unzoomed
+Run when a window is unzoomed.
+.It window\-zoomed
+Run when a window is zoomed.
 .It window\-unlinked
 Run when a window is unlinked from a session.
 .El
@@ -6405,13 +6516,15 @@ Run when a window is unlinked from a session.
 Hooks are managed with these commands:
 .Bl -tag -width Ds
 .It Xo Ic set\-hook
-.Op Fl agpRuw
+.Op Fl agpERTuw
 .Op Fl B Ar name:what:format
 .Op Fl t Ar target\-pane
 .Ar hook\-name
 .Op Ar command
 .Xc
 Without
+.Fl E
+or
 .Fl R ,
 sets (or with
 .Fl u
@@ -6434,6 +6547,11 @@ is the hook to run,
 selects the session, pane, all panes, window, or all windows, and
 .Ar format
 is expanded once a second.
+With
+.Fl T ,
+the hook is run only when
+.Ar format
+is true.
 For monitor hooks,
 .Ar name
 must begin with
@@ -6450,6 +6568,14 @@ With
 the subscription named by
 .Fl B
 is removed.
+.Pp
+With
+.Fl E ,
+fire the user event named
+.Ar hook\-name .
+.Ar hook\-name
+must begin with
+.Ql @ .
 .Pp
 With
 .Fl R ,
@@ -6478,12 +6604,13 @@ When built with plugin support
 can load plugins: WebAssembly modules that run inside the
 .Nm
 server with their own in-memory state.
-Plugins receive events (sessions, windows and panes being created,
-renamed, destroyed and so on, plus escape sequences emitted by programs
-inside panes: OSC 133;A as
-.Ql pane-prompt
-and OSC 9 or OSC 777 notifications as
-.Ql pane-notification ) ,
+Plugins receive every event on the
+.Nm
+event bus (the same vocabulary available to hooks: sessions, windows and
+panes being created, renamed, destroyed, OSC 133 shell-integration events
+and so on), plus OSC 9 or OSC 777 notifications emitted by programs
+inside panes as
+.Ql pane-notification ,
 and act on
 .Nm
 through host APIs: sending keys, capturing panes, reading and setting
@@ -6591,7 +6718,7 @@ limited to one plugin.
 .Sh MOUSE SUPPORT
 If the
 .Ic mouse
-option is on (the default is off),
+option is on,
 .Nm
 allows mouse events to be bound as keys.
 The name of each key is made up of a mouse event (such as
@@ -6607,6 +6734,7 @@ and a location suffix, one of the following:
 .It Li "ScrollbarSlider" Ta "the scrollbar slider"
 .It Li "ScrollbarUp" Ta "above the scrollbar slider"
 .It Li "ScrollbarDown" Ta "below the scrollbar slider"
+.It Li "Empty" Ta "empty space in the window"
 .It Li "ControlN" Ta "on control range N"
 .El
 .Pp
@@ -7213,6 +7341,7 @@ The following variables are available, where appropriate:
 .It Li "copy_cursor_word" Ta "" Ta "Word under cursor in copy mode"
 .It Li "copy_cursor_x" Ta "" Ta "Cursor X position in copy mode"
 .It Li "copy_cursor_y" Ta "" Ta "Cursor Y position in copy mode"
+.It Li "copy_line_numbers" Ta "" Ta "1 if line numbers are shown in copy mode"
 .It Li "copy_position" Ta "" Ta "Position shown in the copy mode indicator"
 .It Li "copy_position_limit" Ta "" Ta "Limit shown in the copy mode indicator"
 .It Li "current_file" Ta "" Ta "Current configuration file"
@@ -7278,6 +7407,11 @@ The following variables are available, where appropriate:
 .It Li "pane_at_top" Ta "" Ta "1 if pane is at the top of window"
 .It Li "pane_bg" Ta "" Ta "Pane background colour"
 .It Li "pane_bottom" Ta "" Ta "Bottom of pane"
+.It Li "pane_command_duration" Ta "" Ta "Current or most recent OSC 133 command duration in seconds"
+.It Li "pane_command_end_time" Ta "" Ta "Time most recent OSC 133 command ended"
+.It Li "pane_command_running" Ta "" Ta "1 if an OSC 133 command is running"
+.It Li "pane_command_start_time" Ta "" Ta "Time current or most recent OSC 133 command started"
+.It Li "pane_command_status" Ta "" Ta "Exit status from most recent OSC 133 command"
 .It Li "pane_current_command" Ta "" Ta "Current command if available"
 .It Li "pane_current_path" Ta "" Ta "Current path if available"
 .It Li "pane_dead" Ta "" Ta "1 if pane is dead"
@@ -7295,9 +7429,12 @@ The following variables are available, where appropriate:
 .It Li "pane_input_off" Ta "" Ta "1 if input to pane is disabled"
 .It Li "pane_key_mode" Ta "" Ta "Extended key reporting mode in this pane"
 .It Li "pane_last" Ta "" Ta "1 if last pane"
+.It Li "pane_last_output_time" Ta "" Ta "Time pane last produced output"
+.It Li "pane_last_prompt_time" Ta "" Ta "Time most recent OSC 133 prompt began"
 .It Li "pane_left" Ta "" Ta "Left of pane"
 .It Li "pane_marked" Ta "" Ta "1 if this is the marked pane"
 .It Li "pane_marked_set" Ta "" Ta "1 if a marked pane is set"
+.It Li "pane_modal_flag" Ta "" Ta "1 if pane is modal"
 .It Li "pane_mode" Ta "" Ta "Name of pane mode, if any"
 .It Li "pane_path" Ta "" Ta "Path of pane (can be set by application)"
 .It Li "pane_pid" Ta "" Ta "PID of first process in pane"
@@ -7325,6 +7462,7 @@ The following variables are available, where appropriate:
 .It Li "prev_window_active" Ta "" Ta "1 if previous window in W: loop is active"
 .It Li "prev_window_index" Ta "" Ta "Index of previous window in W: loop"
 .It Li "rectangle_toggle" Ta "" Ta "1 if rectangle selection is activated"
+.It Li "refresh_active" Ta "" Ta "1 if copy mode refresh is active"
 .It Li "scroll_position" Ta "" Ta "Scroll position in copy mode"
 .It Li "scroll_region_lower" Ta "" Ta "Bottom of scroll region in pane"
 .It Li "scroll_region_upper" Ta "" Ta "Top of scroll region in pane"
@@ -7397,6 +7535,7 @@ The following variables are available, where appropriate:
 .It Li "window_manual_height" Ta "" Ta "Manual height of window, if set"
 .It Li "window_manual_width" Ta "" Ta "Manual width of window, if set"
 .It Li "window_marked_flag" Ta "" Ta "1 if window contains the marked pane"
+.It Li "window_modal_pane" Ta "" Ta "Modal pane in window, if any"
 .It Li "window_name" Ta "#W" Ta "Name of window"
 .It Li "window_offset_x" Ta "" Ta "X offset into window if larger than client"
 .It Li "window_offset_y" Ta "" Ta "Y offset into window if larger than client"
@@ -8679,8 +8818,10 @@ or the current pane if omitted) after the command finishes.
 If the command fails, the exit status is also displayed.
 .Tg wait
 .It Xo Ic wait\-for
-.Op Fl L | S | U
-.Ar channel
+.Op Fl ELSUlv
+.Op Fl F Ar format
+.Op Fl w Ar waiter
+.Ar name
 .Xc
 .D1 Pq alias: Ic wait
 When used without options, prevents the client from exiting until woken using
@@ -8693,6 +8834,41 @@ is used, the channel is locked and any clients that try to lock the same
 channel are made to wait until the channel is unlocked with
 .Ic wait\-for
 .Fl U .
+.Pp
+With
+.Fl E ,
+.Nm
+waits for the next event with
+.Ar name .
+Events include hook and notification names, and user
+.Ql @
+events generated by
+.Ic set-hook
+.Fl E
+or
+.Ic set-hook
+.Fl B .
+If
+.Fl F
+is given,
+.Ar format
+must also be true.
+If
+.Fl v
+is given, event payload keys are printed (whether or not
+.Ar format
+is true).
+.Pp
+.Fl l
+list the waiters for
+.Ar name
+and
+.Fl w
+wakes
+.Ar waiter
+on
+.Ar name
+immediately.
 .El
 .Sh EXIT MESSAGES
 When a

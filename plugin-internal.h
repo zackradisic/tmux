@@ -48,4 +48,8 @@ uint64_t plugin_vtable_timer_start(uint64_t, uint64_t);
 int	 plugin_vtable_timer_cancel(uint64_t);
 void	 plugin_async_shutdown(void);
 
+/* plugin-events.c */
+void	 plugin_events_init(void);
+void	 plugin_events_shutdown(void);
+
 #endif /* PLUGIN_INTERNAL_H */

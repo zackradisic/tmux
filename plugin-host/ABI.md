@@ -108,13 +108,18 @@ Error codes (numeric value used by negative `host_request` returns):
 Scoped instances receive events touching their object; server-scoped
 instances receive everything. `*-created` / `*-destroyed` events (plus
 `session-closed`) are delivered without subscription; everything else
-requires `subscribe`. All tmux notifications are bridged (session-created,
-window-linked/unlinked/renamed, pane-focus-in/out, ...), plus synthesized
-`window-created`, `pane-created`, `session-destroyed`, `window-destroyed`,
-`pane-destroyed`, `client-destroyed`, and two escape-sequence events:
-`pane-prompt` (OSC 133;A) and `pane-notification` (OSC 9;message or OSC
+requires `subscribe`. The bridge registers an event-bus sink for every
+hookable tmux event (session-created, window-linked/unlinked/renamed,
+pane-focus-in/out, pane-shell-prompt, pane-command-started/finished, ...);
+extra payload items (window_index, exit_status, command_duration,
+old_pane, ...) are forwarded flat and land in the guest event's `data`.
+Synthesized events replace the bus versions for object lifecycle:
+`window-created`, `pane-created`, `client-created` (fired at the object
+level, so they also cover panes created outside spawn paths) and
+`session-destroyed`, `window-destroyed`, `pane-destroyed`,
+`client-destroyed`. `pane-notification` (OSC 9;message or OSC
 777;notify;title;body — the message travels in `data.text`, ≤512 bytes,
-valid UTF-8).
+valid UTF-8) has no bus equivalent and is delivered directly.
 
 ## Scopes, lifecycle, reload
 

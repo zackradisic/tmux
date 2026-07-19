@@ -4,7 +4,7 @@ CLEANFILES = tmux.1.mdoc tmux.1.man cmd-parse.c
 
 # Distribution tarball options.
 EXTRA_DIST = \
-	CHANGES README README.ja COPYING example_tmux.conf \
+	CHANGES README COPYING example_tmux.conf \
 	osdep-*.c mdoc2man.awk tmux.1
 dist_EXTRA_tmux_SOURCES = compat/*.[ch]
 
@@ -101,7 +101,6 @@ dist_tmux_SOURCES = \
 	cmd-detach-client.c \
 	cmd-display-menu.c \
 	cmd-display-message.c \
-	cmd-display-panes.c \
 	cmd-find-window.c \
 	cmd-find.c \
 	cmd-if-shell.c \
@@ -161,13 +160,16 @@ dist_tmux_SOURCES = \
 	control-notify.c \
 	control.c \
 	environ.c \
+	events-payload.c \
+	events.c \
 	file.c \
-	format.c \
 	format-draw.c \
+	format.c \
 	fuzzy.c \
 	grid-reader.c \
 	grid-view.c \
 	grid.c \
+	hooks.c \
 	hyperlinks.c \
 	input-keys.c \
 	input.c \
@@ -182,14 +184,13 @@ dist_tmux_SOURCES = \
 	mode-tree.c \
 	monitor.c \
 	names.c \
-	notify.c \
 	options-table.c \
 	options.c \
 	paste.c \
 	popup.c \
 	proc.c \
-	prompt.c \
 	prompt-history.c \
+	prompt.c \
 	regsub.c \
 	resize.c \
 	screen-redraw.c \
@@ -204,9 +205,9 @@ dist_tmux_SOURCES = \
 	spawn.c \
 	status.c \
 	style.c \
+	tmux-protocol.h \
 	tmux.c \
 	tmux.h \
-	tmux-protocol.h \
 	tty-acs.c \
 	tty-draw.c \
 	tty-features.c \
@@ -221,6 +222,7 @@ dist_tmux_SOURCES = \
 	window-clock.c \
 	window-copy.c \
 	window-customize.c \
+	window-panes.c \
 	window-switch.c \
 	window-tree.c \
 	window-visible.c \

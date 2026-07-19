@@ -177,22 +177,34 @@ Delivered without subscription (lifecycle): `session-created`,
 `window-created`, `pane-created`, `session-destroyed`, `window-destroyed`,
 `pane-destroyed`, `client-destroyed`, `session-closed`.
 
-Available via `ctx.subscribe(&[...])` — the bridged tmux notifications:
+Available via `ctx.subscribe(&[...])` — every event on the tmux event bus
+(the bridge registers a sink for each hookable event, so new upstream
+events appear here automatically). The vocabulary as of next-3.8:
 `window-linked`, `window-unlinked`, `window-renamed`, `window-resized`,
-`window-layout-changed`, `window-pane-changed`, `session-renamed`,
-`session-window-changed`, `pane-focus-in`, `pane-focus-out`, `pane-exited`,
-`pane-died`, `pane-mode-changed`, `pane-title-changed`,
-`pane-set-clipboard`, `client-attached`, `client-detached`,
-`client-resized`, `client-active`, `client-session-changed`,
-`paste-buffer-changed`, `paste-buffer-deleted`, `alert-activity`,
-`alert-bell`, `alert-silence`.
+`window-layout-changed`, `window-pane-changed`, `window-closed`,
+`window-zoomed`, `window-unzoomed`, `session-renamed`,
+`session-window-changed`, `pane-focus-in`, `pane-focus-out`, `pane-exited`
+(with `exit_status`/`exit_signal`/`exit_success` in data), `pane-died`,
+`pane-mode-changed`, `pane-title-changed`, `pane-set-clipboard`,
+`pane-moved`, `pane-resized`, `pane-activity`, `pane-bell`,
+`marked-pane-changed`, `client-attached`, `client-detached`,
+`client-closed`, `client-resized`, `client-active`,
+`client-session-changed`, `client-focus-in`, `client-focus-out`,
+`client-dark-theme`, `client-light-theme`, `paste-buffer-changed`,
+`paste-buffer-deleted` (buffer name as `data.paste_buffer`),
+`alert-activity`, `alert-bell`, `alert-silence`.
 
-Two events originate from escape sequences a program emits inside a pane
-(scope carries the pane, and its window):
+Extra payload fields tmux attaches to an event (e.g. `window_index`,
+`old_pane`, `exit_status`) are forwarded verbatim in `event.data`.
 
-- `pane-prompt` — OSC `133;A` (shell prompt shown, i.e. a command just
+Shell-integration events (from escape sequences a program emits inside a
+pane; scope carries the pane and its window):
+
+- `pane-shell-prompt` — OSC `133;A` (prompt shown, i.e. a command just
   finished). Enable by making the shell emit the mark, e.g. in ~/.bashrc:
   `PROMPT_COMMAND='printf "\e]133;A\a"'"${PROMPT_COMMAND:+;$PROMPT_COMMAND}"`
+- `pane-command-started` / `pane-command-finished` — OSC `133;B/C/D`, with
+  `command_status`, `command_start_time` and `command_duration` in data.
 - `pane-notification` — OSC `9;message` (iTerm2 style; `9;4;...` progress
   reports are excluded) or OSC `777;notify;title;body` (rxvt style). The
   message arrives as `event.data["text"]` (`title: body` for 777). Handy

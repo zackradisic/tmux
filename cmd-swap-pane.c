@@ -1,4 +1,4 @@
-/* $OpenBSD$ */
+/* $OpenBSD: cmd-swap-pane.c,v 1.55 2026/07/15 13:02:33 nicm Exp $ */
 
 /*
  * Copyright (c) 2009 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -68,11 +68,19 @@ cmd_swap_pane_exec(struct cmd *self, struct cmdq_item *item)
 	struct window_pane	*tmp_wp, *src_wp, *dst_wp;
 	struct layout_cell	*src_lc, *dst_lc;
 	u_int			 sx, sy, xoff, yoff;
+	int			 src_idx, dst_idx;
 
 	dst_w = target->wl->window;
 	dst_wp = target->wp;
+	dst_idx = target->wl->idx;
 	src_w = source->wl->window;
 	src_wp = source->wp;
+	src_idx = source->wl->idx;
+
+	if (src_wp == src_w->modal || dst_wp == dst_w->modal) {
+		cmdq_error(item, "pane is modal");
+		return (CMD_RETURN_ERROR);
+	}
 
 	if (window_push_zoom(dst_w, 0, args_has(args, 'Z')))
 		server_redraw_window(dst_w);
@@ -180,9 +188,13 @@ cmd_swap_pane_exec(struct cmd *self, struct cmdq_item *item)
 	redraw_invalidate_scene(dst_w);
 	server_redraw_window(dst_w);
 
-	notify_window("window-layout-changed", src_w);
+	if (src_w != dst_w) {
+		window_fire_pane_moved(src_wp, src_w, src_idx, dst_w, dst_idx);
+		window_fire_pane_moved(dst_wp, dst_w, dst_idx, src_w, src_idx);
+	}
+	events_fire_window("window-layout-changed", src_w);
 	if (src_w != dst_w)
-		notify_window("window-layout-changed", dst_w);
+		events_fire_window("window-layout-changed", dst_w);
 
 out:
 	if (window_pop_zoom(src_w))

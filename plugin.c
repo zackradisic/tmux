@@ -79,6 +79,7 @@ plugin_init(void)
 	}
 	evtimer_set(&plugin_drain_timer, plugin_drain_timer_cb, NULL);
 	plugin_initialized = 1;
+	plugin_events_init();
 }
 
 void
@@ -87,6 +88,7 @@ plugin_shutdown(void)
 	if (!plugin_initialized)
 		return;
 	plugin_initialized = 0;
+	plugin_events_shutdown();
 	evtimer_del(&plugin_drain_timer);
 	plugin_async_shutdown();
 	pgh_shutdown();

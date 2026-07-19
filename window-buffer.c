@@ -1,4 +1,4 @@
-/* $OpenBSD$ */
+/* $OpenBSD: window-buffer.c,v 1.51 2026/07/15 12:45:39 nicm Exp $ */
 
 /*
  * Copyright (c) 2017 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -28,7 +28,8 @@
 #include "tmux.h"
 
 static struct screen	*window_buffer_init(struct window_mode_entry *,
-			     struct cmd_find_state *, struct args *);
+			     struct cmdq_item *, struct cmd_find_state *,
+			     struct args *);
 static void		 window_buffer_free(struct window_mode_entry *);
 static void		 window_buffer_resize(struct window_mode_entry *, u_int,
 			     u_int);
@@ -362,7 +363,8 @@ window_buffer_help(u_int *width, const char **item)
 }
 
 static struct screen *
-window_buffer_init(struct window_mode_entry *wme, struct cmd_find_state *fs,
+window_buffer_init(struct window_mode_entry *wme,
+    __unused struct cmdq_item *item, struct cmd_find_state *fs,
     struct args *args)
 {
 	struct window_pane		*wp = wme->wp;
@@ -523,6 +525,8 @@ window_buffer_draw_waiting(struct window_buffer_modedata *data)
 	screen_write_start(&ctx, s);
 	screen_write_cursormove(&ctx, x, y, 0);
 	screen_write_box(&ctx, box_w, box_h, BOX_LINES_DEFAULT, &gc, NULL);
+	screen_write_cursormove(&ctx, x + 1, y + 1, 0);
+	screen_write_clearcharacter(&ctx, box_w - 2, gc.bg);
 	screen_write_cursormove(&ctx, text_x, y + 1, 0);
 	screen_write_nputs(&ctx, box_w - 2, &gc, "%s", text);
 	screen_write_stop(&ctx);

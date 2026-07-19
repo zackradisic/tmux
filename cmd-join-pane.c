@@ -1,4 +1,4 @@
-/* $OpenBSD$ */
+/* $OpenBSD: cmd-join-pane.c,v 1.73 2026/07/17 15:24:30 nicm Exp $ */
 
 /*
  * Copyright (c) 2011 George Nachman <tmux@georgester.com>
@@ -186,7 +186,8 @@ cmd_join_pane_place(struct cmdq_item *item, struct winlink *wl,
 		lc->g.yoff = yoff;
 		layout_fix_panes(w, NULL);
 	}
-	notify_window("window-layout-changed", w);
+	redraw_invalidate_scene(w);
+	events_fire_window("window-layout-changed", w);
 	server_redraw_window(w);
 
 	return (CMD_RETURN_NORMAL);
@@ -256,7 +257,7 @@ cmd_join_pane_move(struct cmdq_item *item, struct args *args,
 		lc->g.xoff = xoff;
 		lc->g.yoff = yoff;
 		layout_fix_panes(w, NULL);
-		notify_window("window-layout-changed", w);
+		events_fire_window("window-layout-changed", w);
 		server_redraw_window(w);
 	}
 
@@ -358,7 +359,8 @@ cmd_join_pane_zindex(struct cmdq_item *item, struct winlink *wl,
 	else
 		TAILQ_INSERT_TAIL(&w->z_index, wp, zentry);
 
-	notify_window("window-layout-changed", w);
+	redraw_invalidate_scene(w);
+	events_fire_window("window-layout-changed", w);
 	server_redraw_window(w);
 
 	return (CMD_RETURN_NORMAL);
@@ -397,7 +399,8 @@ cmd_join_pane_tile(struct cmdq_item *item, struct args *args, struct window *w,
 		window_set_active_pane(w, wp, 1);
 	layout_fix_offsets(w);
 	layout_fix_panes(w, NULL);
-	notify_window("window-layout-changed", w);
+	redraw_invalidate_scene(w);
+	events_fire_window("window-layout-changed", w);
 	server_redraw_window(w);
 
 	return (CMD_RETURN_NORMAL);
@@ -424,7 +427,6 @@ cmd_join_pane_exec(struct cmd *self, struct cmdq_item *item)
 	dst_wp = target->wp;
 	dst_w = dst_wl->window;
 	dst_idx = dst_wl->idx;
-	server_unzoom_window(dst_w);
 
 	if (cmd_get_entry(self) == &cmd_move_pane_entry) {
 		if (args_has(args, 'M'))
@@ -433,22 +435,35 @@ cmd_join_pane_exec(struct cmd *self, struct cmdq_item *item)
 			cmdq_error(item, "pane is not floating");
 			return (CMD_RETURN_ERROR);
 		}
-		if ((s = args_get(args, 'P')) != NULL)
+		if ((s = args_get(args, 'P')) != NULL) {
+			server_unzoom_window(dst_w);
 			return (cmd_join_pane_place(item, dst_wl, dst_wp, s));
-		if ((s = args_get(args, 'z')) != NULL)
+		}
+		if ((s = args_get(args, 'z')) != NULL) {
+			server_unzoom_window(dst_w);
 			return (cmd_join_pane_zindex(item, dst_wl, dst_wp, s));
+		}
 		if (args_has(args, 'X') ||
 		    args_has(args, 'Y') ||
 		    args_has(args, 'U') ||
 		    args_has(args, 'D') ||
 		    args_has(args, 'L') ||
-		    args_has(args, 'R'))
+		    args_has(args, 'R')) {
+			server_unzoom_window(dst_w);
 			return (cmd_join_pane_move(item, args, dst_wl, dst_wp));
+		}
 	}
 
 	src_wl = source->wl;
 	src_wp = source->wp;
 	src_w = src_wl->window;
+
+	if (src_wp == src_w->modal || dst_wp == dst_w->modal) {
+		cmdq_error(item, "pane is modal");
+		return (CMD_RETURN_ERROR);
+	}
+
+	server_unzoom_window(dst_w);
 	server_unzoom_window(src_w);
 
 	if (src_wp == dst_wp) {
@@ -457,6 +472,13 @@ cmd_join_pane_exec(struct cmd *self, struct cmdq_item *item)
 		cmdq_error(item, "source and target panes must be different");
 		return (CMD_RETURN_ERROR);
 	}
+
+	if (args_has(args, 'h'))
+		flags |= SPAWN_HORIZONTAL;
+	if (args_has(args, 'b'))
+		flags |= SPAWN_BEFORE;
+	if (args_has(args, 'f'))
+		flags |= SPAWN_FULLSIZE;
 
 	lc = layout_get_tiled_cell(item, args, dst_w, dst_wp, flags, &cause);
 	if (cause != NULL) {
@@ -498,11 +520,12 @@ cmd_join_pane_exec(struct cmd *self, struct cmdq_item *item)
 	} else
 		server_status_session(dst_s);
 
+	window_fire_pane_moved(src_wp, src_w, src_wl->idx, dst_w, dst_idx);
 	if (window_count_panes(src_w, 1) == 0)
 		server_kill_window(src_w, 1);
 	else
-		notify_window("window-layout-changed", src_w);
-	notify_window("window-layout-changed", dst_w);
+		events_fire_window("window-layout-changed", src_w);
+	events_fire_window("window-layout-changed", dst_w);
 
 	return (CMD_RETURN_NORMAL);
 }

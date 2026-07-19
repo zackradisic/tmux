@@ -86,6 +86,11 @@ pub struct BridgeEvent {
     /// Free-form event payload (e.g. the message of a pane-notification).
     #[serde(default)]
     pub text: Option<String>,
+    /// Everything else the bridge forwards from the tmux event payload
+    /// (window_index, exit_status, command_duration, old_pane, ...);
+    /// passed through into `Event::data` verbatim.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl BridgeEvent {
@@ -120,6 +125,9 @@ impl BridgeEvent {
         }
         if let Some(text) = self.text {
             data.insert("text".into(), text.into());
+        }
+        for (key, value) in self.extra {
+            data.insert(key, value);
         }
 
         Event {

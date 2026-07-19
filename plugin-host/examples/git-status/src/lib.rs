@@ -7,9 +7,9 @@
 //! repository.
 //!
 //! Refresh triggers:
-//!  - `pane-prompt` (OSC 133;A from shell integration): a command just
-//!    finished in this pane -> refresh immediately. Enable by making the
-//!    shell emit the mark, e.g. in ~/.bashrc:
+//!  - `pane-shell-prompt` (OSC 133;A from shell integration): a command
+//!    just finished in this pane -> refresh immediately. Enable by making
+//!    the shell emit the mark, e.g. in ~/.bashrc:
 //!      PROMPT_COMMAND='printf "\e]133;A\a"'"${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
 //!  - becoming the active pane (`window-pane-changed` /
 //!    `session-window-changed`, which fire on every pane/window switch,
@@ -125,7 +125,7 @@ impl Plugin for GitStatus {
             "session-window-changed", // window switch made this pane visible
             "pane-focus-in",         // only with focus-events on
             "pane-focus-out",
-            "pane-prompt",           // command finished (OSC 133;A)
+            "pane-shell-prompt",     // command finished (OSC 133;A)
         ])
         .map_err(|e| e.message.clone())?;
 
@@ -165,7 +165,7 @@ impl Plugin for GitStatus {
             // inactivity on its own at the next tick.
             "pane-focus-out" => self.stop_polling(),
             // A command just finished in this pane (OSC 133;A).
-            "pane-prompt" => {
+            "pane-shell-prompt" => {
                 let pane = self.pane;
                 let in_flight = Rc::clone(&self.in_flight);
                 ctx.spawn(async move {

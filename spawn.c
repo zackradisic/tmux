@@ -1,4 +1,4 @@
-/* $OpenBSD$ */
+/* $OpenBSD: spawn.c,v 1.49 2026/07/15 13:02:33 nicm Exp $ */
 
 /*
  * Copyright (c) 2019 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -71,6 +71,45 @@ spawn_log(const char *from, struct spawn_context *sc)
 	log_debug("%s: s=$%u %s idx=%d", from, s->id, tmp, sc->idx);
 }
 
+static void
+spawn_fire_pane_created(struct spawn_context *sc, struct window_pane *wp)
+{
+	struct event_payload	*ep;
+	struct cmd_find_state	 fs;
+	char			*cmd = NULL;
+	const char		*cwd = wp->cwd;
+
+	ep = event_payload_create();
+	cmd_find_from_winlink_pane(&fs, sc->wl, wp, 0);
+	event_payload_set_target(ep, &fs);
+	event_payload_set_session(ep, "session", sc->s);
+	event_payload_set_window(ep, "window", wp->window);
+	event_payload_set_int(ep, "window_index", sc->wl->idx);
+	event_payload_set_pane(ep, "pane", wp);
+
+	if (wp->argc != 0)
+		cmd = cmd_stringify_argv(wp->argc, wp->argv);
+	if (cmd != NULL && *cmd != '\0')
+		event_payload_set_string(ep, "pane_command", "%s", cmd);
+	else if (wp->shell != NULL)
+		event_payload_set_string(ep, "pane_command", "%s", wp->shell);
+	free(cmd);
+
+	if (cwd != NULL)
+		event_payload_set_string(ep, "pane_current_path", "%s", cwd);
+
+	if (sc->flags & SPAWN_EMPTY)
+		event_payload_set_int(ep, "created_empty", 1);
+	else
+		event_payload_set_int(ep, "created_empty", 0);
+	if (sc->flags & SPAWN_RESPAWN)
+		event_payload_set_int(ep, "created_respawn", 1);
+	else
+		event_payload_set_int(ep, "created_respawn", 0);
+
+	events_fire("pane-created", ep);
+}
+
 struct winlink *
 spawn_window(struct spawn_context *sc, char **cause)
 {
@@ -131,7 +170,7 @@ spawn_window(struct spawn_context *sc, char **cause)
 			 * if this makes it empty.
 			 */
 			wl->flags &= ~WINLINK_ALERTFLAGS;
-			notify_session_window("window-unlinked", s, wl->window);
+			events_fire_winlink("window-unlinked", wl);
 			winlink_stack_remove(&s->lastw, wl);
 			winlink_remove(&s->windows, wl);
 
@@ -190,8 +229,10 @@ spawn_window(struct spawn_context *sc, char **cause)
 		session_select(s, sc->wl->idx);
 
 	/* Fire notification if new window. */
-	if (~sc->flags & SPAWN_RESPAWN)
-		notify_session_window("window-linked", s, w);
+	if (~sc->flags & SPAWN_RESPAWN) {
+		events_fire_window("window-created", w);
+		events_fire_winlink("window-linked", sc->wl);
+	}
 
 	session_group_synchronize_from(s);
 	return (sc->wl);
@@ -229,6 +270,17 @@ spawn_pane(struct spawn_context *sc, char **cause)
 	}
 
 	spawn_log(__func__, sc);
+
+	if (sc->flags & SPAWN_MODAL) {
+		if (~sc->flags & SPAWN_FLOATING) {
+			xasprintf(cause, "modal pane must be floating");
+			return (NULL);
+		}
+		if (w->modal != NULL) {
+			xasprintf(cause, "window already has a modal pane");
+			return (NULL);
+		}
+	}
 
 	/*
 	 * Work out the current working directory. If respawning, use
@@ -519,19 +571,28 @@ complete:
 
 	sigprocmask(SIG_SETMASK, &oldset, NULL);
 	window_pane_set_event(new_wp);
-
 	environ_free(child);
+	spawn_fire_pane_created(sc, new_wp);
 
 	if (sc->flags & SPAWN_RESPAWN)
 		return (new_wp);
-	if ((~sc->flags & SPAWN_DETACHED) || w->active == NULL) {
+	if (sc->flags & SPAWN_MODAL) {
+		w->modal_last = w->active;
+		w->modal = new_wp;
+		window_redraw_active_switch(w, new_wp);
+		if (sc->flags & SPAWN_NONOTIFY)
+			window_set_active_pane(w, new_wp, 0);
+		else
+			window_set_active_pane(w, new_wp, 1);
+	} else if (((~sc->flags & SPAWN_DETACHED) || w->active == NULL) &&
+	    w->modal == NULL) {
 		if (sc->flags & SPAWN_NONOTIFY)
 			window_set_active_pane(w, new_wp, 0);
 		else
 			window_set_active_pane(w, new_wp, 1);
 	}
 	if (~sc->flags & SPAWN_NONOTIFY)
-		notify_window("window-layout-changed", w);
+		events_fire_window("window-layout-changed", w);
 	return (new_wp);
 }
 
@@ -640,6 +701,9 @@ spawn_editor(struct client *c, const char *buf, size_t len,
 	const char			*editor;
 	int				 fd;
 
+	if (w->modal != NULL)
+		return (NULL);
+
 	editor = options_get_string(global_options, "editor");
 	fd = mkstemp(path);
 	if (fd == -1)
@@ -666,9 +730,10 @@ spawn_editor(struct client *c, const char *buf, size_t len,
 	lg.sy = w->sy * 9 / 10;
 	lg.xoff = w->sx / 2 - lg.sx / 2;
 	lg.yoff = w->sy / 2 - lg.sy / 2;
-	window_push_zoom(w, 1, 0);
+	window_push_modal_zoom(w);
 	lc = layout_floating_pane(w, NULL, &lg);
 	if (lc == NULL) {
+		window_pop_modal_zoom(w);
 		spawn_editor_free(es);
 		return (NULL);
 	}
@@ -685,13 +750,14 @@ spawn_editor(struct client *c, const char *buf, size_t len,
 	sc.environ = env;
 	sc.idx = -1;
 	sc.cwd = _PATH_TMP;
-	sc.flags = SPAWN_FLOATING;
+	sc.flags = SPAWN_FLOATING|SPAWN_MODAL;
 
 	wp = spawn_pane(&sc, &cause);
 	free(cmd);
 	environ_free(env);
 	if (wp == NULL) {
 		free(cause);
+		window_pop_modal_zoom(w);
 		spawn_editor_free(es);
 		return (NULL);
 	}

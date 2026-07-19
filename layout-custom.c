@@ -1,4 +1,4 @@
-/* $OpenBSD$ */
+/* $OpenBSD: layout-custom.c,v 1.38 2026/07/16 12:36:58 nicm Exp $ */
 
 /*
  * Copyright (c) 2010 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -177,7 +177,7 @@ layout_parse(struct window *w, const char *layout, char **cause)
 	struct window_pane	*wp;
 	u_int			 npanes, ncells, sx = 0, sy = 0;
 	u_short			 csum;
-	int			 n;
+	int			 n = 0;
 
 	/* Check validity. */
 	if (sscanf(layout, "%hx,%n", &csum, &n) != 1 || n != 5) {
@@ -286,7 +286,7 @@ layout_parse(struct window *w, const char *layout, char **cause)
 	recalculate_sizes();
 	layout_print_cell(tiled_lc, __func__, 0);
 
-	notify_window("window-layout-changed", w);
+	events_fire_window("window-layout-changed", w);
 
 	return (0);
 
