@@ -21,8 +21,10 @@
 //! Load (tmux.conf):
 //!   load-plugin -s server -c run-command ~/.tmux/plugins/notify_toast.wasm
 //!
-//! Options (-o): duration_ms (default 6000), width (default 44),
-//! show_when_visible (default 1; 0 = suppress in the source window).
+//! Options (-o): duration_ms (default 6000; 0 or "infinite" = lines never
+//! expire), width (default 44), show_when_visible (default 1; 0 =
+//! suppress in the source window). Clicking the pane (the ✕ in its
+//! corner, or anywhere else on it) dismisses the whole feed.
 //!
 //! Build: cargo build -p notify-toast --target wasm32-unknown-unknown --release
 
@@ -79,7 +81,8 @@ struct Shared {
 type State = Rc<RefCell<Shared>>;
 
 struct NotifyToast {
-    duration_ms: u64,
+    /// None = lines never expire (dismiss by clicking the pane).
+    duration: Option<u64>,
     width: u64,
     show_when_visible: bool,
     seq: u64,
@@ -193,7 +196,15 @@ async fn repaint(
             let view = st.views.get(&window);
             let old = view.and_then(|v| v.pane);
             let shown = view.and_then(|v| v.shown.clone());
-            (old, shown, lines.join("\\n"), lines.len())
+            let body = if lines.is_empty() {
+                String::new()
+            } else {
+                // First row: the dismiss affordance, right-aligned
+                // (clicking anywhere in the pane dismisses).
+                let pad = " ".repeat((width as usize).saturating_sub(5));
+                format!("{pad}✕\\n{}", lines.join("\\n"))
+            };
+            (old, shown, body, lines.len())
         };
 
         // Already showing exactly this? Don't touch anything (the pane
@@ -237,7 +248,7 @@ async fn repaint(
                 let cmd = format!(
                     "new-pane -d -x {width} -y {height} -X {x} -Y 0 \
                      -t '@{window}' -T 'notifications' -e 'TOAST_BODY={body}' \
-                     'printf \"%b\" \"\\n$TOAST_BODY\\n\"; \
+                     'printf \"%b\" \"$TOAST_BODY\"; \
                      sleep {keeper_secs}'"
                 );
                 if run_command(&cmd).await.is_ok() {
@@ -312,16 +323,21 @@ impl Plugin for NotifyToast {
             "client-session-changed",
             "client-attached",
             "client-detached",
+            // Click-to-dismiss: focusing a toast pane fires this.
+            "window-pane-changed",
         ])
         .map_err(|e| e.message.clone())?;
 
         Ok(Self {
-            duration_ms: config
-                .duration_ms
-                .as_deref()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(6_000)
-                .clamp(1_000, 300_000),
+            duration: match config.duration_ms.as_deref() {
+                Some("0") | Some("infinite") => None,
+                other => Some(
+                    other
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(6_000)
+                        .clamp(1_000, 300_000),
+                ),
+            },
             width: config
                 .width
                 .as_deref()
@@ -337,8 +353,10 @@ impl Plugin for NotifyToast {
 
     fn on_event(&mut self, ctx: &Ctx, event: Event) {
         let width = self.width;
-        let keeper_secs =
-            self.duration_ms.div_ceil(1000) * (MAX_LINES as u64) + 60;
+        let keeper_secs = match self.duration {
+            Some(d) => d.div_ceil(1000) * (MAX_LINES as u64) + 60,
+            None => 2_147_483_647, // pane keeper for never-expiring lines
+        };
         let show_when_visible = self.show_when_visible;
         let state = Rc::clone(&self.state);
 
@@ -351,6 +369,26 @@ impl Plugin for NotifyToast {
             "session-window-changed" | "client-session-changed"
             | "client-attached" | "client-detached" => {
                 ctx.spawn(async move {
+                    sync_views(&state, width, keeper_secs, show_when_visible)
+                        .await;
+                });
+                return;
+            }
+            // Clicking (or otherwise focusing) a notification pane
+            // dismisses the feed - that's the X in the corner.
+            "window-pane-changed" => {
+                let Some(p) = event.scope.pane else { return };
+                let is_view = state
+                    .borrow()
+                    .views
+                    .values()
+                    .any(|v| v.pane == Some(u64::from(p)));
+                if !is_view {
+                    return;
+                }
+                log("notification pane clicked: dismissing feed");
+                ctx.spawn(async move {
+                    state.borrow_mut().entries.clear();
                     sync_views(&state, width, keeper_secs, show_when_visible)
                         .await;
                 });
@@ -379,7 +417,7 @@ impl Plugin for NotifyToast {
 
         self.seq += 1;
         let seq = self.seq;
-        let duration_ms = self.duration_ms;
+        let duration = self.duration;
 
         ctx.spawn(async move {
             {
@@ -392,7 +430,9 @@ impl Plugin for NotifyToast {
             log(&format!("notification from %{src_pane}: added to feed"));
             sync_views(&state, width, keeper_secs, show_when_visible).await;
 
-            // Expire this line, then reconcile again.
+            // Expire this line, then reconcile again. With an infinite
+            // duration the line stays until the pane is dismissed.
+            let Some(duration_ms) = duration else { return };
             if sleep_ms(duration_ms).await.is_err() {
                 return; // instance torn down
             }
