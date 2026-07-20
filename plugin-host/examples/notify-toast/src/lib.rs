@@ -2,18 +2,21 @@
 //!
 //! Listens for `pane-notification` events (OSC 9 "message" or OSC 777
 //! "notify;title;body" emitted by a program in any pane - e.g. a coding
-//! agent's stop hook running `printf '\e]9;done\a'`) and shows the message
-//! as a small floating pane in the top-right corner of whatever window the
-//! user is currently looking at.
+//! agent's stop hook running `printf '\e]9;done\a'`) and shows them in a
+//! single floating notification pane in the top-right corner of whatever
+//! window the user is currently looking at.
+//!
+//! The pane aggregates: each notification is one line, formatted
+//!   %<pane> [<session>:<window>] <text>
+//! and expires on its own after `duration_ms`; the pane grows and shrinks
+//! with its contents and disappears when the last line expires.
 //!
 //! Policy:
-//!  - one toast per attached session, placed in that session's current
-//!    window (floating panes are window-scoped, so the toast must go where
-//!    the user is looking, not where the notifying program ran);
+//!  - one notification pane per window, placed in each attached session's
+//!    current window (floating panes are window-scoped, so the toast must
+//!    go where the user is looking, not where the notifying program ran);
 //!  - suppressed when the notifying pane's window *is* the current window
-//!    (the user can already see it);
-//!  - the toast self-dismisses after `duration_ms` (its command exits and
-//!    the pane closes); a newer toast for the same window replaces it;
+//!    (the user can already see it) - `plugin-log` says so;
 //!  - it is a real pane: click to focus it, scroll it, `join-pane` it into
 //!    the layout, kill it early - all normal pane operations work.
 //!
@@ -22,13 +25,12 @@
 //!
 //! Options (-o): duration_ms (default 6000), width (default 44),
 //! show_when_visible=1 (show even when the source window is on display -
-//! useful for testing; without it a notification from the window you are
-//! looking at is suppressed, and says so in `plugin-log`).
+//! useful for testing in a single window).
 //!
 //! Build: cargo build -p notify-toast --target wasm32-unknown-unknown --release
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use serde::Deserialize;
@@ -45,29 +47,159 @@ struct Config {
     show_when_visible: Option<String>,
 }
 
+/// Most notification lines shown at once; older ones are dropped early.
+const MAX_LINES: usize = 6;
+
+struct Entry {
+    seq: u64,
+    line: String,
+}
+
+/// One window's notification pane and its pending lines.
+#[derive(Default)]
+struct WinState {
+    entries: VecDeque<Entry>,
+    pane: Option<u64>,
+    /// Repaint mutex: a repaint in flight absorbs later requests via
+    /// `dirty` instead of racing to spawn a second pane.
+    repainting: bool,
+    dirty: bool,
+}
+
+type Wins = Rc<RefCell<HashMap<u64, WinState>>>;
+
 struct NotifyToast {
     duration_ms: u64,
     width: u64,
     show_when_visible: bool,
-    /// Live toast per window (window id -> toast pane id), so a newer
-    /// notification replaces a stale toast instead of stacking under it.
-    toasts: Rc<RefCell<HashMap<u64, u64>>>,
+    seq: u64,
+    wins: Wins,
 }
 
-/// Make a notification message safe to embed in a single-quoted tmux
-/// argument: the only dangerous character is the single quote itself
-/// (swapped for U+2019), and control characters are flattened to spaces.
-/// The message reaches the toast via an environment variable, so the shell
-/// never parses it.
+/// Make text safe for a single-quoted tmux argument rendered via
+/// printf %b: single quotes swapped for U+2019, control characters
+/// flattened, backslashes doubled so %b shows them literally (the
+/// bridge's own \n separators stay meaningful).
 fn sanitize(msg: &str, max_chars: usize) -> String {
-    msg.chars()
+    let flat: String = msg
+        .chars()
         .map(|c| match c {
             '\'' => '\u{2019}',
             c if c.is_control() => ' ',
             c => c,
         })
         .take(max_chars)
-        .collect()
+        .collect();
+    flat.replace('\\', "\\\\")
+}
+
+/// Best-effort "[session:window]" tag for the notifying pane.
+fn origin_tag(src_window: Option<u32>) -> String {
+    let Some(window) = src_window else { return String::new() };
+    let Ok(wi) = resolve_window(WindowId(window)) else {
+        return String::new();
+    };
+    let wname = wi.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+    let sname = wi
+        .get("sessions")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_u64())
+        .and_then(|sid| resolve_session(SessionId(sid as u32)).ok())
+        .and_then(|s| {
+            s.get("name").and_then(|v| v.as_str()).map(String::from)
+        })
+        .unwrap_or_else(|| "?".into());
+    format!(" [{sname}:{wname}]")
+}
+
+fn pane_ids(window: &serde_json::Value) -> Vec<u64> {
+    window
+        .get("panes")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
+        .unwrap_or_default()
+}
+
+/*
+ * Rebuild the notification pane for a window from its current entries:
+ * kill the old pane, spawn a fresh one sized to the lines (or nothing if
+ * all lines have expired). Serialized per window via the repainting flag;
+ * calls arriving mid-repaint set `dirty` and are absorbed by the loop.
+ */
+async fn repaint(wins: &Wins, window: u64, width: u64, keeper_secs: u64) {
+    {
+        let mut m = wins.borrow_mut();
+        let Some(ws) = m.get_mut(&window) else { return };
+        if ws.repainting {
+            ws.dirty = true;
+            return;
+        }
+        ws.repainting = true;
+    }
+
+    loop {
+        let (old, body, nlines) = {
+            let m = wins.borrow();
+            let Some(ws) = m.get(&window) else { return };
+            let body = ws
+                .entries
+                .iter()
+                .map(|e| format!(" {}", e.line))
+                .collect::<Vec<_>>()
+                .join("\\n");
+            (ws.pane, body, ws.entries.len())
+        };
+
+        if let Some(old) = old {
+            let _ = run_command(&format!("kill-pane -t %{old}")).await;
+            if let Some(ws) = wins.borrow_mut().get_mut(&window) {
+                ws.pane = None;
+            }
+        }
+
+        if nlines > 0 {
+            let height = nlines as u64 + 3;
+            if let Ok(before) = resolve_window(WindowId(window as u32)) {
+                let win_width =
+                    before.get("width").and_then(|v| v.as_u64()).unwrap_or(80);
+                let x = win_width.saturating_sub(width);
+                let pre = pane_ids(&before);
+                let cmd = format!(
+                    "new-pane -d -x {width} -y {height} -X {x} -Y 0 \
+                     -t '@{window}' -T 'notifications' -e 'TOAST_BODY={body}' \
+                     'printf \"%b\" \"\\n$TOAST_BODY\\n\"; \
+                     sleep {keeper_secs}'"
+                );
+                if run_command(&cmd).await.is_ok() {
+                    let new_pane = resolve_window(WindowId(window as u32))
+                        .ok()
+                        .and_then(|after| {
+                            pane_ids(&after)
+                                .into_iter()
+                                .find(|id| !pre.contains(id))
+                        });
+                    if let Some(ws) = wins.borrow_mut().get_mut(&window) {
+                        ws.pane = new_pane;
+                    }
+                }
+            }
+        }
+
+        let mut m = wins.borrow_mut();
+        let Some(ws) = m.get_mut(&window) else { return };
+        if ws.dirty {
+            ws.dirty = false;
+            drop(m);
+            continue;
+        }
+        ws.repainting = false;
+        let done = ws.entries.is_empty() && ws.pane.is_none();
+        if done {
+            m.remove(&window);
+        }
+        return;
+    }
 }
 
 impl Plugin for NotifyToast {
@@ -98,7 +230,8 @@ impl Plugin for NotifyToast {
                 .clamp(20, 120),
             show_when_visible: config.show_when_visible.as_deref()
                 == Some("1"),
-            toasts: Rc::new(RefCell::new(HashMap::new())),
+            seq: 0,
+            wins: Rc::new(RefCell::new(HashMap::new())),
         })
     }
 
@@ -108,33 +241,35 @@ impl Plugin for NotifyToast {
         }
         let Some(src_pane) = event.scope.pane else { return };
         let src_window = event.scope.window;
-        let Some(msg) = event
-            .data
-            .get("text")
-            .and_then(|v| v.as_str())
-            .map(|m| sanitize(m, 200))
-        else {
+        let Some(msg) = event.data.get("text").and_then(|v| v.as_str()) else {
             return;
         };
         if msg.trim().is_empty() {
             return;
         }
 
+        // "%5 [main:bash] the message", truncated to the pane width.
+        let line = {
+            let prefix = format!("%{src_pane}{}", origin_tag(src_window));
+            let room =
+                (self.width as usize).saturating_sub(prefix.len() + 5).max(8);
+            format!("{prefix} {}", sanitize(msg, room))
+        };
+
+        self.seq += 1;
+        let seq = self.seq;
         let duration_ms = self.duration_ms;
         let width = self.width;
+        let keeper_secs = duration_ms.div_ceil(1000) * (MAX_LINES as u64) + 60;
         let show_when_visible = self.show_when_visible;
-        let toasts = Rc::clone(&self.toasts);
+        let wins = Rc::clone(&self.wins);
+
         ctx.spawn(async move {
             let Ok(sessions) = list_sessions() else { return };
             let Some(sessions) = sessions.as_array().cloned() else { return };
-            let mut shown = 0u32;
-            for s in sessions {
+            let mut targets: Vec<u64> = Vec::new();
+            for s in &sessions {
                 if s.get("attached").and_then(|v| v.as_bool()) != Some(true) {
-                    log(&format!(
-                        "notification from %{src_pane}: session ${} not \
-                         attached, skipped",
-                        s.get("id").and_then(|v| v.as_u64()).unwrap_or(0)
-                    ));
                     continue;
                 }
                 let (Some(sid), Some(curw)) = (
@@ -152,86 +287,47 @@ impl Plugin for NotifyToast {
                     ));
                     continue;
                 }
-                show_toast(
-                    &toasts, sid, curw, src_pane, &msg, width, duration_ms,
-                )
-                .await;
-                shown += 1;
+                if !targets.contains(&curw) {
+                    targets.push(curw);
+                }
             }
-            if shown > 0 {
-                log(&format!(
-                    "notification from %{src_pane}: toast shown in {shown} \
-                     session(s)"
-                ));
+            if targets.is_empty() {
+                return;
+            }
+
+            for &window in &targets {
+                {
+                    let mut m = wins.borrow_mut();
+                    let ws = m.entry(window).or_default();
+                    ws.entries.push_back(Entry {
+                        seq,
+                        line: line.clone(),
+                    });
+                    while ws.entries.len() > MAX_LINES {
+                        ws.entries.pop_front();
+                    }
+                }
+                repaint(&wins, window, width, keeper_secs).await;
+            }
+            log(&format!(
+                "notification from %{src_pane}: shown in {} window(s)",
+                targets.len()
+            ));
+
+            // Expire this line everywhere it was shown, then repaint.
+            if sleep_ms(duration_ms).await.is_err() {
+                return; // instance torn down
+            }
+            for &window in &targets {
+                {
+                    let mut m = wins.borrow_mut();
+                    let Some(ws) = m.get_mut(&window) else { continue };
+                    ws.entries.retain(|e| e.seq != seq);
+                }
+                repaint(&wins, window, width, keeper_secs).await;
             }
         });
     }
-}
-
-async fn show_toast(
-    toasts: &RefCell<HashMap<u64, u64>>,
-    session: u64,
-    window: u64,
-    src_pane: u32,
-    msg: &str,
-    width: u64,
-    duration_ms: u64,
-) {
-    let Ok(before) = resolve_window(WindowId(window as u32)) else { return };
-    let win_width = before.get("width").and_then(|v| v.as_u64()).unwrap_or(80);
-    let pre: Vec<u64> = pane_ids(&before);
-
-    // Replace a still-live toast in this window rather than stacking.
-    // (Separate statement: an if-let scrutinee's RefMut would live across
-    // the await in edition 2021.)
-    let old = toasts.borrow_mut().remove(&window);
-    if let Some(old) = old {
-        let _ = run_command(&format!("kill-pane -t %{old}")).await;
-    }
-
-    // Height 5 = border + blank + message + source line. The message goes
-    // through an environment variable (-e) so neither tmux's parser nor the
-    // shell ever interprets it; sanitize() already removed single quotes.
-    let x = win_width.saturating_sub(width);
-    let secs = duration_ms.div_ceil(1000);
-    let cmd = format!(
-        "new-pane -d -x {width} -y 5 -X {x} -Y 0 -t '${session}:' \
-         -T 'notification' -e 'TOAST_MSG={msg}' -e 'TOAST_SRC=%{src_pane}' \
-         'printf \"\\n %s\\n [%s]\" \"$TOAST_MSG\" \"$TOAST_SRC\"; \
-         sleep {secs}'"
-    );
-    if run_command(&cmd).await.is_err() {
-        return;
-    }
-
-    // The toast normally dismisses itself (its command exits and the pane
-    // closes); find its id so a follow-up toast can replace it early and,
-    // as a safety net (remain-on-exit), reap it after a grace period.
-    let Ok(after) = resolve_window(WindowId(window as u32)) else { return };
-    let Some(new_pane) =
-        pane_ids(&after).into_iter().find(|id| !pre.contains(id))
-    else {
-        return;
-    };
-    toasts.borrow_mut().insert(window, new_pane);
-
-    if sleep_ms(duration_ms + 2_000).await.is_err() {
-        return; // instance torn down
-    }
-    let mut map = toasts.borrow_mut();
-    if map.get(&window) == Some(&new_pane) {
-        map.remove(&window);
-        drop(map);
-        let _ = run_command(&format!("kill-pane -t %{new_pane}")).await;
-    }
-}
-
-fn pane_ids(window: &serde_json::Value) -> Vec<u64> {
-    window
-        .get("panes")
-        .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
-        .unwrap_or_default()
 }
 
 tmux_plugin!(NotifyToast);
