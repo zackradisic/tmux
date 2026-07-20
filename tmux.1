@@ -6643,7 +6643,13 @@ capabilities:
 .Ql capture-pane ,
 .Ql run-process ,
 .Ql run-command ,
-.Ql cross-scope .
+.Ql cross-scope ,
+.Ql mode .
+The
+.Ql mode
+capability lets a plugin open interactive UI panels: floating panes the
+plugin draws into directly (with optional live previews of other
+panes), used for choosers and similar interfaces.
 A plugin may ship a TOML manifest next to the
 .Ql .wasm
 file declaring the capabilities it needs; the effective set is the

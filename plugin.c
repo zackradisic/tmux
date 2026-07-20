@@ -72,6 +72,10 @@ plugin_init(void)
 	vt.timer_start = plugin_vtable_timer_start;
 	vt.timer_cancel = plugin_vtable_timer_cancel;
 	vt.plugin_state_changed = plugin_vtable_state_changed;
+	vt.mode_open = plugin_vtable_mode_open;
+	vt.mode_write = plugin_vtable_mode_write;
+	vt.mode_preview = plugin_vtable_mode_preview;
+	vt.mode_close = plugin_vtable_mode_close;
 
 	if (pgh_init(&vt) != 0) {
 		log_debug("%s: plugin host failed to initialize", __func__);
@@ -91,6 +95,7 @@ plugin_shutdown(void)
 	plugin_events_shutdown();
 	evtimer_del(&plugin_drain_timer);
 	plugin_async_shutdown();
+	plugin_mode_shutdown();
 	pgh_shutdown();
 }
 

@@ -25,6 +25,10 @@ pub enum Delivery {
     /// Async completion from the C side; delivered to the owning instance
     /// after a generation check (stale completions are dropped).
     AsyncComplete { token: u64, json: String, is_error: bool },
+    /// Mode event from the C side (mode-key, mode-resize, mode-closed);
+    /// delivered only to the instance owning the mode, after a generation
+    /// check (stale events are dropped).
+    ModeEvent { mode_id: u64, name: String, json: String },
 }
 
 pub struct EventQueue {

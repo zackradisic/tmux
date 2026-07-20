@@ -48,6 +48,27 @@ uint64_t plugin_vtable_timer_start(uint64_t, uint64_t);
 int	 plugin_vtable_timer_cancel(uint64_t);
 void	 plugin_async_shutdown(void);
 
+/* plugin-mode.c */
+int64_t	 plugin_vtable_mode_open(u_int, u_int, u_int, int, int,
+	     const char *);
+int	 plugin_vtable_mode_write(uint64_t, const u_char *, size_t);
+int	 plugin_vtable_mode_preview(uint64_t, int64_t, u_int, u_int, u_int,
+	     u_int);
+int	 plugin_vtable_mode_close(uint64_t);
+int	 plugin_mode_pending_take(uint64_t *);
+void	 plugin_mode_event(uint64_t, const char *, const char *);
+void	 plugin_mode_unregister(uint64_t);
+void	 plugin_mode_shutdown(void);
+
+/* window-plugin-mode.c */
+uint64_t window_plugin_mode_id(struct window_mode_entry *);
+void	 window_plugin_mode_set_close_reason(struct window_mode_entry *,
+	     const char *);
+void	 window_plugin_mode_write(struct window_mode_entry *,
+	     const u_char *, size_t);
+int	 window_plugin_mode_preview(struct window_mode_entry *, int64_t,
+	     u_int, u_int, u_int, u_int);
+
 /* plugin-events.c */
 void	 plugin_events_init(void);
 void	 plugin_events_shutdown(void);

@@ -118,6 +118,9 @@ pub fn drain(max_us: u32) -> u32 {
             Delivery::AsyncComplete { token, json, is_error } => {
                 deliver_async(token, &json, is_error);
             }
+            Delivery::ModeEvent { mode_id, name, json } => {
+                deliver_mode_event(mode_id, &name, &json);
+            }
         }
 
         // Unloads queued by work above run in the same slice.
@@ -144,7 +147,7 @@ fn process_dying() {
                 &format!("on_unload failed (ignored): {e}"),
             );
         }
-        cancel_instance_tokens(&inst);
+        release_instance_resources(&inst);
         hostlog::debug(
             &inst.plugin,
             &format!("instance {} unloaded", inst.scope_id),
@@ -159,16 +162,24 @@ fn process_dying() {
     }
 }
 
-/// Drop a dying instance's pending tokens and cancel its live C timers.
-fn cancel_instance_tokens(inst: &Instance) {
+/// Release a dying instance's C-side resources: drop its pending tokens,
+/// cancel its live timers and force-close its open modes. The mode_close
+/// vtable call only *schedules* the pane teardown (deferred to a safe
+/// point), so this never destroys tmux objects synchronously.
+pub fn release_instance_resources(inst: &Instance) {
     let timers =
         crate::tokens::purge_instance(&inst.plugin, inst.scope_id, inst.generation);
-    if timers.is_empty() {
+    let modes =
+        crate::modes::purge_instance(&inst.plugin, inst.scope_id, inst.generation);
+    if timers.is_empty() && modes.is_empty() {
         return;
     }
     let Some(vt) = crate::vtable() else { return };
     for id in timers {
         unsafe { (vt.timer_cancel)(id) };
+    }
+    for id in modes {
+        unsafe { (vt.mode_close)(id) };
     }
 }
 
@@ -214,6 +225,83 @@ fn deliver_async(token: u64, json: &str, is_error: bool) {
     check_in(key, inst, trapped, true);
 }
 
+/// Deliver a mode event to the instance owning the mode, generation-
+/// checked. Mode events are targeted (never broadcast) and need no
+/// subscription; they arrive as ordinary guest events with the mode id in
+/// `data.mode`.
+fn deliver_mode_event(mode_id: u64, name: &str, json: &str) {
+    // Unknown mode: owner already torn down (modes purged) or the mode was
+    // closed - drop silently. mode-closed is terminal: the C-side registry
+    // entry is already gone, so drop ours too.
+    let owner = if name == "mode-closed" {
+        crate::modes::take(mode_id)
+    } else {
+        crate::modes::owner_of(mode_id)
+    };
+    let Some(owner) = owner else { return };
+
+    let key = REGISTRY.with(|r| {
+        r.borrow()
+            .by_scope
+            .get(&(owner.plugin.clone(), owner.scope))
+            .copied()
+    });
+    let Some(key) = key else { return };
+
+    let inst = REGISTRY.with(|r| {
+        r.borrow_mut().instances.get_mut(key).and_then(Option::take)
+    });
+    let Some(mut inst) = inst else { return };
+
+    // A new generation at the same scope must not receive events from the
+    // old instance's modes.
+    if inst.generation != owner.generation {
+        REGISTRY.with(|r| {
+            if let Some(slot) = r.borrow_mut().instances.get_mut(key) {
+                *slot = Some(inst);
+            }
+        });
+        return;
+    }
+
+    let mut data = match serde_json::from_str::<serde_json::Value>(json) {
+        Ok(serde_json::Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    };
+    data.insert("mode".into(), mode_id.into());
+    let seq = EVENTS.with(|e| {
+        let mut q = e.borrow_mut();
+        q.seq += 1;
+        q.seq
+    });
+    let event = Event {
+        event: name.to_string(),
+        seq,
+        scope: EventScope::default(),
+        data: serde_json::Value::Object(data),
+    };
+    let json = match serde_json::to_string(&event) {
+        Ok(j) => j,
+        Err(e) => {
+            hostlog::error("host", &format!("mode event serialize: {e}"));
+            REGISTRY.with(|r| {
+                if let Some(slot) = r.borrow_mut().instances.get_mut(key) {
+                    *slot = Some(inst);
+                }
+            });
+            return;
+        }
+    };
+
+    let outcome = inst.guest.call_on_event(&json);
+    inst.stats.record(&outcome);
+    let trapped = outcome.trapped();
+    if let Err(e) = &outcome.result {
+        hostlog::error(&inst.plugin, &format!("on_event({name}) trapped: {e}"));
+    }
+    check_in(key, inst, trapped, true);
+}
+
 /// Return a checked-out instance to its slot, or apply the failure policy
 /// if the guest trapped. `ran` = a guest call actually happened.
 fn check_in(key: usize, inst: Instance, trapped: bool, ran: bool) {
@@ -227,7 +315,7 @@ fn check_in(key: usize, inst: Instance, trapped: bool, ran: bool) {
                 engine.instance_removed();
             }
             drop(reg);
-            cancel_instance_tokens(&inst);
+            release_instance_resources(&inst);
             REGISTRY.with(|r2| {
                 r2.borrow_mut()
                     .record_failure(&plugin, "guest trap in callback");

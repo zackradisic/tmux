@@ -15,9 +15,9 @@ use tmux_plugin_abi::LoadDescriptor;
 
 use crate::events::build_guest;
 use crate::hostlog;
+use crate::events;
 use crate::registry::{Instance, PluginState, ScopeId};
 use crate::state::REGISTRY;
-use crate::{events, tokens};
 
 /// Load or update a plugin definition. Returns a short human-readable
 /// outcome ("loaded", "unchanged", "code reloaded", ...).
@@ -285,13 +285,7 @@ fn swap_instances(name: &str, migrate: bool) {
 
         // Commit: unload v1, swap in v2 under a new generation.
         let _ = old.guest.call_on_unload();
-        let timers =
-            tokens::purge_instance(&old.plugin, old.scope_id, old.generation);
-        if let Some(vt) = crate::vtable() {
-            for id in timers {
-                unsafe { (vt.timer_cancel)(id) };
-            }
-        }
+        events::release_instance_resources(&old);
         REGISTRY.with(|r| {
             let mut reg = r.borrow_mut();
             if let Some(slot) = reg.instances.get_mut(key) {
@@ -372,13 +366,7 @@ fn swap_instances_subset(name: &str, subset: &[(usize, ScopeId)]) {
         };
         let (guest, generation, stats) = built;
         let _ = old.guest.call_on_unload();
-        let timers =
-            tokens::purge_instance(&old.plugin, old.scope_id, old.generation);
-        if let Some(vt) = crate::vtable() {
-            for id in timers {
-                unsafe { (vt.timer_cancel)(id) };
-            }
-        }
+        events::release_instance_resources(&old);
         REGISTRY.with(|r| {
             if let Some(slot) = r.borrow_mut().instances.get_mut(key) {
                 *slot = Some(Instance {

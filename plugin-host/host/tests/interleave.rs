@@ -94,6 +94,32 @@ unsafe extern "C" fn vt_state_changed(
     _r: *const c_char,
 ) {
 }
+unsafe extern "C" fn vt_mode_open(
+    _w: u32,
+    _width: u32,
+    _height: u32,
+    _x: c_int,
+    _y: c_int,
+    _t: *const c_char,
+) -> i64 {
+    9
+}
+unsafe extern "C" fn vt_mode_write(_m: u64, _d: *const u8, _l: usize) -> c_int {
+    0
+}
+unsafe extern "C" fn vt_mode_preview(
+    _m: u64,
+    _p: i64,
+    _x: u32,
+    _y: u32,
+    _w: u32,
+    _h: u32,
+) -> c_int {
+    0
+}
+unsafe extern "C" fn vt_mode_close(_m: u64) -> c_int {
+    0
+}
 
 unsafe extern "C" fn collect_sink(ctx: *mut c_void, ptr: *const c_char, len: usize) {
     let buf = &mut *(ctx as *mut Vec<u8>);
@@ -163,6 +189,10 @@ fn random_interleavings_never_poison() {
         timer_start: vt_timer_start,
         timer_cancel: vt_timer_cancel,
         plugin_state_changed: vt_state_changed,
+        mode_open: vt_mode_open,
+        mode_write: vt_mode_write,
+        mode_preview: vt_mode_preview,
+        mode_close: vt_mode_close,
     };
     assert_eq!(unsafe { pgh_init(&vt) }, 0);
 
@@ -181,7 +211,7 @@ fn random_interleavings_never_poison() {
         let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
         for step in 0..400 {
             let name = names[(rng.next() as usize) % names.len()];
-            match rng.next() % 10 {
+            match rng.next() % 11 {
                 0 | 1 => {
                     let scope = scopes[(rng.next() as usize) % scopes.len()];
                     let desc = CString::new(format!(
@@ -237,6 +267,14 @@ fn random_interleavings_never_poison() {
                             collect_sink,
                             &mut err as *mut Vec<u8> as *mut c_void,
                         )
+                    };
+                }
+                9 => {
+                    // Mode events for ids nothing owns: dropped silently.
+                    let ev = CString::new("mode-key").unwrap();
+                    let data = CString::new(r#"{"key":"q"}"#).unwrap();
+                    unsafe {
+                        pgh_mode_event(rng.next() % 16, ev.as_ptr(), data.as_ptr())
                     };
                 }
                 _ => {

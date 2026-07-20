@@ -31,3 +31,21 @@ id_type!(SessionId, "$");
 id_type!(WindowId, "@");
 id_type!(PaneId, "%");
 id_type!(ClientId, "#");
+
+/// Handle to an open plugin UI mode (from `mode_open`). Dead after
+/// `mode-closed`; host calls on a closed mode return `E_NO_SUCH_OBJECT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ModeId(pub u64);
+
+impl fmt::Display for ModeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "mode:{}", self.0)
+    }
+}
+
+impl From<u64> for ModeId {
+    fn from(id: u64) -> Self {
+        Self(id)
+    }
+}

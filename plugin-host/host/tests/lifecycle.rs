@@ -96,6 +96,36 @@ unsafe extern "C" fn vt_state_changed(
 ) {
 }
 
+unsafe extern "C" fn vt_mode_open(
+    _w: u32,
+    _width: u32,
+    _height: u32,
+    _x: c_int,
+    _y: c_int,
+    _t: *const c_char,
+) -> i64 {
+    -1
+}
+
+unsafe extern "C" fn vt_mode_write(_m: u64, _d: *const u8, _l: usize) -> c_int {
+    -1
+}
+
+unsafe extern "C" fn vt_mode_preview(
+    _m: u64,
+    _p: i64,
+    _x: u32,
+    _y: u32,
+    _w: u32,
+    _h: u32,
+) -> c_int {
+    -1
+}
+
+unsafe extern "C" fn vt_mode_close(_m: u64) -> c_int {
+    -1
+}
+
 unsafe extern "C" fn collect_sink(ctx: *mut c_void, ptr: *const c_char, len: usize) {
     let buf = &mut *(ctx as *mut Vec<u8>);
     buf.extend_from_slice(std::slice::from_raw_parts(ptr as *const u8, len));
@@ -154,6 +184,10 @@ fn full_lifecycle() {
         timer_start: vt_timer_start,
         timer_cancel: vt_timer_cancel,
         plugin_state_changed: vt_state_changed,
+        mode_open: vt_mode_open,
+        mode_write: vt_mode_write,
+        mode_preview: vt_mode_preview,
+        mode_close: vt_mode_close,
     };
     assert_eq!(unsafe { pgh_init(&vt) }, 0);
 

@@ -85,6 +85,10 @@ Error codes (numeric value used by negative `host_request` returns):
 | `capture_pane` | `{pane, start?, end?, escapes?}` | `{text}` | capture-pane (≤2000 lines, ≤256 KiB) |
 | `display_message` | `{client?, message}` | `{}` | display-message |
 | `timer_cancel` | `{token}` | `{}` | timers |
+| `mode_open` | `{window?, width, height, x?, y?, title?}` | `{mode}` | mode |
+| `mode_write` | `{mode, data_b64}` | `{}` | mode (≤256 KiB decoded) |
+| `mode_preview` | `{mode, pane?, x, y, w, h}` | `{}` | mode |
+| `mode_close` | `{mode}` | `{}` | mode |
 
 `scope` is `{"type":"server"}` (default) or
 `{"type":"session"|"window"|"pane","id":n}`.
@@ -121,6 +125,50 @@ level, so they also cover panes created outside spawn paths) and
 777;notify;title;body — the message travels in `data.text`, ≤512 bytes,
 valid UTF-8) has no bus equivalent and is delivered directly.
 
+## UI modes
+
+A mode is an interactive panel owned by one plugin instance: a freshly
+spawned **empty floating pane** (no process) running a dedicated window
+mode, opened with `mode_open` (capability `mode`). The pane is focused on
+open so keys flow to it immediately; ids are monotonic and never reused.
+(Entering a mode on an *existing* pane — tmux's own copy-mode pattern —
+is not offered in v1; the design for it is in
+[MODE-ATTACH.md](MODE-ATTACH.md).)
+
+- **Target window**: scope-implied. Pane- and window-scoped instances may
+  only open in their own window (`window` may be omitted); session-scoped
+  in windows linked to their session (default: the session's current
+  window); server-scoped anywhere (`window` required). `cross-scope`
+  relaxes the checks.
+- **Rendering**: `mode_write` sends raw ANSI bytes, parsed server-side by
+  the full tmux escape parser into the mode's screen — cursor addressing,
+  SGR, clears, alternate charsets all work, so ratatui-style TUI libraries
+  can render unmodified. Transport is base64 (`data_b64`) because
+  host_call payloads are JSON; at most 256 KiB decoded per call. A later
+  raw-memory import can lift the base64 hop without changing this method's
+  semantics. Note the screen is not a terminal: nothing echoes back, and
+  replies that would go to a terminal (OSC 52 queries etc.) are dropped.
+- **Preview**: `mode_preview` declares one retained rect `{pane, x, y, w,
+  h}` mirroring the source pane's live grid (grid-cell blit, no escape
+  reparsing), refreshed ~every 500 ms until cleared (`pane` omitted), the
+  source pane dies, or the mode closes. The rect must fit the mode screen;
+  scope-implied pane targeting applies as for `capture_pane`.
+- **Events** (delivered only to the owning instance, no subscription
+  needed; the mode id arrives in `data.mode`):
+  - `mode-key` — `{mode, key, mouse?: {x, y, b}}`; `key` is a tmux key
+    name ("q", "Enter", "Escape", "MouseDown1Pane", ...), `mouse` carries
+    pane-relative cell coordinates when the key is a mouse event.
+  - `mode-resize` — `{mode, width, height}`; the float was resized,
+    redraw.
+  - `mode-closed` — `{mode, reason}`; terminal. `reason` is `"closed"`
+    (the plugin called `mode_close`) or `"killed"` (anything else: the
+    user killed the pane, the window died, the plugin was reloaded or
+    unloaded). The id is dead afterwards.
+- **Close**: `mode_close` returns immediately; the pane teardown happens
+  at the next event-loop iteration and delivers `mode-closed`. Instance
+  teardown (unload, reload, scope-object death) force-closes all modes the
+  instance owns; stale events from a previous generation are dropped.
+
 ## Scopes, lifecycle, reload
 
 One instance per (plugin, scope object): `server`, `session`, `window`, or
@@ -151,7 +199,8 @@ sidecar `<stem>.toml` next to the `.wasm` — effective = requests ∩ grants.
 Defaults always granted: `read-state`, `display-message`, `timers`. Others:
 `write-options`, `send-keys`, `capture-pane`, `run-process` (with optional
 `[caps.run-process] argv0 = [...]` allowlist), `run-command`,
-`cross-scope`, and reserved: `popup`, `menu`, `fs-read`, `fs-write`.
+`cross-scope`, `mode` (UI modes), and reserved: `popup`, `menu`,
+`fs-read`, `fs-write`.
 Scope-implied targeting is enforced on top: a pane-scoped instance may only
 target its own pane, window-scoped its window's panes, session-scoped its
 session's panes; `cross-scope` lifts this.

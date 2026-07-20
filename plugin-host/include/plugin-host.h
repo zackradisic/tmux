@@ -8,7 +8,8 @@
  * Threading contract:
  *  - All pgh_* functions are main-thread only.
  *  - Vtable callbacks are invoked only synchronously from inside pgh_* calls.
- *  - Vtable callbacks may re-enter pgh_notify (enqueue-only), nothing else.
+ *  - Vtable callbacks may re-enter pgh_notify, pgh_async_complete and
+ *    pgh_mode_event (all enqueue-only), nothing else.
  */
 
 #ifndef PLUGIN_HOST_H
@@ -44,6 +45,8 @@
 #define FS_READ (1 << 11)
 
 #define FS_WRITE (1 << 12)
+
+#define MODE (1 << 13)
 
 /**
  * Granted to every plugin without being asked for.
@@ -173,6 +176,37 @@ typedef struct {
    * the server message log.
    */
   void (*plugin_state_changed)(const char *plugin, const char *state, const char *reason);
+  /**
+   * Open a plugin UI mode in a freshly spawned empty floating pane in
+   * `window`. x/y are top-left cell offsets, -1 = centered; `title` may
+   * be NULL. Returns the new mode id (> 0) synchronously, or a negative
+   * error: -1 no such window, -2 spawn failed, -3 mode init failed.
+   * Events for the mode arrive later via pgh_mode_event.
+   */
+  int64_t (*mode_open)(uint32_t window,
+                       uint32_t width,
+                       uint32_t height,
+                       int x,
+                       int y,
+                       const char *title);
+  /**
+   * Parse ANSI bytes into a mode's screen (server-side escape parser,
+   * no tty round-trip). 0 ok, -1 no such mode.
+   */
+  int (*mode_write)(uint64_t mode, const uint8_t *data, uintptr_t len);
+  /**
+   * Set (pane >= 0) or clear (pane < 0) a mode's retained preview rect:
+   * a live blit of the source pane's grid at (x, y), size (w, h),
+   * refreshed periodically until cleared. 0 ok, -1 no such mode,
+   * -2 rect does not fit the mode screen.
+   */
+  int (*mode_preview)(uint64_t mode, int64_t pane, uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+  /**
+   * Close a mode: the floating pane is torn down at the next safe
+   * point (never synchronously inside this call), which delivers
+   * pgh_mode_event(mode, "mode-closed", ...). 0 ok, -1 no such mode.
+   */
+  int (*mode_close)(uint64_t mode);
 } pgh_host_vtable;
 
 #ifdef __cplusplus
@@ -280,6 +314,22 @@ void pgh_object_destroyed(int kind, uint32_t id);
  * `result_json` must be NUL-terminated.
  */
 void pgh_async_complete(uint64_t token, const char *result_json, int is_error);
+
+/**
+ * Deliver a mode event (mode-key, mode-resize, mode-closed) for a plugin
+ * UI mode opened through the mode_open vtable call. `data_json` is a JSON
+ * object merged into the guest event's `data` (alongside "mode").
+ *
+ * ENQUEUE ONLY, like pgh_notify: legal to call from any main-thread
+ * context, including from inside vtable callbacks. Ownership and
+ * generation checks at drain time drop events whose owning instance died
+ * or was reloaded. The C side should call plugin_schedule_drain()
+ * afterwards.
+ *
+ * # Safety
+ * `name` and `data_json` must be NUL-terminated.
+ */
+void pgh_mode_event(uint64_t mode_id, const char *name, const char *data_json);
 
 /**
  * Run queued plugin work for at most `max_us` microseconds of wall clock

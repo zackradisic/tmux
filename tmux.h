@@ -4253,6 +4253,9 @@ void	 plugin_notify(const char *, struct client *, struct session *,
 void	 plugin_object_created(enum plugin_obj_kind, u_int);
 void	 plugin_object_destroyed(enum plugin_obj_kind, u_int);
 
+/* window-plugin-mode.c */
+extern const struct window_mode window_plugin_mode;
+
 /* plugin-json.c */
 struct plugin_json;
 struct plugin_json	*plugin_json_create(void);

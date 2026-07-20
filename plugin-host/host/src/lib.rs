@@ -13,6 +13,7 @@ mod engine;
 mod events;
 mod ffi;
 mod hostlog;
+mod modes;
 mod registry;
 mod reload;
 mod state;
@@ -318,6 +319,35 @@ pub unsafe extern "C" fn pgh_async_complete(
         EVENTS.with(|e| {
             e.borrow_mut().deliveries.push_back(
                 state::Delivery::AsyncComplete { token, json, is_error: is_error != 0 },
+            );
+        });
+    })
+}
+
+/// Deliver a mode event (mode-key, mode-resize, mode-closed) for a plugin
+/// UI mode opened through the mode_open vtable call. `data_json` is a JSON
+/// object merged into the guest event's `data` (alongside "mode").
+///
+/// ENQUEUE ONLY, like pgh_notify: legal to call from any main-thread
+/// context, including from inside vtable callbacks. Ownership and
+/// generation checks at drain time drop events whose owning instance died
+/// or was reloaded. The C side should call plugin_schedule_drain()
+/// afterwards.
+///
+/// # Safety
+/// `name` and `data_json` must be NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn pgh_mode_event(
+    mode_id: u64,
+    name: *const c_char,
+    data_json: *const c_char,
+) {
+    ffi_guard!((), {
+        let Some(name) = cstr_lossy(name) else { return };
+        let json = cstr_lossy(data_json).unwrap_or_else(|| "{}".into());
+        EVENTS.with(|e| {
+            e.borrow_mut().deliveries.push_back(
+                state::Delivery::ModeEvent { mode_id, name, json },
             );
         });
     })

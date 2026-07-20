@@ -13,7 +13,8 @@ header = """/*
  * Threading contract:
  *  - All pgh_* functions are main-thread only.
  *  - Vtable callbacks are invoked only synchronously from inside pgh_* calls.
- *  - Vtable callbacks may re-enter pgh_notify (enqueue-only), nothing else.
+ *  - Vtable callbacks may re-enter pgh_notify, pgh_async_complete and
+ *    pgh_mode_event (all enqueue-only), nothing else.
  */"""
 
 [export]

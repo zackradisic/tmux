@@ -18,13 +18,19 @@
 //! The view is a real pane: click to focus it, scroll it, `join-pane` it
 //! into the layout, kill it early - all normal pane operations work.
 //!
+//! Clicking a toast opens the **chooser**: a centered floating panel (a
+//! plugin UI mode) listing the feed with a live preview of the selected
+//! notification's source pane. `j`/`k` (or arrows) move the selection,
+//! `1`-`9` or `Enter` jump to the source pane (and drop the entry), `d`
+//! dismisses an entry, `q`/`Escape` closes the panel.
+//!
 //! Load (tmux.conf):
-//!   load-plugin -s server -c run-command ~/.tmux/plugins/notify_toast.wasm
+//!   load-plugin -s server -c run-command -c mode \
+//!       ~/.tmux/plugins/notify_toast.wasm
 //!
 //! Options (-o): duration_ms (default 6000; 0 or "infinite" = lines never
 //! expire), width (default 44), show_when_visible (default 1; 0 =
-//! suppress in the source window). Clicking the pane (the ✕ in its
-//! corner, or anywhere else on it) dismisses the whole feed.
+//! suppress in the source window).
 //!
 //! Build: cargo build -p notify-toast --target wasm32-unknown-unknown --release
 
@@ -54,6 +60,7 @@ struct Entry {
     seq: u64,
     line: String,
     src_window: Option<u64>,
+    src_pane: u64,
 }
 
 /// One window's rendering of the feed (just the pane and a repaint
@@ -80,13 +87,22 @@ struct Shared {
 
 type State = Rc<RefCell<Shared>>;
 
+/// The expanded chooser: one open plugin UI mode at a time.
+struct Chooser {
+    mode: ModeId,
+    selected: usize,
+    width: u32,
+    height: u32,
+}
+
 struct NotifyToast {
-    /// None = lines never expire (dismiss by clicking the pane).
+    /// None = lines never expire (dismiss from the chooser).
     duration: Option<u64>,
     width: u64,
     show_when_visible: bool,
     seq: u64,
     state: State,
+    chooser: Option<Chooser>,
 }
 
 /// Make text safe for a single-quoted tmux argument rendered via
@@ -199,10 +215,10 @@ async fn repaint(
             let body = if lines.is_empty() {
                 String::new()
             } else {
-                // First row: the dismiss affordance, right-aligned
-                // (clicking anywhere in the pane dismisses).
+                // First row: the expand affordance, right-aligned
+                // (clicking anywhere in the pane opens the chooser).
                 let pad = " ".repeat((width as usize).saturating_sub(5));
-                format!("{pad}✕\\n{}", lines.join("\\n"))
+                format!("{pad}\u{2261}\\n{}", lines.join("\\n"))
             };
             (old, shown, body, lines.len())
         };
@@ -305,6 +321,226 @@ async fn sync_views(
     }
 }
 
+// ---- chooser: the expanded view, a plugin UI mode ----
+
+/// Columns the list occupies; the preview takes the rest (none when the
+/// panel is too narrow).
+fn chooser_list_width(width: u32) -> u32 {
+    if width >= 46 {
+        width * 2 / 5
+    } else {
+        width
+    }
+}
+
+/// The retained preview rect for the selected entry's source pane.
+fn chooser_preview_rect(
+    ch: &Chooser,
+    entries: &VecDeque<Entry>,
+) -> Option<PreviewRect> {
+    if entries.is_empty() {
+        return None;
+    }
+    let sel = ch.selected.min(entries.len() - 1);
+    let list_w = chooser_list_width(ch.width);
+    if list_w >= ch.width {
+        return None;
+    }
+    let x = list_w + 1;
+    let w = ch.width.saturating_sub(x);
+    let h = ch.height.saturating_sub(2);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    Some(PreviewRect {
+        pane: PaneId(entries[sel].src_pane as u32),
+        x,
+        y: 0,
+        w,
+        h,
+    })
+}
+
+/// Full redraw of the chooser screen plus the preview rect. Recomputes
+/// from the live feed each time, so it is safe to call with a selection
+/// that expiry has made stale.
+fn chooser_render(ch: &Chooser, entries: &VecDeque<Entry>) {
+    let height = ch.height as usize;
+    let list_w = chooser_list_width(ch.width) as usize;
+    let sel = ch.selected.min(entries.len().saturating_sub(1));
+
+    let mut out = String::from("\x1b[2J\x1b[H");
+    if entries.is_empty() {
+        out.push_str("\x1b[2;2H\x1b[2mno notifications\x1b[0m");
+    }
+    for (i, e) in entries.iter().enumerate() {
+        let row = i + 2; // 1-based; row 1 is a margin
+        if row + 1 > height {
+            break;
+        }
+        let text: String = format!("{}. {}", i + 1, e.line)
+            .chars()
+            .take(list_w.saturating_sub(2))
+            .collect();
+        if i == sel {
+            out.push_str(&format!("\x1b[{row};1H\x1b[7m {text}\x1b[0m"));
+        } else {
+            out.push_str(&format!("\x1b[{row};1H {text}"));
+        }
+    }
+    if list_w < ch.width as usize {
+        for row in 1..height {
+            out.push_str(&format!(
+                "\x1b[{row};{col}H\x1b[2m\u{2502}\x1b[0m",
+                col = list_w + 1
+            ));
+        }
+    }
+    out.push_str(&format!(
+        "\x1b[{height};1H\x1b[2m j/k move \u{b7} 1-9/Enter jump \u{b7} \
+         d dismiss \u{b7} q close\x1b[0m"
+    ));
+
+    let _ = mode_write(ch.mode, out.as_bytes());
+    let _ = mode_preview(ch.mode, chooser_preview_rect(ch, entries).as_ref());
+}
+
+impl NotifyToast {
+    fn open_chooser(&mut self, window: u64) {
+        if self.chooser.is_some() {
+            return;
+        }
+        let nentries = self.state.borrow().entries.len();
+        if nentries == 0 {
+            return;
+        }
+        let Ok(wi) = resolve_window(WindowId(window as u32)) else { return };
+        let win_w =
+            wi.get("width").and_then(|v| v.as_u64()).unwrap_or(80) as u32;
+        let win_h =
+            wi.get("height").and_then(|v| v.as_u64()).unwrap_or(24) as u32;
+        let width = win_w.saturating_sub(8).clamp(24, 90);
+        let height = (nentries as u32 + 6)
+            .max(10)
+            .min(win_h.saturating_sub(4).max(5));
+
+        match mode_open(&ModeOpts {
+            window: Some(WindowId(window as u32)),
+            width,
+            height,
+            x: None, // centered
+            y: None,
+            title: Some("notifications".into()),
+        }) {
+            Ok(mode) => {
+                let ch = Chooser { mode, selected: 0, width, height };
+                chooser_render(&ch, &self.state.borrow().entries);
+                self.chooser = Some(ch);
+            }
+            Err(e) => log(&format!("chooser open failed: {}", e.message)),
+        }
+    }
+
+    /// Jump to entry `idx`'s source pane, drop the entry and close.
+    fn chooser_jump(&mut self, ctx: &Ctx, idx: usize) {
+        let Some(ch) = self.chooser.as_ref() else { return };
+        let target = {
+            let st = self.state.borrow();
+            st.entries.get(idx).map(|e| (e.seq, e.src_window, e.src_pane))
+        };
+        let Some((seq, src_window, src_pane)) = target else { return };
+        let _ = mode_close(ch.mode);
+
+        let state = Rc::clone(&self.state);
+        let (width, keeper_secs, show_when_visible) = self.view_params();
+        ctx.spawn(async move {
+            if let Some(window) = src_window {
+                let _ =
+                    run_command(&format!("select-window -t @{window}")).await;
+            }
+            let _ = run_command(&format!("select-pane -t %{src_pane}")).await;
+            state.borrow_mut().entries.retain(|e| e.seq != seq);
+            sync_views(&state, width, keeper_secs, show_when_visible).await;
+        });
+    }
+
+    /// Drop entry `idx` from the feed; close when it was the last one.
+    fn chooser_dismiss(&mut self, ctx: &Ctx, idx: usize) {
+        let seq = {
+            let st = self.state.borrow();
+            st.entries.get(idx).map(|e| e.seq)
+        };
+        let Some(seq) = seq else { return };
+        self.state.borrow_mut().entries.retain(|e| e.seq != seq);
+
+        let empty = self.state.borrow().entries.is_empty();
+        if let Some(ch) = self.chooser.as_mut() {
+            if empty {
+                let _ = mode_close(ch.mode);
+            } else {
+                ch.selected = ch.selected.min(
+                    self.state.borrow().entries.len() - 1,
+                );
+                chooser_render(ch, &self.state.borrow().entries);
+            }
+        }
+
+        let state = Rc::clone(&self.state);
+        let (width, keeper_secs, show_when_visible) = self.view_params();
+        ctx.spawn(async move {
+            sync_views(&state, width, keeper_secs, show_when_visible).await;
+        });
+    }
+
+    fn chooser_key(&mut self, ctx: &Ctx, key: &str, mouse_row: Option<u64>) {
+        let nentries = self.state.borrow().entries.len();
+        let Some(ch) = self.chooser.as_mut() else { return };
+        let sel = ch.selected.min(nentries.saturating_sub(1));
+
+        match key {
+            "j" | "Down" if nentries > 0 => {
+                ch.selected = (sel + 1) % nentries;
+                chooser_render(ch, &self.state.borrow().entries);
+            }
+            "k" | "Up" if nentries > 0 => {
+                ch.selected = (sel + nentries - 1) % nentries;
+                chooser_render(ch, &self.state.borrow().entries);
+            }
+            "Enter" if nentries > 0 => self.chooser_jump(ctx, sel),
+            "d" if nentries > 0 => self.chooser_dismiss(ctx, sel),
+            "q" | "Escape" => {
+                let _ = mode_close(ch.mode);
+            }
+            "MouseDown1Pane" => {
+                // List rows start at screen row 1 (0-based).
+                let Some(row) = mouse_row else { return };
+                let idx = (row as usize).wrapping_sub(1);
+                if idx < nentries {
+                    ch.selected = idx;
+                    chooser_render(ch, &self.state.borrow().entries);
+                }
+            }
+            k => {
+                if let Some(idx) =
+                    k.parse::<usize>().ok().filter(|n| (1..=9).contains(n))
+                {
+                    if idx <= nentries {
+                        self.chooser_jump(ctx, idx - 1);
+                    }
+                }
+            }
+        }
+    }
+
+    fn view_params(&self) -> (u64, u64, bool) {
+        let keeper_secs = match self.duration {
+            Some(d) => d.div_ceil(1000) * (MAX_LINES as u64) + 60,
+            None => 2_147_483_647,
+        };
+        (self.width, keeper_secs, self.show_when_visible)
+    }
+}
+
 impl Plugin for NotifyToast {
     const NAME: &'static str = "notify-toast";
     type Config = Config;
@@ -348,20 +584,66 @@ impl Plugin for NotifyToast {
                 != Some("0"),
             seq: 0,
             state: State::default(),
+            chooser: None,
         })
     }
 
     fn on_event(&mut self, ctx: &Ctx, event: Event) {
-        let width = self.width;
-        let keeper_secs = match self.duration {
-            Some(d) => d.div_ceil(1000) * (MAX_LINES as u64) + 60,
-            None => 2_147_483_647, // pane keeper for never-expiring lines
-        };
-        let show_when_visible = self.show_when_visible;
+        let (width, keeper_secs, show_when_visible) = self.view_params();
         let state = Rc::clone(&self.state);
 
         match event.event.as_str() {
             "pane-notification" => {}
+            // Chooser events, targeted at this instance by mode id.
+            "mode-key" => {
+                let matches = self.chooser.as_ref().is_some_and(|ch| {
+                    event.data.get("mode").and_then(|v| v.as_u64())
+                        == Some(ch.mode.0)
+                });
+                if !matches {
+                    return;
+                }
+                let Some(key) =
+                    event.data.get("key").and_then(|v| v.as_str())
+                else {
+                    return;
+                };
+                let mouse_row = event.data.pointer("/mouse/y").and_then(
+                    serde_json::Value::as_u64,
+                );
+                let key = key.to_string();
+                self.chooser_key(ctx, &key, mouse_row);
+                return;
+            }
+            "mode-resize" => {
+                let Some(ch) = self.chooser.as_mut() else { return };
+                if event.data.get("mode").and_then(|v| v.as_u64())
+                    != Some(ch.mode.0)
+                {
+                    return;
+                }
+                if let Some(w) =
+                    event.data.get("width").and_then(|v| v.as_u64())
+                {
+                    ch.width = w as u32;
+                }
+                if let Some(h) =
+                    event.data.get("height").and_then(|v| v.as_u64())
+                {
+                    ch.height = h as u32;
+                }
+                chooser_render(ch, &state.borrow().entries);
+                return;
+            }
+            "mode-closed" => {
+                if self.chooser.as_ref().is_some_and(|ch| {
+                    event.data.get("mode").and_then(|v| v.as_u64())
+                        == Some(ch.mode.0)
+                }) {
+                    self.chooser = None;
+                }
+                return;
+            }
             // A window-switch (or attach/detach): move the view. Other
             // events (e.g. the implicit lifecycle deliveries - including
             // our own toasts' pane-created/destroyed) are ignored;
@@ -374,24 +656,22 @@ impl Plugin for NotifyToast {
                 });
                 return;
             }
-            // Clicking (or otherwise focusing) a notification pane
-            // dismisses the feed - that's the X in the corner.
+            // Clicking (or otherwise focusing) a notification pane opens
+            // the chooser in that window. The chooser's own floating pane
+            // fires this too when it takes focus, but it is not a view
+            // pane, so it never matches here (the mode pane must be
+            // excluded or opening the chooser would re-trigger this).
             "window-pane-changed" => {
                 let Some(p) = event.scope.pane else { return };
-                let is_view = state
+                let window = state
                     .borrow()
                     .views
-                    .values()
-                    .any(|v| v.pane == Some(u64::from(p)));
-                if !is_view {
-                    return;
-                }
-                log("notification pane clicked: dismissing feed");
-                ctx.spawn(async move {
-                    state.borrow_mut().entries.clear();
-                    sync_views(&state, width, keeper_secs, show_when_visible)
-                        .await;
-                });
+                    .iter()
+                    .find(|(_, v)| v.pane == Some(u64::from(p)))
+                    .map(|(w, _)| *w);
+                let Some(window) = window else { return };
+                log("notification pane clicked: opening chooser");
+                self.open_chooser(window);
                 return;
             }
             _ => return,
@@ -419,10 +699,16 @@ impl Plugin for NotifyToast {
         let seq = self.seq;
         let duration = self.duration;
 
+        let src_pane = u64::from(src_pane);
         ctx.spawn(async move {
             {
                 let mut st = state.borrow_mut();
-                st.entries.push_back(Entry { seq, line, src_window });
+                st.entries.push_back(Entry {
+                    seq,
+                    line,
+                    src_window,
+                    src_pane,
+                });
                 while st.entries.len() > MAX_LINES {
                     st.entries.pop_front();
                 }

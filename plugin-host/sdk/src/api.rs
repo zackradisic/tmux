@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use tmux_plugin_abi::{ErrorCode, HostError, HostResponse};
 
 use crate::executor::{HostFuture, HostResult};
-use crate::ids::{PaneId, SessionId, WindowId};
+use crate::ids::{ModeId, PaneId, SessionId, WindowId};
 use crate::runtime;
 
 fn host_err(code: ErrorCode, message: impl Into<String>) -> HostError {
@@ -214,6 +214,91 @@ pub fn display_message(msg: &str) -> Result<(), HostError> {
 
 pub fn log(msg: &str) {
     runtime::log(1, msg);
+}
+
+// ---- UI modes (capability: mode) ----
+
+/// Options for [`mode_open`]. Size is in cells; `x`/`y` are the top-left
+/// offset within the window (`None` = centered). `window` defaults to the
+/// instance's own window (pane/window scope) or the session's current
+/// window (session scope); server-scoped instances must set it.
+#[derive(Debug, Clone, Default)]
+pub struct ModeOpts {
+    pub window: Option<WindowId>,
+    pub width: u32,
+    pub height: u32,
+    pub x: Option<u32>,
+    pub y: Option<u32>,
+    pub title: Option<String>,
+}
+
+/// A retained preview rect for [`mode_preview`]: a live mirror of `pane`'s
+/// grid drawn at (x, y), size (w, h), inside the mode screen.
+#[derive(Debug, Clone, Copy)]
+pub struct PreviewRect {
+    pub pane: PaneId,
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
+/// Open a UI mode: a freshly spawned empty floating pane owned by this
+/// instance. Render with [`mode_write`]; `mode-key` / `mode-resize` /
+/// `mode-closed` events arrive through `Plugin::on_event` with the mode id
+/// in `event.data["mode"]`.
+pub fn mode_open(opts: &ModeOpts) -> Result<ModeId, HostError> {
+    let mut params = json!({ "width": opts.width, "height": opts.height });
+    if let Some(w) = opts.window {
+        params["window"] = w.0.into();
+    }
+    if let Some(x) = opts.x {
+        params["x"] = x.into();
+    }
+    if let Some(y) = opts.y {
+        params["y"] = y.into();
+    }
+    if let Some(t) = &opts.title {
+        params["title"] = t.as_str().into();
+    }
+    let v = host_call("mode_open", params)?;
+    v.get("mode")
+        .and_then(Value::as_u64)
+        .map(ModeId)
+        .ok_or_else(|| host_err(ErrorCode::Host, "mode_open returned no id"))
+}
+
+/// Send ANSI bytes to a mode's screen (parsed server-side: cursor
+/// addressing, SGR, clears, ... - anything a terminal accepts). At most
+/// 256 KiB per call; a full-screen redraw is idiomatic.
+pub fn mode_write(mode: ModeId, data: &[u8]) -> Result<(), HostError> {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(data);
+    host_call("mode_write", json!({ "mode": mode.0, "data_b64": b64 }))
+        .map(|_| ())
+}
+
+/// Set (or clear, with `None`) a mode's retained preview rect. The host
+/// redraws it from the source pane's live grid every ~500ms until cleared
+/// or the source pane dies.
+pub fn mode_preview(
+    mode: ModeId,
+    rect: Option<&PreviewRect>,
+) -> Result<(), HostError> {
+    let params = match rect {
+        Some(r) => json!({
+            "mode": mode.0, "pane": r.pane.0,
+            "x": r.x, "y": r.y, "w": r.w, "h": r.h,
+        }),
+        None => json!({ "mode": mode.0 }),
+    };
+    host_call("mode_preview", params).map(|_| ())
+}
+
+/// Close a mode. The floating pane is torn down at the next safe point;
+/// a final `mode-closed` event (reason "closed") follows.
+pub fn mode_close(mode: ModeId) -> Result<(), HostError> {
+    host_call("mode_close", json!({ "mode": mode.0 })).map(|_| ())
 }
 
 // ---- async API ----

@@ -150,6 +150,7 @@ fn required_cap(method: &str) -> u32 {
         "timer_start" | "timer_cancel" => TIMERS,
         "run_job" => RUN_PROCESS,
         "run_command" => RUN_COMMAND,
+        "mode_open" | "mode_write" | "mode_preview" | "mode_close" => MODE,
         _ => 0,
     }
 }
@@ -226,6 +227,78 @@ fn check_pane_target(data: &StoreData, pane_id: u32) -> Result<(), HostError> {
     }
 }
 
+/// Resolve the window a mode_open targets, scope-implied: pane/window
+/// scope may only open in their own window (and may omit the param);
+/// session scope in windows linked to their session (default: the
+/// session's current window); server scope anywhere (param required).
+/// CROSS_SCOPE relaxes the checks but not the defaults.
+fn mode_target_window(
+    data: &StoreData,
+    requested: Option<u32>,
+) -> Result<u32, HostError> {
+    use crate::registry::ScopeId;
+
+    let cross = data.caps.has(crate::caps::CROSS_SCOPE);
+    let out_of_scope = |msg: String| err(ErrorCode::OutOfScope, msg);
+
+    let own_window = match data.scope {
+        ScopeId::Server => None,
+        ScopeId::Window(own) => Some(own),
+        ScopeId::Pane(own) => {
+            let info = resolve_object(PGH_OBJ_PANE, own)?;
+            Some(
+                info.get("window")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| err(ErrorCode::Host, "pane without window"))?
+                    as u32,
+            )
+        }
+        ScopeId::Session(own) => match requested {
+            // Default: the session's current window.
+            None => {
+                let info = resolve_object(PGH_OBJ_SESSION, own)?;
+                Some(
+                    info.get("current_window")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| {
+                            err(ErrorCode::NoSuchObject, "session has no current window")
+                        })? as u32,
+                )
+            }
+            Some(window) => {
+                if !cross {
+                    let winfo = resolve_object(PGH_OBJ_WINDOW, window)?;
+                    let linked = winfo
+                        .get("sessions")
+                        .and_then(Value::as_array)
+                        .is_some_and(|a| {
+                            a.iter().any(|v| v.as_u64() == Some(u64::from(own)))
+                        });
+                    if !linked {
+                        return Err(out_of_scope(format!(
+                            "session-scoped instance ${own} may not open a mode in window @{window}"
+                        )));
+                    }
+                }
+                return Ok(window);
+            }
+        },
+    };
+
+    match (own_window, requested) {
+        (Some(own), None) => Ok(own),
+        (Some(own), Some(req)) if req == own || cross => Ok(req),
+        (Some(own), Some(req)) => Err(out_of_scope(format!(
+            "instance scoped to window @{own} may not open a mode in window @{req}"
+        ))),
+        (None, Some(req)) => Ok(req),
+        (None, None) => Err(err(
+            ErrorCode::BadRequest,
+            "server-scoped mode_open requires a window",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,6 +352,7 @@ mod tests {
             "subscribe", "send_keys", "capture_pane", "get_option",
             "set_option", "display_message", "run_job", "run_command",
             "timer_start", "timer_cancel", "resolve", "bogus",
+            "mode_open", "mode_write", "mode_preview", "mode_close",
         ];
         let mut rng = Rng(0x74_6d_75_78_32);
         for _ in 0..5000 {
@@ -505,6 +579,179 @@ pub fn dispatch(data: &StoreData, request: &[u8]) -> Result<Value, HostError> {
                 "scope": data.scope.to_json(),
                 "generation": data.generation,
             }))
+        }
+        "mode_open" => {
+            #[derive(Deserialize)]
+            struct ModeOpenParams {
+                #[serde(default)]
+                window: Option<u32>,
+                width: u32,
+                height: u32,
+                #[serde(default)]
+                x: Option<u32>,
+                #[serde(default)]
+                y: Option<u32>,
+                #[serde(default)]
+                title: Option<String>,
+            }
+            let p: ModeOpenParams = params(req.params)?;
+            if p.width == 0 || p.height == 0 {
+                return Err(err(ErrorCode::BadRequest, "zero mode size"));
+            }
+            let window = mode_target_window(data, p.window)?;
+            let vt = vtable()?;
+            let title = match &p.title {
+                Some(t) => Some(cstring(t)?),
+                None => None,
+            };
+            let to_off = |v: Option<u32>| -> Result<i32, HostError> {
+                match v {
+                    None => Ok(-1),
+                    Some(n) => i32::try_from(n).map_err(|_| {
+                        err(ErrorCode::BadRequest, "position out of range")
+                    }),
+                }
+            };
+            let rc = unsafe {
+                (vt.mode_open)(
+                    window,
+                    p.width,
+                    p.height,
+                    to_off(p.x)?,
+                    to_off(p.y)?,
+                    title.as_ref().map_or(std::ptr::null(), |t| t.as_ptr()),
+                )
+            };
+            match rc {
+                id if id > 0 => {
+                    crate::modes::register(
+                        id as u64,
+                        &data.plugin,
+                        data.scope,
+                        data.generation,
+                    );
+                    Ok(json!({ "mode": id as u64 }))
+                }
+                -1 => Err(err(
+                    ErrorCode::NoSuchObject,
+                    format!("no such window @{window}"),
+                )),
+                -3 => Err(err(ErrorCode::Host, "mode init failed")),
+                _ => Err(err(ErrorCode::Host, "failed to spawn mode pane")),
+            }
+        }
+        "mode_write" => {
+            #[derive(Deserialize)]
+            struct ModeWriteParams {
+                mode: u64,
+                data_b64: String,
+            }
+            const MAX_MODE_WRITE_BYTES: usize = 256 * 1024;
+            let p: ModeWriteParams = params(req.params)?;
+            if !crate::modes::owned_by(p.mode, data) {
+                return Err(err(
+                    ErrorCode::NoSuchObject,
+                    format!("no such mode {}", p.mode),
+                ));
+            }
+            use base64::Engine as _;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(&p.data_b64)
+                .map_err(|e| {
+                    err(ErrorCode::BadRequest, format!("bad base64: {e}"))
+                })?;
+            if bytes.len() > MAX_MODE_WRITE_BYTES {
+                return Err(err(
+                    ErrorCode::Limit,
+                    format!("mode_write exceeds {MAX_MODE_WRITE_BYTES} bytes"),
+                ));
+            }
+            let vt = vtable()?;
+            let rc = unsafe {
+                (vt.mode_write)(p.mode, bytes.as_ptr(), bytes.len())
+            };
+            if rc != 0 {
+                return Err(err(
+                    ErrorCode::NoSuchObject,
+                    format!("no such mode {}", p.mode),
+                ));
+            }
+            Ok(json!({}))
+        }
+        "mode_preview" => {
+            #[derive(Deserialize)]
+            struct ModePreviewParams {
+                mode: u64,
+                #[serde(default)]
+                pane: Option<u32>,
+                #[serde(default)]
+                x: u32,
+                #[serde(default)]
+                y: u32,
+                #[serde(default)]
+                w: u32,
+                #[serde(default)]
+                h: u32,
+            }
+            let p: ModePreviewParams = params(req.params)?;
+            if !crate::modes::owned_by(p.mode, data) {
+                return Err(err(
+                    ErrorCode::NoSuchObject,
+                    format!("no such mode {}", p.mode),
+                ));
+            }
+            let pane = match p.pane {
+                Some(pane) => {
+                    // Previewing mirrors another pane's content; apply the
+                    // same scope-implied targeting as capture_pane.
+                    check_pane_target(data, pane)?;
+                    if p.w == 0 || p.h == 0 {
+                        return Err(err(
+                            ErrorCode::BadRequest,
+                            "zero preview size",
+                        ));
+                    }
+                    i64::from(pane)
+                }
+                None => -1,
+            };
+            let vt = vtable()?;
+            let rc = unsafe {
+                (vt.mode_preview)(p.mode, pane, p.x, p.y, p.w, p.h)
+            };
+            match rc {
+                0 => Ok(json!({})),
+                -2 => Err(err(
+                    ErrorCode::BadRequest,
+                    "preview rect does not fit the mode screen",
+                )),
+                _ => Err(err(
+                    ErrorCode::NoSuchObject,
+                    format!("no such mode {}", p.mode),
+                )),
+            }
+        }
+        "mode_close" => {
+            #[derive(Deserialize)]
+            struct ModeCloseParams {
+                mode: u64,
+            }
+            let p: ModeCloseParams = params(req.params)?;
+            if !crate::modes::owned_by(p.mode, data) {
+                return Err(err(
+                    ErrorCode::NoSuchObject,
+                    format!("no such mode {}", p.mode),
+                ));
+            }
+            let vt = vtable()?;
+            let rc = unsafe { (vt.mode_close)(p.mode) };
+            if rc != 0 {
+                return Err(err(
+                    ErrorCode::NoSuchObject,
+                    format!("no such mode {}", p.mode),
+                ));
+            }
+            Ok(json!({}))
         }
         "timer_cancel" => {
             #[derive(Deserialize)]

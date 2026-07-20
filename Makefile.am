@@ -263,8 +263,10 @@ dist_tmux_SOURCES += \
 	plugin-events.c \
 	plugin-internal.h \
 	plugin-json.c \
+	plugin-mode.c \
 	plugin-vtable.c \
-	plugin.c
+	plugin.c \
+	window-plugin-mode.c
 PLUGIN_HOST_LIB += plugin-host/target/@CARGO_TARGET_DIR@/libplugin_host.a
 plugin-host/target/@CARGO_TARGET_DIR@/libplugin_host.a: plugin-host-build
 plugin-host-build:

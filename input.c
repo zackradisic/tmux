@@ -3486,6 +3486,8 @@ input_reply_clipboard(struct bufferevent *bev, const char *buf, size_t len,
 	char	*out = NULL;
 	int	 outlen = 0;
 
+	if (bev == NULL) /* parser without a terminal (plugin mode, popup) */
+		return;
 	if (buf != NULL && len != 0) {
 		if (len >= ((size_t)INT_MAX * 3 / 4) - 1)
 			return;

@@ -26,6 +26,7 @@ pub const POPUP: u32 = 1 << 9;
 pub const MENU: u32 = 1 << 10;
 pub const FS_READ: u32 = 1 << 11;
 pub const FS_WRITE: u32 = 1 << 12;
+pub const MODE: u32 = 1 << 13;
 
 /// Granted to every plugin without being asked for.
 pub const DEFAULT_CAPS: u32 = READ_STATE | DISPLAY_MESSAGE | TIMERS;
@@ -45,6 +46,7 @@ pub fn cap_from_name(name: &str) -> Option<u32> {
         "menu" => MENU,
         "fs-read" => FS_READ,
         "fs-write" => FS_WRITE,
+        "mode" => MODE,
         _ => return None,
     })
 }
@@ -64,6 +66,7 @@ pub fn cap_name(flag: u32) -> &'static str {
         MENU => "menu",
         FS_READ => "fs-read",
         FS_WRITE => "fs-write",
+        MODE => "mode",
         _ => "?",
     }
 }
@@ -85,7 +88,7 @@ impl EffectiveCaps {
     /// Human-readable list for show-plugins -v.
     pub fn describe(&self) -> String {
         let mut names = Vec::new();
-        for bit in 0..13 {
+        for bit in 0..14 {
             let flag = 1u32 << bit;
             if self.flags & flag != 0 {
                 names.push(cap_name(flag));

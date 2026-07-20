@@ -4,8 +4,11 @@
 //! - Every `pgh_*` export is called only from the tmux server main thread.
 //! - Vtable function pointers are called only synchronously from inside a
 //!   `pgh_*` call, on that same thread.
-//! - Vtable calls may re-enter `pgh_notify` (which is enqueue-only) but must
-//!   never re-enter any other `pgh_*` entry point.
+//! - Vtable calls may re-enter `pgh_notify`, `pgh_async_complete` and
+//!   `pgh_mode_event` (all enqueue-only) but must never re-enter any other
+//!   `pgh_*` entry point. In particular they must never destroy tmux
+//!   objects synchronously (that would re-enter `pgh_object_destroyed`
+//!   while the calling instance is checked out of the registry).
 
 #![allow(non_camel_case_types)]
 
@@ -110,6 +113,32 @@ pub struct pgh_host_vtable {
         state: *const c_char,
         reason: *const c_char,
     ),
+    /// Open a plugin UI mode in a freshly spawned empty floating pane in
+    /// `window`. x/y are top-left cell offsets, -1 = centered; `title` may
+    /// be NULL. Returns the new mode id (> 0) synchronously, or a negative
+    /// error: -1 no such window, -2 spawn failed, -3 mode init failed.
+    /// Events for the mode arrive later via pgh_mode_event.
+    pub mode_open: unsafe extern "C" fn(
+        window: u32,
+        width: u32,
+        height: u32,
+        x: c_int,
+        y: c_int,
+        title: *const c_char,
+    ) -> i64,
+    /// Parse ANSI bytes into a mode's screen (server-side escape parser,
+    /// no tty round-trip). 0 ok, -1 no such mode.
+    pub mode_write: unsafe extern "C" fn(mode: u64, data: *const u8, len: usize) -> c_int,
+    /// Set (pane >= 0) or clear (pane < 0) a mode's retained preview rect:
+    /// a live blit of the source pane's grid at (x, y), size (w, h),
+    /// refreshed periodically until cleared. 0 ok, -1 no such mode,
+    /// -2 rect does not fit the mode screen.
+    pub mode_preview:
+        unsafe extern "C" fn(mode: u64, pane: i64, x: u32, y: u32, w: u32, h: u32) -> c_int,
+    /// Close a mode: the floating pane is torn down at the next safe
+    /// point (never synchronously inside this call), which delivers
+    /// pgh_mode_event(mode, "mode-closed", ...). 0 ok, -1 no such mode.
+    pub mode_close: unsafe extern "C" fn(mode: u64) -> c_int,
 }
 
 // Function pointers are Send + Sync; the vtable is stored in a OnceLock.

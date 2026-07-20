@@ -234,6 +234,13 @@ set_option(name: &str, value: &str)                     // @-options only
 display_message(msg: &str)                              // status line + log
 log(msg: &str)                                          // plugin-log only
 host_call(method, params) -> Result<Value, HostError>   // raw escape hatch
+
+// UI modes (capability: mode) — see the "UI modes" section
+mode_open(&ModeOpts { window?, width, height, x?, y?, title? })
+                                                        -> Result<ModeId, _>
+mode_write(ModeId, data: &[u8])                         // ANSI bytes, ≤256 KiB
+mode_preview(ModeId, Option<&PreviewRect>)              // live pane mirror
+mode_close(ModeId)
 ```
 
 Async (`.await` inside spawned tasks):
@@ -282,6 +289,7 @@ load-plugin -c send-keys -c run-process ... myplugin.wasm
 | `run-process` | `run_job` |
 | `run-command` | `run_command` |
 | `cross-scope` | acting on objects outside the instance's scope |
+| `mode` | UI modes (`mode_open` and friends) |
 
 Denied calls return `HostError { code: E_CAP_DENIED }` — handle errors, do
 not unwrap host results.
@@ -295,6 +303,68 @@ requests = ["run-process", "write-options"]
 [caps.run-process]
 argv0 = ["git"]
 ```
+
+## UI modes: interactive panels
+
+In tmux, a *window mode* is a takeover of a pane: while a mode is
+entered, the mode — not the process in the pane — owns the screen the
+pane displays and receives its keys and resizes. `copy-mode`,
+`clock-mode` and the `choose-tree` browser are all window modes. The
+`mode` capability exposes this machinery to plugins; in v1 a plugin mode
+always runs on a **freshly spawned empty floating pane** (entering a mode
+on an existing pane is deliberately not offered yet — the design for
+that is in [MODE-ATTACH.md](MODE-ATTACH.md)), so in practice it behaves
+like a floating panel your plugin draws directly.
+
+`mode_open` spawns the empty float, enters the mode on it and focuses
+it. You render by sending ANSI bytes — the server parses them with the
+full terminal escape parser, so anything from `printf`-style positioning
+to a ratatui buffer works. Keys pressed while the panel is focused come
+back to you as events; one optional **preview rect** shows a live mirror
+of another pane inside your panel (refreshed automatically, ~2x/second).
+
+```rust
+// Open: centered 60x12 float in this window (pane/window scope can omit
+// `window`; server scope must name one).
+let mode = mode_open(&ModeOpts {
+    width: 60, height: 12,
+    title: Some("picker".into()),
+    ..Default::default()
+})?;
+
+// Draw: full redraws are idiomatic. \x1b[2J clear, \x1b[row;colH move,
+// \x1b[7m reverse video, \x1b[0m reset. Rows/columns are 1-based.
+mode_write(mode, b"\x1b[2J\x1b[1;2HPick a pane:\x1b[3;2H\x1b[7m 1. shell \x1b[0m")?;
+
+// Live preview of pane %5 on the right half (cells are 0-based here).
+mode_preview(mode, Some(&PreviewRect { pane: PaneId(5), x: 30, y: 0, w: 29, h: 10 }))?;
+```
+
+Events arrive through the normal `on_event`, targeted at your instance
+only (no subscription needed); match them by the mode id in
+`event.data["mode"]`:
+
+- `mode-key`: `data.key` is a tmux key name ("q", "Enter", "Escape",
+  "Down", "MouseDown1Pane", ...); mouse keys add `data.mouse.{x,y,b}`
+  with pane-relative cell coordinates.
+- `mode-resize`: `data.width`/`data.height` — redraw at the new size.
+- `mode-closed`: terminal, with `data.reason` `"closed"` (your
+  `mode_close`) or `"killed"` (user killed the pane, reload, window
+  died). Drop your state for the mode; the id is dead.
+
+Notes:
+
+- The panel is a real pane: users can kill it, resize it, or stack
+  copy-mode on top (your writes fail with `E_NO_SUCH_OBJECT` while they
+  browse; the pane stays yours when copy-mode exits).
+- `mode_close` tears the pane down at the next event-loop pass and then
+  delivers `mode-closed` — treat that event, not the call, as "gone".
+- Your modes are force-closed when your instance is reloaded/unloaded or
+  its scope object dies.
+
+The notify-toast example's chooser (`examples/notify-toast/`) is a
+complete mode UI: list rendering with a selection bar, hotkeys, mouse
+selection, and a live preview of the selected notification's source pane.
 
 ## Debugging checklist
 
