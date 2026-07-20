@@ -11,9 +11,9 @@
 //! - each expiring on its own after `duration_ms`. The view follows the
 //! user: it is rendered in every attached session's *current* window and
 //! repainted on window switches, so the same feed is always where you
-//! are looking. A window does not show lines whose source is that window
-//! itself (you can already see the pane that sent them); set
-//! show_when_visible=1 to disable that filter.
+//! are looking - including the window the notification came from (set
+//! show_when_visible=0 to hide lines whose source window is the one on
+//! display).
 //!
 //! The view is a real pane: click to focus it, scroll it, `join-pane` it
 //! into the layout, kill it early - all normal pane operations work.
@@ -22,7 +22,7 @@
 //!   load-plugin -s server -c run-command ~/.tmux/plugins/notify_toast.wasm
 //!
 //! Options (-o): duration_ms (default 6000), width (default 44),
-//! show_when_visible=1.
+//! show_when_visible (default 1; 0 = suppress in the source window).
 //!
 //! Build: cargo build -p notify-toast --target wasm32-unknown-unknown --release
 
@@ -39,7 +39,8 @@ struct Config {
     duration_ms: Option<String>, // -o values arrive as strings
     #[serde(default)]
     width: Option<String>,
-    /// "1" also shows lines whose source window is the one on display.
+    /// "0" hides lines whose source window is the one on display
+    /// (default is to show them everywhere).
     #[serde(default)]
     show_when_visible: Option<String>,
 }
@@ -328,7 +329,7 @@ impl Plugin for NotifyToast {
                 .unwrap_or(44)
                 .clamp(20, 120),
             show_when_visible: config.show_when_visible.as_deref()
-                == Some("1"),
+                != Some("0"),
             seq: 0,
             state: State::default(),
         })
