@@ -90,6 +90,9 @@ type State = Rc<RefCell<Shared>>;
 /// The expanded chooser: one open plugin UI mode at a time.
 struct Chooser {
     mode: ModeId,
+    /// Window the panel lives in; switching away from it closes the
+    /// chooser (a mode pane cannot follow the user across windows).
+    window: u64,
     selected: usize,
     width: u32,
     height: u32,
@@ -407,8 +410,15 @@ fn chooser_render(ch: &Chooser, entries: &VecDeque<Entry>) {
 
 impl NotifyToast {
     fn open_chooser(&mut self, window: u64) {
-        if self.chooser.is_some() {
-            return;
+        // Only one chooser at a time. A click in the window that already
+        // shows it is a no-op; a click elsewhere replaces it (belt and
+        // braces for a panel left behind by a missed window switch).
+        if let Some(ch) = self.chooser.as_ref() {
+            if ch.window == window {
+                return;
+            }
+            let _ = mode_close(ch.mode);
+            self.chooser = None;
         }
         let nentries = self.state.borrow().entries.len();
         if nentries == 0 {
@@ -433,7 +443,7 @@ impl NotifyToast {
             title: Some("notifications".into()),
         }) {
             Ok(mode) => {
-                let ch = Chooser { mode, selected: 0, width, height };
+                let ch = Chooser { mode, window, selected: 0, width, height };
                 chooser_render(&ch, &self.state.borrow().entries);
                 self.chooser = Some(ch);
             }
@@ -650,6 +660,16 @@ impl Plugin for NotifyToast {
             // repaint is idempotent anyway, but no need to churn.
             "session-window-changed" | "client-session-changed"
             | "client-attached" | "client-detached" => {
+                // The chooser cannot follow the user: close it as soon
+                // as its window stops being on display. Clear the state
+                // immediately (not at mode-closed) so a toast click in
+                // the new window can open a fresh one right away.
+                if let Some(ch) = self.chooser.as_ref() {
+                    if !current_windows().contains(&ch.window) {
+                        let _ = mode_close(ch.mode);
+                        self.chooser = None;
+                    }
+                }
                 ctx.spawn(async move {
                     sync_views(&state, width, keeper_secs, show_when_visible)
                         .await;
