@@ -196,6 +196,7 @@ macro_rules! tmux_plugin {
                 match <$ty as $crate::Plugin>::restore(old_version, state) {
                     Some(plugin) => {
                         PLUGIN.with(|p| *p.borrow_mut() = Some(plugin));
+                        executor::run_until_stalled();
                         0
                     }
                     None => 1,

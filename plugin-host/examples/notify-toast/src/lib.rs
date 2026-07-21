@@ -38,7 +38,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tmux_plugin_sdk::prelude::*;
 
 #[derive(Deserialize, Default)]
@@ -56,6 +56,7 @@ struct Config {
 /// Most notification lines shown at once; older ones are dropped early.
 const MAX_LINES: usize = 6;
 
+#[derive(Clone, Serialize, Deserialize)]
 struct Entry {
     seq: u64,
     line: String,
@@ -106,6 +107,21 @@ struct NotifyToast {
     seq: u64,
     state: State,
     chooser: Option<Chooser>,
+}
+
+/// State carried across a live code reload. The view panes are real tmux
+/// panes only our `views` map knows about: without this, a reload
+/// orphans them (the fresh instance spawns new panes next to the old
+/// ones, which - with an infinite duration - never go away).
+#[derive(Serialize, Deserialize)]
+struct Snapshot {
+    duration: Option<u64>,
+    width: u64,
+    show_when_visible: bool,
+    seq: u64,
+    entries: Vec<Entry>,
+    /// window -> (pane, body on display); repaint flags start fresh.
+    views: HashMap<u64, (Option<u64>, Option<String>)>,
 }
 
 /// Make text safe for a single-quoted tmux argument rendered via
@@ -596,6 +612,72 @@ impl Plugin for NotifyToast {
             state: State::default(),
             chooser: None,
         })
+    }
+
+    fn snapshot(&self) -> Option<serde_json::Value> {
+        // The chooser is deliberately absent: the host force-closes our
+        // modes during the swap, so the new generation must start
+        // without one.
+        let st = self.state.borrow();
+        serde_json::to_value(Snapshot {
+            duration: self.duration,
+            width: self.width,
+            show_when_visible: self.show_when_visible,
+            seq: self.seq,
+            entries: st.entries.iter().cloned().collect(),
+            views: st
+                .views
+                .iter()
+                .map(|(w, v)| (*w, (v.pane, v.shown.clone())))
+                .collect(),
+        })
+        .ok()
+    }
+
+    fn restore(_old_version: i32, state: serde_json::Value) -> Option<Self> {
+        let snap: Snapshot = serde_json::from_value(state).ok()?;
+        let me = Self {
+            duration: snap.duration,
+            width: snap.width,
+            show_when_visible: snap.show_when_visible,
+            seq: snap.seq,
+            state: Rc::new(RefCell::new(Shared {
+                entries: snap.entries.into_iter().collect(),
+                views: snap
+                    .views
+                    .into_iter()
+                    .map(|(w, (pane, shown))| {
+                        (w, View { pane, shown, ..View::default() })
+                    })
+                    .collect(),
+            })),
+            chooser: None,
+        };
+
+        // The old instance's expiry tasks died with it: re-arm one per
+        // restored entry (each gets a fresh full duration; the elapsed
+        // part is not carried), then reconcile the adopted panes once.
+        let (width, keeper_secs, show_when_visible) = me.view_params();
+        let ctx = Ctx::new();
+        if let Some(duration_ms) = me.duration {
+            for e in me.state.borrow().entries.iter() {
+                let seq = e.seq;
+                let state = Rc::clone(&me.state);
+                ctx.spawn(async move {
+                    if sleep_ms(duration_ms).await.is_err() {
+                        return;
+                    }
+                    state.borrow_mut().entries.retain(|x| x.seq != seq);
+                    sync_views(&state, width, keeper_secs, show_when_visible)
+                        .await;
+                });
+            }
+        }
+        let state = Rc::clone(&me.state);
+        ctx.spawn(async move {
+            sync_views(&state, width, keeper_secs, show_when_visible).await;
+        });
+        Some(me)
     }
 
     fn on_event(&mut self, ctx: &Ctx, event: Event) {
