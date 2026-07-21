@@ -425,7 +425,7 @@ fn chooser_render(ch: &Chooser, entries: &VecDeque<Entry>) {
 }
 
 impl NotifyToast {
-    fn open_chooser(&mut self, window: u64) {
+    fn open_chooser(&mut self, window: u64, selected: usize) {
         // Only one chooser at a time. A click in the window that already
         // shows it is a no-op; a click elsewhere replaces it (belt and
         // braces for a panel left behind by a missed window switch).
@@ -459,7 +459,13 @@ impl NotifyToast {
             title: Some("notifications".into()),
         }) {
             Ok(mode) => {
-                let ch = Chooser { mode, window, selected: 0, width, height };
+                let ch = Chooser {
+                    mode,
+                    window,
+                    selected: selected.min(nentries - 1),
+                    width,
+                    height,
+                };
                 chooser_render(&ch, &self.state.borrow().entries);
                 self.chooser = Some(ch);
             }
@@ -742,14 +748,27 @@ impl Plugin for NotifyToast {
             // repaint is idempotent anyway, but no need to churn.
             "session-window-changed" | "client-session-changed"
             | "client-attached" | "client-detached" => {
-                // The chooser cannot follow the user: close it as soon
-                // as its window stops being on display. Clear the state
-                // immediately (not at mode-closed) so a toast click in
-                // the new window can open a fresh one right away.
+                // A mode pane cannot span windows, so the chooser
+                // follows the user the only way it can: when its window
+                // stops being on display, close it and reopen it (same
+                // selection) in the window now shown. State is cleared
+                // immediately, not at mode-closed, so the reopen (or a
+                // toast click) is not blocked by the closing panel.
                 if let Some(ch) = self.chooser.as_ref() {
-                    if !current_windows().contains(&ch.window) {
+                    let current = current_windows();
+                    if !current.contains(&ch.window) {
                         let _ = mode_close(ch.mode);
+                        let selected = ch.selected;
                         self.chooser = None;
+                        let target = event
+                            .scope
+                            .window
+                            .map(u64::from)
+                            .filter(|w| current.contains(w))
+                            .or_else(|| current.first().copied());
+                        if let Some(w) = target {
+                            self.open_chooser(w, selected);
+                        }
                     }
                 }
                 ctx.spawn(async move {
@@ -773,7 +792,7 @@ impl Plugin for NotifyToast {
                     .map(|(w, _)| *w);
                 let Some(window) = window else { return };
                 log("notification pane clicked: opening chooser");
-                self.open_chooser(window);
+                self.open_chooser(window, 0);
                 return;
             }
             _ => return,
