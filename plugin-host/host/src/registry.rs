@@ -77,6 +77,10 @@ pub struct PluginDef {
     pub state: PluginState,
     /// Consecutive failures; reset by any clean callback return.
     pub failure_count: u32,
+    /// Owned by the manifest pool (sync-plugins): swept when the manifest
+    /// no longer names it. Interactive load-plugin definitions are
+    /// unmanaged.
+    pub managed: bool,
 }
 
 pub struct Instance {
@@ -187,6 +191,7 @@ impl Registry {
                 caps,
                 state: PluginState::Running,
                 failure_count: 0,
+                managed: false,
             },
         );
         hostlog::info(
@@ -304,12 +309,13 @@ impl Registry {
                 .count();
             let _ = writeln!(
                 out,
-                "{}: scope {}, {}, {} instance{}, path {}",
+                "{}: scope {}, {}, {} instance{}, {}path {}",
                 def.name,
                 def.scope_type,
                 state,
                 ninstances,
                 if ninstances == 1 { "" } else { "s" },
+                if def.managed { "managed, " } else { "" },
                 def.path.display()
             );
             if verbose {

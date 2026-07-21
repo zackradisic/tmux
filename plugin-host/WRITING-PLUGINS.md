@@ -97,9 +97,53 @@ tmux reload-plugin myplugin   # live swap, state preserved via snapshot()
 ```
 
 `load-plugin` is idempotent: re-running it with unchanged code/config does
-nothing; with changed code it live-reloads. Put the line in `~/.tmux.conf`
-to load at server start. To remove a plugin, `unload-plugin myplugin`
-(removing the config line alone does not unload a running server's copy).
+nothing; with changed code it live-reloads. To remove a plugin,
+`unload-plugin myplugin`.
+
+### Declarative loading: the manifest
+
+For everything beyond quick experiments, declare your plugins in a TOML
+manifest and let `sync-plugins` reconcile the world against it — loading
+new entries, live-reloading changed ones, and **unloading anything you
+removed** (which plain `load-plugin` lines in tmux.conf never do):
+
+```toml
+# ~/.tmux/plugins.toml
+[plugins.notify-toast]
+path  = "notify_toast.wasm"          # relative to this manifest
+scope = "server"
+caps  = ["run-command", "mode"]
+config = { duration_ms = 0 }         # native types, not -o strings
+
+[plugins.git-status]
+path  = "git_status.wasm"
+scope = "pane"
+caps  = ["run-process", "write-options"]
+enabled = true                       # false = keep declared, disabled
+```
+
+```
+# tmux.conf
+sync-plugins ~/.tmux/plugins.toml
+bind r source-file ~/.tmux.conf      # edits converge on reload
+```
+
+Rules worth knowing:
+
+- **Identity is the `[plugins.NAME]` key.** Rename the `.wasm` file and
+  update `path`: same plugin, and a no-op if the content is unchanged.
+  Rename the key: that declares a *different* plugin (old unloads, new
+  loads fresh).
+- **Only managed plugins are swept.** Interactive `load-plugin` runs are
+  unmanaged and survive any sync; a manifest entry with the same name
+  adopts them (and an explicit `load-plugin` takes a name back out of the
+  pool until the next sync).
+- **Bad manifests change nothing**: parse errors, unknown capabilities or
+  missing files reject the whole sync atomically.
+- `config` tables pass native JSON types to your `Config` struct (numbers
+  arrive as numbers — no string parsing as with `-o`).
+- `show-plugins` marks managed plugins; the sync prints a summary
+  (`synced ...: 1 loaded, 1 updated, 2 unchanged, 1 unloaded`).
 
 ## The `Plugin` trait
 

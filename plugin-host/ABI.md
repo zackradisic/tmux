@@ -219,12 +219,22 @@ session's panes; `cross-scope` lifts this.
 ```
 load-plugin [-n name] [-s server|session|window|pane] [-c cap]...
             [-o key=value]... path.wasm
+sync-plugins manifest.toml
 unload-plugin name
 reload-plugin [-a] [name]
 enable-plugin name / disable-plugin name
 show-plugins [-v]
 plugin-log [-n lines] [name]
 ```
+
+`sync-plugins` reconciles the *managed* plugin pool against a TOML
+manifest (declarative loading): new entries load, changed ones follow the
+load-plugin reconcile rules, and managed plugins the manifest no longer
+names are unloaded. Identity is the `[plugins.NAME]` key; entry paths
+resolve relative to the manifest. Interactive `load-plugin` definitions
+are unmanaged and never swept (a manifest entry of the same name adopts
+them). A manifest that fails to parse or validate changes nothing. See
+WRITING-PLUGINS.md for the manifest format.
 
 Build tmux with `./configure --enable-plugins` (requires cargo; links
 `plugin-host/target/release/libplugin_host.a`).

@@ -69,6 +69,20 @@ const struct cmd_entry cmd_unload_plugin_entry = {
 	.exec = cmd_unload_plugin_exec
 };
 
+static enum cmd_retval	cmd_sync_plugins_exec(struct cmd *,
+			    struct cmdq_item *);
+
+const struct cmd_entry cmd_sync_plugins_entry = {
+	.name = "sync-plugins",
+	.alias = NULL,
+
+	.args = { "", 1, 1, NULL },
+	.usage = "manifest-path",
+
+	.flags = CMD_AFTERHOOK,
+	.exec = cmd_sync_plugins_exec
+};
+
 static enum cmd_retval	cmd_reload_plugin_exec(struct cmd *,
 			    struct cmdq_item *);
 static enum cmd_retval	cmd_enable_plugin_exec(struct cmd *,
@@ -273,6 +287,41 @@ cmd_unload_plugin_exec(struct cmd *self, struct cmdq_item *item)
 		cmdq_error(item, "unknown plugin: %s", name);
 		return (CMD_RETURN_ERROR);
 	}
+	plugin_schedule_drain();
+	return (CMD_RETURN_NORMAL);
+}
+
+/*
+ * Reconcile the managed plugin pool against a TOML manifest: load new
+ * entries, upsert changed ones, unload managed plugins the manifest no
+ * longer names. Validation is atomic (a bad manifest changes nothing).
+ */
+static enum cmd_retval
+cmd_sync_plugins_exec(struct cmd *self, struct cmdq_item *item)
+{
+	struct args	*args = cmd_get_args(self);
+	const char	*path = args_string(args, 0);
+	struct evbuffer	*evb;
+
+	if (!plugin_enabled()) {
+		cmdq_error(item, "plugin support not available");
+		return (CMD_RETURN_ERROR);
+	}
+
+	evb = evbuffer_new();
+	if (evb == NULL)
+		fatalx("out of memory");
+	if (pgh_plugin_sync(path, cmd_plugin_sink, evb) != 0) {
+		evbuffer_add(evb, "", 1);
+		cmdq_error(item, "sync-plugins: %s",
+		    (const char *)EVBUFFER_DATA(evb));
+		evbuffer_free(evb);
+		return (CMD_RETURN_ERROR);
+	}
+	cmd_plugin_print(item, evb);
+	evbuffer_free(evb);
+
+	/* Instantiations and unloads are queued; run at the safe point. */
 	plugin_schedule_drain();
 	return (CMD_RETURN_NORMAL);
 }

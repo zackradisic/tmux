@@ -6688,10 +6688,34 @@ configuration it offers the new configuration to running instances.
 Loading the same plugins from the configuration file with
 .Ic source-file
 is therefore safe and does not disturb running instances.
+.It Ic sync-plugins Ar manifest-path
+Reconcile the set of loaded plugins against a TOML manifest
+(declarative loading): entries new to the manifest are loaded, changed
+entries follow the same reconcile rules as
+.Ic load-plugin ,
+and plugins previously loaded from a manifest but no longer named in it
+are unloaded.
+Each
+.Ql [plugins.NAME]
+table gives the plugin name and may set
+.Ql path
+(required; relative paths resolve against the manifest),
+.Ql scope ,
+.Ql caps ,
+.Ql config
+and
+.Ql enabled .
+Plugins loaded interactively with
+.Ic load-plugin
+are never unloaded by a sync.
+A manifest that fails to parse or validate changes nothing.
 .It Ic unload-plugin Ar name
 Unload a plugin and destroy its instances.
-Plugins removed from the configuration file are not unloaded
-automatically; use this command.
+Plugins loaded with
+.Ic load-plugin
+and removed from the configuration file are not unloaded
+automatically; use this command (or manage plugins with
+.Ic sync-plugins ) .
 .It Xo Ic reload-plugin
 .Op Fl a
 .Op Ar name

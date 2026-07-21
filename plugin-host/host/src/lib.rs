@@ -13,6 +13,7 @@ mod engine;
 mod events;
 mod ffi;
 mod hostlog;
+mod manifest;
 mod modes;
 mod registry;
 mod reload;
@@ -164,9 +165,52 @@ pub unsafe extern "C" fn pgh_plugin_load(
                     return -1;
                 }
             };
+        let name = desc.name.clone();
         match reload::upsert(desc) {
             Ok(outcome) => {
+                // An explicit load-plugin takes the definition out of the
+                // manifest pool: it is hand-managed until a sync re-adopts
+                // it by name.
+                REGISTRY.with(|r| {
+                    if let Some(def) = r.borrow_mut().plugins.get_mut(&name) {
+                        def.managed = false;
+                    }
+                });
                 sink_str(err_sink, err_ctx, outcome);
+                0
+            }
+            Err(e) => {
+                sink_str(err_sink, err_ctx, &e);
+                -1
+            }
+        }
+    })
+}
+
+/// Reconcile the managed plugin pool against the TOML manifest at
+/// `manifest_path` (see WRITING-PLUGINS.md): load new entries, upsert
+/// changed ones, unload managed plugins the manifest no longer names. A
+/// manifest that fails to parse or validate changes nothing and returns
+/// -1 with the error in the sink; on success the sink receives a summary
+/// line (plus any per-entry apply failures) and 0 is returned. The C side
+/// should call plugin_schedule_drain() afterwards.
+///
+/// # Safety
+/// `manifest_path` must be NUL-terminated; `err_sink` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn pgh_plugin_sync(
+    manifest_path: *const c_char,
+    err_sink: pgh_sink,
+    err_ctx: *mut c_void,
+) -> c_int {
+    ffi_guard!(-1, {
+        let Some(path) = cstr_lossy(manifest_path) else {
+            sink_str(err_sink, err_ctx, "null manifest path");
+            return -1;
+        };
+        match manifest::sync_manifest(&path) {
+            Ok(report) => {
+                sink_str(err_sink, err_ctx, &report);
                 0
             }
             Err(e) => {

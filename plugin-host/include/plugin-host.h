@@ -251,6 +251,20 @@ void pgh_shutdown(void);
 int pgh_plugin_load(const char *desc_json, pgh_sink err_sink, void *err_ctx);
 
 /**
+ * Reconcile the managed plugin pool against the TOML manifest at
+ * `manifest_path` (see WRITING-PLUGINS.md): load new entries, upsert
+ * changed ones, unload managed plugins the manifest no longer names. A
+ * manifest that fails to parse or validate changes nothing and returns
+ * -1 with the error in the sink; on success the sink receives a summary
+ * line (plus any per-entry apply failures) and 0 is returned. The C side
+ * should call plugin_schedule_drain() afterwards.
+ *
+ * # Safety
+ * `manifest_path` must be NUL-terminated; `err_sink` must be valid.
+ */
+int pgh_plugin_sync(const char *manifest_path, pgh_sink err_sink, void *err_ctx);
+
+/**
  * Reload a plugin from disk (or all plugins when `name` is NULL): every
  * instance is swapped transactionally with snapshot/migrate and a new
  * generation; failures keep the old instance running. Errors go to the

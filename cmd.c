@@ -113,6 +113,7 @@ extern const struct cmd_entry cmd_load_plugin_entry;
 extern const struct cmd_entry cmd_plugin_log_entry;
 extern const struct cmd_entry cmd_reload_plugin_entry;
 extern const struct cmd_entry cmd_show_plugins_entry;
+extern const struct cmd_entry cmd_sync_plugins_entry;
 extern const struct cmd_entry cmd_unload_plugin_entry;
 #endif
 extern const struct cmd_entry cmd_show_prompt_history_entry;
@@ -240,6 +241,7 @@ const struct cmd_entry *cmd_table[] = {
 	&cmd_unbind_key_entry,
 	&cmd_unlink_window_entry,
 #ifdef ENABLE_PLUGINS
+	&cmd_sync_plugins_entry,
 	&cmd_unload_plugin_entry,
 #endif
 	&cmd_wait_for_entry,
