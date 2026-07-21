@@ -160,11 +160,14 @@ impl Plugin for MyPlugin {
     fn on_event(&mut self, ctx: &Ctx, event: Event) {}
 
     // Carry state across a live code reload. Stateless (None, default):
-    // reload just re-inits. Stateful: snapshot() serializes, and after the
-    // NEW code's init() runs, restore() replaces the fresh value. restore
-    // returning None refuses the state and the OLD code keeps running.
+    // reload just re-inits. Stateful: snapshot() serializes STATE ONLY
+    // (never config), and after the NEW code's init() runs, restore()
+    // combines that fresh instance (config-derived fields) with the
+    // carried state; the result replaces `fresh`. Returning None refuses
+    // the state and the OLD code keeps running.
     fn snapshot(&self) -> Option<serde_json::Value> { None }
-    fn restore(old_version: i32, state: serde_json::Value) -> Option<Self> { None }
+    fn restore(fresh: Self, old_version: i32, state: serde_json::Value)
+        -> Option<Self> { None }
 
     // Return true to absorb a config change; false (default) = restart me
     // with the new config.

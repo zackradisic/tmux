@@ -156,16 +156,11 @@ struct NotifyToast {
 /// State carried across a live code reload. The view panes are real tmux
 /// panes only our `views` map knows about: without this, a reload
 /// orphans them (the fresh instance spawns new panes next to the old
-/// ones, which - with an infinite duration - never go away).
+/// ones, which - with an infinite duration - never go away). State only:
+/// config-derived fields come from the fresh init in restore(), so a
+/// config change applied together with a code reload wins.
 #[derive(Serialize, Deserialize)]
 struct Snapshot {
-    duration: Option<u64>,
-    width: u64,
-    show_when_visible: bool,
-    #[serde(default)]
-    chooser_width: Option<SizeSpec>,
-    #[serde(default)]
-    chooser_height: Option<SizeSpec>,
     seq: u64,
     entries: Vec<Entry>,
     /// window -> (pane, body on display); repaint flags start fresh.
@@ -472,6 +467,35 @@ fn chooser_render(ch: &Chooser, entries: &VecDeque<Entry>) {
     let _ = mode_preview(ch.mode, chooser_preview_rect(ch, entries).as_ref());
 }
 
+/// Config -> (duration, width, show_when_visible, chooser_w, chooser_h);
+/// shared by init and on_config_changed so both parse identically.
+fn parse_config(
+    config: &Config,
+) -> (Option<u64>, u64, bool, Option<SizeSpec>, Option<SizeSpec>) {
+    let duration = match config.duration_ms.as_deref() {
+        Some("0") | Some("infinite") => None,
+        other => Some(
+            other
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(6_000)
+                .clamp(1_000, 300_000),
+        ),
+    };
+    let width = config
+        .width
+        .as_deref()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(44)
+        .clamp(20, 120);
+    (
+        duration,
+        width,
+        config.show_when_visible.as_deref() != Some("0"),
+        SizeSpec::parse(config.chooser_width.as_ref()),
+        SizeSpec::parse(config.chooser_height.as_ref()),
+    )
+}
+
 impl NotifyToast {
     fn open_chooser(
         &mut self,
@@ -639,6 +663,8 @@ impl Plugin for NotifyToast {
         if me.pointer("/scope/type").and_then(|v| v.as_str()) != Some("server") {
             return Err("notify-toast must be loaded with -s server".into());
         }
+        let (duration, width, show_when_visible, chooser_width, chooser_height) =
+            parse_config(&config);
 
         ctx.subscribe(&[
             "pane-notification",
@@ -654,29 +680,31 @@ impl Plugin for NotifyToast {
         .map_err(|e| e.message.clone())?;
 
         Ok(Self {
-            duration: match config.duration_ms.as_deref() {
-                Some("0") | Some("infinite") => None,
-                other => Some(
-                    other
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(6_000)
-                        .clamp(1_000, 300_000),
-                ),
-            },
-            width: config
-                .width
-                .as_deref()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(44)
-                .clamp(20, 120),
-            show_when_visible: config.show_when_visible.as_deref()
-                != Some("0"),
-            chooser_width: SizeSpec::parse(config.chooser_width.as_ref()),
-            chooser_height: SizeSpec::parse(config.chooser_height.as_ref()),
+            duration,
+            width,
+            show_when_visible,
+            chooser_width,
+            chooser_height,
             seq: 0,
             state: State::default(),
             chooser: None,
         })
+    }
+
+    /// Absorb config changes in place: a restart would orphan the view
+    /// panes (only our views map knows about them) and drop the feed.
+    /// Already-armed expiry timers keep their old duration; new entries
+    /// use the new one.
+    fn on_config_changed(&mut self, _ctx: &Ctx, config: Config) -> bool {
+        (
+            self.duration,
+            self.width,
+            self.show_when_visible,
+            self.chooser_width,
+            self.chooser_height,
+        ) = parse_config(&config);
+        log("config absorbed");
+        true
     }
 
     fn snapshot(&self) -> Option<serde_json::Value> {
@@ -685,11 +713,6 @@ impl Plugin for NotifyToast {
         // without one.
         let st = self.state.borrow();
         serde_json::to_value(Snapshot {
-            duration: self.duration,
-            width: self.width,
-            show_when_visible: self.show_when_visible,
-            chooser_width: self.chooser_width,
-            chooser_height: self.chooser_height,
             seq: self.seq,
             entries: st.entries.iter().cloned().collect(),
             views: st
@@ -701,14 +724,15 @@ impl Plugin for NotifyToast {
         .ok()
     }
 
-    fn restore(_old_version: i32, state: serde_json::Value) -> Option<Self> {
+    fn restore(
+        fresh: Self,
+        _old_version: i32,
+        state: serde_json::Value,
+    ) -> Option<Self> {
         let snap: Snapshot = serde_json::from_value(state).ok()?;
+        // Config-derived fields from the fresh init (current config);
+        // only the carried state comes from the snapshot.
         let me = Self {
-            duration: snap.duration,
-            width: snap.width,
-            show_when_visible: snap.show_when_visible,
-            chooser_width: snap.chooser_width,
-            chooser_height: snap.chooser_height,
             seq: snap.seq,
             state: Rc::new(RefCell::new(Shared {
                 entries: snap.entries.into_iter().collect(),
@@ -721,6 +745,7 @@ impl Plugin for NotifyToast {
                     .collect(),
             })),
             chooser: None,
+            ..fresh
         };
 
         // The old instance's expiry tasks died with it: re-arm one per

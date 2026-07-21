@@ -88,9 +88,16 @@ pub trait Plugin: Sized + 'static {
     }
 
     /// Rebuild from a previous version's snapshot after a code reload.
-    /// Runs after `init`; the returned value replaces the freshly-inited
-    /// one. `None` refuses the state, keeping the OLD code running.
-    fn restore(_old_version: i32, _state: serde_json::Value) -> Option<Self> {
+    /// Runs after `init`: `fresh` is the instance init just built from the
+    /// CURRENT config — take config-derived fields from it and only the
+    /// carried state from `state` (a snapshot must never override config).
+    /// The returned value replaces `fresh`; `None` refuses the state,
+    /// keeping the OLD code running.
+    fn restore(
+        _fresh: Self,
+        _old_version: i32,
+        _state: serde_json::Value,
+    ) -> Option<Self> {
         None
     }
 
@@ -193,7 +200,14 @@ macro_rules! tmux_plugin {
                 let Ok(state) = serde_json::from_slice(&bytes) else {
                     return 1;
                 };
-                match <$ty as $crate::Plugin>::restore(old_version, state) {
+                // init already ran with the current config; hand that
+                // fresh instance to restore so config always wins over
+                // snapshot state.
+                let Some(fresh) = PLUGIN.with(|p| p.borrow_mut().take())
+                else {
+                    return 1;
+                };
+                match <$ty as $crate::Plugin>::restore(fresh, old_version, state) {
                     Some(plugin) => {
                         PLUGIN.with(|p| *p.borrow_mut() = Some(plugin));
                         executor::run_until_stalled();
