@@ -126,6 +126,10 @@ unsafe extern "C" fn vt_mode_close(_m: u64) -> c_int {
     -1
 }
 
+unsafe extern "C" fn vt_mode_move(_m: u64, _w: u32, _x: c_int, _y: c_int) -> c_int {
+    -1
+}
+
 unsafe extern "C" fn collect_sink(ctx: *mut c_void, ptr: *const c_char, len: usize) {
     let buf = &mut *(ctx as *mut Vec<u8>);
     buf.extend_from_slice(std::slice::from_raw_parts(ptr as *const u8, len));
@@ -188,6 +192,7 @@ fn full_lifecycle() {
         mode_write: vt_mode_write,
         mode_preview: vt_mode_preview,
         mode_close: vt_mode_close,
+        mode_move: vt_mode_move,
     };
     assert_eq!(unsafe { pgh_init(&vt) }, 0);
 

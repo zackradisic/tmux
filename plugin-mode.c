@@ -303,6 +303,127 @@ plugin_vtable_mode_preview(uint64_t mode_id, int64_t pane, u_int x, u_int y,
 	return (window_plugin_mode_preview(wme, pane, x, y, w, h));
 }
 
+/*
+ * Move a mode's floating pane to another window (join-pane mechanics:
+ * the same struct window_pane is relinked, so the pane id, the mode
+ * entry and its screen all survive; at most a resize follows). Runs
+ * inline during a drain, which is safe because nothing here destroys
+ * tmux objects - the one destructive case (the move would leave the
+ * source window paneless, and join-pane would kill it) is refused.
+ * 0 ok, -1 no such mode, -2 no such window or unmovable pane, -3 would
+ * empty the source window.
+ */
+int
+plugin_vtable_mode_move(uint64_t mode_id, u_int window, int x, int y)
+{
+	struct plugin_mode		 find, *pm;
+	struct window_pane		*wp;
+	struct window			*src_w, *dst_w;
+	struct window_mode_entry	*wme;
+	struct winlink			*src_wl, *dst_wl;
+	struct layout_cell		*lc;
+	struct layout_geometry		 lg;
+	u_int				 sx, sy;
+	int				 border, xoff, yoff, found = 0;
+
+	find.id = mode_id;
+	pm = RB_FIND(plugin_modes, &plugin_modes, &find);
+	if (pm == NULL)
+		return (-1);
+	wp = window_pane_find_by_id(pm->pane_id);
+	if (wp == NULL || (wp->flags & PANE_DESTROYED))
+		return (-1);
+	/* Anywhere in the stack: the pane moves wholesale, so a stacked
+	 * copy-mode does not block the move. */
+	TAILQ_FOREACH(wme, &wp->modes, entry) {
+		if (wme->mode == &window_plugin_mode &&
+		    window_plugin_mode_id(wme) == mode_id) {
+			found = 1;
+			break;
+		}
+	}
+	if (!found)
+		return (-1);
+	src_w = wp->window;
+
+	dst_w = window_find_by_id(window);
+	if (dst_w == NULL)
+		return (-2);
+	dst_wl = TAILQ_FIRST(&dst_w->winlinks);
+	if (dst_wl == NULL)
+		return (-2);
+	if (dst_w == src_w)
+		return (0);
+	if (wp == src_w->modal)
+		return (-2);
+	if (dst_w->sx <= PANE_MINIMUM + 2 || dst_w->sy <= PANE_MINIMUM + 2)
+		return (-2);
+	if (window_count_panes(src_w, 1) <= 1)
+		return (-3);
+
+	server_unzoom_window(src_w);
+	server_unzoom_window(dst_w);
+
+	/* Keep the size (clamped to the destination); explicit offsets or
+	 * centered, as in mode_open. */
+	border = window_get_pane_lines(dst_w) != PANE_LINES_NONE;
+	sx = wp->sx;
+	if (sx < PANE_MINIMUM)
+		sx = PANE_MINIMUM;
+	if (sx > dst_w->sx - 2 * border)
+		sx = dst_w->sx - 2 * border;
+	sy = wp->sy;
+	if (sy < PANE_MINIMUM)
+		sy = PANE_MINIMUM;
+	if (sy > dst_w->sy - 2 * border)
+		sy = dst_w->sy - 2 * border;
+	xoff = x >= 0 ? x + border : (int)(dst_w->sx - sx) / 2;
+	yoff = y >= 0 ? y + border : (int)(dst_w->sy - sy) / 2;
+	if (xoff < border)
+		xoff = border;
+	if (xoff + (int)sx > (int)dst_w->sx - border)
+		xoff = (int)dst_w->sx - border - (int)sx;
+	if (yoff < border)
+		yoff = border;
+	if (yoff + (int)sy > (int)dst_w->sy - border)
+		yoff = (int)dst_w->sy - border - (int)sy;
+
+	/* Leave the source window (cmd-join-pane.c mechanics). */
+	layout_close_pane(wp);
+	server_client_remove_pane(wp);
+	window_lost_pane(src_w, wp);
+	TAILQ_REMOVE(&src_w->panes, wp, entry);
+	TAILQ_REMOVE(&src_w->z_index, wp, zentry);
+
+	/* Relink into the destination; floats sit on top of the z order. */
+	wp->window = dst_w;
+	options_set_parent(wp->options, dst_w->options);
+	wp->flags |= (PANE_STYLECHANGED|PANE_THEMECHANGED);
+	TAILQ_INSERT_TAIL(&dst_w->panes, wp, entry);
+	TAILQ_INSERT_HEAD(&dst_w->z_index, wp, zentry);
+
+	lg.sx = sx;
+	lg.sy = sy;
+	lg.xoff = xoff;
+	lg.yoff = yoff;
+	lc = layout_floating_pane(dst_w, dst_w->active, &lg);
+	layout_assign_pane(lc, wp, 0);
+	colour_palette_from_option(&wp->palette, wp->options);
+
+	recalculate_sizes();
+	server_redraw_window(src_w);
+	server_redraw_window(dst_w);
+
+	/* Keys should follow the panel, as on open. */
+	window_set_active_pane(dst_w, wp, 1);
+
+	src_wl = TAILQ_FIRST(&src_w->winlinks);
+	window_fire_pane_moved(wp, src_w,
+	    src_wl != NULL ? src_wl->idx : -1, dst_w, dst_wl->idx);
+
+	return (0);
+}
+
 /* Run the deferred closes: the safe point for killing the mode panes. */
 static void
 plugin_mode_close_timer_callback(__unused int fd, __unused short events,

@@ -139,6 +139,12 @@ pub struct pgh_host_vtable {
     /// point (never synchronously inside this call), which delivers
     /// pgh_mode_event(mode, "mode-closed", ...). 0 ok, -1 no such mode.
     pub mode_close: unsafe extern "C" fn(mode: u64) -> c_int,
+    /// Move a mode's floating pane to another window, keeping the pane,
+    /// the mode and its screen contents intact (join-pane style relink;
+    /// at most a mode-resize event follows). x/y as for mode_open
+    /// (-1 = centered). 0 ok, -1 no such mode, -2 no such window or
+    /// unmovable pane, -3 the move would empty the source window.
+    pub mode_move: unsafe extern "C" fn(mode: u64, window: u32, x: c_int, y: c_int) -> c_int,
 }
 
 // Function pointers are Send + Sync; the vtable is stored in a OnceLock.

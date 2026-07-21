@@ -91,9 +91,14 @@ type State = Rc<RefCell<Shared>>;
 /// The expanded chooser: one open plugin UI mode at a time.
 struct Chooser {
     mode: ModeId,
-    /// Window the panel lives in; switching away from it closes the
-    /// chooser (a mode pane cannot follow the user across windows).
+    /// Window the panel currently lives in (updated when it follows the
+    /// user to another window).
     window: u64,
+    /// Where focus came from (the click event's old_pane): restored on
+    /// an interactive close so the toast view - which the click made
+    /// active - does not end up focused, which would both swallow the
+    /// next click (no pane change) and look like a click to us.
+    return_pane: Option<u64>,
     selected: usize,
     width: u32,
     height: u32,
@@ -425,16 +430,14 @@ fn chooser_render(ch: &Chooser, entries: &VecDeque<Entry>) {
 }
 
 impl NotifyToast {
-    fn open_chooser(&mut self, window: u64, selected: usize) {
-        // Only one chooser at a time. A click in the window that already
-        // shows it is a no-op; a click elsewhere replaces it (belt and
-        // braces for a panel left behind by a missed window switch).
-        if let Some(ch) = self.chooser.as_ref() {
-            if ch.window == window {
-                return;
-            }
-            let _ = mode_close(ch.mode);
-            self.chooser = None;
+    fn open_chooser(
+        &mut self,
+        window: u64,
+        selected: usize,
+        return_pane: Option<u64>,
+    ) {
+        if self.chooser.is_some() {
+            return;
         }
         let nentries = self.state.borrow().entries.len();
         if nentries == 0 {
@@ -462,6 +465,7 @@ impl NotifyToast {
                 let ch = Chooser {
                     mode,
                     window,
+                    return_pane,
                     selected: selected.min(nentries - 1),
                     width,
                     height,
@@ -482,6 +486,9 @@ impl NotifyToast {
         };
         let Some((seq, src_window, src_pane)) = target else { return };
         let _ = mode_close(ch.mode);
+        // Cleared now (not at mode-closed) so the jump's own focus
+        // change wins; the late mode-closed for this id is then a no-op.
+        self.chooser = None;
 
         let state = Rc::clone(&self.state);
         let (width, keeper_secs, show_when_visible) = self.view_params();
@@ -738,7 +745,19 @@ impl Plugin for NotifyToast {
                     event.data.get("mode").and_then(|v| v.as_u64())
                         == Some(ch.mode.0)
                 }) {
-                    self.chooser = None;
+                    let ch = self.chooser.take().unwrap();
+                    // Hand focus back to where the opening click came
+                    // from: tmux's fallback would otherwise focus the
+                    // toast view, whose next click could not fire (no
+                    // pane change). Dead panes fail harmlessly.
+                    if let Some(rp) = ch.return_pane {
+                        ctx.spawn(async move {
+                            let _ = run_command(&format!(
+                                "select-pane -t %{rp}"
+                            ))
+                            .await;
+                        });
+                    }
                 }
                 return;
             }
@@ -748,26 +767,40 @@ impl Plugin for NotifyToast {
             // repaint is idempotent anyway, but no need to churn.
             "session-window-changed" | "client-session-changed"
             | "client-attached" | "client-detached" => {
-                // A mode pane cannot span windows, so the chooser
-                // follows the user the only way it can: when its window
-                // stops being on display, close it and reopen it (same
-                // selection) in the window now shown. State is cleared
-                // immediately, not at mode-closed, so the reopen (or a
-                // toast click) is not blocked by the closing panel.
-                if let Some(ch) = self.chooser.as_ref() {
+                // The chooser follows the user: when its window stops
+                // being on display, move the float to the window now
+                // shown. The move keeps the pane, the mode id and the
+                // rendered screen (at most a mode-resize follows), so
+                // no state needs carrying. Fallback to close-and-reopen
+                // if the move is refused (it would empty the old
+                // window); plain close when there is nowhere to follow
+                // (e.g. the last client detached).
+                if let Some(ch) = self.chooser.as_mut() {
                     let current = current_windows();
                     if !current.contains(&ch.window) {
-                        let _ = mode_close(ch.mode);
-                        let selected = ch.selected;
-                        self.chooser = None;
                         let target = event
                             .scope
                             .window
                             .map(u64::from)
                             .filter(|w| current.contains(w))
                             .or_else(|| current.first().copied());
-                        if let Some(w) = target {
-                            self.open_chooser(w, selected);
+                        match target {
+                            Some(w) => match mode_move(
+                                ch.mode,
+                                Some(WindowId(w as u32)),
+                            ) {
+                                Ok(()) => ch.window = w,
+                                Err(_) => {
+                                    let _ = mode_close(ch.mode);
+                                    let selected = ch.selected;
+                                    self.chooser = None;
+                                    self.open_chooser(w, selected, None);
+                                }
+                            },
+                            None => {
+                                let _ = mode_close(ch.mode);
+                                self.chooser = None;
+                            }
                         }
                     }
                 }
@@ -778,11 +811,17 @@ impl Plugin for NotifyToast {
                 return;
             }
             // Clicking (or otherwise focusing) a notification pane opens
-            // the chooser in that window. The chooser's own floating pane
-            // fires this too when it takes focus, but it is not a view
-            // pane, so it never matches here (the mode pane must be
-            // excluded or opening the chooser would re-trigger this).
+            // the chooser in that window. Two exclusions keep this from
+            // misfiring: the chooser's own pane is not a view pane (a
+            // mode pane taking focus never matches), and while a chooser
+            // exists ALL of these are ignored - tmux's focus fallback
+            // makes the toast active whenever a float leaves its window
+            // (close, kill or a follow move), and that is
+            // indistinguishable from a click by pane alone.
             "window-pane-changed" => {
+                if self.chooser.is_some() {
+                    return;
+                }
                 let Some(p) = event.scope.pane else { return };
                 let window = state
                     .borrow()
@@ -791,8 +830,10 @@ impl Plugin for NotifyToast {
                     .find(|(_, v)| v.pane == Some(u64::from(p)))
                     .map(|(w, _)| *w);
                 let Some(window) = window else { return };
+                let return_pane =
+                    event.data.get("old_pane").and_then(|v| v.as_u64());
                 log("notification pane clicked: opening chooser");
-                self.open_chooser(window, 0);
+                self.open_chooser(window, 0, return_pane);
                 return;
             }
             _ => return,

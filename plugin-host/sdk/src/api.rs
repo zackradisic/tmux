@@ -295,6 +295,23 @@ pub fn mode_preview(
     host_call("mode_preview", params).map(|_| ())
 }
 
+/// Move a mode's floating pane to another window, keeping the mode id,
+/// the pane and its rendered screen intact (at most a `mode-resize`
+/// follows if the destination clamps the size). `window` defaults as in
+/// [`mode_open`]; position is re-centered unless `x`/`y` are given.
+/// Fails with `E_LIMIT` if the move would leave the source window empty
+/// (close instead).
+pub fn mode_move(
+    mode: ModeId,
+    window: Option<WindowId>,
+) -> Result<(), HostError> {
+    let mut params = json!({ "mode": mode.0 });
+    if let Some(w) = window {
+        params["window"] = w.0.into();
+    }
+    host_call("mode_move", params).map(|_| ())
+}
+
 /// Close a mode. The floating pane is torn down at the next safe point;
 /// a final `mode-closed` event (reason "closed") follows.
 pub fn mode_close(mode: ModeId) -> Result<(), HostError> {

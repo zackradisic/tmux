@@ -150,7 +150,8 @@ fn required_cap(method: &str) -> u32 {
         "timer_start" | "timer_cancel" => TIMERS,
         "run_job" => RUN_PROCESS,
         "run_command" => RUN_COMMAND,
-        "mode_open" | "mode_write" | "mode_preview" | "mode_close" => MODE,
+        "mode_open" | "mode_write" | "mode_preview" | "mode_close"
+        | "mode_move" => MODE,
         _ => 0,
     }
 }
@@ -353,6 +354,7 @@ mod tests {
             "set_option", "display_message", "run_job", "run_command",
             "timer_start", "timer_cancel", "resolve", "bogus",
             "mode_open", "mode_write", "mode_preview", "mode_close",
+            "mode_move",
         ];
         let mut rng = Rng(0x74_6d_75_78_32);
         for _ in 0..5000 {
@@ -724,6 +726,53 @@ pub fn dispatch(data: &StoreData, request: &[u8]) -> Result<Value, HostError> {
                 -2 => Err(err(
                     ErrorCode::BadRequest,
                     "preview rect does not fit the mode screen",
+                )),
+                _ => Err(err(
+                    ErrorCode::NoSuchObject,
+                    format!("no such mode {}", p.mode),
+                )),
+            }
+        }
+        "mode_move" => {
+            #[derive(Deserialize)]
+            struct ModeMoveParams {
+                mode: u64,
+                #[serde(default)]
+                window: Option<u32>,
+                #[serde(default)]
+                x: Option<u32>,
+                #[serde(default)]
+                y: Option<u32>,
+            }
+            let p: ModeMoveParams = params(req.params)?;
+            if !crate::modes::owned_by(p.mode, data) {
+                return Err(err(
+                    ErrorCode::NoSuchObject,
+                    format!("no such mode {}", p.mode),
+                ));
+            }
+            let window = mode_target_window(data, p.window)?;
+            let to_off = |v: Option<u32>| -> Result<i32, HostError> {
+                match v {
+                    None => Ok(-1),
+                    Some(n) => i32::try_from(n).map_err(|_| {
+                        err(ErrorCode::BadRequest, "position out of range")
+                    }),
+                }
+            };
+            let vt = vtable()?;
+            let rc = unsafe {
+                (vt.mode_move)(p.mode, window, to_off(p.x)?, to_off(p.y)?)
+            };
+            match rc {
+                0 => Ok(json!({})),
+                -2 => Err(err(
+                    ErrorCode::NoSuchObject,
+                    format!("no such window @{window} (or unmovable pane)"),
+                )),
+                -3 => Err(err(
+                    ErrorCode::Limit,
+                    "move would empty the source window; close instead",
                 )),
                 _ => Err(err(
                     ErrorCode::NoSuchObject,

@@ -13,6 +13,7 @@ static LOGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static MODE_OPENS: Mutex<Vec<(u32, u32, u32)>> = Mutex::new(Vec::new());
 static MODE_WRITES: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 static MODE_CLOSES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+static MODE_MOVES: Mutex<Vec<(u64, u32)>> = Mutex::new(Vec::new());
 static NEXT_MODE_ID: Mutex<u64> = Mutex::new(0);
 
 unsafe extern "C" fn vt_log(_level: c_int, plugin: *const c_char, msg: *const c_char) {
@@ -136,17 +137,23 @@ unsafe extern "C" fn vt_mode_close(mode: u64) -> c_int {
     0
 }
 
+unsafe extern "C" fn vt_mode_move(mode: u64, window: u32, _x: c_int, _y: c_int) -> c_int {
+    MODE_MOVES.lock().unwrap().push((mode, window));
+    0
+}
+
 unsafe extern "C" fn collect_sink(ctx: *mut c_void, ptr: *const c_char, len: usize) {
     let buf = &mut *(ctx as *mut Vec<u8>);
     buf.extend_from_slice(std::slice::from_raw_parts(ptr as *const u8, len));
 }
 
-/// Guest that opens a mode (and writes "hi" to it) from init, and logs
-/// every event it receives verbatim. Built with the two host_call request
-/// JSONs spliced into data segments.
+/// Guest that opens a mode, writes "hi" to it and moves it to window 2,
+/// all from init, and logs every event it receives verbatim. Built with
+/// the host_call request JSONs spliced into data segments.
 fn guest_wat() -> String {
     let open = r#"{"method":"mode_open","params":{"window":1,"width":10,"height":5}}"#;
     let write = r#"{"method":"mode_write","params":{"mode":1,"data_b64":"aGk="}}"#;
+    let mv = r#"{"method":"mode_move","params":{"mode":1,"window":2}}"#;
     format!(
         r#"
 (module
@@ -156,6 +163,7 @@ fn guest_wat() -> String {
   (global $next (mut i32) (i32.const 2048))
   (data (i32.const 0) "{open_escaped}")
   (data (i32.const 512) "{write_escaped}")
+  (data (i32.const 768) "{mv_escaped}")
   (func (export "pgh_abi_version") (result i32) (i32.const 1))
   (func (export "pgh_alloc") (param i32) (result i32)
     (local i32)
@@ -170,6 +178,7 @@ fn guest_wat() -> String {
   (func (export "pgh_init") (param i32 i32) (result i32)
     (drop (call $call (i32.const 0) (i32.const {open_len}) (i32.const 1024) (i32.const 1028)))
     (drop (call $call (i32.const 512) (i32.const {write_len}) (i32.const 1024) (i32.const 1028)))
+    (drop (call $call (i32.const 768) (i32.const {mv_len}) (i32.const 1024) (i32.const 1028)))
     (i32.const 0))
   (func (export "pgh_on_event") (param i32 i32)
     (call $log (i32.const 1) (local.get 0) (local.get 1)))
@@ -178,8 +187,10 @@ fn guest_wat() -> String {
 "#,
         open_escaped = open.replace('"', "\\\""),
         write_escaped = write.replace('"', "\\\""),
+        mv_escaped = mv.replace('"', "\\\""),
         open_len = open.len(),
         write_len = write.len(),
+        mv_len = mv.len(),
     )
 }
 
@@ -212,6 +223,7 @@ fn mode_lifecycle() {
         mode_write: vt_mode_write,
         mode_preview: vt_mode_preview,
         mode_close: vt_mode_close,
+        mode_move: vt_mode_move,
     };
     assert_eq!(unsafe { pgh_init(&vt) }, 0);
 
@@ -234,6 +246,8 @@ fn mode_lifecycle() {
     assert_eq!(pgh_drain(0), 0);
     assert_eq!(MODE_OPENS.lock().unwrap().as_slice(), &[(1, 10, 5)]);
     assert_eq!(MODE_WRITES.lock().unwrap().as_slice(), &[b"hi".to_vec()]);
+    // The move went through with the owner's id and explicit window.
+    assert_eq!(MODE_MOVES.lock().unwrap().as_slice(), &[(1, 2)]);
 
     // A key event for the open mode reaches the guest, with the mode id
     // in data, no subscription needed.

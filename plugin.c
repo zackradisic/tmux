@@ -76,6 +76,7 @@ plugin_init(void)
 	vt.mode_write = plugin_vtable_mode_write;
 	vt.mode_preview = plugin_vtable_mode_preview;
 	vt.mode_close = plugin_vtable_mode_close;
+	vt.mode_move = plugin_vtable_mode_move;
 
 	if (pgh_init(&vt) != 0) {
 		log_debug("%s: plugin host failed to initialize", __func__);

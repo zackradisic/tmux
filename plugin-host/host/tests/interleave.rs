@@ -120,6 +120,9 @@ unsafe extern "C" fn vt_mode_preview(
 unsafe extern "C" fn vt_mode_close(_m: u64) -> c_int {
     0
 }
+unsafe extern "C" fn vt_mode_move(_m: u64, _w: u32, _x: c_int, _y: c_int) -> c_int {
+    0
+}
 
 unsafe extern "C" fn collect_sink(ctx: *mut c_void, ptr: *const c_char, len: usize) {
     let buf = &mut *(ctx as *mut Vec<u8>);
@@ -193,6 +196,7 @@ fn random_interleavings_never_poison() {
         mode_write: vt_mode_write,
         mode_preview: vt_mode_preview,
         mode_close: vt_mode_close,
+        mode_move: vt_mode_move,
     };
     assert_eq!(unsafe { pgh_init(&vt) }, 0);
 

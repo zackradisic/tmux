@@ -55,6 +55,7 @@ int	 plugin_vtable_mode_write(uint64_t, const u_char *, size_t);
 int	 plugin_vtable_mode_preview(uint64_t, int64_t, u_int, u_int, u_int,
 	     u_int);
 int	 plugin_vtable_mode_close(uint64_t);
+int	 plugin_vtable_mode_move(uint64_t, u_int, int, int);
 int	 plugin_mode_pending_take(uint64_t *);
 void	 plugin_mode_event(uint64_t, const char *, const char *);
 void	 plugin_mode_unregister(uint64_t);

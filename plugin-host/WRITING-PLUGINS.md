@@ -240,6 +240,8 @@ mode_open(&ModeOpts { window?, width, height, x?, y?, title? })
                                                         -> Result<ModeId, _>
 mode_write(ModeId, data: &[u8])                         // ANSI bytes, ≤256 KiB
 mode_preview(ModeId, Option<&PreviewRect>)              // live pane mirror
+mode_move(ModeId, window: Option<WindowId>)             // relocate the float,
+                                                        // id/screen intact
 mode_close(ModeId)
 ```
 
@@ -359,6 +361,13 @@ Notes:
   browse; the pane stays yours when copy-mode exits).
 - `mode_close` tears the pane down at the next event-loop pass and then
   delivers `mode-closed` — treat that event, not the call, as "gone".
+- A panel can follow the user across windows with `mode_move`: the same
+  pane is relinked into the new window, so your mode id, rendered screen
+  and event stream survive the move (at most a `mode-resize` arrives).
+  Call it from a `session-window-changed` handler; see the notify-toast
+  chooser. One caveat: when the float leaves a window, tmux's focus
+  fallback fires `window-pane-changed` there — don't misread your own
+  fallout as user input.
 - Your modes are force-closed when your instance is reloaded/unloaded or
   its scope object dies.
 

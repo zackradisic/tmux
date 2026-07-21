@@ -207,6 +207,14 @@ typedef struct {
    * pgh_mode_event(mode, "mode-closed", ...). 0 ok, -1 no such mode.
    */
   int (*mode_close)(uint64_t mode);
+  /**
+   * Move a mode's floating pane to another window, keeping the pane,
+   * the mode and its screen contents intact (join-pane style relink;
+   * at most a mode-resize event follows). x/y as for mode_open
+   * (-1 = centered). 0 ok, -1 no such mode, -2 no such window or
+   * unmovable pane, -3 the move would empty the source window.
+   */
+  int (*mode_move)(uint64_t mode, uint32_t window, int x, int y);
 } pgh_host_vtable;
 
 #ifdef __cplusplus

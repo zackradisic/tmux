@@ -88,6 +88,7 @@ Error codes (numeric value used by negative `host_request` returns):
 | `mode_open` | `{window?, width, height, x?, y?, title?}` | `{mode}` | mode |
 | `mode_write` | `{mode, data_b64}` | `{}` | mode (≤256 KiB decoded) |
 | `mode_preview` | `{mode, pane?, x, y, w, h}` | `{}` | mode |
+| `mode_move` | `{mode, window?, x?, y?}` | `{}` | mode |
 | `mode_close` | `{mode}` | `{}` | mode |
 
 `scope` is `{"type":"server"}` (default) or
@@ -164,6 +165,14 @@ is not offered in v1; the design for it is in
     (the plugin called `mode_close`) or `"killed"` (anything else: the
     user killed the pane, the window died, the plugin was reloaded or
     unloaded). The id is dead afterwards.
+- **Move**: `mode_move` relocates the float to another window,
+  join-pane style: the same pane is relinked, so the mode id, the pane
+  id, the rendered screen and the event stream all survive - at most a
+  `mode-resize` follows if the destination clamps the size. Target
+  window rules and `x`/`y` as for `mode_open` (default: re-centered).
+  Refused with `E_LIMIT` when the move would leave the source window
+  empty (close instead; a paneless window cannot be left behind). This
+  is the primitive for follow-the-user panels.
 - **Close**: `mode_close` returns immediately; the pane teardown happens
   at the next event-loop iteration and delivers `mode-closed`. Instance
   teardown (unload, reload, scope-object death) force-closes all modes the
