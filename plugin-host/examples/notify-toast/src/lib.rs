@@ -30,7 +30,9 @@
 //!
 //! Options (-o): duration_ms (default 6000; 0 or "infinite" = lines never
 //! expire), width (default 44), show_when_visible (default 1; 0 =
-//! suppress in the source window).
+//! suppress in the source window), chooser_width / chooser_height
+//! (chooser panel size: cells, or "NN%" of the window; default: most of
+//! the window width capped at 90, height sized to the feed).
 //!
 //! Build: cargo build -p notify-toast --target wasm32-unknown-unknown --release
 
@@ -51,6 +53,41 @@ struct Config {
     /// (default is to show them everywhere).
     #[serde(default)]
     show_when_visible: Option<String>,
+    /// Chooser panel size: a cell count or "NN%" of the window. Values
+    /// arrive as strings from -o and as native numbers from a manifest,
+    /// so these accept any JSON value.
+    #[serde(default)]
+    chooser_width: Option<serde_json::Value>,
+    #[serde(default)]
+    chooser_height: Option<serde_json::Value>,
+}
+
+/// A configured dimension: absolute cells or a percentage of the window.
+#[derive(Clone, Copy, Serialize, Deserialize)]
+enum SizeSpec {
+    Cells(u32),
+    Percent(u32),
+}
+
+impl SizeSpec {
+    fn parse(v: Option<&serde_json::Value>) -> Option<Self> {
+        let v = v?;
+        if let Some(n) = v.as_u64() {
+            return Some(SizeSpec::Cells(n as u32));
+        }
+        let s = v.as_str()?.trim();
+        if let Some(p) = s.strip_suffix('%') {
+            return p.trim().parse().ok().map(SizeSpec::Percent);
+        }
+        s.parse().ok().map(SizeSpec::Cells)
+    }
+
+    fn resolve(self, total: u32) -> u32 {
+        match self {
+            SizeSpec::Cells(n) => n,
+            SizeSpec::Percent(p) => total * p.min(100) / 100,
+        }
+    }
 }
 
 /// Most notification lines shown at once; older ones are dropped early.
@@ -109,6 +146,8 @@ struct NotifyToast {
     duration: Option<u64>,
     width: u64,
     show_when_visible: bool,
+    chooser_width: Option<SizeSpec>,
+    chooser_height: Option<SizeSpec>,
     seq: u64,
     state: State,
     chooser: Option<Chooser>,
@@ -123,6 +162,10 @@ struct Snapshot {
     duration: Option<u64>,
     width: u64,
     show_when_visible: bool,
+    #[serde(default)]
+    chooser_width: Option<SizeSpec>,
+    #[serde(default)]
+    chooser_height: Option<SizeSpec>,
     seq: u64,
     entries: Vec<Entry>,
     /// window -> (pane, body on display); repaint flags start fresh.
@@ -448,10 +491,17 @@ impl NotifyToast {
             wi.get("width").and_then(|v| v.as_u64()).unwrap_or(80) as u32;
         let win_h =
             wi.get("height").and_then(|v| v.as_u64()).unwrap_or(24) as u32;
-        let width = win_w.saturating_sub(8).clamp(24, 90);
-        let height = (nentries as u32 + 6)
-            .max(10)
-            .min(win_h.saturating_sub(4).max(5));
+        let width = self
+            .chooser_width
+            .map(|s| s.resolve(win_w))
+            .unwrap_or_else(|| win_w.saturating_sub(8).min(90))
+            .clamp(24.min(win_w.saturating_sub(4).max(10)),
+                win_w.saturating_sub(4).max(10));
+        let height = self
+            .chooser_height
+            .map(|s| s.resolve(win_h))
+            .unwrap_or_else(|| (nentries as u32 + 6).max(10))
+            .clamp(5, win_h.saturating_sub(2).max(5));
 
         match mode_open(&ModeOpts {
             window: Some(WindowId(window as u32)),
@@ -621,6 +671,8 @@ impl Plugin for NotifyToast {
                 .clamp(20, 120),
             show_when_visible: config.show_when_visible.as_deref()
                 != Some("0"),
+            chooser_width: SizeSpec::parse(config.chooser_width.as_ref()),
+            chooser_height: SizeSpec::parse(config.chooser_height.as_ref()),
             seq: 0,
             state: State::default(),
             chooser: None,
@@ -636,6 +688,8 @@ impl Plugin for NotifyToast {
             duration: self.duration,
             width: self.width,
             show_when_visible: self.show_when_visible,
+            chooser_width: self.chooser_width,
+            chooser_height: self.chooser_height,
             seq: self.seq,
             entries: st.entries.iter().cloned().collect(),
             views: st
@@ -653,6 +707,8 @@ impl Plugin for NotifyToast {
             duration: snap.duration,
             width: snap.width,
             show_when_visible: snap.show_when_visible,
+            chooser_width: snap.chooser_width,
+            chooser_height: snap.chooser_height,
             seq: snap.seq,
             state: Rc::new(RefCell::new(Shared {
                 entries: snap.entries.into_iter().collect(),
