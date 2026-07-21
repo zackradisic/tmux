@@ -506,10 +506,9 @@ impl NotifyToast {
         if self.chooser.is_some() {
             return;
         }
+        // An empty feed still opens (the keybinding path): the panel
+        // shows "no notifications" and q closes it.
         let nentries = self.state.borrow().entries.len();
-        if nentries == 0 {
-            return;
-        }
         let Ok(wi) = resolve_window(WindowId(window as u32)) else { return };
         let win_w =
             wi.get("width").and_then(|v| v.as_u64()).unwrap_or(80) as u32;
@@ -540,7 +539,7 @@ impl NotifyToast {
                     mode,
                     window,
                     return_pane,
-                    selected: selected.min(nentries - 1),
+                    selected: selected.min(nentries.saturating_sub(1)),
                     width,
                     height,
                 };
@@ -676,6 +675,8 @@ impl Plugin for NotifyToast {
             "client-detached",
             // Click-to-dismiss: focusing a toast pane fires this.
             "window-pane-changed",
+            // Key bindings: `plugin-command notify_toast chooser`.
+            "plugin-command",
         ])
         .map_err(|e| e.message.clone())?;
 
@@ -780,6 +781,27 @@ impl Plugin for NotifyToast {
 
         match event.event.as_str() {
             "pane-notification" => {}
+            // Key binding: toggle the chooser in the target window.
+            "plugin-command" => {
+                if event.data.get("text").and_then(|v| v.as_str())
+                    != Some("chooser")
+                {
+                    return;
+                }
+                let Some(window) = event.scope.window.map(u64::from) else {
+                    return;
+                };
+                if let Some(ch) = self.chooser.as_ref() {
+                    let same = ch.window == window;
+                    let _ = mode_close(ch.mode);
+                    self.chooser = None;
+                    if same {
+                        return; // toggle off
+                    }
+                }
+                self.open_chooser(window, 0, event.scope.pane.map(u64::from));
+                return;
+            }
             // Chooser events, targeted at this instance by mode id.
             "mode-key" => {
                 let matches = self.chooser.as_ref().is_some_and(|ch| {

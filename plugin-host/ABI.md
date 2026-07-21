@@ -125,6 +125,10 @@ level, so they also cover panes created outside spawn paths) and
 `client-destroyed`. `pane-notification` (OSC 9;message or OSC
 777;notify;title;body — the message travels in `data.text`, ≤512 bytes,
 valid UTF-8) has no bus equivalent and is delivered directly.
+`plugin-command` (from the tmux command of the same name) is targeted:
+only the plugin named in `data.plugin` receives it (subscription still
+required); the command string is `data.text` and the target
+pane/window/session form the scope.
 
 ## UI modes
 

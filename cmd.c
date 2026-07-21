@@ -110,6 +110,7 @@ extern const struct cmd_entry cmd_show_options_entry;
 extern const struct cmd_entry cmd_disable_plugin_entry;
 extern const struct cmd_entry cmd_enable_plugin_entry;
 extern const struct cmd_entry cmd_load_plugin_entry;
+extern const struct cmd_entry cmd_plugin_command_entry;
 extern const struct cmd_entry cmd_plugin_log_entry;
 extern const struct cmd_entry cmd_reload_plugin_entry;
 extern const struct cmd_entry cmd_show_plugins_entry;
@@ -191,6 +192,7 @@ const struct cmd_entry *cmd_table[] = {
 	&cmd_next_window_entry,
 	&cmd_paste_buffer_entry,
 #ifdef ENABLE_PLUGINS
+	&cmd_plugin_command_entry,
 	&cmd_plugin_log_entry,
 #endif
 	&cmd_pipe_pane_entry,

@@ -493,6 +493,12 @@ fn route_event(event: &Event) {
 
         let subscribed = implicit_event(&event.event)
             || inst.guest.store.data().subscriptions.contains(&event.event);
+        // plugin-command events are addressed to one plugin by name;
+        // others must not see them even when subscribed.
+        let subscribed = subscribed
+            && (event.event != "plugin-command"
+                || event.data.get("plugin").and_then(|v| v.as_str())
+                    == Some(inst.plugin.as_str()));
 
         let mut trapped = false;
         if subscribed {

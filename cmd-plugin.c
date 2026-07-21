@@ -71,6 +71,21 @@ const struct cmd_entry cmd_unload_plugin_entry = {
 
 static enum cmd_retval	cmd_sync_plugins_exec(struct cmd *,
 			    struct cmdq_item *);
+static enum cmd_retval	cmd_plugin_command_exec(struct cmd *,
+			    struct cmdq_item *);
+
+const struct cmd_entry cmd_plugin_command_entry = {
+	.name = "plugin-command",
+	.alias = NULL,
+
+	.args = { "t:", 2, 2, NULL },
+	.usage = CMD_TARGET_PANE_USAGE " plugin command",
+
+	.target = { 't', CMD_FIND_PANE, 0 },
+
+	.flags = CMD_AFTERHOOK,
+	.exec = cmd_plugin_command_exec
+};
 
 const struct cmd_entry cmd_sync_plugins_entry = {
 	.name = "sync-plugins",
@@ -287,6 +302,60 @@ cmd_unload_plugin_exec(struct cmd *self, struct cmdq_item *item)
 		cmdq_error(item, "unknown plugin: %s", name);
 		return (CMD_RETURN_ERROR);
 	}
+	plugin_schedule_drain();
+	return (CMD_RETURN_NORMAL);
+}
+
+/*
+ * Send a command string to a named plugin as a targeted "plugin-command"
+ * event (delivered only to that plugin's subscribed instances). The
+ * target pane/window/session travel in the event scope, so key bindings
+ * can tell a plugin where to act.
+ */
+static enum cmd_retval
+cmd_plugin_command_exec(struct cmd *self, struct cmdq_item *item)
+{
+	struct args		*args = cmd_get_args(self);
+	struct cmd_find_state	*target = cmdq_get_target(item);
+	struct client		*c = cmdq_get_client(item);
+	struct plugin_json	*pj;
+
+	if (!plugin_enabled()) {
+		cmdq_error(item, "plugin support not available");
+		return (CMD_RETURN_ERROR);
+	}
+
+	pj = plugin_json_create();
+	plugin_json_obj_start(pj, NULL);
+	plugin_json_str(pj, "event", "plugin-command");
+	plugin_json_str(pj, "plugin", args_string(args, 0));
+	plugin_json_str(pj, "text", args_string(args, 1));
+	if (c != NULL) {
+		plugin_json_obj_start(pj, "client");
+		plugin_json_num(pj, "id", c->id);
+		plugin_json_obj_end(pj);
+	}
+	if (target->s != NULL) {
+		plugin_json_obj_start(pj, "session");
+		plugin_json_num(pj, "id", target->s->id);
+		plugin_json_obj_end(pj);
+	}
+	if (target->w != NULL) {
+		plugin_json_obj_start(pj, "window");
+		plugin_json_num(pj, "id", target->w->id);
+		plugin_json_obj_end(pj);
+	}
+	if (target->wp != NULL) {
+		plugin_json_obj_start(pj, "pane");
+		plugin_json_num(pj, "id", target->wp->id);
+		if (target->w != NULL)
+			plugin_json_num(pj, "window", target->w->id);
+		plugin_json_obj_end(pj);
+	}
+	plugin_json_obj_end(pj);
+
+	pgh_notify(plugin_json_string(pj));
+	plugin_json_free(pj);
 	plugin_schedule_drain();
 	return (CMD_RETURN_NORMAL);
 }

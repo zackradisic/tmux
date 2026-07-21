@@ -6688,6 +6688,19 @@ configuration it offers the new configuration to running instances.
 Loading the same plugins from the configuration file with
 .Ic source-file
 is therefore safe and does not disturb running instances.
+.It Xo Ic plugin-command
+.Op Fl t Ar target-pane
+.Ar plugin
+.Ar command
+.Xc
+Send a command string to a named plugin as a targeted
+.Ql plugin-command
+event; only that plugin's instances receive it (they must subscribe).
+The target pane, window and session travel in the event scope, so key
+bindings can tell a plugin where to act, for example:
+.Bd -literal -offset indent
+bind N plugin-command notify_toast chooser
+.Ed
 .It Ic sync-plugins Ar manifest-path
 Reconcile the set of loaded plugins against a TOML manifest
 (declarative loading): entries new to the manifest are loaded, changed

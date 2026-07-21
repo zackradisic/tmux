@@ -257,6 +257,11 @@ pane; scope carries the pane and its window):
   message arrives as `event.data["text"]` (`title: body` for 777). Handy
   for agents/build scripts: `printf '\e]9;done\a'` from any pane, however
   deeply nested (ssh, make, ...), reaches a subscribed plugin.
+- `plugin-command` — sent by the `plugin-command <plugin> <command>` tmux
+  command, so users can wire key bindings to your plugin (e.g. `bind N
+  plugin-command notify_toast chooser`). Targeted: only the named plugin
+  receives it. Subscribe to it, match `event.data["text"]`, and use the
+  scope (the `-t` target's pane/window/session) to know where to act.
 
 ## API reference (`tmux_plugin_sdk::prelude::*`)
 
