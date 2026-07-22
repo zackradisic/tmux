@@ -182,7 +182,7 @@ window_plugin_resize(struct window_mode_entry *wme, u_int sx, u_int sy)
 }
 
 static void
-window_plugin_key(struct window_mode_entry *wme, __unused struct client *c,
+window_plugin_key(struct window_mode_entry *wme, struct client *c,
     __unused struct session *s, __unused struct winlink *wl, key_code key,
     struct mouse_event *m)
 {
@@ -195,6 +195,10 @@ window_plugin_key(struct window_mode_entry *wme, __unused struct client *c,
 	/* key_string_lookup_key returns a static buffer: serialized (copied)
 	 * immediately by plugin_json_str. */
 	plugin_json_str(pj, "key", key_string_lookup_key(key, 0));
+	/* The pressing client, so plugins can act on the right client
+	 * (e.g. switch-client for a cross-session jump). */
+	if (c != NULL)
+		plugin_json_num(pj, "client", c->id);
 	if (KEYC_IS_MOUSE(key) && m != NULL &&
 	    cmd_mouse_at(wme->wp, m, &mx, &my, 0) == 0) {
 		plugin_json_obj_start(pj, "mouse");

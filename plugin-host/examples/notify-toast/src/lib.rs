@@ -624,7 +624,11 @@ impl NotifyToast {
     }
 
     /// Jump to entry `idx`'s source pane, drop the entry and close.
-    fn chooser_jump(&mut self, ctx: &Ctx, idx: usize) {
+    /// `client` is who pressed the key: select-window/select-pane only
+    /// mutate session/window state, so a cross-session jump must also
+    /// switch-client THAT client to the source's session or nothing
+    /// visibly happens.
+    fn chooser_jump(&mut self, ctx: &Ctx, idx: usize, client: Option<u64>) {
         let Some(ch) = self.chooser.as_ref() else { return };
         let target = {
             let st = self.state.borrow();
@@ -639,11 +643,70 @@ impl NotifyToast {
         let state = Rc::clone(&self.state);
         let (width, keeper_secs, show_when_visible) = self.view_params();
         ctx.spawn(async move {
-            if let Some(window) = src_window {
-                let _ =
-                    run_command(&format!("select-window -t @{window}")).await;
+            // Which sessions contain the source window, and where is the
+            // pressing client right now?
+            let sessions: Vec<u64> = src_window
+                .and_then(|w| resolve_window(WindowId(w as u32)).ok())
+                .and_then(|wi| {
+                    wi.get("sessions").and_then(|v| v.as_array()).map(|a| {
+                        a.iter().filter_map(|v| v.as_u64()).collect()
+                    })
+                })
+                .unwrap_or_default();
+            let client_info = client.and_then(|cid| {
+                list_clients().ok()?.as_array()?.iter().find_map(|c| {
+                    (c.get("id").and_then(|v| v.as_u64()) == Some(cid))
+                        .then(|| {
+                            (
+                                c.get("name")
+                                    .and_then(|v| v.as_str())
+                                    .map(String::from),
+                                c.get("session").and_then(|v| v.as_u64()),
+                            )
+                        })
+                })
+            });
+
+            // Prefer the session the client is already on; otherwise the
+            // first session linked to the window, switching the client
+            // over to it.
+            let dest = client_info
+                .as_ref()
+                .and_then(|(_, s)| *s)
+                .filter(|s| sessions.contains(s))
+                .or_else(|| sessions.first().copied());
+            if let (Some((Some(name), cur)), Some(dest)) =
+                (client_info.as_ref(), dest)
+            {
+                if *cur != Some(dest) {
+                    let r = run_command(&format!(
+                        "switch-client -c '{name}' -t '${dest}'"
+                    ))
+                    .await;
+                    if let Err(e) = r {
+                        log(&format!("jump: switch-client failed: {}",
+                            e.message));
+                    }
+                }
             }
-            let _ = run_command(&format!("select-pane -t %{src_pane}")).await;
+            if let Some(window) = src_window {
+                // Session-qualified so grouped sessions (which share
+                // windows) pick the session we just switched to.
+                let t = match dest {
+                    Some(s) => format!("'${s}:@{window}'"),
+                    None => format!("'@{window}'"),
+                };
+                if let Err(e) =
+                    run_command(&format!("select-window -t {t}")).await
+                {
+                    log(&format!("jump: select-window failed: {}", e.message));
+                }
+            }
+            if let Err(e) =
+                run_command(&format!("select-pane -t %{src_pane}")).await
+            {
+                log(&format!("jump: select-pane failed: {}", e.message));
+            }
             state.borrow_mut().entries.retain(|e| e.seq != seq);
             sync_views(&state, width, keeper_secs, show_when_visible).await;
         });
@@ -677,7 +740,13 @@ impl NotifyToast {
         });
     }
 
-    fn chooser_key(&mut self, ctx: &Ctx, key: &str, mouse_row: Option<u64>) {
+    fn chooser_key(
+        &mut self,
+        ctx: &Ctx,
+        key: &str,
+        mouse_row: Option<u64>,
+        client: Option<u64>,
+    ) {
         let nentries = self.state.borrow().entries.len();
         let Some(ch) = self.chooser.as_mut() else { return };
         let sel = ch.selected.min(nentries.saturating_sub(1));
@@ -691,7 +760,7 @@ impl NotifyToast {
                 ch.selected = (sel + nentries - 1) % nentries;
                 chooser_render(ch, &self.state.borrow().entries);
             }
-            "Enter" if nentries > 0 => self.chooser_jump(ctx, sel),
+            "Enter" if nentries > 0 => self.chooser_jump(ctx, sel, client),
             "d" if nentries > 0 => self.chooser_dismiss(ctx, sel),
             "q" | "Escape" => {
                 let _ = mode_close(ch.mode);
@@ -710,7 +779,7 @@ impl NotifyToast {
                     k.parse::<usize>().ok().filter(|n| (1..=9).contains(n))
                 {
                     if idx <= nentries {
-                        self.chooser_jump(ctx, idx - 1);
+                        self.chooser_jump(ctx, idx - 1, client);
                     }
                 }
             }
@@ -895,8 +964,10 @@ impl Plugin for NotifyToast {
                 let mouse_row = event.data.pointer("/mouse/y").and_then(
                     serde_json::Value::as_u64,
                 );
+                let client =
+                    event.data.get("client").and_then(|v| v.as_u64());
                 let key = key.to_string();
-                self.chooser_key(ctx, &key, mouse_row);
+                self.chooser_key(ctx, &key, mouse_row, client);
                 return;
             }
             "mode-resize" => {
