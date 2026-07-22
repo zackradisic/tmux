@@ -285,6 +285,34 @@ async fn repaint(
             (old, shown, body, lines.len())
         };
 
+        // Self-healing: kill any "notifications"-titled pane in this
+        // window that is not the tracked view. Orphans arise when a
+        // spawn was in flight across a plugin reload (the command runs,
+        // the completion is dropped, the new generation never learns the
+        // pane id) - without this they duplicate forever. The chooser
+        // float is excluded by its distinct title.
+        if let Ok(panes) = list_panes() {
+            let orphans: Vec<u64> = panes
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter(|p| {
+                            p.get("window").and_then(|v| v.as_u64())
+                                == Some(window)
+                                && p.get("title").and_then(|v| v.as_str())
+                                    == Some("notifications")
+                                && p.get("id").and_then(|v| v.as_u64()) != old
+                        })
+                        .filter_map(|p| p.get("id").and_then(|v| v.as_u64()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for orphan in orphans {
+                log(&format!("repaint @{window}: killing orphan %{orphan}"));
+                let _ = run_command(&format!("kill-pane -t %{orphan}")).await;
+            }
+        }
+
         // Already showing exactly this? Don't touch anything (the pane
         // may have been closed behind our back, e.g. by the user - then
         // repaint it after all).
@@ -308,7 +336,13 @@ async fn repaint(
 
         if let Some(old) = old {
             if pane_alive {
-                let _ = run_command(&format!("kill-pane -t %{old}")).await;
+                let r = run_command(&format!("kill-pane -t %{old}")).await;
+                log(&format!(
+                    "repaint @{window}: killed %{old} ok={}",
+                    r.is_ok()
+                ));
+            } else {
+                log(&format!("repaint @{window}: %{old} already gone"));
             }
             if let Some(view) = state.borrow_mut().views.get_mut(&window) {
                 view.pane = None;
@@ -329,21 +363,37 @@ async fn repaint(
                      'printf \"%b\" \"$TOAST_BODY\"; \
                      sleep {keeper_secs}'"
                 );
-                if run_command(&cmd).await.is_ok() {
-                    let new_pane = resolve_window(WindowId(window as u32))
-                        .ok()
-                        .and_then(|after| {
-                            pane_ids(&after)
-                                .into_iter()
-                                .find(|id| !pre.contains(id))
-                        });
-                    if let Some(view) =
-                        state.borrow_mut().views.get_mut(&window)
-                    {
-                        view.pane = new_pane;
-                        view.shown =
-                            new_pane.is_some().then(|| body.clone());
+                match run_command(&cmd).await {
+                    Ok(()) => {
+                        let new_pane = resolve_window(WindowId(window as u32))
+                            .ok()
+                            .and_then(|after| {
+                                pane_ids(&after)
+                                    .into_iter()
+                                    .find(|id| !pre.contains(id))
+                            });
+                        if new_pane.is_none() {
+                            log(&format!(
+                                "repaint @{window}: DIFF MISS (pre={pre:?})"
+                            ));
+                        } else {
+                            log(&format!(
+                                "repaint @{window}: spawned %{}",
+                                new_pane.unwrap()
+                            ));
+                        }
+                        if let Some(view) =
+                            state.borrow_mut().views.get_mut(&window)
+                        {
+                            view.pane = new_pane;
+                            view.shown =
+                                new_pane.is_some().then(|| body.clone());
+                        }
                     }
+                    Err(e) => log(&format!(
+                        "repaint @{window}: spawn FAILED: {}",
+                        e.message
+                    )),
                 }
             }
         }
@@ -532,7 +582,9 @@ impl NotifyToast {
             height,
             x: None, // centered
             y: None,
-            title: Some("notifications".into()),
+            // Distinct from the toast panes' title: the orphan sweep in
+            // repaint matches exact "notifications".
+            title: Some("notifications \u{25b8}".into()),
         }) {
             Ok(mode) => {
                 let ch = Chooser {

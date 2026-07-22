@@ -119,6 +119,8 @@ plugin_vtable_emit_pane(struct plugin_json *pj, struct window_pane *wp)
 	plugin_json_bool(pj, "active", wp == wp->window->active);
 	plugin_json_bool(pj, "floating", window_pane_is_floating(wp));
 	plugin_json_bool(pj, "dead", (wp->flags & PANE_EXITED) != 0);
+	if (wp->base.title != NULL)
+		plugin_json_str(pj, "title", wp->base.title);
 	if (wp->shell != NULL)
 		plugin_json_str(pj, "shell", wp->shell);
 	/* Same source as #{pane_current_path}; buffer is static, not freed. */
