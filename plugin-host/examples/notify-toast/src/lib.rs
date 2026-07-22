@@ -313,15 +313,36 @@ async fn repaint(
             }
         }
 
-        // Already showing exactly this? Don't touch anything (the pane
-        // may have been closed behind our back, e.g. by the user - then
-        // repaint it after all).
+        // Already showing exactly this? Just enforce the position (the
+        // window may have been resized - tmux does not reposition floats,
+        // so a toast spawned at one width sits stranded at another) and
+        // don't touch anything else (the pane may have been closed behind
+        // our back, e.g. by the user - then repaint it after all).
         let pane_alive = match old {
             Some(p) => resolve_pane(PaneId(p as u32)).is_ok(),
             None => false,
         };
         if shown.as_deref() == Some(body.as_str()) && (pane_alive || nlines == 0)
         {
+            if let (Some(p), true) = (old, pane_alive && nlines > 0) {
+                if let Ok(wi) = resolve_window(WindowId(window as u32)) {
+                    let win_width = wi
+                        .get("width")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(80);
+                    let x = win_width.saturating_sub(width);
+                    if let Err(e) = run_command(&format!(
+                        "move-pane -t %{p} -X {x} -Y 0"
+                    ))
+                    .await
+                    {
+                        log(&format!(
+                            "repaint @{window}: reposition failed: {}",
+                            e.message
+                        ));
+                    }
+                }
+            }
             let mut st = state.borrow_mut();
             if let Some(view) = st.views.get_mut(&window) {
                 if view.dirty {
@@ -729,6 +750,9 @@ impl Plugin for NotifyToast {
             "window-pane-changed",
             // Key bindings: `plugin-command notify_toast chooser`.
             "plugin-command",
+            // Re-anchor the toast when its window changes size (tmux
+            // does not reposition floating panes on resize).
+            "window-resized",
         ])
         .map_err(|e| e.message.clone())?;
 
@@ -920,6 +944,23 @@ impl Plugin for NotifyToast {
             // events (e.g. the implicit lifecycle deliveries - including
             // our own toasts' pane-created/destroyed) are ignored;
             // repaint is idempotent anyway, but no need to churn.
+            // A resized window strands its toast at the old offset:
+            // repaint re-anchors it (position-only when content matches).
+            "window-resized" => {
+                let Some(w) = event.scope.window.map(u64::from) else {
+                    return;
+                };
+                let tracked =
+                    state.borrow().views.get(&w).is_some_and(|v| v.pane.is_some());
+                if !tracked {
+                    return;
+                }
+                ctx.spawn(async move {
+                    repaint(&state, w, width, keeper_secs, show_when_visible)
+                        .await;
+                });
+                return;
+            }
             "session-window-changed" | "client-session-changed"
             | "client-attached" | "client-detached" => {
                 // The chooser follows the user: when its window stops
