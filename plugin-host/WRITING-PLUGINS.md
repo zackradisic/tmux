@@ -263,6 +263,16 @@ pane; scope carries the pane and its window):
   receives it. Subscribe to it, match `event.data["text"]`, and use the
   scope (the `-t` target's pane/window/session) to know where to act.
 
+  Chooser keys: keys unhandled by choose-tree (`prefix w` / `prefix s`)
+  are looked up in the `choose-tree` key table and run with the
+  *highlighted* item as target — so `bind -T choose-tree W plugin-command
+  worktree new` delivers a `plugin-command` event whose session/window/
+  pane describe whatever row the user's cursor was on (a session row
+  resolves to its active window/pane). The `worktree` example is built
+  on this. Note the pressing client's *current* window is not in the
+  event — the target may live in another session; resolve the client id
+  via `list_clients` if you need to open UI where the user is looking.
+
 ## API reference (`tmux_plugin_sdk::prelude::*`)
 
 Sync (return immediately):
