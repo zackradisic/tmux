@@ -138,8 +138,9 @@ plugin_vtable_run_job(const char *cmd, const char *cwd, uint64_t token)
 	pjob = xcalloc(1, sizeof *pjob);
 	pjob->token = token;
 
+	/* JOB_SHOWSTDERR: "output" is documented as combined stdout+stderr. */
 	if (job_run(cmd, 0, NULL, NULL, NULL, cwd, NULL, plugin_job_complete,
-	    plugin_job_free, pjob, JOB_NOWAIT, -1, -1) == NULL) {
+	    plugin_job_free, pjob, JOB_NOWAIT|JOB_SHOWSTDERR, -1, -1) == NULL) {
 		free(pjob);
 		return (-1);
 	}
