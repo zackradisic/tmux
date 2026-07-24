@@ -1438,7 +1438,9 @@ window_tree_key(struct window_mode_entry *wme, struct client *c,
 	struct window_tree_modedata	*data = wme->data;
 	struct window_tree_itemdata	*item, *new_item;
 	char				*name, *prompt = NULL;
-	struct cmd_find_state		 fs, *fsp = &data->fs;
+	struct cmd_find_state		 fs, kfs, *fsp = &data->fs;
+	struct key_table		*table;
+	struct key_binding		*bd;
 	int				 finished;
 	u_int				 tagged, x, y, idx;
 	struct session			*ns;
@@ -1550,6 +1552,34 @@ again:
 			mode_tree_run_command(c, NULL, data->command, name);
 		finished = 1;
 		free(name);
+		break;
+	default:
+		/*
+		 * Any other key: look it up in the "choose-tree" key table
+		 * and dispatch the binding with the selected item as the
+		 * command target. The command is appended to the client's
+		 * queue (it runs after this handler returns), and the mode
+		 * closes as for Enter.
+		 */
+		if (key == KEYC_NONE || KEYC_IS_MOUSE(key))
+			break;
+		table = key_bindings_get_table("choose-tree", 0);
+		if (table == NULL)
+			break;
+		bd = key_bindings_get(table, key & ~KEYC_MASK_FLAGS);
+		if (bd == NULL)
+			break;
+		window_tree_pull_item(item, &ns, &nwl, &nwp);
+		if (nwl != NULL && nwp != NULL)
+			cmd_find_from_winlink_pane(&kfs, nwl, nwp, 0);
+		else if (nwl != NULL)
+			cmd_find_from_winlink(&kfs, nwl, 0);
+		else if (ns != NULL)
+			cmd_find_from_session(&kfs, ns, 0);
+		else
+			break;
+		key_bindings_dispatch(bd, NULL, c, NULL, &kfs);
+		finished = 1;
 		break;
 	}
 	if (finished)

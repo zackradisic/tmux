@@ -3003,6 +3003,21 @@ The following keys may be used in tree mode:
 .It Li "q" Ta "Exit mode"
 .El
 .Pp
+Keys not handled by tree mode are looked up in the
+.Ql choose-tree
+key table; if bound (see
+.Ic bind-key ) ,
+the command is executed with the selected item as its target and the mode
+exits.
+For example, after
+.Bd -literal -offset indent
+bind-key -T choose-tree ! kill-session
+.Ed
+.Pp
+pressing
+.Ql !\&
+in tree mode kills the selected session.
+.Pp
 After a session, window or pane is chosen, the first instance of
 .Ql %%
 and all instances of
