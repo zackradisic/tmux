@@ -434,8 +434,22 @@ Notes:
   its scope object dies.
 
 The notify-toast example's chooser (`examples/notify-toast/`) is a
-complete mode UI: list rendering with a selection bar, hotkeys, mouse
-selection, and a live preview of the selected notification's source pane.
+complete mode UI: a session > window > pane tree drawn like
+`choose-tree`, with a selection bar, scrolling, folding (`h`/`l`),
+hotkeys, mouse selection, and a live preview of the selected row's pane.
+
+There is no host call for format expansion, but `set -F` expands a value
+server-side, so a scratch `@`-option is a round trip that gets one back:
+
+```
+run_command("set -p -F -t %7 @scratch '#{pane_current_command}'").await;
+let cmd = get_option_in(OptionTarget::Pane(PaneId(7)), "@scratch")?;
+```
+
+Keep the option pane-scoped (or window-scoped): concurrent expansions
+then cannot read each other's answer, and the option dies with its
+object. notify-toast uses this for `#{pane_current_command}` and
+`#{pane_title}`.
 
 ## Debugging checklist
 
