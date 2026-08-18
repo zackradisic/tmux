@@ -1,18 +1,24 @@
 //! SDK example plugin: create git worktrees from the choose-tree chooser.
 //!
-//! Wire a chooser key to it in ~/.tmux.conf:
+//! Wire keys to it in ~/.tmux.conf:
 //!
 //! ```tmux
-//! bind -T choose-tree W plugin-command worktree new
+//! bind -T choose-tree W plugin-command worktree new   # repo from highlight
+//! bind W plugin-command worktree pick                 # repo editable
 //! ```
 //!
-//! Pressing that key in `prefix w` / `prefix s` closes the chooser and
-//! delivers a `plugin-command` event whose target is the *highlighted*
-//! item (a session row resolves to its active pane). The plugin detects
-//! the git repo from that pane's cwd, opens a small form (a plugin UI
-//! mode) on the window the pressing client is actually looking at, and on
-//! Enter runs `git worktree add`, then creates a session rooted in the
-//! new worktree and switches the client to it.
+//! `new` (from `prefix w` / `prefix s`) closes the chooser and delivers a
+//! `plugin-command` event whose target is the *highlighted* item (a
+//! session row resolves to its active pane). The plugin detects the git
+//! repo from that pane's cwd, opens a small form (a plugin UI mode) on
+//! the window the pressing client is actually looking at, and on Enter
+//! runs `git worktree add`, then creates a session rooted in the new
+//! worktree and switches the client to it.
+//!
+//! `pick` is the same form, but the repo field stays editable: prefilled
+//! with the detected repo when there is one (C-u clears it), so the
+//! worktree can come from any repo, not the one under the target pane.
+//! Bound outside the chooser it acts on the current pane.
 //!
 //! Load server-scoped with caps `mode`, `run-process`, `run-command`.
 //!
@@ -117,8 +123,14 @@ struct Worktree {
 }
 
 /// Repo detection + form-open context, gathered asynchronously after the
-/// plugin-command event.
-async fn open_form(state: State, target_pane: Option<u64>, client: Option<u64>) {
+/// plugin-command event. With `editable_repo` the detected repo only
+/// prefills an editable field instead of locking the form to it.
+async fn open_form(
+    state: State,
+    target_pane: Option<u64>,
+    client: Option<u64>,
+    editable_repo: bool,
+) {
     // Repo from the highlighted item's pane cwd.
     let cwd = target_pane
         .and_then(|p| resolve_pane(PaneId(p as u32)).ok())
@@ -186,9 +198,14 @@ async fn open_form(state: State, target_pane: Option<u64>, client: Option<u64>) 
         }
     };
 
+    let editable = editable_repo || repo.is_none();
     let mut fields = Vec::new();
-    if repo.is_none() {
-        fields.push(Field { label: "repo", value: String::new(), touched: false });
+    if editable {
+        fields.push(Field {
+            label: "repo",
+            value: repo.clone().unwrap_or_default(),
+            touched: false,
+        });
     }
     fields.push(Field { label: "name", value: String::new(), touched: false });
     fields.push(Field { label: "dest", value: String::new(), touched: false });
@@ -198,10 +215,16 @@ async fn open_form(state: State, target_pane: Option<u64>, client: Option<u64>) 
         mode,
         width: FORM_WIDTH,
         height: FORM_HEIGHT,
-        repo,
+        repo: if editable { None } else { repo },
         client_name: client_info.and_then(|(name, _)| name),
+        // A prefilled editable repo is usually accepted as-is: start on
+        // name. An empty repo field must be filled first: start there.
+        focused: if fields[0].label == "repo" && !fields[0].value.is_empty() {
+            1
+        } else {
+            0
+        },
         fields,
-        focused: 0,
         error: None,
         busy: false,
     };
@@ -222,7 +245,17 @@ fn render(form: &Form) {
         }
         None => {
             // The editable repo field is rendered with the others below.
-            out.push_str("  \x1b[33mno git repo detected — enter one:\x1b[0m\r\n\r\n");
+            let empty = form
+                .fields
+                .first()
+                .is_some_and(|f| f.label == "repo" && f.value.trim().is_empty());
+            if empty {
+                out.push_str(
+                    "  \x1b[33mno git repo detected — enter one:\x1b[0m\r\n\r\n",
+                );
+            } else {
+                out.push_str("  \x1b[2mrepo is editable — C-u clears\x1b[0m\r\n\r\n");
+            }
         }
     }
     for (i, f) in form.fields.iter().enumerate() {
@@ -393,9 +426,11 @@ impl Plugin for Worktree {
     fn on_event(&mut self, ctx: &Ctx, event: Event) {
         match event.event.as_str() {
             "plugin-command" => {
-                if event.data.get("text").and_then(|v| v.as_str()) != Some("new") {
-                    return;
-                }
+                let editable = match event.data.get("text").and_then(|v| v.as_str()) {
+                    Some("new") => false,
+                    Some("pick") => true,
+                    _ => return,
+                };
                 if self.state.borrow().form.is_some() {
                     let _ = display_message("worktree: form already open");
                     return;
@@ -403,7 +438,7 @@ impl Plugin for Worktree {
                 let target_pane = event.scope.pane.map(u64::from);
                 let client = event.scope.client.map(u64::from);
                 let state = Rc::clone(&self.state);
-                ctx.spawn(open_form(state, target_pane, client));
+                ctx.spawn(open_form(state, target_pane, client, editable));
             }
             "mode-key" => {
                 let mut st = self.state.borrow_mut();
