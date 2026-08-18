@@ -439,11 +439,11 @@ impl Plugin for Worktree {
                         drop(st);
                         ctx.spawn(submit(Rc::clone(&self.state)));
                     }
-                    "Tab" | "Down" => {
+                    "Tab" | "Down" | "C-j" => {
                         form.focused = (form.focused + 1) % form.fields.len();
                         render(form);
                     }
-                    "BTab" | "Up" => {
+                    "BTab" | "Up" | "C-k" => {
                         form.focused =
                             (form.focused + form.fields.len() - 1) % form.fields.len();
                         render(form);
