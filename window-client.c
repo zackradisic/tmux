@@ -530,6 +530,10 @@ window_client_key(struct window_mode_entry *wme, struct client *c,
 	struct window_client_modedata	*data = wme->data;
 	struct mode_tree_data		*mtd = data->data;
 	struct window_client_itemdata	*item;
+	struct key_table		*table;
+	struct key_binding		*bd;
+	struct format_tree		*ft;
+	struct cmd_find_state		 kfs;
 	int				 finished;
 
 	finished = mode_tree_key(mtd, c, &key, m, NULL, NULL);
@@ -559,6 +563,29 @@ window_client_key(struct window_mode_entry *wme, struct client *c,
 		item = mode_tree_get_current(mtd);
 		mode_tree_run_command(c, NULL, data->command, item->ttyname);
 		finished = 1;
+		break;
+	default:
+		/*
+		 * Any other key: look it up in the "choose-client" key
+		 * table. Formats in the bound command expand against the
+		 * selected client before parsing (see choose-tree); the
+		 * mode closes as for Enter unless the binding has -k.
+		 */
+		if (key == KEYC_NONE || KEYC_IS_MOUSE(key))
+			break;
+		table = key_bindings_get_table("choose-client", 0);
+		if (table == NULL)
+			break;
+		bd = key_bindings_get(table, key & ~KEYC_MASK_FLAGS);
+		if (bd == NULL)
+			break;
+		item = mode_tree_get_current(mtd);
+		cmd_find_from_client(&kfs, item->c, 0);
+		ft = format_create(NULL, NULL, FORMAT_NONE, 0);
+		format_defaults(ft, item->c, NULL, NULL, NULL);
+		if (key_bindings_dispatch_expand(bd, c, &kfs, ft))
+			finished = 1;
+		format_free(ft);
 		break;
 	}
 	if (finished || server_client_how_many() == 0)

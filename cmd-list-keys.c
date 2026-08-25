@@ -34,6 +34,7 @@
 	"#{?key_note,#{key_note},#{key_command}}"		\
 	","							\
 	"bind-key #{?key_has_repeat,#{?key_repeat,-r,  },} "	\
+	"#{?key_keep,-k ,}"					\
 	"-T #{p|#{key_table_width}:key_table} "			\
 	"#{p|#{key_string_width}:#{q|a:key_string}} "		\
 	"#{key_command}}"
@@ -146,6 +147,10 @@ cmd_list_keys_format_add_key_binding(struct format_tree *ft,
 		format_add(ft, "key_repeat", "1");
 	else
 		format_add(ft, "key_repeat", "0");
+	if (bd->flags & KEY_BINDING_KEEP)
+		format_add(ft, "key_keep", "1");
+	else
+		format_add(ft, "key_keep", "0");
 
 	if (bd->note != NULL)
 		format_add(ft, "key_note", "%s", bd->note);

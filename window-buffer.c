@@ -626,6 +626,10 @@ window_buffer_key(struct window_mode_entry *wme, struct client *c,
 	struct window_buffer_modedata	*data = wme->data;
 	struct mode_tree_data		*mtd = data->data;
 	struct window_buffer_itemdata	*item;
+	struct key_table		*table;
+	struct key_binding		*bd;
+	struct format_tree		*ft;
+	struct paste_buffer		*pb;
 	int				 finished;
 
 	if (paste_is_empty()) {
@@ -664,6 +668,32 @@ window_buffer_key(struct window_mode_entry *wme, struct client *c,
 		item = mode_tree_get_current(mtd);
 		window_buffer_do_paste(data, item, c, key);
 		finished = 1;
+		break;
+	default:
+		/*
+		 * Any other key: look it up in the "choose-buffer" key
+		 * table. Formats in the bound command expand against the
+		 * selected buffer before parsing (see choose-tree); the
+		 * mode closes as for Enter unless the binding has -k.
+		 */
+		if (key == KEYC_NONE || KEYC_IS_MOUSE(key))
+			break;
+		table = key_bindings_get_table("choose-buffer", 0);
+		if (table == NULL)
+			break;
+		bd = key_bindings_get(table, key & ~KEYC_MASK_FLAGS);
+		if (bd == NULL)
+			break;
+		item = mode_tree_get_current(mtd);
+		pb = paste_get_name(item->name);
+		if (pb == NULL)
+			break;
+		ft = format_create(NULL, NULL, FORMAT_NONE, 0);
+		format_defaults(ft, c, NULL, NULL, NULL);
+		format_defaults_paste_buffer(ft, pb);
+		if (key_bindings_dispatch_expand(bd, c, &data->fs, ft))
+			finished = 1;
+		format_free(ft);
 		break;
 	}
 

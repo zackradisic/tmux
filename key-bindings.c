@@ -218,7 +218,7 @@ key_bindings_next(__unused struct key_table *table, struct key_binding *bd)
 }
 
 void
-key_bindings_add(const char *name, key_code key, const char *note, int repeat,
+key_bindings_add(const char *name, key_code key, const char *note, int flags,
     struct cmd_list *cmdlist)
 {
 	struct key_table	*table;
@@ -234,8 +234,7 @@ key_bindings_add(const char *name, key_code key, const char *note, int repeat,
 				free((void *)bd->note);
 				bd->note = xstrdup(note);
 			}
-			if (repeat)
-				bd->flags |= KEY_BINDING_REPEAT;
+			bd->flags |= flags;
 		}
 		return;
 	}
@@ -251,8 +250,7 @@ key_bindings_add(const char *name, key_code key, const char *note, int repeat,
 		bd->note = xstrdup(note);
 	RB_INSERT(key_bindings, &table->key_bindings, bd);
 
-	if (repeat)
-		bd->flags |= KEY_BINDING_REPEAT;
+	bd->flags |= flags;
 	bd->cmdlist = cmdlist;
 
 	s = cmd_list_print(bd->cmdlist, 0);
@@ -776,6 +774,48 @@ key_bindings_dispatch(struct key_binding *bd, struct cmdq_item *item,
 	else
 		new_item = cmdq_append(c, new_item);
 	return (new_item);
+}
+
+/*
+ * Dispatch a chooser key-table binding (choose-tree and friends).
+ * Formats in the bound command are expanded against the given format
+ * tree - built by the mode from the selected item - before parsing, so
+ * targets and prompts written in the binding refer to the item that was
+ * selected when the key was pressed. The find state also becomes the
+ * queue state's current item, for commands that resolve a default
+ * target. Returns 1 if the mode should close (Enter-like, the default)
+ * or 0 if the binding has the -k flag and the mode stays open.
+ */
+int
+key_bindings_dispatch_expand(struct key_binding *bd, struct client *c,
+    struct cmd_find_state *fs, struct format_tree *ft)
+{
+	struct cmdq_state	*new_state;
+	struct cmdq_item	*new_item;
+	struct cmd_parse_result	*pr;
+	char			*s, *expanded;
+
+	if (c != NULL && (c->flags & CLIENT_READONLY) &&
+	    !cmd_list_all_have(bd->cmdlist, CMD_READONLY))
+		new_item = cmdq_get_callback(key_bindings_read_only, NULL);
+	else {
+		s = cmd_list_print(bd->cmdlist, 0);
+		expanded = format_expand(ft, s);
+		free(s);
+		pr = cmd_parse_from_string(expanded, NULL);
+		free(expanded);
+		if (pr->status == CMD_PARSE_ERROR) {
+			new_item = cmdq_get_error(pr->error);
+			free(pr->error);
+		} else {
+			new_state = cmdq_new_state(fs, NULL, 0);
+			new_item = cmdq_get_command(pr->cmdlist, new_state);
+			cmdq_free_state(new_state);
+			cmd_list_free(pr->cmdlist);
+		}
+	}
+	cmdq_append(c, new_item);
+	return ((bd->flags & KEY_BINDING_KEEP) == 0);
 }
 
 int

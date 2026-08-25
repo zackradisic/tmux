@@ -2905,6 +2905,15 @@ The following keys may be used in client mode:
 .It Li "q" Ta "Exit mode"
 .El
 .Pp
+Keys not handled by client mode are looked up in the
+.Ql choose-client
+key table; if bound, formats in the command are expanded with the
+selected client before it is parsed and the command is executed; the
+mode exits unless the binding has the
+.Ic bind-key
+.Fl k
+flag.
+.Pp
 After a client is chosen,
 .Ql %%
 is replaced by the client name in
@@ -3007,16 +3016,29 @@ Keys not handled by tree mode are looked up in the
 .Ql choose-tree
 key table; if bound (see
 .Ic bind-key ) ,
-the command is executed with the selected item as its target and the mode
-exits.
+formats in the command are expanded with the selected item before it is
+parsed, the command is executed with the selected item as its target and
+the mode exits.
+If the binding has the
+.Ic bind-key
+.Fl k
+flag, the mode stays open instead.
 For example, after
 .Bd -literal -offset indent
 bind-key -T choose-tree ! kill-session
+bind-key -T choose-tree -k R command-prompt -I '#{session_name}' \e
+    "rename-session -t '#{session_id}' '%%'"
 .Ed
 .Pp
 pressing
 .Ql !\&
-in tree mode kills the selected session.
+in tree mode kills the selected session, and
+.Ql R
+prompts for a new name for the selected session while the mode stays
+open.
+To expand a format when the command runs rather than when the key is
+pressed, escape it as
+.Ql ##{ .
 .Pp
 After a session, window or pane is chosen, the first instance of
 .Ql %%
@@ -4308,7 +4330,7 @@ Commands related to key bindings are as follows:
 .Bl -tag -width Ds
 .Tg bind
 .It Xo Ic bind\-key
-.Op Fl nr
+.Op Fl knr
 .Op Fl N Ar note
 .Op Fl T Ar key\-table
 .Ar key
@@ -4360,12 +4382,21 @@ flag indicates this key may repeat, see the
 and
 .Ic repeat\-time
 options.
+The
+.Fl k
+flag applies to bindings in the chooser key tables
+.Pf ( Ql choose\-tree ,
+.Ql choose\-client
+and
+.Ql choose\-buffer ) :
+the mode stays open after the command runs instead of exiting.
 .Fl N
 attaches a note to the key (shown with
 .Ic list\-keys
 .Fl N ) ,
 which can be cleared by passing an empty string.
 The
+.Fl k ,
 .Fl r
 and
 .Fl N
@@ -8599,6 +8630,15 @@ The following keys may be used in buffer mode:
 .It Li "F1 or C\-h" Ta "Display help"
 .It Li "q" Ta "Exit mode"
 .El
+.Pp
+Keys not handled by buffer mode are looked up in the
+.Ql choose-buffer
+key table; if bound, formats in the command are expanded with the
+selected buffer before it is parsed and the command is executed; the
+mode exits unless the binding has the
+.Ic bind-key
+.Fl k
+flag.
 .Pp
 After a buffer is chosen,
 .Ql %%

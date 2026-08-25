@@ -2386,6 +2386,7 @@ struct key_binding {
 
 	int			 flags;
 #define KEY_BINDING_REPEAT 0x1
+#define KEY_BINDING_KEEP 0x2
 
 	RB_ENTRY(key_binding)	 entry;
 };
@@ -3223,6 +3224,8 @@ int	 key_bindings_has_repeat(struct key_binding **, u_int);
 struct cmdq_item *key_bindings_dispatch(struct key_binding *,
 	     struct cmdq_item *, struct client *, struct key_event *,
 	     struct cmd_find_state *);
+int	 key_bindings_dispatch_expand(struct key_binding *, struct client *,
+	     struct cmd_find_state *, struct format_tree *);
 
 /* key-string.c */
 key_code	 key_string_lookup_string(const char *);

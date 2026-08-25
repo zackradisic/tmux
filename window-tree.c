@@ -1441,6 +1441,7 @@ window_tree_key(struct window_mode_entry *wme, struct client *c,
 	struct cmd_find_state		 fs, kfs, *fsp = &data->fs;
 	struct key_table		*table;
 	struct key_binding		*bd;
+	struct format_tree		*ft;
 	int				 finished;
 	u_int				 tagged, x, y, idx;
 	struct session			*ns;
@@ -1555,11 +1556,12 @@ again:
 		break;
 	default:
 		/*
-		 * Any other key: look it up in the "choose-tree" key table
-		 * and dispatch the binding with the selected item as the
-		 * command target. The command is appended to the client's
-		 * queue (it runs after this handler returns), and the mode
-		 * closes as for Enter.
+		 * Any other key: look it up in the "choose-tree" key table.
+		 * Formats in the bound command expand against the selected
+		 * item before parsing, and the item becomes the command's
+		 * default target. The command is appended to the client's
+		 * queue (it runs after this handler returns); the mode
+		 * closes as for Enter unless the binding has -k.
 		 */
 		if (key == KEYC_NONE || KEYC_IS_MOUSE(key))
 			break;
@@ -1578,8 +1580,11 @@ again:
 			cmd_find_from_session(&kfs, ns, 0);
 		else
 			break;
-		key_bindings_dispatch(bd, NULL, c, NULL, &kfs);
-		finished = 1;
+		ft = format_create(NULL, NULL, FORMAT_NONE, 0);
+		format_defaults(ft, c, ns, nwl, nwp);
+		if (key_bindings_dispatch_expand(bd, c, &kfs, ft))
+			finished = 1;
+		format_free(ft);
 		break;
 	}
 	if (finished)
