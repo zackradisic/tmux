@@ -8,7 +8,7 @@ members = [
     "examples/ticker",
     "examples/git-status",
     "examples/notify-toast",
-    "examples/worktree",
+    "examples/session_creator",
 ]
 default-members = ["host"]
 

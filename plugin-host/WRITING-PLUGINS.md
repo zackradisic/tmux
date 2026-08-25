@@ -263,15 +263,24 @@ pane; scope carries the pane and its window):
   receives it. Subscribe to it, match `event.data["text"]`, and use the
   scope (the `-t` target's pane/window/session) to know where to act.
 
-  Chooser keys: keys unhandled by choose-tree (`prefix w` / `prefix s`)
-  are looked up in the `choose-tree` key table and run with the
-  *highlighted* item as target — so `bind -T choose-tree W plugin-command
-  worktree new` delivers a `plugin-command` event whose session/window/
-  pane describe whatever row the user's cursor was on (a session row
-  resolves to its active window/pane). The `worktree` example is built
-  on this. Note the pressing client's *current* window is not in the
-  event — the target may live in another session; resolve the client id
-  via `list_clients` if you need to open UI where the user is looking.
+  Chooser keys: keys unhandled by choose-tree (`prefix w` / `prefix s`),
+  choose-client or choose-buffer are looked up in the `choose-tree`,
+  `choose-client` or `choose-buffer` key table. Formats in the bound
+  command expand against the *highlighted* item before parsing, and the
+  command runs with that item as target — so `bind -T choose-tree W
+  plugin-command session_creator worktree` delivers a `plugin-command`
+  event whose session/window/pane describe whatever row the user's
+  cursor was on (a session row resolves to its active window/pane). The
+  chooser closes like Enter unless the binding has `-k` (keep open). The
+  `session_creator` example builds on this: a two-kind new-session form
+  (plain folder or git worktree) prefilled from the target pane's cwd.
+  The mechanism is plugin-agnostic — plain tmux commands work too, e.g.
+  `bind -T choose-tree -k R command-prompt -I '#{session_name}'
+  "rename-session -t '#{session_id}' '%%'"` renames the highlighted
+  session in place, chooser still open. Note the pressing client's
+  *current* window is not in the event — the target may live in another
+  session; resolve the client id via `list_clients` if you need to open
+  UI where the user is looking.
 
 ## API reference (`tmux_plugin_sdk::prelude::*`)
 

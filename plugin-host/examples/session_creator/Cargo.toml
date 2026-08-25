@@ -1,5 +1,5 @@
 [package]
-name = "worktree"
+name = "session_creator"
 version.workspace = true
 edition.workspace = true
 
