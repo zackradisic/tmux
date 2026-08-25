@@ -1437,6 +1437,7 @@ window_tree_key(struct window_mode_entry *wme, struct client *c,
 	struct window_pane		*wp = wme->wp;
 	struct window_tree_modedata	*data = wme->data;
 	struct window_tree_itemdata	*item, *new_item;
+	const char			*tname;
 	char				*name, *prompt = NULL;
 	struct cmd_find_state		 fs, kfs, *fsp = &data->fs;
 	struct key_table		*table;
@@ -1556,7 +1557,9 @@ again:
 		break;
 	default:
 		/*
-		 * Any other key: look it up in the "choose-tree" key table.
+		 * Any other key: look it up in the key table matching the
+		 * selected item's type (choose-tree-session, -window or
+		 * -pane), falling back to the generic "choose-tree" table.
 		 * Formats in the bound command expand against the selected
 		 * item before parsing, and the item becomes the command's
 		 * default target. The command is appended to the client's
@@ -1565,10 +1568,28 @@ again:
 		 */
 		if (key == KEYC_NONE || KEYC_IS_MOUSE(key))
 			break;
-		table = key_bindings_get_table("choose-tree", 0);
-		if (table == NULL)
+		switch (item->type) {
+		case WINDOW_TREE_SESSION:
+			tname = "choose-tree-session";
 			break;
-		bd = key_bindings_get(table, key & ~KEYC_MASK_FLAGS);
+		case WINDOW_TREE_WINDOW:
+			tname = "choose-tree-window";
+			break;
+		default:
+			tname = "choose-tree-pane";
+			break;
+		}
+		bd = NULL;
+		table = key_bindings_get_table(tname, 0);
+		if (table != NULL)
+			bd = key_bindings_get(table, key & ~KEYC_MASK_FLAGS);
+		if (bd == NULL) {
+			table = key_bindings_get_table("choose-tree", 0);
+			if (table != NULL) {
+				bd = key_bindings_get(table,
+				    key & ~KEYC_MASK_FLAGS);
+			}
+		}
 		if (bd == NULL)
 			break;
 		window_tree_pull_item(item, &ns, &nwl, &nwp);

@@ -265,7 +265,9 @@ pane; scope carries the pane and its window):
 
   Chooser keys: keys unhandled by choose-tree (`prefix w` / `prefix s`),
   choose-client or choose-buffer are looked up in the `choose-tree`,
-  `choose-client` or `choose-buffer` key table. Formats in the bound
+  `choose-client` or `choose-buffer` key table (choose-tree first
+  consults a table for the selected row's type: `choose-tree-session`,
+  `choose-tree-window` or `choose-tree-pane`). Formats in the bound
   command expand against the *highlighted* item before parsing, and the
   command runs with that item as target — so `bind -T choose-tree W
   plugin-command session_creator worktree` delivers a `plugin-command`
@@ -275,9 +277,10 @@ pane; scope carries the pane and its window):
   `session_creator` example builds on this: a two-kind new-session form
   (plain folder or git worktree) prefilled from the target pane's cwd.
   The mechanism is plugin-agnostic — plain tmux commands work too, e.g.
-  `bind -T choose-tree -k R command-prompt -I '#{session_name}'
+  `bind -T choose-tree-session -k R command-prompt -I '#{session_name}'
   "rename-session -t '#{session_id}' '%%'"` renames the highlighted
-  session in place, chooser still open. Note the pressing client's
+  session in place, chooser still open (bind `rename-window` to R in
+  `choose-tree-window` for window rows). Note the pressing client's
   *current* window is not in the event — the target may live in another
   session; resolve the client id via `list_clients` if you need to open
   UI where the user is looking.

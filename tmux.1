@@ -3012,7 +3012,13 @@ The following keys may be used in tree mode:
 .It Li "q" Ta "Exit mode"
 .El
 .Pp
-Keys not handled by tree mode are looked up in the
+Keys not handled by tree mode are looked up in a key table chosen by the
+selected item's type
+.Pf ( Ql choose-tree-session ,
+.Ql choose-tree-window
+or
+.Ql choose-tree-pane ) ,
+falling back to the
 .Ql choose-tree
 key table; if bound (see
 .Ic bind-key ) ,
@@ -3026,16 +3032,18 @@ flag, the mode stays open instead.
 For example, after
 .Bd -literal -offset indent
 bind-key -T choose-tree ! kill-session
-bind-key -T choose-tree -k R command-prompt -I '#{session_name}' \e
-    "rename-session -t '#{session_id}' '%%'"
+bind-key -T choose-tree-session -k R command-prompt \e
+    -I '#{session_name}' "rename-session -t '#{session_id}' '%%'"
+bind-key -T choose-tree-window -k R command-prompt \e
+    -I '#{window_name}' "rename-window -t '#{window_id}' '%%'"
 .Ed
 .Pp
 pressing
 .Ql !\&
 in tree mode kills the selected session, and
 .Ql R
-prompts for a new name for the selected session while the mode stays
-open.
+prompts for a new name for the selected session or window while the mode
+stays open.
 To expand a format when the command runs rather than when the key is
 pressed, escape it as
 .Ql ##{ .
