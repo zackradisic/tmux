@@ -24,3 +24,5 @@ libc = "0.2"
 
 [dev-dependencies]
 wat = "1"
+# bench_fs.rs sleeps on the fs doorbell fd the way libevent does.
+libc = "0.2"
