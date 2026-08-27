@@ -207,6 +207,9 @@ impl Registry {
                 self.dying.push(inst);
             }
         }
+        // Release the plugin's cached sandbox root descriptor. An fs job
+        // still in flight holds its own Arc, so this cannot disturb it.
+        crate::fsbox::forget(name);
         hostlog::info(name, "unloaded");
         true
     }

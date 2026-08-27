@@ -115,6 +115,9 @@ pub extern "C" fn pgh_shutdown() {
         // and write pinned guest memory, so the stores must still be
         // alive here.
         fsworker::shutdown();
+        // The worker is joined, so no job can still hold a root; drop the
+        // cached sandbox descriptors.
+        fsbox::forget_all();
         // Give every live instance its on_unload (tiny budget) before the
         // stores drop: server shutdown is a safe point like any drain.
         let mut doomed: Vec<registry::Instance> = Vec::new();

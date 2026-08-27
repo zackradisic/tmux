@@ -36,7 +36,8 @@ use tmux_plugin_sdk::prelude::*;
 /// Rows per capture_pane page: safely under the host's 2000-line cap
 /// while keeping pages comfortably sized.
 const PAGE_ROWS: i32 = 800;
-/// Max bytes per fs_write call (the ABI transfer cap).
+/// Bytes per fs_write call. The ABI caps nothing here; chunking keeps
+/// each write short so pane teardown never waits on a big one.
 const WRITE_CHUNK: usize = 256 * 1024;
 
 #[derive(Serialize, Deserialize, Clone)]

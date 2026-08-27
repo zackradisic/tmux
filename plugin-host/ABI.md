@@ -109,8 +109,18 @@ Errors: sync imports return `0` or `-code`; value-returning imports
 | `log` | `(level, ptr, len)` — raw UTF-8; 0=debug 1=info 2=warn 3=error | none |
 
 fs paths are raw UTF-8 (host-consumed - the NUL rule does not apply);
-they resolve inside the plugin's sandboxed data directory. Each fs
-transfer is capped at 256 KiB - page bigger data.
+they resolve inside the plugin's sandboxed data directory. That root is
+resolved once per plugin and held as a directory descriptor. Containment
+is checked twice: the host rejects absolute paths and any `..` component
+on the string, then the OS enforces it on the open - `openat2` with
+`RESOLVE_BENEATH` on Linux 5.6+, which is atomic and also refuses to
+follow a symlink out of the tree, and canonicalize-the-parent elsewhere.
+`fs_root` reports the canonical path. fs transfers
+have no per-call byte cap: each one names a buffer in the guest's own
+linear memory, so the instance memory limit is the ceiling, and no fs
+path copies through a host allocation. Two costs stay with the caller -
+a long sync call burns the instance's CPU budget, and an in-flight async
+call holds off instance teardown.
 
 ### Asynchronous imports
 

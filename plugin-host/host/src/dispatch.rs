@@ -19,7 +19,7 @@ use std::ffi::c_void;
 
 use tmux_plugin_abi::{
     ErrorCode, SelfInfo, KIND_CLIENT, KIND_PANE, KIND_SERVER, KIND_SESSION,
-    KIND_WINDOW, MAX_TRANSFER_BYTES,
+    KIND_WINDOW, MAX_MODE_WRITE_BYTES,
 };
 
 use crate::abi::{collect_sink, err, out_sink, GuestMem, HostError};
@@ -527,10 +527,10 @@ pub fn mode_write(
 ) -> Result<(), HostError> {
     check_cap(mem, crate::caps::MODE)?;
     let mode = check_mode(mem, mode)?;
-    if len as usize > MAX_TRANSFER_BYTES {
+    if len as usize > MAX_MODE_WRITE_BYTES {
         return Err(err(
             ErrorCode::Limit,
-            format!("mode_write exceeds {MAX_TRANSFER_BYTES} bytes"),
+            format!("mode_write exceeds {MAX_MODE_WRITE_BYTES} bytes"),
         ));
     }
     let vt = vtable()?;
@@ -711,31 +711,37 @@ pub fn run_command(
 // worker thread with pinned guest buffers (zero-copy); the sync pair
 // blocks the loop for one bounded page-cache access, like tmux's own
 // file I/O.
+//
+// No per-call byte cap: every transfer names a buffer inside the guest's
+// own linear memory, which the bounds check validates and the store's
+// memory limit bounds, and no path copies through a host allocation.
+// Two limits remain, and they are the caller's to respect: a sync call
+// that runs long burns the instance's wall-clock CPU budget (the epoch
+// deadline trips once guest code resumes), and an async call holds off
+// instance teardown until the worker finishes.
 // ---------------------------------------------------------------------------
 
-fn fs_path(
+fn fs_err(e: crate::fsbox::FsError) -> HostError {
+    let code = e.code();
+    err(code, e.message())
+}
+
+/// The plugin's sandbox root, resolved once per plugin and cached.
+fn fs_root_of(
+    mem: &GuestMem<'_, '_>,
+) -> Result<std::sync::Arc<crate::fsbox::Root>, HostError> {
+    crate::fsbox::root_for(&mem.data().plugin).map_err(fs_err)
+}
+
+/// The guest's relative path, as an owned String (validated inside fsbox).
+fn fs_rel(
     mem: &GuestMem<'_, '_>,
     ptr: i32,
     len: i32,
-    create_dirs: bool,
-) -> Result<std::path::PathBuf, HostError> {
+) -> Result<String, HostError> {
     let bytes = mem.read(ptr, len)?;
-    let rel = String::from_utf8(bytes)
-        .map_err(|_| err(ErrorCode::BadRequest, "invalid UTF-8 path"))?;
-    let root = crate::fsbox::plugin_data_dir(&mem.data().plugin)
-        .map_err(|e| err(ErrorCode::Host, e))?;
-    crate::fsbox::sandboxed_path(&root, &rel, create_dirs)
-        .map_err(|e| err(ErrorCode::BadRequest, e))
-}
-
-fn check_transfer(len: i32) -> Result<(), HostError> {
-    if len < 0 || len as usize > MAX_TRANSFER_BYTES {
-        return Err(err(
-            ErrorCode::Limit,
-            format!("transfer exceeds {MAX_TRANSFER_BYTES} bytes"),
-        ));
-    }
-    Ok(())
+    String::from_utf8(bytes)
+        .map_err(|_| err(ErrorCode::BadRequest, "invalid UTF-8 path"))
 }
 
 pub fn fs_write_async(
@@ -747,8 +753,8 @@ pub fn fs_write_async(
     append: i32,
 ) -> Result<i64, HostError> {
     check_cap(mem, crate::caps::FS_WRITE)?;
-    check_transfer(data_len)?;
-    let path = fs_path(mem, path_ptr, path_len, true)?;
+    let root = fs_root_of(mem)?;
+    let rel = fs_rel(mem, path_ptr, path_len)?;
     let ptr = mem.pinned_bytes(data_ptr, data_len)?;
     let data = mem.data();
     let key = (data.plugin.clone(), data.scope, data.generation);
@@ -756,7 +762,8 @@ pub fn fs_write_async(
     let job = crate::fsworker::FsJob::Write {
         token,
         key,
-        path,
+        root,
+        rel,
         append: append != 0,
         data: crate::fsworker::GuestSlice { ptr, len: data_len as usize },
     };
@@ -776,11 +783,11 @@ pub fn fs_read_async(
     out_cap: i32,
 ) -> Result<i64, HostError> {
     check_cap(mem, crate::caps::FS_READ)?;
-    check_transfer(out_cap)?;
     if offset < 0 {
         return Err(err(ErrorCode::BadRequest, "negative offset"));
     }
-    let path = fs_path(mem, path_ptr, path_len, false)?;
+    let root = fs_root_of(mem)?;
+    let rel = fs_rel(mem, path_ptr, path_len)?;
     let ptr = mem.pinned_bytes_mut(out_ptr, out_cap)?;
     let data = mem.data();
     let key = (data.plugin.clone(), data.scope, data.generation);
@@ -788,7 +795,8 @@ pub fn fs_read_async(
     let job = crate::fsworker::FsJob::Read {
         token,
         key,
-        path,
+        root,
+        rel,
         offset: offset as u64,
         out: crate::fsworker::GuestSliceMut { ptr, cap: out_cap as usize },
     };
@@ -810,17 +818,15 @@ pub fn fs_write_sync(
     use std::io::Write as _;
 
     check_cap(mem, crate::caps::FS_WRITE)?;
-    check_transfer(data_len)?;
-    let path = fs_path(mem, path_ptr, path_len, true)?;
-    let bytes = mem.read(data_ptr, data_len)?;
-    std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .append(append != 0)
-        .truncate(append == 0)
-        .open(&path)
-        .and_then(|mut f| f.write_all(&bytes))
-        .map_err(|e| err(ErrorCode::Host, format!("{}: {e}", path.display())))?;
+    let root = fs_root_of(mem)?;
+    let rel = fs_rel(mem, path_ptr, path_len)?;
+    let mut file =
+        crate::fsbox::open_write(&root, &rel, append != 0).map_err(fs_err)?;
+    // Write straight out of guest memory: no host copy sized by the
+    // guest. Nothing re-enters the guest while the borrow is live.
+    let bytes = mem.byte_slice(data_ptr, data_len)?;
+    file.write_all(bytes)
+        .map_err(|e| err(ErrorCode::Host, format!("{rel}: {e}")))?;
     Ok(bytes.len() as i64)
 }
 
@@ -838,37 +844,38 @@ pub fn fs_read_sync(
     use std::io::{Read as _, Seek as _};
 
     check_cap(mem, crate::caps::FS_READ)?;
-    check_transfer(cap)?;
     if offset < 0 {
         return Err(err(ErrorCode::BadRequest, "negative offset"));
     }
-    let path = fs_path(mem, path_ptr, path_len, false)?;
-    let mut buf = vec![0u8; cap.max(0) as usize];
-    let (read, eof) = (|| -> std::io::Result<(usize, bool)> {
-        let mut f = std::fs::File::open(&path)?;
-        let size = f.metadata()?.len();
-        f.seek(std::io::SeekFrom::Start(offset as u64))?;
-        let mut read = 0;
-        while read < buf.len() {
-            let n = f.read(&mut buf[read..])?;
-            if n == 0 {
-                break;
+    let root = fs_root_of(mem)?;
+    let rel = fs_rel(mem, path_ptr, path_len)?;
+    let mut file = crate::fsbox::open_read(&root, &rel).map_err(fs_err)?;
+    // Read straight into the guest's out-buffer: no host copy at all, and
+    // the bounds check happens before anything is sized by the guest.
+    // On an I/O error the guest buffer may hold a partial read - the call
+    // returns an error and never writes len_out, so the guest must not
+    // read it (the SDK clears its buffer on error).
+    let (read, eof) = {
+        let dst = mem.out_bytes_mut(out, cap)?;
+        (|| -> std::io::Result<(usize, bool)> {
+            let size = file.metadata()?.len();
+            file.seek(std::io::SeekFrom::Start(offset as u64))?;
+            let mut read = 0;
+            while read < dst.len() {
+                let n = file.read(&mut dst[read..])?;
+                if n == 0 {
+                    break;
+                }
+                read += n;
             }
-            read += n;
-        }
-        let eof = (offset as u64).saturating_add(read as u64) >= size;
-        Ok((read, eof))
-    })()
-    .map_err(|e| {
-        let code = if e.kind() == std::io::ErrorKind::NotFound {
-            ErrorCode::NoSuchObject
-        } else {
-            ErrorCode::Host
-        };
-        err(code, format!("{}: {e}", path.display()))
-    })?;
+            let eof = (offset as u64).saturating_add(read as u64) >= size;
+            Ok((read, eof))
+        })()
+        .map_err(|e| err(ErrorCode::Host, format!("{rel}: {e}")))?
+    };
     mem.write_u32_at(eof_out, u32::from(eof))?;
-    mem.write_out(&buf[..read], out, cap, len_out)
+    mem.write_u32_at(len_out, read as u32)?;
+    Ok(())
 }
 
 pub fn fs_root(
@@ -877,9 +884,8 @@ pub fn fs_root(
     cap: i32,
     len_out: i32,
 ) -> Result<(), HostError> {
-    let root = crate::fsbox::plugin_data_dir(&mem.data().plugin)
-        .map_err(|e| err(ErrorCode::Host, e))?;
-    let text = root.to_string_lossy().into_owned();
+    let root = fs_root_of(mem)?;
+    let text = root.path().to_string_lossy().into_owned();
     mem.write_out(text.as_bytes(), out, cap, len_out)
 }
 

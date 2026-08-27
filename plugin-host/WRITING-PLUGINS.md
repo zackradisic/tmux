@@ -347,7 +347,7 @@ run_job("shell command", cwd: Option<&str>).await
     -> Result<JobOutput { status, signalled, output }, HostError>
 run_command("any tmux command string").await            // via command queue
 fs_write(path, data: Vec<u8>, append).await -> bytes    // fs worker thread,
-fs_read(path, offset, capacity).await -> (Vec<u8>, eof) // zero-copy, ≤256 KiB
+fs_read(path, offset, capacity).await -> (Vec<u8>, eof) // zero-copy, no cap
 ```
 
 Async tasks are spawned with `ctx.spawn(async move { ... })` in `init` (or

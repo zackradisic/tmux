@@ -676,6 +676,16 @@ impl<'a, 'b> GuestMem<'a, 'b> {
         Ok(data[start..].as_mut_ptr())
     }
 
+    /// A bounds-checked read-only slice of guest memory, for host code
+    /// that consumes the bytes in place (Rust-side; C callees get the
+    /// raw-pointer `bytes` above, with its debug tripwire). Valid until
+    /// the next guest re-entry, which the borrow of `self` prevents.
+    pub fn byte_slice(&self, ptr: i32, len: i32) -> Result<&[u8], HostError> {
+        let start = self.check(ptr, len, 0)?;
+        let data = self.memory.data(&*self.caller);
+        Ok(&data[start..start + len as usize])
+    }
+
     /// Copy bytes out of guest memory (owned; survives re-entry).
     pub fn read(&self, ptr: i32, len: i32) -> Result<Vec<u8>, HostError> {
         let start = self.check(ptr, len, 0)?;
@@ -713,6 +723,21 @@ impl<'a, 'b> GuestMem<'a, 'b> {
             written: 0,
             total: 0,
         })
+    }
+
+    /// A bounds-checked mutable view of a guest OutBuf, for host code that
+    /// fills it in place instead of copying through a host buffer. The
+    /// borrow of `self` keeps it from outliving a guest re-entry, so no
+    /// raw pointer discipline is needed (unlike `out_sink`).
+    pub fn out_bytes_mut(
+        &mut self,
+        out: i32,
+        cap: i32,
+    ) -> Result<&mut [u8], HostError> {
+        let start = self.check(out, cap, 0)?;
+        let end = start + cap.max(0) as usize;
+        let data = self.memory.data_mut(&mut *self.caller);
+        Ok(&mut data[start..end])
     }
 
     /// Finish an OutBuf write: store the length (written on success, needed

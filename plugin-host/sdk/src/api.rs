@@ -521,9 +521,9 @@ pub async fn sleep_ms(ms: u64) -> Result<(), HostError> {
 //
 // Paths are relative to the plugin's private data directory
 // ($XDG_DATA_HOME|~/.local/share + tmux/plugins/<name>/); absolute paths
-// and `..` are rejected. At most 256 KiB per call - page bigger data.
-// Awaited calls are fully ordered; do not keep two writes to the SAME
-// file in flight at once.
+// and `..` are rejected. There is no per-call byte cap; a transfer is
+// bounded by the plugin's own memory. Awaited calls are fully ordered;
+// do not keep two writes to the SAME file in flight at once.
 
 /// Write (append=false truncates/creates) a file asynchronously on the
 /// host's fs worker - the tmux event loop never blocks. Zero-copy: the
@@ -560,8 +560,7 @@ pub async fn fs_read(
     offset: u64,
     capacity: usize,
 ) -> Result<(Vec<u8>, bool), HostError> {
-    let cap = capacity
-        .clamp(1, tmux_plugin_abi::MAX_TRANSFER_BYTES);
+    let cap = capacity.max(1);
     let mut buf = vec![0u8; cap];
     let token = unsafe {
         raw::fs_read(
@@ -593,7 +592,9 @@ pub fn fs_root() -> Result<String, HostError> {
 }
 
 /// Synchronous write for small files (blocks the tmux loop for one
-/// bounded page-cache access, like tmux's own file I/O).
+/// page-cache access, like tmux's own file I/O). Keep it small: the time
+/// spent here counts against the instance's CPU budget, so a slow write
+/// traps the plugin. Use `fs_write` for anything bigger.
 pub fn fs_write_sync(
     path: &str,
     data: &[u8],
@@ -612,7 +613,8 @@ pub fn fs_write_sync(
 }
 
 /// Synchronous read for small files. Fills `buf` up to its capacity
-/// (allocating 4096 if empty); returns eof.
+/// (allocating 4096 if empty); returns eof. Same budget warning as
+/// `fs_write_sync` - use `fs_read` for anything bigger.
 pub fn fs_read_sync(
     path: &str,
     offset: u64,
@@ -621,9 +623,7 @@ pub fn fs_read_sync(
     if buf.capacity() == 0 {
         buf.reserve(4096);
     }
-    let cap = buf
-        .capacity()
-        .min(tmux_plugin_abi::MAX_TRANSFER_BYTES);
+    let cap = buf.capacity();
     buf.clear();
     buf.resize(cap, 0);
     let mut len: u32 = 0;

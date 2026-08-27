@@ -23,19 +23,22 @@
 //! unordered; callers must not overlap those.
 //!
 //! Thread discipline: the worker touches no tmux or host state — only
-//! syscalls on pre-resolved paths and pre-validated buffers. All host
-//! bookkeeping happens on the main thread.
+//! syscalls under the plugin's sandbox root descriptor, on pre-validated
+//! buffers. All host bookkeeping happens on the main thread. The open
+//! itself runs here, so a slow filesystem never stalls the event loop;
+//! containment still holds, because resolution is confined beneath the
+//! root descriptor the main thread resolved (see fsbox).
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, Write};
 use std::os::fd::RawFd;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
 use tmux_plugin_abi::ErrorCode;
 
+use crate::fsbox::{FsError, Root};
 use crate::registry::ScopeId;
 
 /// The instance a job belongs to, for teardown coordination.
@@ -61,14 +64,19 @@ pub enum FsJob {
     Write {
         token: u64,
         key: InstKey,
-        path: PathBuf,
+        /// The plugin's sandbox root. The worker opens through it, so the
+        /// path walk happens here rather than on the event loop, and the
+        /// kernel still confines resolution beneath this descriptor.
+        root: Arc<Root>,
+        rel: String,
         append: bool,
         data: GuestSlice,
     },
     Read {
         token: u64,
         key: InstKey,
-        path: PathBuf,
+        root: Arc<Root>,
+        rel: String,
         offset: u64,
         out: GuestSliceMut,
     },
@@ -326,34 +334,37 @@ fn worker_main(
 ) {
     while let Ok(job) = jobs.recv() {
         match job {
-            FsJob::Write { token, key, path, append, data } => {
-                let completion = do_write(token, &path, append, &data);
+            FsJob::Write { token, key, root, rel, append, data } => {
+                let completion = do_write(token, &root, &rel, append, &data);
                 finish(&done, doorbell, inflight, key, completion);
             }
-            FsJob::Read { token, key, path, offset, out } => {
-                let completion = do_read(token, &path, offset, &out);
+            FsJob::Read { token, key, root, rel, offset, out } => {
+                let completion = do_read(token, &root, &rel, offset, &out);
                 finish(&done, doorbell, inflight, key, completion);
             }
         }
     }
 }
 
+/// Turn a sandbox or open failure into a completion the guest can read.
+fn open_failed(token: u64, e: FsError) -> FsCompletion {
+    let code = e.code();
+    err_completion(token, code, e.message())
+}
+
 fn do_write(
     token: u64,
-    path: &PathBuf,
+    root: &Root,
+    rel: &str,
     append: bool,
     data: &GuestSlice,
 ) -> FsCompletion {
-    let bytes =
-        unsafe { std::slice::from_raw_parts(data.ptr, data.len) };
-    let result = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .append(append)
-        .truncate(!append)
-        .open(path)
-        .and_then(|mut f| f.write_all(bytes));
-    match result {
+    let mut file = match crate::fsbox::open_write(root, rel, append) {
+        Ok(f) => f,
+        Err(e) => return open_failed(token, e),
+    };
+    let bytes = unsafe { std::slice::from_raw_parts(data.ptr, data.len) };
+    match file.write_all(bytes) {
         Ok(()) => FsCompletion {
             token,
             err: 0,
@@ -361,29 +372,30 @@ fn do_write(
             v1: 0,
             data: Vec::new(),
         },
-        Err(e) => err_completion(
-            token,
-            ErrorCode::Host,
-            format!("{}: {e}", path.display()),
-        ),
+        Err(e) => {
+            err_completion(token, ErrorCode::Host, format!("{rel}: {e}"))
+        }
     }
 }
 
 fn do_read(
     token: u64,
-    path: &PathBuf,
+    root: &Root,
+    rel: &str,
     offset: u64,
     out: &GuestSliceMut,
 ) -> FsCompletion {
-    let dst =
-        unsafe { std::slice::from_raw_parts_mut(out.ptr, out.cap) };
+    let mut file = match crate::fsbox::open_read(root, rel) {
+        Ok(f) => f,
+        Err(e) => return open_failed(token, e),
+    };
+    let dst = unsafe { std::slice::from_raw_parts_mut(out.ptr, out.cap) };
     let result = (|| -> std::io::Result<(usize, bool)> {
-        let mut f = std::fs::File::open(path)?;
-        let size = f.metadata()?.len();
-        f.seek(std::io::SeekFrom::Start(offset))?;
+        let size = file.metadata()?.len();
+        file.seek(std::io::SeekFrom::Start(offset))?;
         let mut read = 0;
         while read < dst.len() {
-            let n = f.read(&mut dst[read..])?;
+            let n = file.read(&mut dst[read..])?;
             if n == 0 {
                 break;
             }
@@ -401,12 +413,7 @@ fn do_read(
             data: Vec::new(),
         },
         Err(e) => {
-            let code = if e.kind() == std::io::ErrorKind::NotFound {
-                ErrorCode::NoSuchObject
-            } else {
-                ErrorCode::Host
-            };
-            err_completion(token, code, format!("{}: {e}", path.display()))
+            err_completion(token, ErrorCode::Host, format!("{rel}: {e}"))
         }
     }
 }

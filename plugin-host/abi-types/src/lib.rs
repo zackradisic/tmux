@@ -906,8 +906,12 @@ impl SelfInfo {
 // Limits (single source of truth for both sides).
 // ---------------------------------------------------------------------------
 
-/// Per-call cap on OutBuf-shaped results and Bytes-shaped inputs.
-pub const MAX_TRANSFER_BYTES: usize = 256 * 1024;
+/// Per-call cap on mode_write's ANSI payload. The bytes are parsed into
+/// a pane's screen on the main thread, so this bounds that parse.
+///
+/// The fs imports are NOT capped: they are bounded by the instance's
+/// linear-memory limit, since every fs transfer names a buffer inside it.
+pub const MAX_MODE_WRITE_BYTES: usize = 256 * 1024;
 /// Cap on captured job output carried in a completion.
 pub const MAX_JOB_OUTPUT_BYTES: usize = 256 * 1024;
 
