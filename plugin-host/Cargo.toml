@@ -4,10 +4,12 @@ members = [
     "host",
     "abi-types",
     "sdk",
+    "examples/fs-probe",
     "examples/hello-raw",
     "examples/ticker",
     "examples/git-status",
     "examples/notify-toast",
+    "examples/resurrect",
     "examples/session_creator",
 ]
 default-members = ["host"]

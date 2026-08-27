@@ -411,6 +411,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
+name = "fs-probe"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tmux-plugin-sdk",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -743,6 +751,15 @@ dependencies = [
  "log",
  "rustc-hash",
  "smallvec",
+]
+
+[[package]]
+name = "resurrect"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tmux-plugin-sdk",
 ]
 
 [[package]]

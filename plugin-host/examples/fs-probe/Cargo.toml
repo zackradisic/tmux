@@ -1,0 +1,11 @@
+[package]
+name = "fs-probe"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+tmux-plugin-sdk = { path = "../../sdk" }
+serde_json = "1"
