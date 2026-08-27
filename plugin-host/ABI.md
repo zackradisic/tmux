@@ -1,15 +1,48 @@
-# tmux plugin ABI, version 1
+# tmux plugin ABI
 
-A tmux plugin is a core WebAssembly module (`wasm32-unknown-unknown`). It has
-no WASI and no ambient authority: every effect goes through host imports,
-gated by capabilities. Payloads are UTF-8 JSON in the guest's linear memory.
+A tmux plugin is a core WebAssembly module (`wasm32-unknown-unknown`). It
+has no WASI and no ambient authority: every effect goes through typed host
+imports, gated by capabilities. The ABI is C-like: one import per method,
+scalars only, strings and buffers as (ptr, len) pairs, binary event
+buffers. There is no JSON and no base64 anywhere on the wire.
 
 Plugins run inside the tmux server on its event loop. Every entry into the
 guest runs to completion under a CPU budget (epoch interruption, ~2 ms soft
 warning, ~8 ms hard trap). There is no stack suspension: async host
 operations complete via a callback export. The Rust SDK
-(`plugin-host/sdk`, crate `tmux-plugin-sdk`) builds async/await on top and
-hides all of the below.
+(`plugin-host/sdk`, crate `tmux-plugin-sdk`) hides all of the below.
+
+## Buffer taxonomy
+
+Every value crossing the boundary has one of five shapes:
+
+| shape      | direction  | wire form               | contract |
+|------------|------------|-------------------------|----------|
+| `Str`      | guest→host | `ptr, len` scalars      | borrowed for the call; **NUL byte at `data[len]`**, no interior NUL. The host validates and passes `base+ptr` straight into C — zero copies. `ptr 0, len 0` = absent (optional params). |
+| `Bytes`    | guest→host | `ptr, len` scalars      | borrowed for the call; raw bytes, no NUL (mode_write). Zero copies. |
+| pinned     | guest→host | `ptr, len` scalars      | async input (future fs calls): the SDK future owns the buffer until the completion arrives; the host/worker may read it after the call returns. |
+| `OutBuf`   | host→guest | `out_ptr, out_cap, len_out_ptr` | caller-provided output. The host writes the data and stores the length (u32 LE) at `len_out_ptr`. Does not fit → `-E_LIMIT`, with the NEEDED size in `len_out` (grow and retry). |
+| `OwnedBuf` | host→guest | out-ptr to 8 bytes `{ptr: u32, len: u32}` LE | host allocates exactly `len` via `pgh_alloc`, guest frees `(ptr, len)` via `pgh_free` (RAII in the SDK). |
+
+Copy floor: guest→host strings/bytes cross with zero copies (the guest is
+frozen during the call; C consumes before returning). Results cost exactly
+one copy (into guest memory). tmux copies internally only where it takes
+ownership (e.g. `options_set_string`).
+
+Memory rules: the host never caches a raw guest pointer across a guest
+call; the engine additionally pins linear memories so growth can only
+extend, never relocate. Debug builds of the host replace every borrowed
+pointer handed to C with a call-lifetime copy, so C code that stashes one
+becomes an ASAN-visible use-after-free in CI.
+
+## Interning
+
+Event names and payload field keys are u32 ids, interned in one host table
+shared by both sides: the C bridge interns through `pgh_intern` when
+building event buffers; guests intern through the `intern` import to
+subscribe and to compare keys. Ids start at 1 (0 marks an inline key), are
+stable for the server lifetime, and are never reused. `intern_name` is the
+reverse lookup. Routing compares integers, never strings.
 
 ## Guest exports
 
@@ -21,114 +54,145 @@ Required:
 | `pgh_abi_version` | `() -> i32` | must return `1` |
 | `pgh_alloc` | `(size: i32) -> i32` | 8-aligned; 0 = OOM (treated as failure) |
 | `pgh_free` | `(ptr: i32, size: i32)` | size is echoed back exactly |
-| `pgh_init` | `(cfg_ptr: i32, cfg_len: i32) -> i32` | config JSON; nonzero = init failed |
-| `pgh_on_event` | `(ptr: i32, len: i32)` | one event JSON |
+| `pgh_init` | `(cfg_ptr: i32, cfg_len: i32) -> i32` | config field block; nonzero = init failed |
+| `pgh_on_event` | `(ptr: i32, len: i32)` | one binary event buffer |
 
 Optional:
 
 | export | signature | notes |
 |---|---|---|
-| `pgh_on_async_complete` | `(token: i64, ptr: i32, len: i32, is_error: i32)` | async results |
+| `pgh_on_async_complete` | `(token: i64, err: i32, v0: i64, v1: i64, ptr: i32, len: i32)` | see Async |
 | `pgh_on_unload` | `()` | tiny budget; best-effort |
 | `pgh_state_version` | `() -> i32` | schema version of snapshot bytes |
 | `pgh_snapshot` | `(out_ptr_ptr: i32, out_len_ptr: i32) -> i32` | 0 = wrote {ptr,len}; nonzero = stateless |
 | `pgh_migrate` | `(old_version: i32, ptr: i32, len: i32) -> i32` | nonzero refuses (old code keeps running) |
 | `pgh_on_config_changed` | `(ptr: i32, len: i32) -> i32` | 1 = absorbed, 0 = restart me |
 
+Snapshot/migrate bytes are opaque to the host (the SDK uses JSON there;
+that is plugin-internal, not ABI).
+
 ## Host imports (module `"tmux"`)
 
-```
-host_call(req_ptr, req_len, out_ptr, out_len_ptr) -> i32
-    Synchronous request/response. The host writes the response into a
-    buffer obtained from the guest's pgh_alloc and stores {ptr,len} into
-    the two 4-byte little-endian out-slots. Returns 0 (ok: response is the
-    result), 1 (structured error: response is the error), or 2 (ABI
-    failure: nothing written). The guest frees the response buffer.
+Errors: sync imports return `0` or `-code`; value-returning imports
+(`intern`, `mode_open`, the async starters) return a positive value or
+`-code`. The message for the most recent error is fetched with
+`last_error` (an OutBuf). Codes: `E_BAD_REQUEST`(1), `E_UNKNOWN_METHOD`(2),
+`E_CAP_DENIED`(3), `E_NO_SUCH_OBJECT`(4), `E_OUT_OF_SCOPE`(5),
+`E_LIMIT`(6), `E_HOST`(7), `E_CANCELLED`(8), `E_UNSUPPORTED`(9).
 
-host_request(req_ptr, req_len) -> i64
-    Asynchronous request. Returns a token > 0; the result arrives later
-    via pgh_on_async_complete. Negative return = -ErrorCode (rejected
-    synchronously, e.g. capability denied).
+`kind` values: -1 server/global, 0 session, 1 window, 2 pane, 3 client.
 
-host_log(level, ptr, len)
-    0=debug 1=info 2=warn 3=error. Always permitted. Feeds `plugin-log`.
-```
+| import | signature | capability |
+|---|---|---|
+| `intern` | `(ptr, len) -> i64` — raw UTF-8, host-consumed (no NUL needed); id > 0 | none |
+| `intern_name` | `(id, out, cap, len_out) -> i32` | none |
+| `subscribe` / `unsubscribe` | `(event_id) -> i32` | read-state |
+| `list` | `(kind, owned_out) -> i32` — object list buffer | read-state |
+| `resolve` | `(kind, id, owned_out) -> i32` — one object record | read-state |
+| `self_info` | `(out) -> i32` — 16-byte `{scope_kind: i32, scope_id: u32, generation: u64}` | read-state |
+| `get_option` | `(kind, id, name Str, out, cap, len_out) -> i32` | read-state |
+| `set_option` | `(kind, id, name Str, value Str) -> i32` (@-options only) | write-options |
+| `format_expand` | `(kind, id, fmt Str, out, cap, len_out) -> i32` — `#{...}` against the scope; `#()` disabled | read-state |
+| `send_keys` | `(pane, keys Str, literal) -> i32` | send-keys |
+| `capture_pane` | `(pane, start, end, escapes, out, cap, len_out) -> i32` (≤2000 lines/call) | capture-pane |
+| `display_message` | `(client /* -1 = all */, msg Str) -> i32` | display-message |
+| `timer_cancel` | `(token: i64) -> i32` | timers |
+| `mode_open` | `(window /* -1 = default */, width, height, x, y, title Str?) -> i64` (mode id) | mode |
+| `mode_write` | `(mode: i64, data Bytes) -> i32` (≤256 KiB; raw ANSI, zero-copy) | mode |
+| `mode_preview` | `(mode: i64, pane: i64 /* -1 = clear */, x, y, w, h) -> i32` | mode |
+| `mode_move` | `(mode: i64, window /* -1 = default */, x, y) -> i32` | mode |
+| `mode_close` | `(mode: i64) -> i32` | mode |
+| `last_error` | `(out, cap, len_out) -> i32` | none |
+| `fs_root` | `(out, cap, len_out) -> i32` — the plugin data dir's absolute path | none |
+| `fs_write_sync` | `(path, data Bytes, append) -> i64` (bytes written) | fs-write |
+| `fs_read_sync` | `(path, offset: i64, out, cap, len_out, eof_out) -> i32` | fs-read |
+| `log` | `(level, ptr, len)` — raw UTF-8; 0=debug 1=info 2=warn 3=error | none |
 
-Memory rules: request buffers are guest-owned (host copies out before
-returning); host-written payloads (events, responses, config, migrate
-state) are allocated with `pgh_alloc` and freed by the guest. `pgh_alloc`
-may grow/move memory; the host never caches raw pointers across guest
-calls.
+fs paths are raw UTF-8 (host-consumed - the NUL rule does not apply);
+they resolve inside the plugin's sandboxed data directory. Each fs
+transfer is capped at 256 KiB - page bigger data.
 
-## Requests and responses
+### Asynchronous imports
 
-Request: `{"method": "...", "params": {...}}`
-Response: `{"ok": <value>}` or
-`{"err": {"code": "E_...", "message": "...", "data": ...}}`
+Return a token > 0 (or `-code` on synchronous rejection); the result
+arrives later via `pgh_on_async_complete(token, err, v0, v1, ptr, len)`.
+`err` = 0 on success or an error code; `(ptr, len)` is an OwnedBuf the
+guest frees (the error message bytes when `err != 0`; empty = none).
 
-Error codes (numeric value used by negative `host_request` returns):
-`E_BAD_REQUEST`(1), `E_UNKNOWN_METHOD`(2), `E_CAP_DENIED`(3),
-`E_NO_SUCH_OBJECT`(4), `E_OUT_OF_SCOPE`(5), `E_LIMIT`(6), `E_HOST`(7),
-`E_CANCELLED`(8), `E_UNSUPPORTED`(9).
-
-### Synchronous methods (host_call)
-
-| method | params | result | capability |
+| import | signature | completion | capability |
 |---|---|---|---|
-| `subscribe` / `unsubscribe` | `{events: [..]}` | `{}` | read-state |
-| `list_sessions/windows/panes/clients` | `{}` | array | read-state |
-| `resolve` | `{kind, id}` | object | read-state |
-| `self` | `{}` | plugin/scope/generation | read-state |
-| `get_option` | `{scope?, name}` | `{value}` | read-state |
-| `set_option` | `{scope?, name, value}` | `{}` | write-options (@-options only) |
-| `send_keys` | `{pane, keys, literal?}` | `{}` | send-keys |
-| `capture_pane` | `{pane, start?, end?, escapes?}` | `{text}` | capture-pane (≤2000 lines, ≤256 KiB) |
-| `display_message` | `{client?, message}` | `{}` | display-message |
-| `timer_cancel` | `{token}` | `{}` | timers |
-| `mode_open` | `{window?, width, height, x?, y?, title?}` | `{mode}` | mode |
-| `mode_write` | `{mode, data_b64}` | `{}` | mode (≤256 KiB decoded) |
-| `mode_preview` | `{mode, pane?, x, y, w, h}` | `{}` | mode |
-| `mode_move` | `{mode, window?, x?, y?}` | `{}` | mode |
-| `mode_close` | `{mode}` | `{}` | mode |
+| `run_job` | `(cmd Str, cwd Str?) -> i64` | v0 = exit status (or signal), v1 = signalled, data = combined output (≤256 KiB, truncated) | run-process |
+| `run_command` | `(cmd Str) -> i64` | nothing; parse errors arrive as error completions (a command that runs and fails still completes Ok) | run-command |
+| `timer_start` | `(ms: i64) -> i64` | nothing | timers |
+| `fs_write` | `(path, data, append) -> i64` | v0 = bytes written | fs-write |
+| `fs_read` | `(path, offset: i64, out_ptr, out_cap) -> i64` | v0 = bytes read, v1 = eof | fs-read |
 
-`scope` is `{"type":"server"}` (default) or
-`{"type":"session"|"window"|"pane","id":n}`.
+The async fs pair runs on the host's fs worker thread (the tmux loop
+never blocks) with ZERO copies: the worker reads `fs_write`'s data and
+fills `fs_read`'s out-buffer directly in plugin memory. The buffers are
+pinned by the SDK future until the completion arrives; awaited fs ops
+are fully ordered, but two in-flight ops on the SAME file are not -
+await each before the next. Completion means the data reached the page
+cache (survives kill-server; not a power loss).
 
-### Asynchronous methods (host_request)
+## Object records (list / resolve results)
 
-| method | params | completion payload | capability |
-|---|---|---|---|
-| `run_job` | `{cmd, cwd?}` | `{status, signalled, output}` | run-process |
-| `run_command` | `{command}` | `{}` (parse errors as error completion) | run-command |
-| `timer_start` | `{ms}` | `{}` on fire | timers |
+Sequential little-endian records with inline `str` = u32 length + UTF-8
+bytes (no NUL; empty = absent). `list` prefixes `u32 count`; `resolve`
+returns one bare record. `NONE` = 0xffffffff.
+
+```
+session := u32 id, u8 attached, u32 current_window(NONE),
+           str name, u32 nwindows, nwindows * { u32 index, u32 id }
+window  := u32 id, u32 width, u32 height, u32 active_pane(NONE),
+           str name, u32 nsessions, nsessions * u32,
+           u32 npanes, npanes * u32          (pane ids in window order)
+pane    := u32 id, u32 window, u32 width, u32 height,
+           u8 flags(1 active | 2 floating | 4 dead),
+           str title, str shell, str cwd
+client  := u32 id, u32 session(NONE), u8 flags(1 attached | 2 control),
+           str name
+```
 
 ## Events
 
-```json
-{"event": "pane-focus-in", "seq": 42,
- "scope": {"client": 1, "session": 0, "window": 3, "pane": 7},
- "data": {"session_name": "main", ...}}
+A binary buffer: fixed header + field block, all little-endian, packed.
+
 ```
+event  := u32 event_id            (interned)
+          u64 seq                 (host-assigned delivery order)
+          u32 client, session, window, pane    (scope; NONE = absent)
+          field block
+fields := u16 count, count * field
+field  := u32 key_id              (0 = inline key: u32 len + bytes follow)
+          u8 tag
+          value
+tags   := 0 null | 1 bool (u8) | 2 i64 (8B) | 3 f64 (8B)
+          | 4 str (u32 len + bytes) | 5 json (u32 len + bytes; config only)
+```
+
+Object names travel as flat fields (`session_name`, `window_name`,
+`client_name`); the notification/command text as `text`; extra bus payload
+items keep their names (`window_index`, `exit_status`, `command_duration`,
+`old_pane`, ...) as i64 or str fields.
 
 Scoped instances receive events touching their object; server-scoped
 instances receive everything. `*-created` / `*-destroyed` events (plus
 `session-closed`) are delivered without subscription; everything else
 requires `subscribe`. The bridge registers an event-bus sink for every
-hookable tmux event (session-created, window-linked/unlinked/renamed,
-pane-focus-in/out, pane-shell-prompt, pane-command-started/finished, ...);
-extra payload items (window_index, exit_status, command_duration,
-old_pane, ...) are forwarded flat and land in the guest event's `data`.
-Synthesized events replace the bus versions for object lifecycle:
-`window-created`, `pane-created`, `client-created` (fired at the object
-level, so they also cover panes created outside spawn paths) and
-`session-destroyed`, `window-destroyed`, `pane-destroyed`,
-`client-destroyed`. `pane-notification` (OSC 9;message or OSC
-777;notify;title;body — the message travels in `data.text`, ≤512 bytes,
-valid UTF-8) has no bus equivalent and is delivered directly.
+hookable tmux event; synthesized object-lifecycle events replace the bus
+versions for creation (`window-created`, `pane-created`, `client-created`)
+and destruction. `pane-notification` (OSC 9;message or OSC
+777;notify;title;body — the message travels in the `text` field, ≤512
+bytes, valid UTF-8) has no bus equivalent and is delivered directly.
 `plugin-command` (from the tmux command of the same name) is targeted:
-only the plugin named in `data.plugin` receives it (subscription still
-required); the command string is `data.text` and the target
+only the plugin named in its `plugin` field receives it (subscription
+still required); the command string is the `text` field and the target
 pane/window/session form the scope.
+
+Config (`pgh_init` / `pgh_on_config_changed`) is a bare field block with
+inline string keys; scalar values map directly, nested values (arrays /
+tables from a sync-plugins manifest) use the `json` tag.
 
 ## UI modes
 
@@ -137,41 +201,40 @@ spawned **empty floating pane** (no process) running a dedicated window
 mode, opened with `mode_open` (capability `mode`). The pane is focused on
 open so keys flow to it immediately; ids are monotonic and never reused.
 (Entering a mode on an *existing* pane — tmux's own copy-mode pattern —
-is not offered in v1; the design for it is in
-[MODE-ATTACH.md](MODE-ATTACH.md).)
+is not offered; the design for it is in [MODE-ATTACH.md](MODE-ATTACH.md).)
 
 - **Target window**: scope-implied. Pane- and window-scoped instances may
-  only open in their own window (`window` may be omitted); session-scoped
-  in windows linked to their session (default: the session's current
-  window); server-scoped anywhere (`window` required). `cross-scope`
-  relaxes the checks.
-- **Rendering**: `mode_write` sends raw ANSI bytes, parsed server-side by
-  the full tmux escape parser into the mode's screen — cursor addressing,
-  SGR, clears, alternate charsets all work, so ratatui-style TUI libraries
-  can render unmodified. Transport is base64 (`data_b64`) because
-  host_call payloads are JSON; at most 256 KiB decoded per call. A later
-  raw-memory import can lift the base64 hop without changing this method's
-  semantics. Note the screen is not a terminal: nothing echoes back, and
-  replies that would go to a terminal (OSC 52 queries etc.) are dropped.
-- **Preview**: `mode_preview` declares one retained rect `{pane, x, y, w,
-  h}` mirroring the source pane's live grid (grid-cell blit, no escape
-  reparsing), refreshed ~every 500 ms until cleared (`pane` omitted), the
-  source pane dies, or the mode closes. The rect must fit the mode screen;
-  scope-implied pane targeting applies as for `capture_pane`.
+  only open in their own window (pass -1); session-scoped in windows
+  linked to their session (default: the session's current window);
+  server-scoped anywhere (window required). `cross-scope` relaxes the
+  checks.
+- **Rendering**: `mode_write` sends raw ANSI bytes (a borrowed `Bytes`,
+  parsed straight out of plugin memory by the full tmux escape parser)
+  into the mode's screen — cursor addressing, SGR, clears, alternate
+  charsets all work, so ratatui-style TUI libraries can render
+  unmodified. At most 256 KiB per call. Note the screen is not a
+  terminal: nothing echoes back, and replies that would go to a terminal
+  (OSC 52 queries etc.) are dropped.
+- **Preview**: `mode_preview` declares one retained rect `(pane, x, y, w,
+  h)` mirroring the source pane's live grid (grid-cell blit, no escape
+  reparsing), refreshed ~every 500 ms until cleared (pane -1), the
+  source pane dies, or the mode closes. The rect must fit the mode
+  screen; scope-implied pane targeting applies as for `capture_pane`.
 - **Events** (delivered only to the owning instance, no subscription
-  needed; the mode id arrives in `data.mode`):
-  - `mode-key` — `{mode, key, mouse?: {x, y, b}}`; `key` is a tmux key
-    name ("q", "Enter", "Escape", "MouseDown1Pane", ...), `mouse` carries
-    pane-relative cell coordinates when the key is a mouse event.
-  - `mode-resize` — `{mode, width, height}`; the float was resized,
-    redraw.
-  - `mode-closed` — `{mode, reason}`; terminal. `reason` is `"closed"`
-    (the plugin called `mode_close`) or `"killed"` (anything else: the
-    user killed the pane, the window died, the plugin was reloaded or
-    unloaded). The id is dead afterwards.
-- **Move**: `mode_move` relocates the float to another window,
-  join-pane style: the same pane is relinked, so the mode id, the pane
-  id, the rendered screen and the event stream all survive - at most a
+  needed; the mode id arrives in the `mode` field):
+  - `mode-key` — fields `mode`, `key` (a tmux key name: "q", "Enter",
+    "Escape", "MouseDown1Pane", ...), `client` (the pressing client),
+    and for mouse keys `mouse_x`, `mouse_y`, `mouse_b` (pane-relative
+    cell coordinates).
+  - `mode-resize` — fields `mode`, `width`, `height`; the float was
+    resized, redraw.
+  - `mode-closed` — fields `mode`, `reason`; terminal. `reason` is
+    `"closed"` (the plugin called `mode_close`) or `"killed"` (anything
+    else: the user killed the pane, the window died, the plugin was
+    reloaded or unloaded). The id is dead afterwards.
+- **Move**: `mode_move` relocates the float to another window, join-pane
+  style: the same pane is relinked, so the mode id, the pane id, the
+  rendered screen and the event stream all survive - at most a
   `mode-resize` follows if the destination clamps the size. Target
   window rules and `x`/`y` as for `mode_open` (default: re-centered).
   Refused with `E_LIMIT` when the move would leave the source window
@@ -202,7 +265,7 @@ caps or scope restarts. `reload-plugin` forces the transaction.
 A trap (including the hard CPU budget and guest panics) tears down the
 instance and counts one failure; three consecutive failures disable the
 plugin until an explicit reload. Host API misuse returns structured errors
-and never counts. Guests never see raw pointers: all handles are ids,
+and never counts. Guests never see raw host pointers: all handles are ids,
 validated on every call (`E_NO_SUCH_OBJECT` after death).
 
 ## Capabilities
@@ -212,8 +275,10 @@ sidecar `<stem>.toml` next to the `.wasm` — effective = requests ∩ grants.
 Defaults always granted: `read-state`, `display-message`, `timers`. Others:
 `write-options`, `send-keys`, `capture-pane`, `run-process` (with optional
 `[caps.run-process] argv0 = [...]` allowlist), `run-command`,
-`cross-scope`, `mode` (UI modes), and reserved: `popup`, `menu`,
-`fs-read`, `fs-write`.
+`cross-scope`, `mode` (UI modes), `fs-read`, `fs-write` (sandboxed to the
+plugin's data directory: `$XDG_DATA_HOME|~/.local/share` +
+`tmux/plugins/<name>/`; relative paths only, no `..`, symlink escapes
+rejected), and reserved: `popup`, `menu`.
 Scope-implied targeting is enforced on top: a pane-scoped instance may only
 target its own pane, window-scoped its window's panes, session-scoped its
 session's panes; `cross-scope` lifts this.
@@ -229,6 +294,7 @@ reload-plugin [-a] [name]
 enable-plugin name / disable-plugin name
 show-plugins [-v]
 plugin-log [-n lines] [name]
+plugin-command [-t target] plugin command
 ```
 
 `sync-plugins` reconciles the *managed* plugin pool against a TOML

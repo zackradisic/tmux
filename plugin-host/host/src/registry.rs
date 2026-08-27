@@ -45,20 +45,6 @@ impl std::fmt::Display for ScopeId {
     }
 }
 
-impl ScopeId {
-    pub fn to_json(self) -> Value {
-        match self {
-            ScopeId::Server => serde_json::json!({ "type": "server" }),
-            ScopeId::Session(id) => {
-                serde_json::json!({ "type": "session", "id": id })
-            }
-            ScopeId::Window(id) => {
-                serde_json::json!({ "type": "window", "id": id })
-            }
-            ScopeId::Pane(id) => serde_json::json!({ "type": "pane", "id": id }),
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PluginState {

@@ -2,16 +2,20 @@
 //! protocol, and budgeted guest calls.
 //!
 //! Together with engine.rs this file confines every wasmtime type in the
-//! crate. The ABI itself (export names, host_call encoding, memory rules) is
-//! documented in plugin-host/ABI.md and mirrored by tmux-plugin-abi.
+//! crate. The ABI itself (import signatures, buffer taxonomy, memory rules)
+//! is documented in plugin-host/ABI.md and defined in tmux-plugin-abi.
+//!
+//! Memory discipline: guest memory is touched through `GuestMem` only.
+//! Raw pointers into linear memory are valid only until the next guest
+//! re-entry (`pgh_alloc` via `give_owned`); every method consumes its
+//! borrowed inputs (or copies them) before any re-entry. The engine pins
+//! memory so it can never move (engine.rs), but the discipline holds
+//! regardless.
 
 use std::collections::HashSet;
 use std::time::Instant;
 
-use tmux_plugin_abi::{
-    exports, imports, ErrorCode, ABI_VERSION, HOST_CALL_ABI_FAILURE,
-    HOST_CALL_ERR, HOST_CALL_OK,
-};
+use tmux_plugin_abi::{exports, imports, ErrorCode, ABI_VERSION};
 use wasmtime::{
     Caller, Engine, Instance as WtInstance, Linker, Memory, Module, Store,
     StoreLimits, StoreLimitsBuilder, TypedFunc, UpdateDeadline,
@@ -31,7 +35,8 @@ pub struct StoreData {
     pub generation: u64,
     pub scope: crate::registry::ScopeId,
     pub caps: crate::caps::EffectiveCaps,
-    pub subscriptions: HashSet<String>,
+    /// Subscribed event ids (interned).
+    pub subscriptions: HashSet<u32>,
     pub soft_warned: bool,
     limits: StoreLimits,
 }
@@ -62,12 +67,12 @@ pub struct Guest {
     instance: WtInstance,
     memory: Memory,
     alloc: TypedFunc<i32, i32>,
-    #[allow(dead_code)] // the guest frees what it receives; host use is rare
     free: TypedFunc<(i32, i32), ()>,
     init: TypedFunc<(i32, i32), i32>,
     on_event: TypedFunc<(i32, i32), ()>,
     pub on_unload: Option<TypedFunc<(), ()>>,
-    pub on_async_complete: Option<TypedFunc<(i64, i32, i32, i32), ()>>,
+    pub on_async_complete:
+        Option<TypedFunc<(i64, i32, i64, i64, i32, i32), ()>>,
     state_version: Option<TypedFunc<(), i32>>,
     snapshot: Option<TypedFunc<(i32, i32), i32>>,
     migrate: Option<TypedFunc<(i32, i32, i32), i32>>,
@@ -104,6 +109,38 @@ pub fn validate_module(module: &Module) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Encode a plugin config Value as the field-block config payload. Scalar
+/// top-level entries map directly; nested arrays/objects travel as the
+/// JSON escape-hatch tag (interpreted by the guest SDK only).
+pub fn encode_config(config: &serde_json::Value) -> Vec<u8> {
+    use tmux_plugin_abi::{FieldWriter, KeyRef};
+
+    let mut w = FieldWriter::new();
+    match config {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                let key = KeyRef::Name(key);
+                match value {
+                    serde_json::Value::Null => w.null(key),
+                    serde_json::Value::Bool(b) => w.bool(key, *b),
+                    serde_json::Value::Number(n) => {
+                        if let Some(i) = n.as_i64() {
+                            w.i64(key, i);
+                        } else {
+                            w.f64(key, n.as_f64().unwrap_or(0.0));
+                        }
+                    }
+                    serde_json::Value::String(s) => w.str(key, s),
+                    nested => w.json(key, &nested.to_string()),
+                }
+            }
+        }
+        serde_json::Value::Null => {}
+        other => w.json(KeyRef::Name("config"), &other.to_string()),
+    }
+    w.finish()
 }
 
 /// Instantiate a module, verify the ABI handshake and bind exports.
@@ -266,12 +303,11 @@ impl Guest {
         CallOutcome { result, soft_warned, elapsed_ns }
     }
 
-    /// Call the guest's init export with its config JSON.
-    pub fn call_init(&mut self, config_json: &str) -> CallOutcome<()> {
+    /// Call the guest's init export with its config field block.
+    pub fn call_init(&mut self, config: &[u8]) -> CallOutcome<()> {
         self.budgeted(HARD_TICKS, |g| {
-            let (ptr, len) = g
-                .write_bytes(config_json.as_bytes())
-                .map_err(wasmtime::Error::msg)?;
+            let (ptr, len) =
+                g.write_bytes(config).map_err(wasmtime::Error::msg)?;
             let rc = g.init.call(&mut g.store, (ptr, len))?;
             if rc != 0 {
                 return Err(wasmtime::Error::msg(format!(
@@ -282,23 +318,26 @@ impl Guest {
         })
     }
 
-    /// Deliver one event to the guest.
-    pub fn call_on_event(&mut self, event_json: &str) -> CallOutcome<()> {
+    /// Deliver one binary event buffer to the guest.
+    pub fn call_on_event(&mut self, event: &[u8]) -> CallOutcome<()> {
         self.budgeted(HARD_TICKS, |g| {
-            let (ptr, len) = g
-                .write_bytes(event_json.as_bytes())
-                .map_err(wasmtime::Error::msg)?;
+            let (ptr, len) =
+                g.write_bytes(event).map_err(wasmtime::Error::msg)?;
             g.on_event.call(&mut g.store, (ptr, len))?;
             Ok(())
         })
     }
 
-    /// Deliver an async completion to the guest.
+    /// Deliver an async completion to the guest. `err` is 0 or an
+    /// ErrorCode number; `data` becomes a guest-owned buffer (error
+    /// message bytes on error, per-method payload on success).
     pub fn call_on_async_complete(
         &mut self,
         token: u64,
-        json: &str,
-        is_error: bool,
+        err: i32,
+        v0: i64,
+        v1: i64,
+        data: &[u8],
     ) -> CallOutcome<()> {
         if self.on_async_complete.is_none() {
             return CallOutcome {
@@ -308,14 +347,13 @@ impl Guest {
             };
         }
         self.budgeted(HARD_TICKS, |g| {
-            let (ptr, len) = g
-                .write_bytes(json.as_bytes())
-                .map_err(wasmtime::Error::msg)?;
+            let (ptr, len) = if data.is_empty() {
+                (0, 0)
+            } else {
+                g.write_bytes(data).map_err(wasmtime::Error::msg)?
+            };
             let f = g.on_async_complete.as_ref().unwrap();
-            f.call(
-                &mut g.store,
-                (token as i64, ptr, len, i32::from(is_error)),
-            )?;
+            f.call(&mut g.store, (token as i64, err, v0, v1, ptr, len))?;
             Ok(())
         })
     }
@@ -389,12 +427,11 @@ impl Guest {
 
     /// Offer a changed config. Some(true) = absorbed; Some(false) = plugin
     /// asks for a restart; None = no export (restart).
-    pub fn call_on_config_changed(&mut self, config_json: &str) -> Option<bool> {
+    pub fn call_on_config_changed(&mut self, config: &[u8]) -> Option<bool> {
         self.on_config_changed.as_ref()?;
         let outcome = self.budgeted(HARD_TICKS, |g| {
-            let (ptr, len) = g
-                .write_bytes(config_json.as_bytes())
-                .map_err(wasmtime::Error::msg)?;
+            let (ptr, len) =
+                g.write_bytes(config).map_err(wasmtime::Error::msg)?;
             let f = g.on_config_changed.as_ref().unwrap();
             Ok(f.call(&mut g.store, (ptr, len))?)
         });
@@ -418,152 +455,562 @@ impl Guest {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Guest memory access for imports.
+// ---------------------------------------------------------------------------
+
+/// Structured error carried through dispatch; the message lands in the
+/// per-thread last-error slot for the guest to fetch.
+#[derive(Debug, Clone)]
+pub struct HostError {
+    pub code: ErrorCode,
+    pub message: String,
+}
+
+pub fn err(code: ErrorCode, message: impl Into<String>) -> HostError {
+    HostError { code, message: message.into() }
+}
+
+thread_local! {
+    static LAST_ERROR: std::cell::RefCell<String> =
+        const { std::cell::RefCell::new(String::new()) };
+}
+
+fn set_last_error(msg: &str) {
+    LAST_ERROR.with(|e| {
+        let mut e = e.borrow_mut();
+        e.clear();
+        e.push_str(msg);
+    });
+}
+
+fn last_error() -> String {
+    LAST_ERROR.with(|e| e.borrow().clone())
+}
+
+/// The one gateway to guest linear memory during an import call.
+///
+/// Raw pointers returned by `c_str`/`bytes` point into linear memory and
+/// are valid only until the next guest re-entry; the only re-entry inside
+/// an import is `give_owned` (the guest allocator), so the rule is:
+/// consume every raw pointer before calling `give_owned`.
+pub struct GuestMem<'a, 'b> {
+    caller: &'a mut Caller<'b, StoreData>,
+    memory: Memory,
+    /// Debug tripwire for the C borrow contract: in debug builds, borrowed
+    /// strings/bytes are COPIES freed when the import call ends, so any C
+    /// code that stashes a pointer past the call becomes a use-after-free
+    /// that ASAN catches in CI. Release builds pass guest memory directly
+    /// (zero-copy).
+    #[cfg(debug_assertions)]
+    debug_copies: std::cell::RefCell<Vec<Box<[u8]>>>,
+}
+
+/// Sink context writing directly into a guest OutBuf. Counts the total
+/// regardless of capacity so the needed size can be reported on overflow.
+#[repr(C)]
+pub struct OutSink {
+    dst: *mut u8,
+    cap: usize,
+    written: usize,
+    total: usize,
+}
+
+/// pgh_sink writing into an OutSink (guest OutBuf).
+pub unsafe extern "C" fn out_sink(
+    ctx: *mut std::ffi::c_void,
+    ptr: *const std::os::raw::c_char,
+    len: usize,
+) {
+    let s = &mut *(ctx as *mut OutSink);
+    let n = len.min(s.cap.saturating_sub(s.written));
+    if n > 0 {
+        std::ptr::copy_nonoverlapping(ptr as *const u8, s.dst.add(s.written), n);
+        s.written += n;
+    }
+    s.total = s.total.saturating_add(len);
+}
+
+/// pgh_sink collecting into a host Vec (for OwnedBuf results).
+pub unsafe extern "C" fn collect_sink(
+    ctx: *mut std::ffi::c_void,
+    ptr: *const std::os::raw::c_char,
+    len: usize,
+) {
+    let buf = &mut *(ctx as *mut Vec<u8>);
+    buf.extend_from_slice(std::slice::from_raw_parts(ptr as *const u8, len));
+}
+
+impl<'a, 'b> GuestMem<'a, 'b> {
+    fn new(caller: &'a mut Caller<'b, StoreData>) -> Result<Self, HostError> {
+        let memory = caller
+            .get_export("memory")
+            .and_then(|e| e.into_memory())
+            .ok_or_else(|| err(ErrorCode::Host, "guest has no memory"))?;
+        Ok(Self {
+            caller,
+            memory,
+            #[cfg(debug_assertions)]
+            debug_copies: std::cell::RefCell::new(Vec::new()),
+        })
+    }
+
+    /// Debug builds: return a call-lifetime copy instead of the guest
+    /// pointer (see the field docs). No-op passthrough in release.
+    #[cfg(debug_assertions)]
+    fn tripwire(&self, bytes: &[u8]) -> *const u8 {
+        let boxed: Box<[u8]> = bytes.into();
+        let ptr = boxed.as_ptr();
+        self.debug_copies.borrow_mut().push(boxed);
+        ptr
+    }
+
+    pub fn data(&self) -> &StoreData {
+        self.caller.data()
+    }
+
+    pub fn data_mut(&mut self) -> &mut StoreData {
+        self.caller.data_mut()
+    }
+
+    /// Bounds-check ptr..ptr+len(+extra) and return the start offset.
+    fn check(
+        &self,
+        ptr: i32,
+        len: i32,
+        extra: usize,
+    ) -> Result<usize, HostError> {
+        if ptr < 0 || len < 0 {
+            return Err(err(ErrorCode::BadRequest, "negative ptr/len"));
+        }
+        let start = ptr as usize;
+        let end = start
+            .checked_add(len as usize)
+            .and_then(|e| e.checked_add(extra))
+            .ok_or_else(|| err(ErrorCode::BadRequest, "ptr overflow"))?;
+        if end > self.memory.data_size(&*self.caller) {
+            return Err(err(ErrorCode::BadRequest, "out-of-bounds buffer"));
+        }
+        Ok(start)
+    }
+
+    /// Borrowed C string: (ptr, len) with a NUL byte at data[len] and no
+    /// interior NUL. Returns a raw pointer suitable for passing straight
+    /// into a C vtable call. Valid until the next guest re-entry.
+    pub fn c_str(
+        &self,
+        ptr: i32,
+        len: i32,
+    ) -> Result<*const std::os::raw::c_char, HostError> {
+        let start = self.check(ptr, len, 1)?;
+        let data = self.memory.data(&*self.caller);
+        let bytes = &data[start..start + len as usize + 1];
+        if bytes[len as usize] != 0 {
+            return Err(err(
+                ErrorCode::BadRequest,
+                "string not NUL-terminated at data[len]",
+            ));
+        }
+        if bytes[..len as usize].contains(&0) {
+            return Err(err(ErrorCode::BadRequest, "embedded NUL in string"));
+        }
+        #[cfg(debug_assertions)]
+        return Ok(self.tripwire(bytes) as *const std::os::raw::c_char);
+        #[cfg(not(debug_assertions))]
+        Ok(data[start..].as_ptr() as *const std::os::raw::c_char)
+    }
+
+    /// Optional string: ptr 0 + len 0 = absent.
+    pub fn c_str_opt(
+        &self,
+        ptr: i32,
+        len: i32,
+    ) -> Result<Option<*const std::os::raw::c_char>, HostError> {
+        if ptr == 0 && len == 0 {
+            return Ok(None);
+        }
+        self.c_str(ptr, len).map(Some)
+    }
+
+    /// Borrowed raw bytes (no NUL requirements). Valid until the next
+    /// guest re-entry.
+    pub fn bytes(
+        &self,
+        ptr: i32,
+        len: i32,
+    ) -> Result<(*const u8, usize), HostError> {
+        let start = self.check(ptr, len, 0)?;
+        let data = self.memory.data(&*self.caller);
+        #[cfg(debug_assertions)]
+        return Ok((
+            self.tripwire(&data[start..start + len as usize]),
+            len as usize,
+        ));
+        #[cfg(not(debug_assertions))]
+        Ok((data[start..].as_ptr(), len as usize))
+    }
+
+    /// Raw pointer to a guest buffer PINNED past this call (async fs
+    /// input): the SDK future owns the buffer until the completion
+    /// arrives, memory never moves (engine config), and instance
+    /// teardown waits for in-flight jobs. Bypasses the debug tripwire
+    /// deliberately - the pointer must outlive the import call.
+    pub fn pinned_bytes(
+        &self,
+        ptr: i32,
+        len: i32,
+    ) -> Result<*const u8, HostError> {
+        let start = self.check(ptr, len, 0)?;
+        let data = self.memory.data(&*self.caller);
+        Ok(data[start..].as_ptr())
+    }
+
+    /// Mutable variant for pinned output buffers (async fs_read).
+    pub fn pinned_bytes_mut(
+        &mut self,
+        ptr: i32,
+        len: i32,
+    ) -> Result<*mut u8, HostError> {
+        let start = self.check(ptr, len, 0)?;
+        let data = self.memory.data_mut(&mut *self.caller);
+        Ok(data[start..].as_mut_ptr())
+    }
+
+    /// Copy bytes out of guest memory (owned; survives re-entry).
+    pub fn read(&self, ptr: i32, len: i32) -> Result<Vec<u8>, HostError> {
+        let start = self.check(ptr, len, 0)?;
+        let data = self.memory.data(&*self.caller);
+        Ok(data[start..start + len as usize].to_vec())
+    }
+
+    /// Copy a string out of guest memory (owned; NUL rule as `c_str`).
+    pub fn read_str(&self, ptr: i32, len: i32) -> Result<String, HostError> {
+        let start = self.check(ptr, len, 1)?;
+        let data = self.memory.data(&*self.caller);
+        if data[start + len as usize] != 0 {
+            return Err(err(
+                ErrorCode::BadRequest,
+                "string not NUL-terminated at data[len]",
+            ));
+        }
+        let bytes = &data[start..start + len as usize];
+        if bytes.contains(&0) {
+            return Err(err(ErrorCode::BadRequest, "embedded NUL in string"));
+        }
+        String::from_utf8(bytes.to_vec())
+            .map_err(|_| err(ErrorCode::BadRequest, "invalid UTF-8"))
+    }
+
+    /// Validate a guest OutBuf and build the direct-write sink for it.
+    /// The returned OutSink holds a raw pointer: consume it (and the C
+    /// call using it) before any guest re-entry.
+    pub fn out_sink(&mut self, out: i32, cap: i32) -> Result<OutSink, HostError> {
+        let start = self.check(out, cap, 0)?;
+        let data = self.memory.data_mut(&mut *self.caller);
+        Ok(OutSink {
+            dst: data[start..].as_mut_ptr(),
+            cap: cap as usize,
+            written: 0,
+            total: 0,
+        })
+    }
+
+    /// Finish an OutBuf write: store the length (written on success, needed
+    /// size on overflow) into len_out and map overflow to E_LIMIT.
+    pub fn finish_out(
+        &mut self,
+        sink: OutSink,
+        len_out: i32,
+    ) -> Result<(), HostError> {
+        let total = sink.total;
+        self.write_u32_at(len_out, total as u32)?;
+        if total > sink.cap {
+            return Err(err(
+                ErrorCode::Limit,
+                format!("result is {total} bytes, buffer holds {}", sink.cap),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Write a little-endian u32 at a guest address.
+    pub fn write_u32_at(&mut self, at: i32, value: u32) -> Result<(), HostError> {
+        let start = self.check(at, 4, 0)?;
+        let data = self.memory.data_mut(&mut *self.caller);
+        data[start..start + 4].copy_from_slice(&value.to_le_bytes());
+        Ok(())
+    }
+
+    /// Copy bytes to a guest address (fixed out-structs).
+    pub fn write_at(&mut self, at: i32, bytes: &[u8]) -> Result<(), HostError> {
+        let start = self.check(at, bytes.len() as i32, 0)?;
+        let data = self.memory.data_mut(&mut *self.caller);
+        data[start..start + bytes.len()].copy_from_slice(bytes);
+        Ok(())
+    }
+
+    /// Fill an OutBuf from a host-side byte slice (no sink involved).
+    pub fn write_out(
+        &mut self,
+        bytes: &[u8],
+        out: i32,
+        cap: i32,
+        len_out: i32,
+    ) -> Result<(), HostError> {
+        self.write_u32_at(len_out, bytes.len() as u32)?;
+        if bytes.len() > cap.max(0) as usize {
+            return Err(err(
+                ErrorCode::Limit,
+                format!("result is {} bytes, buffer holds {cap}", bytes.len()),
+            ));
+        }
+        let start = self.check(out, bytes.len() as i32, 0)?;
+        let data = self.memory.data_mut(&mut *self.caller);
+        data[start..start + bytes.len()].copy_from_slice(bytes);
+        Ok(())
+    }
+
+    /// Transfer ownership of `bytes` to the guest: allocate via pgh_alloc
+    /// (a guest re-entry - all raw pointers must be dead), copy the data
+    /// in, and write the {ptr, len} OwnedBuf struct at `owned_out`.
+    pub fn give_owned(
+        &mut self,
+        bytes: &[u8],
+        owned_out: i32,
+    ) -> Result<(), HostError> {
+        // Validate the out-struct location up front (offsets stay valid:
+        // growth never moves or shrinks memory).
+        self.check(owned_out, 8, 0)?;
+        let alloc = self
+            .caller
+            .get_export(exports::ALLOC)
+            .and_then(|e| e.into_func())
+            .ok_or_else(|| err(ErrorCode::Host, "no allocator export"))?
+            .typed::<i32, i32>(&*self.caller)
+            .map_err(|_| err(ErrorCode::Host, "bad allocator signature"))?;
+        let len = i32::try_from(bytes.len())
+            .map_err(|_| err(ErrorCode::Limit, "payload too large"))?;
+        let ptr = alloc
+            .call(&mut *self.caller, len)
+            .map_err(|e| err(ErrorCode::Host, format!("pgh_alloc: {e:#}")))?;
+        if ptr == 0 {
+            return Err(err(ErrorCode::Host, "guest allocator returned NULL"));
+        }
+        // Memory may have grown during the re-entry; re-derive the view.
+        let data = self.memory.data_mut(&mut *self.caller);
+        let start = ptr as usize;
+        let end = start
+            .checked_add(bytes.len())
+            .ok_or_else(|| err(ErrorCode::Host, "guest pointer overflow"))?;
+        if end > data.len() {
+            return Err(err(
+                ErrorCode::Host,
+                "guest allocator returned out-of-bounds pointer",
+            ));
+        }
+        data[start..end].copy_from_slice(bytes);
+        let at = owned_out as usize;
+        data[at..at + 4].copy_from_slice(&(ptr as u32).to_le_bytes());
+        data[at + 4..at + 8]
+            .copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Import registration: one typed wasm import per method.
+// ---------------------------------------------------------------------------
+
+/// Map a dispatch result to the i32 status return, recording the message.
+fn ret_i32(r: Result<(), HostError>) -> i32 {
+    match r {
+        Ok(()) => 0,
+        Err(e) => {
+            set_last_error(&e.message);
+            -e.code.as_num()
+        }
+    }
+}
+
+/// Map a dispatch result to an i64 value return (> 0) or -err.
+fn ret_i64(r: Result<i64, HostError>) -> i64 {
+    match r {
+        Ok(v) => v,
+        Err(e) => {
+            set_last_error(&e.message);
+            -i64::from(e.code.as_num())
+        }
+    }
+}
+
+/// Run a method body with a GuestMem over the caller.
+fn with_mem<T>(
+    caller: &mut Caller<'_, StoreData>,
+    f: impl FnOnce(&mut GuestMem<'_, '_>) -> Result<T, HostError>,
+) -> Result<T, HostError> {
+    let mut mem = GuestMem::new(caller)?;
+    f(&mut mem)
+}
+
 /// Register the `tmux` import namespace on a linker.
 fn register_imports(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
-    linker.func_wrap(
-        imports::MODULE,
-        imports::HOST_CALL,
-        |mut caller: Caller<'_, StoreData>,
-         req_ptr: i32,
-         req_len: i32,
-         out_ptr: i32,
-         out_len_ptr: i32|
-         -> i32 {
-            let request = match read_guest_bytes(&mut caller, req_ptr, req_len) {
-                Ok(b) => b,
-                Err(_) => return HOST_CALL_ABI_FAILURE,
-            };
+    use imports as im;
+    let m = im::MODULE;
 
-            let (status, response) = match dispatch::dispatch(caller.data(), &request) {
-                Ok(value) => (
-                    HOST_CALL_OK,
-                    serde_json::json!({ "ok": value }).to_string(),
-                ),
-                Err(err) => (
-                    HOST_CALL_ERR,
-                    serde_json::json!({ "err": err }).to_string(),
-                ),
-            };
+    linker.func_wrap(m, im::INTERN, |mut c: Caller<'_, StoreData>, ptr: i32, len: i32| -> i64 {
+        ret_i64(with_mem(&mut c, |mem| dispatch::intern(mem, ptr, len)))
+    })?;
 
-            // Apply subscription changes (dispatch cannot borrow the store
-            // data mutably while it also reads it; returns deltas instead).
-            dispatch::apply_pending_subscriptions(caller.data_mut());
+    linker.func_wrap(m, im::INTERN_NAME, |mut c: Caller<'_, StoreData>, id: i32, out: i32, cap: i32, len_out: i32| -> i32 {
+        ret_i32(with_mem(&mut c, |mem| dispatch::intern_name(mem, id, out, cap, len_out)))
+    })?;
 
-            match write_response(&mut caller, out_ptr, out_len_ptr, response.as_bytes()) {
-                Ok(()) => status,
-                Err(_) => HOST_CALL_ABI_FAILURE,
-            }
-        },
-    )?;
+    linker.func_wrap(m, im::SUBSCRIBE, |mut c: Caller<'_, StoreData>, id: i32| -> i32 {
+        ret_i32(with_mem(&mut c, |mem| dispatch::subscribe(mem, id, true)))
+    })?;
 
-    linker.func_wrap(
-        imports::MODULE,
-        imports::HOST_REQUEST,
-        |mut caller: Caller<'_, StoreData>, req_ptr: i32, req_len: i32| -> i64 {
-            let Ok(request) = read_guest_bytes(&mut caller, req_ptr, req_len)
-            else {
-                return -i64::from(ErrorCode::BadRequest.as_num());
-            };
-            match dispatch::dispatch_async(caller.data(), &request) {
-                Ok(token) => token as i64,
-                Err(e) => {
-                    let plugin = caller.data().plugin.clone();
-                    hostlog::debug(
-                        &plugin,
-                        &format!("host_request rejected: {}", e.message),
-                    );
-                    -i64::from(e.code.as_num())
-                }
-            }
-        },
-    )?;
+    linker.func_wrap(m, im::UNSUBSCRIBE, |mut c: Caller<'_, StoreData>, id: i32| -> i32 {
+        ret_i32(with_mem(&mut c, |mem| dispatch::subscribe(mem, id, false)))
+    })?;
 
-    linker.func_wrap(
-        imports::MODULE,
-        imports::HOST_LOG,
-        |mut caller: Caller<'_, StoreData>, level: i32, ptr: i32, len: i32| {
-            let Ok(bytes) = read_guest_bytes(&mut caller, ptr, len) else {
-                return;
-            };
-            let msg = String::from_utf8_lossy(&bytes).into_owned();
-            let plugin = caller.data().plugin.clone();
-            match level {
-                0 => hostlog::debug(&plugin, &msg),
-                1 => hostlog::info(&plugin, &msg),
-                2 => hostlog::warn(&plugin, &msg),
-                _ => hostlog::error(&plugin, &msg),
-            }
-        },
-    )?;
+    linker.func_wrap(m, im::LIST, |mut c: Caller<'_, StoreData>, kind: i32, owned_out: i32| -> i32 {
+        ret_i32(with_mem(&mut c, |mem| dispatch::list(mem, kind, owned_out)))
+    })?;
 
-    Ok(())
-}
+    linker.func_wrap(m, im::RESOLVE, |mut c: Caller<'_, StoreData>, kind: i32, id: i32, owned_out: i32| -> i32 {
+        ret_i32(with_mem(&mut c, |mem| dispatch::resolve(mem, kind, id, owned_out)))
+    })?;
 
-fn caller_memory(caller: &mut Caller<'_, StoreData>) -> Result<Memory, ()> {
-    caller
-        .get_export("memory")
-        .and_then(|e| e.into_memory())
-        .ok_or(())
-}
+    linker.func_wrap(m, im::SELF_INFO, |mut c: Caller<'_, StoreData>, out: i32| -> i32 {
+        ret_i32(with_mem(&mut c, |mem| dispatch::self_info(mem, out)))
+    })?;
 
-fn read_guest_bytes(
-    caller: &mut Caller<'_, StoreData>,
-    ptr: i32,
-    len: i32,
-) -> Result<Vec<u8>, ()> {
-    if ptr < 0 || len < 0 {
-        return Err(());
-    }
-    let memory = caller_memory(caller)?;
-    let data = memory.data(&caller);
-    let start = ptr as usize;
-    let end = start.checked_add(len as usize).ok_or(())?;
-    if end > data.len() {
-        return Err(());
-    }
-    Ok(data[start..end].to_vec())
-}
+    linker.func_wrap(m, im::GET_OPTION, |mut c: Caller<'_, StoreData>, kind: i32, id: i32, name_ptr: i32, name_len: i32, out: i32, cap: i32, len_out: i32| -> i32 {
+        ret_i32(with_mem(&mut c, |mem| {
+            dispatch::get_option(mem, kind, id, name_ptr, name_len, out, cap, len_out)
+        }))
+    })?;
 
-/// Allocate a response buffer in the guest (via its allocator), copy the
-/// payload in, and store {ptr,len} into the two out-slots. The guest frees
-/// the buffer after decoding.
-fn write_response(
-    caller: &mut Caller<'_, StoreData>,
-    out_ptr: i32,
-    out_len_ptr: i32,
-    payload: &[u8],
-) -> Result<(), ()> {
-    let alloc = caller
-        .get_export(exports::ALLOC)
-        .and_then(|e| e.into_func())
-        .ok_or(())?
-        .typed::<i32, i32>(&*caller)
-        .map_err(|_| ())?;
-    let len = i32::try_from(payload.len()).map_err(|_| ())?;
-    // Re-entrant guest call (allocator only); memory may grow/move, so the
-    // Memory handle is re-fetched afterwards and never cached.
-    let ptr = alloc.call(&mut *caller, len).map_err(|_| ())?;
-    if ptr == 0 {
-        return Err(());
-    }
+    linker.func_wrap(m, im::FORMAT_EXPAND, |mut c: Caller<'_, StoreData>, kind: i32, id: i32, fmt_ptr: i32, fmt_len: i32, out: i32, cap: i32, len_out: i32| -> i32 {
+        ret_i32(with_mem(&mut c, |mem| {
+            dispatch::format_expand(mem, kind, id, fmt_ptr, fmt_len, out, cap, len_out)
+        }))
+    })?;
 
-    let memory = caller_memory(caller)?;
-    let data = memory.data_mut(caller);
+    linker.func_wrap(m, im::SET_OPTION, |mut c: Caller<'_, StoreData>, kind: i32, id: i32, name_ptr: i32, name_len: i32, val_ptr: i32, val_len: i32| -> i32 {
+        ret_i32(with_mem(&mut c, |mem| {
+            dispatch::set_option(mem, kind, id, name_ptr, name_len, val_ptr, val_len)
+        }))
+    })?;
 
-    let start = ptr as usize;
-    let end = start.checked_add(payload.len()).ok_or(())?;
-    if end > data.len() {
-        return Err(());
-    }
-    data[start..end].copy_from_slice(payload);
+    linker.func_wrap(m, im::SEND_KEYS, |mut c: Caller<'_, StoreData>, pane: i32, keys_ptr: i32, keys_len: i32, literal: i32| -> i32 {
+        ret_i32(with_mem(&mut c, |mem| {
+            dispatch::send_keys(mem, pane, keys_ptr, keys_len, literal)
+        }))
+    })?;
 
-    for (slot, value) in [(out_ptr, ptr), (out_len_ptr, len)] {
-        let s = slot as usize;
-        let e = s.checked_add(4).ok_or(())?;
-        if slot < 0 || e > data.len() {
-            return Err(());
+    linker.func_wrap(m, im::CAPTURE_PANE, |mut c: Caller<'_, StoreData>, pane: i32, start: i32, end: i32, escapes: i32, out: i32, cap: i32, len_out: i32| -> i32 {
+        ret_i32(with_mem(&mut c, |mem| {
+            dispatch::capture_pane(mem, pane, start, end, escapes, out, cap, len_out)
+        }))
+    })?;
+
+    linker.func_wrap(m, im::DISPLAY_MESSAGE, |mut c: Caller<'_, StoreData>, client: i32, msg_ptr: i32, msg_len: i32| -> i32 {
+        ret_i32(with_mem(&mut c, |mem| {
+            dispatch::display_message(mem, client, msg_ptr, msg_len)
+        }))
+    })?;
+
+    linker.func_wrap(m, im::TIMER_CANCEL, |mut c: Caller<'_, StoreData>, token: i64| -> i32 {
+        ret_i32(with_mem(&mut c, |mem| dispatch::timer_cancel(mem, token)))
+    })?;
+
+    linker.func_wrap(m, im::MODE_OPEN, |mut c: Caller<'_, StoreData>, window: i32, width: i32, height: i32, x: i32, y: i32, title_ptr: i32, title_len: i32| -> i64 {
+        ret_i64(with_mem(&mut c, |mem| {
+            dispatch::mode_open(mem, window, width, height, x, y, title_ptr, title_len)
+        }))
+    })?;
+
+    linker.func_wrap(m, im::MODE_WRITE, |mut c: Caller<'_, StoreData>, mode: i64, ptr: i32, len: i32| -> i32 {
+        ret_i32(with_mem(&mut c, |mem| dispatch::mode_write(mem, mode, ptr, len)))
+    })?;
+
+    linker.func_wrap(m, im::MODE_PREVIEW, |mut c: Caller<'_, StoreData>, mode: i64, pane: i64, x: i32, y: i32, w: i32, h: i32| -> i32 {
+        ret_i32(with_mem(&mut c, |mem| {
+            dispatch::mode_preview(mem, mode, pane, x, y, w, h)
+        }))
+    })?;
+
+    linker.func_wrap(m, im::MODE_MOVE, |mut c: Caller<'_, StoreData>, mode: i64, window: i32, x: i32, y: i32| -> i32 {
+        ret_i32(with_mem(&mut c, |mem| dispatch::mode_move(mem, mode, window, x, y)))
+    })?;
+
+    linker.func_wrap(m, im::MODE_CLOSE, |mut c: Caller<'_, StoreData>, mode: i64| -> i32 {
+        ret_i32(with_mem(&mut c, |mem| dispatch::mode_close(mem, mode)))
+    })?;
+
+    linker.func_wrap(m, im::LAST_ERROR, |mut c: Caller<'_, StoreData>, out: i32, cap: i32, len_out: i32| -> i32 {
+        let msg = last_error();
+        ret_i32(with_mem(&mut c, |mem| {
+            mem.write_out(msg.as_bytes(), out, cap, len_out)
+        }))
+    })?;
+
+    linker.func_wrap(m, im::LOG, |mut c: Caller<'_, StoreData>, level: i32, ptr: i32, len: i32| {
+        let Ok(bytes) = with_mem(&mut c, |mem| mem.read(ptr, len)) else {
+            return;
+        };
+        let msg = String::from_utf8_lossy(&bytes).into_owned();
+        let plugin = c.data().plugin.clone();
+        match level {
+            0 => hostlog::debug(&plugin, &msg),
+            1 => hostlog::info(&plugin, &msg),
+            2 => hostlog::warn(&plugin, &msg),
+            _ => hostlog::error(&plugin, &msg),
         }
-        data[s..e].copy_from_slice(&value.to_le_bytes());
-    }
+    })?;
+
+    linker.func_wrap(m, im::RUN_JOB, |mut c: Caller<'_, StoreData>, cmd_ptr: i32, cmd_len: i32, cwd_ptr: i32, cwd_len: i32| -> i64 {
+        ret_i64(with_mem(&mut c, |mem| {
+            dispatch::run_job(mem, cmd_ptr, cmd_len, cwd_ptr, cwd_len)
+        }))
+    })?;
+
+    linker.func_wrap(m, im::RUN_COMMAND, |mut c: Caller<'_, StoreData>, cmd_ptr: i32, cmd_len: i32| -> i64 {
+        ret_i64(with_mem(&mut c, |mem| dispatch::run_command(mem, cmd_ptr, cmd_len)))
+    })?;
+
+    linker.func_wrap(m, im::TIMER_START, |mut c: Caller<'_, StoreData>, ms: i64| -> i64 {
+        ret_i64(with_mem(&mut c, |mem| dispatch::timer_start(mem, ms)))
+    })?;
+
+    linker.func_wrap(m, im::FS_WRITE, |mut c: Caller<'_, StoreData>, path_ptr: i32, path_len: i32, data_ptr: i32, data_len: i32, append: i32| -> i64 {
+        ret_i64(with_mem(&mut c, |mem| {
+            dispatch::fs_write_async(mem, path_ptr, path_len, data_ptr, data_len, append)
+        }))
+    })?;
+
+    linker.func_wrap(m, im::FS_READ, |mut c: Caller<'_, StoreData>, path_ptr: i32, path_len: i32, offset: i64, out_ptr: i32, out_cap: i32| -> i64 {
+        ret_i64(with_mem(&mut c, |mem| {
+            dispatch::fs_read_async(mem, path_ptr, path_len, offset, out_ptr, out_cap)
+        }))
+    })?;
+
+    linker.func_wrap(m, im::FS_WRITE_SYNC, |mut c: Caller<'_, StoreData>, path_ptr: i32, path_len: i32, data_ptr: i32, data_len: i32, append: i32| -> i64 {
+        ret_i64(with_mem(&mut c, |mem| {
+            dispatch::fs_write_sync(mem, path_ptr, path_len, data_ptr, data_len, append)
+        }))
+    })?;
+
+    linker.func_wrap(m, im::FS_ROOT, |mut c: Caller<'_, StoreData>, out: i32, cap: i32, len_out: i32| -> i32 {
+        ret_i32(with_mem(&mut c, |mem| dispatch::fs_root(mem, out, cap, len_out)))
+    })?;
+
+    linker.func_wrap(m, im::FS_READ_SYNC, |mut c: Caller<'_, StoreData>, path_ptr: i32, path_len: i32, offset: i64, out: i32, cap: i32, len_out: i32, eof_out: i32| -> i32 {
+        ret_i32(with_mem(&mut c, |mem| {
+            dispatch::fs_read_sync(mem, path_ptr, path_len, offset, out, cap, len_out, eof_out)
+        }))
+    })?;
+
     Ok(())
 }

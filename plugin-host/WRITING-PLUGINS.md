@@ -180,8 +180,8 @@ impl Plugin for MyPlugin {
 
 ### Config
 
-`load-plugin -o key=value -o other=x` becomes `{"key":"value","other":"x"}`
-— **all values are JSON strings** (a bare `-o flag` becomes `true`). So
+`load-plugin -o key=value -o other=x` reaches your `Config` with **all
+values as strings** (a bare `-o flag` becomes `true`). So
 model config as `Option<String>` fields and parse numbers yourself:
 
 ```rust
@@ -204,19 +204,29 @@ instantiation:
   automatically when the object appears and destroyed when it dies; it only
   receives events touching its object, and may only *act on* its own
   object (window scope: its panes; session scope: its windows/panes).
-  Find your own identity with `host_call("self", json!({}))` or the ids in
-  incoming events.
+  Find your own identity with `self_info()` (scope kind + id +
+  generation) or the ids in incoming events.
 
 Each instance is fully isolated: own wasm memory, own state, own budget.
 
 ## Events
 
+Events cross the ABI as binary buffers (interned name id + scope ids +
+a flat field block); the SDK wraps them:
+
 ```rust
 pub struct Event {
-    pub event: String,        // e.g. "pane-focus-in"
+    pub id: u32,              // interned event name id
     pub seq: u64,
     pub scope: EventScope,    // Option<u32> ids: client/session/window/pane
-    pub data: serde_json::Value, // names: session_name, window_name, ...
+}
+impl Event {
+    fn name(&self) -> String;              // "pane-focus-in" (cached lookup)
+    fn is(&self, name: &str) -> bool;      // integer compare after one intern
+    fn get_str(&self, key: &str) -> Option<&str>;   // session_name, text, ...
+    fn get_i64(&self, key: &str) -> Option<i64>;    // window_index, ...
+    fn get_bool(&self, key: &str) -> Option<bool>;
+    fn iter(&self) -> impl Iterator<Item = (String, ValueRef)>;
 }
 ```
 
@@ -231,18 +241,19 @@ events appear here automatically). The vocabulary as of next-3.8:
 `window-layout-changed`, `window-pane-changed`, `window-closed`,
 `window-zoomed`, `window-unzoomed`, `session-renamed`,
 `session-window-changed`, `pane-focus-in`, `pane-focus-out`, `pane-exited`
-(with `exit_status`/`exit_signal`/`exit_success` in data), `pane-died`,
+(with `exit_status`/`exit_signal`/`exit_success` fields), `pane-died`,
 `pane-mode-changed`, `pane-title-changed`, `pane-set-clipboard`,
 `pane-moved`, `pane-resized`, `pane-activity`, `pane-bell`,
 `marked-pane-changed`, `client-attached`, `client-detached`,
 `client-closed`, `client-resized`, `client-active`,
 `client-session-changed`, `client-focus-in`, `client-focus-out`,
 `client-dark-theme`, `client-light-theme`, `paste-buffer-changed`,
-`paste-buffer-deleted` (buffer name as `data.paste_buffer`),
+`paste-buffer-deleted` (buffer name in the `paste_buffer` field),
 `alert-activity`, `alert-bell`, `alert-silence`.
 
 Extra payload fields tmux attaches to an event (e.g. `window_index`,
-`old_pane`, `exit_status`) are forwarded verbatim in `event.data`.
+`old_pane`, `exit_status`) are forwarded as fields: `event.get_i64(...)` /
+`event.get_str(...)`.
 
 Shell-integration events (from escape sequences a program emits inside a
 pane; scope carries the pane and its window):
@@ -251,16 +262,16 @@ pane; scope carries the pane and its window):
   finished). Enable by making the shell emit the mark, e.g. in ~/.bashrc:
   `PROMPT_COMMAND='printf "\e]133;A\a"'"${PROMPT_COMMAND:+;$PROMPT_COMMAND}"`
 - `pane-command-started` / `pane-command-finished` — OSC `133;B/C/D`, with
-  `command_status`, `command_start_time` and `command_duration` in data.
+  `command_status`, `command_start_time` and `command_duration` fields.
 - `pane-notification` — OSC `9;message` (iTerm2 style; `9;4;...` progress
   reports are excluded) or OSC `777;notify;title;body` (rxvt style). The
-  message arrives as `event.data["text"]` (`title: body` for 777). Handy
+  message arrives as `event.get_str("text")` (`title: body` for 777). Handy
   for agents/build scripts: `printf '\e]9;done\a'` from any pane, however
   deeply nested (ssh, make, ...), reaches a subscribed plugin.
 - `plugin-command` — sent by the `plugin-command <plugin> <command>` tmux
   command, so users can wire key bindings to your plugin (e.g. `bind N
   plugin-command notify_toast chooser`). Targeted: only the named plugin
-  receives it. Subscribe to it, match `event.data["text"]`, and use the
+  receives it. Subscribe to it, match `event.get_str("text")`, and use the
   scope (the `-t` target's pane/window/session) to know where to act.
 
   Chooser keys: keys unhandled by choose-tree (`prefix w` / `prefix s`),
@@ -291,23 +302,32 @@ Sync (return immediately):
 
 ```rust
 subscribe(&["event", ...]) / unsubscribe(&[...])        -> Result<(), HostError>
-list_sessions() / list_windows() / list_panes() / list_clients()
-                                                        -> Result<Value, HostError>
+list_sessions()  -> Result<Vec<SessionInfo>, HostError>
+list_windows()   -> Result<Vec<WindowInfo>, HostError>
+list_panes()     -> Result<Vec<PaneInfo>, HostError>
+list_clients()   -> Result<Vec<ClientInfo>, HostError>
 send_text(pane: PaneId, text: &str)                     // literal keystrokes
 send_key(pane: PaneId, key: &str)                       // "Enter", "C-c", "M-x"
 capture_pane(pane, start: Option<i32>, end: Option<i32>) -> Result<String, _>
-    // rows relative to visible top; negative = history; caps: 2000 lines/256 KiB
-resolve_pane(PaneId) -> Result<Value, _>    // {id, window, width, height,
-                                            //  active, floating, dead, cwd?, shell?}
-resolve_window(WindowId) -> Result<Value, _> // {id, name, width, height,
-                                            //  sessions, panes, active_pane?}
-resolve_session(SessionId) -> Result<Value, _> // {id, name, attached,
-                                            //  current_window?, windows}
+capture_pane_into(pane, start, end, escapes: bool, &mut Vec<u8>) // reusable buf
+    // rows relative to visible top; negative = history; ≤2000 lines/call
+resolve_pane(PaneId) -> Result<PaneInfo, _>      // id, window, size, active,
+                                                 // floating, dead, title/shell/
+                                                 // cwd ("" = absent)
+resolve_window(WindowId) -> Result<WindowInfo, _>   // + sessions, panes (in
+                                                    // window order), active_pane
+resolve_session(SessionId) -> Result<SessionInfo, _> // + windows [(idx, id)]
+self_info() -> Result<SelfInfo, _>               // scope kind/id + generation
 get_option(name: &str) -> Result<String, _>             // any option
 set_option(name: &str, value: &str)                     // @-options only
+format_expand(target, "#{window_layout} ...") -> Result<String, _>
+    // any #{...} format against a scope; #() jobs disabled
 display_message(msg: &str)                              // status line + log
 log(msg: &str)                                          // plugin-log only
-host_call(method, params) -> Result<Value, HostError>   // raw escape hatch
+intern(name) -> u32 / intern_name(id) -> Option<String> // event/key name ids
+fs_root() -> Result<String, _>       // the plugin's private data dir
+fs_write_sync(path, data, append) / fs_read_sync(path, offset, &mut buf)
+    // small files; paths relative to fs_root; caps fs-write / fs-read
 
 // UI modes (capability: mode) — see the "UI modes" section
 mode_open(&ModeOpts { window?, width, height, x?, y?, title? })
@@ -326,6 +346,8 @@ sleep_ms(ms: u64).await
 run_job("shell command", cwd: Option<&str>).await
     -> Result<JobOutput { status, signalled, output }, HostError>
 run_command("any tmux command string").await            // via command queue
+fs_write(path, data: Vec<u8>, append).await -> bytes    // fs worker thread,
+fs_read(path, offset, capacity).await -> (Vec<u8>, eof) // zero-copy, ≤256 KiB
 ```
 
 Async tasks are spawned with `ctx.spawn(async move { ... })` in `init` (or
@@ -418,13 +440,14 @@ mode_preview(mode, Some(&PreviewRect { pane: PaneId(5), x: 30, y: 0, w: 29, h: 1
 
 Events arrive through the normal `on_event`, targeted at your instance
 only (no subscription needed); match them by the mode id in
-`event.data["mode"]`:
+the `mode` field (`event.get_i64("mode")`):
 
-- `mode-key`: `data.key` is a tmux key name ("q", "Enter", "Escape",
-  "Down", "MouseDown1Pane", ...); mouse keys add `data.mouse.{x,y,b}`
+- `mode-key`: `get_str("key")` is a tmux key name ("q", "Enter", "Escape",
+  "Down", "MouseDown1Pane", ...); mouse keys add `mouse_x`/`mouse_y`/
+  `mouse_b` fields
   with pane-relative cell coordinates.
-- `mode-resize`: `data.width`/`data.height` — redraw at the new size.
-- `mode-closed`: terminal, with `data.reason` `"closed"` (your
+- `mode-resize`: `get_i64("width")`/`get_i64("height")` — redraw.
+- `mode-closed`: terminal, with `get_str("reason")` `"closed"` (your
   `mode_close`) or `"killed"` (user killed the pane, reload, window
   died). Drop your state for the mode; the id is dead.
 

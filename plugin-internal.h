@@ -29,10 +29,37 @@
 /* Hard cap on lines emitted by a single capture_pane call. */
 #define PLUGIN_CAPTURE_MAX_LINES 2000
 
+/*
+ * Cap on job output bytes carried in one async completion (mirrors
+ * abi-types MAX_JOB_OUTPUT_BYTES; keep in sync).
+ */
+#define PLUGIN_JOB_OUTPUT_MAX (256 * 1024)
+
+/* plugin-buf.c: binary emitters for the ABI wire formats. */
+struct plugin_buf;
+struct plugin_buf *plugin_buf_create(void);
+void	 plugin_buf_free(struct plugin_buf *);
+void	 plugin_buf_u8(struct plugin_buf *, uint8_t);
+void	 plugin_buf_u32(struct plugin_buf *, uint32_t);
+void	 plugin_buf_u64(struct plugin_buf *, uint64_t);
+void	 plugin_buf_str(struct plugin_buf *, const char *);
+const u_char *plugin_buf_data(struct plugin_buf *, size_t *);
+struct plugin_buf *plugin_event_create(const char *);
+void	 plugin_event_scope(struct plugin_buf *, int, uint32_t);
+int	 plugin_event_scope_set(struct plugin_buf *, int);
+void	 plugin_event_str(struct plugin_buf *, const char *, const char *);
+void	 plugin_event_i64(struct plugin_buf *, const char *, long long);
+void	 plugin_event_bool(struct plugin_buf *, const char *, int);
+void	 plugin_event_send(struct plugin_buf *);
+void	 plugin_event_send_mode(struct plugin_buf *, uint64_t);
+
 /* plugin-vtable.c */
 void	 plugin_vtable_log(int, const char *, const char *);
 void	 plugin_vtable_list_objects(int, pgh_sink, void *);
 int	 plugin_vtable_resolve_object(int, u_int, pgh_sink, void *);
+int64_t	 plugin_vtable_obj_relation(int, u_int, u_int);
+int	 plugin_vtable_format_expand(int, u_int, const char *, pgh_sink,
+	     void *);
 int	 plugin_vtable_send_keys(u_int, const char *, int);
 int	 plugin_vtable_capture_pane(u_int, int, int, int, pgh_sink, void *);
 int	 plugin_vtable_get_option(int, u_int, const char *, pgh_sink, void *);
@@ -57,7 +84,6 @@ int	 plugin_vtable_mode_preview(uint64_t, int64_t, u_int, u_int, u_int,
 int	 plugin_vtable_mode_close(uint64_t);
 int	 plugin_vtable_mode_move(uint64_t, u_int, int, int);
 int	 plugin_mode_pending_take(uint64_t *);
-void	 plugin_mode_event(uint64_t, const char *, const char *);
 void	 plugin_mode_unregister(uint64_t);
 void	 plugin_mode_shutdown(void);
 

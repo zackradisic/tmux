@@ -1,284 +1,167 @@
-//! host_call method dispatch: the single choke point every guest request
-//! passes through. Capability and scope checks (M7) live here, before any
-//! vtable pointer is touched.
+//! Per-method host import implementations: every guest call lands in one
+//! typed function here. Capability and scope checks happen at the top of
+//! each method, before any vtable pointer is touched.
 //!
 //! Runs while the guest instance is checked out of the registry, so it may
-//! only use the vtable and the caller's StoreData - never the registry.
-//! Vtable calls may re-enter pgh_notify (enqueue-only); that touches the
-//! EVENTS cell only, which is safe here.
+//! only use the vtable and the caller's StoreData (via GuestMem) - never
+//! the registry. Vtable calls may re-enter pgh_notify / pgh_async_complete
+//! / pgh_mode_event (enqueue-only); that touches the EVENTS cell only,
+//! which is safe here.
+//!
+//! Zero-copy rules: string arguments are validated in place (bounds + NUL
+//! at data[len]) and passed to C as raw pointers into linear memory -
+//! valid because the guest is frozen for the duration of the call and the
+//! only re-entry (give_owned's pgh_alloc) happens after every raw pointer
+//! is dead. OutBuf results are written directly into guest memory by the
+//! C sink.
 
-use std::cell::RefCell;
 use std::ffi::c_void;
-use std::os::raw::c_char;
 
-use serde::Deserialize;
-use serde_json::{json, Value};
-use tmux_plugin_abi::{ErrorCode, HostError, HostRequest};
+use tmux_plugin_abi::{
+    ErrorCode, SelfInfo, KIND_CLIENT, KIND_PANE, KIND_SERVER, KIND_SESSION,
+    KIND_WINDOW, MAX_TRANSFER_BYTES,
+};
 
-use crate::abi::StoreData;
-use crate::ffi::{PGH_OBJ_CLIENT, PGH_OBJ_PANE, PGH_OBJ_SESSION, PGH_OBJ_WINDOW};
+use crate::abi::{collect_sink, err, out_sink, GuestMem, HostError};
+use crate::ffi::{
+    pgh_host_vtable, PGH_REL_PANE_IN_SESSION, PGH_REL_PANE_IN_WINDOW,
+    PGH_REL_PANE_WINDOW, PGH_REL_SESSION_CURWIN, PGH_REL_WINDOW_IN_SESSION,
+};
+use crate::intern as interner;
+use crate::registry::ScopeId;
 
-/// Subscription changes requested during a dispatch; applied to StoreData
-/// right after (dispatch itself only has a shared borrow).
-enum SubDelta {
-    Add(Vec<String>),
-    Remove(Vec<String>),
-}
-
-thread_local! {
-    static PENDING_SUBS: RefCell<Vec<SubDelta>> = const { RefCell::new(Vec::new()) };
-}
-
-pub fn apply_pending_subscriptions(data: &mut StoreData) {
-    PENDING_SUBS.with(|p| {
-        for delta in p.borrow_mut().drain(..) {
-            match delta {
-                SubDelta::Add(events) => {
-                    for e in events {
-                        data.subscriptions.insert(e);
-                    }
-                }
-                SubDelta::Remove(events) => {
-                    for e in events {
-                        data.subscriptions.remove(&e);
-                    }
-                }
-            }
-        }
-    });
-}
-
-fn err(code: ErrorCode, message: impl Into<String>) -> HostError {
-    HostError { code, message: message.into(), data: Value::Null }
-}
-
-fn cstring(s: &str) -> Result<std::ffi::CString, HostError> {
-    std::ffi::CString::new(s)
-        .map_err(|_| err(ErrorCode::BadRequest, "embedded NUL in string"))
-}
-
-/// Option scope selector: {"type": "server"} (default) or
-/// {"type": "session"|"window"|"pane", "id": n}.
-#[derive(Deserialize)]
-struct OptionScope {
-    #[serde(rename = "type", default = "default_scope_type")]
-    scope_type: String,
-    #[serde(default)]
-    id: Option<u32>,
-}
-
-fn default_scope_type() -> String {
-    "server".into()
-}
-
-impl Default for OptionScope {
-    fn default() -> Self {
-        Self { scope_type: default_scope_type(), id: None }
-    }
-}
-
-impl OptionScope {
-    fn to_kind(&self) -> Result<(i32, u32), HostError> {
-        if self.scope_type == "server" {
-            return Ok((-1, 0));
-        }
-        let id = self.id.ok_or_else(|| {
-            err(ErrorCode::BadRequest, "scope requires an id")
-        })?;
-        Ok((kind_from_str(&self.scope_type)?, id))
-    }
-}
-
-/// Collect sink: appends vtable string output into a Vec<u8>.
-unsafe extern "C" fn collect_sink(ctx: *mut c_void, ptr: *const c_char, len: usize) {
-    let buf = &mut *(ctx as *mut Vec<u8>);
-    buf.extend_from_slice(std::slice::from_raw_parts(ptr as *const u8, len));
-}
-
-fn vtable() -> Result<&'static crate::ffi::pgh_host_vtable, HostError> {
+fn vtable() -> Result<&'static pgh_host_vtable, HostError> {
     crate::vtable().ok_or_else(|| err(ErrorCode::Host, "host vtable unavailable"))
 }
 
-fn list_objects(kind: i32) -> Result<Value, HostError> {
-    let vt = vtable()?;
-    let mut buf: Vec<u8> = Vec::new();
-    unsafe {
-        (vt.list_objects)(kind, collect_sink, &mut buf as *mut Vec<u8> as *mut c_void)
-    };
-    serde_json::from_str(&String::from_utf8_lossy(&buf))
-        .map_err(|e| err(ErrorCode::Host, format!("bad vtable JSON: {e}")))
-}
-
-fn resolve_object(kind: i32, id: u32) -> Result<Value, HostError> {
-    let vt = vtable()?;
-    let mut buf: Vec<u8> = Vec::new();
-    let rc = unsafe {
-        (vt.resolve_object)(kind, id, collect_sink, &mut buf as *mut Vec<u8> as *mut c_void)
-    };
-    if rc != 0 {
-        return Err(err(ErrorCode::NoSuchObject, format!("no such object id {id}")));
-    }
-    serde_json::from_str(&String::from_utf8_lossy(&buf))
-        .map_err(|e| err(ErrorCode::Host, format!("bad vtable JSON: {e}")))
-}
-
-fn kind_from_str(kind: &str) -> Result<i32, HostError> {
-    match kind {
-        "session" => Ok(PGH_OBJ_SESSION),
-        "window" => Ok(PGH_OBJ_WINDOW),
-        "pane" => Ok(PGH_OBJ_PANE),
-        "client" => Ok(PGH_OBJ_CLIENT),
-        other => Err(err(ErrorCode::BadRequest, format!("bad object kind {other:?}"))),
-    }
-}
-
-fn params<T: for<'de> Deserialize<'de>>(value: Value) -> Result<T, HostError> {
-    serde_json::from_value(value)
-        .map_err(|e| err(ErrorCode::BadRequest, format!("bad params: {e}")))
-}
-
-/// The capability a method needs (single choke point; 0 = none).
-fn required_cap(method: &str) -> u32 {
-    use crate::caps::*;
-    match method {
-        "subscribe" | "unsubscribe" | "self" | "resolve" | "list_sessions"
-        | "list_windows" | "list_panes" | "list_clients" | "get_option" => READ_STATE,
-        "set_option" => WRITE_OPTIONS,
-        "send_keys" => SEND_KEYS,
-        "capture_pane" => CAPTURE_PANE,
-        "display_message" => DISPLAY_MESSAGE,
-        "timer_start" | "timer_cancel" => TIMERS,
-        "run_job" => RUN_PROCESS,
-        "run_command" => RUN_COMMAND,
-        "mode_open" | "mode_write" | "mode_preview" | "mode_close"
-        | "mode_move" => MODE,
-        _ => 0,
-    }
-}
-
-fn check_cap(data: &StoreData, method: &str) -> Result<(), HostError> {
-    let needed = required_cap(method);
-    if needed != 0 && !data.caps.has(needed) {
+fn check_cap(mem: &GuestMem<'_, '_>, flag: u32) -> Result<(), HostError> {
+    if !mem.data().caps.has(flag) {
         return Err(err(
             ErrorCode::CapDenied,
             format!(
-                "capability {:?} not granted (method {method:?})",
-                crate::caps::cap_name(needed)
+                "capability {:?} not granted",
+                crate::caps::cap_name(flag)
             ),
         ));
     }
     Ok(())
 }
 
-/// Scope-implied targeting: may this instance touch pane `pane_id`?
-/// Pane-scoped instances may touch only their own pane; window-scoped their
-/// window's panes; session-scoped panes in windows linked to their session;
-/// server-scoped (or CROSS_SCOPE) may touch anything.
-fn check_pane_target(data: &StoreData, pane_id: u32) -> Result<(), HostError> {
-    use crate::registry::ScopeId;
+fn check_kind(kind: i32) -> Result<(), HostError> {
+    match kind {
+        KIND_SERVER | KIND_SESSION | KIND_WINDOW | KIND_PANE | KIND_CLIENT => {
+            Ok(())
+        }
+        other => Err(err(ErrorCode::BadRequest, format!("bad kind {other}"))),
+    }
+}
 
+fn pane_id(pane: i32) -> Result<u32, HostError> {
+    if pane < 0 {
+        return Err(err(ErrorCode::BadRequest, "negative pane id"));
+    }
+    Ok(pane as u32)
+}
+
+/// Scope-implied targeting: may this instance touch pane `pane`?
+/// Pane-scoped instances may touch only their own pane; window-scoped
+/// their window's panes; session-scoped panes in windows linked to their
+/// session; server-scoped (or CROSS_SCOPE) may touch anything.
+fn check_pane_target(mem: &GuestMem<'_, '_>, pane: u32) -> Result<(), HostError> {
+    let data = mem.data();
     if data.caps.has(crate::caps::CROSS_SCOPE) {
         return Ok(());
     }
-    let out_of_scope = |msg: String| err(ErrorCode::OutOfScope, msg);
+    let relation = |rel: i32, a: u32, b: u32| -> Result<i64, HostError> {
+        let vt = vtable()?;
+        Ok(unsafe { (vt.obj_relation)(rel, a, b) })
+    };
+    let denied = |what: String| Err(err(ErrorCode::OutOfScope, what));
 
     match data.scope {
         ScopeId::Server => Ok(()),
-        ScopeId::Pane(own) => {
-            if own == pane_id {
-                Ok(())
-            } else {
-                Err(out_of_scope(format!(
-                    "pane-scoped instance %{own} may not target pane %{pane_id}"
-                )))
-            }
-        }
+        ScopeId::Pane(own) if own == pane => Ok(()),
+        ScopeId::Pane(own) => denied(format!(
+            "pane-scoped instance %{own} may not target pane %{pane}"
+        )),
         ScopeId::Window(own) => {
-            let info = resolve_object(PGH_OBJ_PANE, pane_id)?;
-            let window = info.get("window").and_then(Value::as_u64);
-            if window == Some(u64::from(own)) {
-                Ok(())
-            } else {
-                Err(out_of_scope(format!(
-                    "window-scoped instance @{own} may not target pane %{pane_id}"
-                )))
+            match relation(PGH_REL_PANE_IN_WINDOW, pane, own)? {
+                1 => Ok(()),
+                -1 => Err(err(
+                    ErrorCode::NoSuchObject,
+                    format!("no such pane %{pane}"),
+                )),
+                _ => denied(format!(
+                    "window-scoped instance @{own} may not target pane %{pane}"
+                )),
             }
         }
         ScopeId::Session(own) => {
-            let info = resolve_object(PGH_OBJ_PANE, pane_id)?;
-            let window = info
-                .get("window")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| err(ErrorCode::Host, "pane without window"))?;
-            let winfo = resolve_object(PGH_OBJ_WINDOW, window as u32)?;
-            let linked = winfo
-                .get("sessions")
-                .and_then(Value::as_array)
-                .is_some_and(|a| {
-                    a.iter().any(|v| v.as_u64() == Some(u64::from(own)))
-                });
-            if linked {
-                Ok(())
-            } else {
-                Err(out_of_scope(format!(
-                    "session-scoped instance ${own} may not target pane %{pane_id}"
-                )))
+            match relation(PGH_REL_PANE_IN_SESSION, pane, own)? {
+                1 => Ok(()),
+                -1 => Err(err(
+                    ErrorCode::NoSuchObject,
+                    format!("no such pane %{pane}"),
+                )),
+                _ => denied(format!(
+                    "session-scoped instance ${own} may not target pane %{pane}"
+                )),
             }
         }
     }
 }
 
-/// Resolve the window a mode_open targets, scope-implied: pane/window
-/// scope may only open in their own window (and may omit the param);
-/// session scope in windows linked to their session (default: the
-/// session's current window); server scope anywhere (param required).
-/// CROSS_SCOPE relaxes the checks but not the defaults.
+/// Resolve the window a mode_open/mode_move targets, scope-implied (see
+/// ABI.md). `requested` < 0 means "default".
 fn mode_target_window(
-    data: &StoreData,
-    requested: Option<u32>,
+    mem: &GuestMem<'_, '_>,
+    requested: i32,
 ) -> Result<u32, HostError> {
-    use crate::registry::ScopeId;
-
+    let data = mem.data();
     let cross = data.caps.has(crate::caps::CROSS_SCOPE);
-    let out_of_scope = |msg: String| err(ErrorCode::OutOfScope, msg);
+    let requested: Option<u32> =
+        if requested < 0 { None } else { Some(requested as u32) };
+    let relation = |rel: i32, a: u32, b: u32| -> Result<i64, HostError> {
+        let vt = vtable()?;
+        Ok(unsafe { (vt.obj_relation)(rel, a, b) })
+    };
+    let denied = |what: String| Err(err(ErrorCode::OutOfScope, what));
 
-    let own_window = match data.scope {
+    let own_window: Option<u32> = match data.scope {
         ScopeId::Server => None,
         ScopeId::Window(own) => Some(own),
-        ScopeId::Pane(own) => {
-            let info = resolve_object(PGH_OBJ_PANE, own)?;
-            Some(
-                info.get("window")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| err(ErrorCode::Host, "pane without window"))?
-                    as u32,
-            )
-        }
+        ScopeId::Pane(own) => match relation(PGH_REL_PANE_WINDOW, own, 0)? {
+            id if id >= 0 => Some(id as u32),
+            _ => {
+                return Err(err(ErrorCode::NoSuchObject, "own pane is gone"))
+            }
+        },
         ScopeId::Session(own) => match requested {
             // Default: the session's current window.
-            None => {
-                let info = resolve_object(PGH_OBJ_SESSION, own)?;
-                Some(
-                    info.get("current_window")
-                        .and_then(Value::as_u64)
-                        .ok_or_else(|| {
-                            err(ErrorCode::NoSuchObject, "session has no current window")
-                        })? as u32,
-                )
-            }
+            None => match relation(PGH_REL_SESSION_CURWIN, own, 0)? {
+                id if id >= 0 => Some(id as u32),
+                _ => {
+                    return Err(err(
+                        ErrorCode::NoSuchObject,
+                        "session has no current window",
+                    ))
+                }
+            },
             Some(window) => {
                 if !cross {
-                    let winfo = resolve_object(PGH_OBJ_WINDOW, window)?;
-                    let linked = winfo
-                        .get("sessions")
-                        .and_then(Value::as_array)
-                        .is_some_and(|a| {
-                            a.iter().any(|v| v.as_u64() == Some(u64::from(own)))
-                        });
-                    if !linked {
-                        return Err(out_of_scope(format!(
-                            "session-scoped instance ${own} may not open a mode in window @{window}"
-                        )));
+                    match relation(PGH_REL_WINDOW_IN_SESSION, window, own)? {
+                        1 => {}
+                        -1 => {
+                            return Err(err(
+                                ErrorCode::NoSuchObject,
+                                format!("no such window @{window}"),
+                            ))
+                        }
+                        _ => {
+                            return denied(format!(
+                                "session-scoped instance ${own} may not open a mode in window @{window}"
+                            ))
+                        }
                     }
                 }
                 return Ok(window);
@@ -289,637 +172,725 @@ fn mode_target_window(
     match (own_window, requested) {
         (Some(own), None) => Ok(own),
         (Some(own), Some(req)) if req == own || cross => Ok(req),
-        (Some(own), Some(req)) => Err(out_of_scope(format!(
+        (Some(own), Some(req)) => denied(format!(
             "instance scoped to window @{own} may not open a mode in window @{req}"
-        ))),
+        )),
         (None, Some(req)) => Ok(req),
         (None, None) => Err(err(
             ErrorCode::BadRequest,
-            "server-scoped mode_open requires a window",
+            "server-scoped mode targeting requires a window",
         )),
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::caps::EffectiveCaps;
-    use crate::registry::ScopeId;
+// ---------------------------------------------------------------------------
+// Interning and subscriptions.
+// ---------------------------------------------------------------------------
 
-    /// xorshift64: deterministic, dependency-free byte soup.
-    struct Rng(u64);
-    impl Rng {
-        fn next(&mut self) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0
-        }
+pub fn intern(
+    mem: &mut GuestMem<'_, '_>,
+    ptr: i32,
+    len: i32,
+) -> Result<i64, HostError> {
+    // Host-consumed only (never crosses into C), so this is raw UTF-8
+    // bytes with no NUL convention.
+    let bytes = mem.read(ptr, len)?;
+    let name = String::from_utf8(bytes)
+        .map_err(|_| err(ErrorCode::BadRequest, "invalid UTF-8 name"))?;
+    if name.is_empty() {
+        return Err(err(ErrorCode::BadRequest, "empty name"));
     }
+    Ok(i64::from(interner::intern(&name)))
+}
 
-    /// dispatch/dispatch_async must never panic and must return structured
-    /// errors on garbage: raw bytes, truncated JSON, wrong param types.
-    /// Every panic here would poison the host in production.
-    #[test]
-    fn dispatch_survives_garbage() {
-        let data = StoreData::for_tests(
-            ScopeId::Pane(1),
-            EffectiveCaps { flags: u32::MAX, argv0_allow: vec![] },
-        );
+pub fn intern_name(
+    mem: &mut GuestMem<'_, '_>,
+    id: i32,
+    out: i32,
+    cap: i32,
+    len_out: i32,
+) -> Result<(), HostError> {
+    let name = interner::name_of(id.max(0) as u32)
+        .ok_or_else(|| err(ErrorCode::NoSuchObject, format!("unknown id {id}")))?;
+    mem.write_out(name.as_bytes(), out, cap, len_out)
+}
 
-        let corpus: Vec<Vec<u8>> = vec![
-            b"".to_vec(),
-            b"{".to_vec(),
-            b"null".to_vec(),
-            b"[]".to_vec(),
-            b"\xff\xfe\x00garbage".to_vec(),
-            br#"{"method":"send_keys"}"#.to_vec(),
-            br#"{"method":"send_keys","params":{"pane":"nope"}}"#.to_vec(),
-            br#"{"method":"send_keys","params":{"pane":-1,"keys":5}}"#.to_vec(),
-            br#"{"method":"capture_pane","params":{"pane":1,"start":2147483647,"end":-2147483648}}"#.to_vec(),
-            br#"{"method":"get_option","params":{"scope":{"type":"pane"},"name":"x"}}"#.to_vec(),
-            br#"{"method":"subscribe","params":{"events":[null]}}"#.to_vec(),
-            br#"{"method":"run_job","params":{"cmd":"x y"}}"#.to_vec(),
-            br#"{"method":"timer_start","params":{"ms":18446744073709551615}}"#.to_vec(),
-            br#"{"method":"","params":{}}"#.to_vec(),
-        ];
-        for input in &corpus {
-            let _ = dispatch(&data, input);
-            let _ = dispatch_async(&data, input);
-        }
+pub fn subscribe(
+    mem: &mut GuestMem<'_, '_>,
+    id: i32,
+    add: bool,
+) -> Result<(), HostError> {
+    check_cap(mem, crate::caps::READ_STATE)?;
+    if id <= 0 {
+        return Err(err(ErrorCode::BadRequest, "bad event id"));
+    }
+    let subs = &mut mem.data_mut().subscriptions;
+    if add {
+        subs.insert(id as u32);
+    } else {
+        subs.remove(&(id as u32));
+    }
+    Ok(())
+}
 
-        // Seeded random soup: raw bytes and JSON-shaped strings.
-        let methods = [
-            "subscribe", "send_keys", "capture_pane", "get_option",
-            "set_option", "display_message", "run_job", "run_command",
-            "timer_start", "timer_cancel", "resolve", "bogus",
-            "mode_open", "mode_write", "mode_preview", "mode_close",
-            "mode_move",
-        ];
-        let mut rng = Rng(0x74_6d_75_78_32);
-        for _ in 0..5000 {
-            let mut bytes = Vec::new();
-            let len = (rng.next() % 64) as usize;
-            for _ in 0..len {
-                bytes.push((rng.next() & 0xff) as u8);
-            }
-            let _ = dispatch(&data, &bytes);
-            let _ = dispatch_async(&data, &bytes);
+// ---------------------------------------------------------------------------
+// Object state.
+// ---------------------------------------------------------------------------
 
-            let m = methods[(rng.next() as usize) % methods.len()];
-            let v = rng.next();
-            let shaped = format!(
-                r#"{{"method":"{m}","params":{{"pane":{},"keys":"{}","name":"@x","value":"y","ms":{},"token":{},"events":["e{}"],"cmd":"true","command":"list-panes","start":{},"end":{}}}}}"#,
-                v % 100,
-                v,
-                v,
-                v % 7,
-                v % 3,
-                (v as i64) % 5000 - 2500,
-                (v as i64) % 5000,
+pub fn list(
+    mem: &mut GuestMem<'_, '_>,
+    kind: i32,
+    owned_out: i32,
+) -> Result<(), HostError> {
+    check_cap(mem, crate::caps::READ_STATE)?;
+    check_kind(kind)?;
+    if kind == KIND_SERVER {
+        return Err(err(ErrorCode::BadRequest, "cannot list the server"));
+    }
+    let vt = vtable()?;
+    let mut buf: Vec<u8> = Vec::new();
+    unsafe {
+        (vt.list_objects)(kind, collect_sink, &mut buf as *mut Vec<u8> as *mut c_void)
+    };
+    mem.give_owned(&buf, owned_out)
+}
+
+pub fn resolve(
+    mem: &mut GuestMem<'_, '_>,
+    kind: i32,
+    id: i32,
+    owned_out: i32,
+) -> Result<(), HostError> {
+    check_cap(mem, crate::caps::READ_STATE)?;
+    check_kind(kind)?;
+    if kind == KIND_SERVER || id < 0 {
+        return Err(err(ErrorCode::BadRequest, "bad resolve target"));
+    }
+    let vt = vtable()?;
+    let mut buf: Vec<u8> = Vec::new();
+    let rc = unsafe {
+        (vt.resolve_object)(
+            kind,
+            id as u32,
+            collect_sink,
+            &mut buf as *mut Vec<u8> as *mut c_void,
+        )
+    };
+    if rc != 0 {
+        return Err(err(
+            ErrorCode::NoSuchObject,
+            format!("no such object id {id}"),
+        ));
+    }
+    mem.give_owned(&buf, owned_out)
+}
+
+pub fn self_info(mem: &mut GuestMem<'_, '_>, out: i32) -> Result<(), HostError> {
+    check_cap(mem, crate::caps::READ_STATE)?;
+    let data = mem.data();
+    let (scope_kind, scope_id) = match data.scope {
+        ScopeId::Server => (KIND_SERVER, 0),
+        ScopeId::Session(id) => (KIND_SESSION, id),
+        ScopeId::Window(id) => (KIND_WINDOW, id),
+        ScopeId::Pane(id) => (KIND_PANE, id),
+    };
+    let info = SelfInfo { scope_kind, scope_id, generation: data.generation };
+    mem.write_at(out, &info.to_bytes())
+}
+
+pub fn get_option(
+    mem: &mut GuestMem<'_, '_>,
+    kind: i32,
+    id: i32,
+    name_ptr: i32,
+    name_len: i32,
+    out: i32,
+    cap: i32,
+    len_out: i32,
+) -> Result<(), HostError> {
+    check_cap(mem, crate::caps::READ_STATE)?;
+    check_kind(kind)?;
+    let vt = vtable()?;
+    let name = mem.c_str(name_ptr, name_len)?;
+    let mut sink = mem.out_sink(out, cap)?;
+    let rc = unsafe {
+        (vt.get_option)(
+            kind,
+            id.max(0) as u32,
+            name,
+            out_sink,
+            &mut sink as *mut _ as *mut c_void,
+        )
+    };
+    match rc {
+        0 => mem.finish_out(sink, len_out),
+        -2 => Err(err(ErrorCode::NoSuchObject, "no such option")),
+        _ => Err(err(ErrorCode::NoSuchObject, "no such target")),
+    }
+}
+
+pub fn format_expand(
+    mem: &mut GuestMem<'_, '_>,
+    kind: i32,
+    id: i32,
+    fmt_ptr: i32,
+    fmt_len: i32,
+    out: i32,
+    cap: i32,
+    len_out: i32,
+) -> Result<(), HostError> {
+    check_cap(mem, crate::caps::READ_STATE)?;
+    if kind == KIND_CLIENT {
+        return Err(err(ErrorCode::BadRequest, "bad format scope"));
+    }
+    check_kind(kind)?;
+    let vt = vtable()?;
+    let fmt = mem.c_str(fmt_ptr, fmt_len)?;
+    let mut sink = mem.out_sink(out, cap)?;
+    let rc = unsafe {
+        (vt.format_expand)(
+            kind,
+            id.max(0) as u32,
+            fmt,
+            out_sink,
+            &mut sink as *mut _ as *mut c_void,
+        )
+    };
+    if rc != 0 {
+        return Err(err(ErrorCode::NoSuchObject, "no such target"));
+    }
+    mem.finish_out(sink, len_out)
+}
+
+pub fn set_option(
+    mem: &mut GuestMem<'_, '_>,
+    kind: i32,
+    id: i32,
+    name_ptr: i32,
+    name_len: i32,
+    val_ptr: i32,
+    val_len: i32,
+) -> Result<(), HostError> {
+    check_cap(mem, crate::caps::WRITE_OPTIONS)?;
+    check_kind(kind)?;
+    let vt = vtable()?;
+    let name = mem.c_str(name_ptr, name_len)?;
+    let value = mem.c_str(val_ptr, val_len)?;
+    let rc = unsafe { (vt.set_option)(kind, id.max(0) as u32, name, value) };
+    match rc {
+        0 => Ok(()),
+        -2 => Err(err(
+            ErrorCode::Unsupported,
+            "only @-prefixed user options can be set directly",
+        )),
+        _ => Err(err(ErrorCode::NoSuchObject, "no such target")),
+    }
+}
+
+pub fn send_keys(
+    mem: &mut GuestMem<'_, '_>,
+    pane: i32,
+    keys_ptr: i32,
+    keys_len: i32,
+    literal: i32,
+) -> Result<(), HostError> {
+    check_cap(mem, crate::caps::SEND_KEYS)?;
+    let pane = pane_id(pane)?;
+    check_pane_target(mem, pane)?;
+    let vt = vtable()?;
+    let keys = mem.c_str(keys_ptr, keys_len)?;
+    let rc = unsafe { (vt.send_keys)(pane, keys, literal) };
+    match rc {
+        0 => Ok(()),
+        -2 => Err(err(ErrorCode::BadRequest, "bad key name")),
+        _ => Err(err(ErrorCode::NoSuchObject, format!("no such pane %{pane}"))),
+    }
+}
+
+pub fn capture_pane(
+    mem: &mut GuestMem<'_, '_>,
+    pane: i32,
+    start: i32,
+    end: i32,
+    escapes: i32,
+    out: i32,
+    cap: i32,
+    len_out: i32,
+) -> Result<(), HostError> {
+    check_cap(mem, crate::caps::CAPTURE_PANE)?;
+    let pane = pane_id(pane)?;
+    check_pane_target(mem, pane)?;
+    let vt = vtable()?;
+    let mut sink = mem.out_sink(out, cap)?;
+    let rc = unsafe {
+        (vt.capture_pane)(
+            pane,
+            start,
+            end,
+            escapes,
+            out_sink,
+            &mut sink as *mut _ as *mut c_void,
+        )
+    };
+    if rc != 0 {
+        return Err(err(ErrorCode::NoSuchObject, format!("no such pane %{pane}")));
+    }
+    mem.finish_out(sink, len_out)
+}
+
+pub fn display_message(
+    mem: &mut GuestMem<'_, '_>,
+    client: i32,
+    msg_ptr: i32,
+    msg_len: i32,
+) -> Result<(), HostError> {
+    check_cap(mem, crate::caps::DISPLAY_MESSAGE)?;
+    let vt = vtable()?;
+    let plugin = std::ffi::CString::new(mem.data().plugin.clone())
+        .map_err(|_| err(ErrorCode::Host, "bad plugin name"))?;
+    let msg = mem.c_str(msg_ptr, msg_len)?;
+    let rc = unsafe { (vt.display_message)(client, plugin.as_ptr(), msg) };
+    if rc != 0 {
+        return Err(err(ErrorCode::NoSuchObject, "no such attached client"));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// UI modes.
+// ---------------------------------------------------------------------------
+
+fn check_mode(mem: &GuestMem<'_, '_>, mode: i64) -> Result<u64, HostError> {
+    if mode <= 0 {
+        return Err(err(ErrorCode::BadRequest, "bad mode id"));
+    }
+    let mode = mode as u64;
+    if !crate::modes::owned_by(mode, mem.data()) {
+        return Err(err(ErrorCode::NoSuchObject, format!("no such mode {mode}")));
+    }
+    Ok(mode)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn mode_open(
+    mem: &mut GuestMem<'_, '_>,
+    window: i32,
+    width: i32,
+    height: i32,
+    x: i32,
+    y: i32,
+    title_ptr: i32,
+    title_len: i32,
+) -> Result<i64, HostError> {
+    check_cap(mem, crate::caps::MODE)?;
+    if width <= 0 || height <= 0 {
+        return Err(err(ErrorCode::BadRequest, "zero mode size"));
+    }
+    let window = mode_target_window(mem, window)?;
+    let vt = vtable()?;
+    let title = mem.c_str_opt(title_ptr, title_len)?;
+    let rc = unsafe {
+        (vt.mode_open)(
+            window,
+            width as u32,
+            height as u32,
+            x.max(-1),
+            y.max(-1),
+            title.unwrap_or(std::ptr::null()),
+        )
+    };
+    match rc {
+        id if id > 0 => {
+            let data = mem.data();
+            crate::modes::register(
+                id as u64,
+                &data.plugin,
+                data.scope,
+                data.generation,
             );
-            let _ = dispatch(&data, shaped.as_bytes());
-            let _ = dispatch_async(&data, shaped.as_bytes());
+            Ok(id)
         }
-        // Applying whatever subscriptions accumulated must not panic
-        // either.
-        let mut data = data;
-        apply_pending_subscriptions(&mut data);
-    }
-}
-
-/// Dispatch one host_call request. `data` identifies the calling instance.
-pub fn dispatch(data: &StoreData, request: &[u8]) -> Result<Value, HostError> {
-    let text = String::from_utf8_lossy(request);
-    let req: HostRequest = serde_json::from_str(&text)
-        .map_err(|e| err(ErrorCode::BadRequest, format!("bad request JSON: {e}")))?;
-
-    check_cap(data, &req.method)?;
-
-    match req.method.as_str() {
-        "subscribe" | "unsubscribe" => {
-            #[derive(Deserialize)]
-            struct SubParams {
-                events: Vec<String>,
-            }
-            let p: SubParams = params(req.params)?;
-            let delta = if req.method == "subscribe" {
-                SubDelta::Add(p.events)
-            } else {
-                SubDelta::Remove(p.events)
-            };
-            PENDING_SUBS.with(|q| q.borrow_mut().push(delta));
-            Ok(json!({}))
-        }
-        "list_sessions" => list_objects(PGH_OBJ_SESSION),
-        "list_windows" => list_objects(PGH_OBJ_WINDOW),
-        "list_panes" => list_objects(PGH_OBJ_PANE),
-        "list_clients" => list_objects(PGH_OBJ_CLIENT),
-        "send_keys" => {
-            #[derive(Deserialize)]
-            struct SendKeysParams {
-                pane: u32,
-                keys: String,
-                #[serde(default)]
-                literal: bool,
-            }
-            let p: SendKeysParams = params(req.params)?;
-            check_pane_target(data, p.pane)?;
-            let vt = vtable()?;
-            let keys = cstring(&p.keys)?;
-            let rc = unsafe {
-                (vt.send_keys)(p.pane, keys.as_ptr(), p.literal.into())
-            };
-            match rc {
-                0 => Ok(json!({})),
-                -2 => Err(err(
-                    ErrorCode::BadRequest,
-                    format!("bad key name {:?}", p.keys),
-                )),
-                _ => Err(err(
-                    ErrorCode::NoSuchObject,
-                    format!("no such pane %{}", p.pane),
-                )),
-            }
-        }
-        "capture_pane" => {
-            #[derive(Deserialize)]
-            struct CaptureParams {
-                pane: u32,
-                #[serde(default)]
-                start: i32,
-                #[serde(default = "default_capture_end")]
-                end: i32,
-                #[serde(default)]
-                escapes: bool,
-            }
-            fn default_capture_end() -> i32 {
-                i32::MAX
-            }
-            const MAX_CAPTURE_BYTES: usize = 256 * 1024;
-            let p: CaptureParams = params(req.params)?;
-            check_pane_target(data, p.pane)?;
-            let vt = vtable()?;
-            let mut buf: Vec<u8> = Vec::new();
-            let rc = unsafe {
-                (vt.capture_pane)(
-                    p.pane,
-                    p.start,
-                    p.end,
-                    p.escapes.into(),
-                    collect_sink,
-                    &mut buf as *mut Vec<u8> as *mut c_void,
-                )
-            };
-            if rc != 0 {
-                return Err(err(
-                    ErrorCode::NoSuchObject,
-                    format!("no such pane %{}", p.pane),
-                ));
-            }
-            if buf.len() > MAX_CAPTURE_BYTES {
-                return Err(err(
-                    ErrorCode::Limit,
-                    format!(
-                        "capture exceeds {MAX_CAPTURE_BYTES} bytes; page with start/end"
-                    ),
-                ));
-            }
-            Ok(json!({ "text": String::from_utf8_lossy(&buf) }))
-        }
-        "get_option" => {
-            #[derive(Deserialize)]
-            struct GetOptionParams {
-                #[serde(default)]
-                scope: OptionScope,
-                name: String,
-            }
-            let p: GetOptionParams = params(req.params)?;
-            let (kind, id) = p.scope.to_kind()?;
-            let vt = vtable()?;
-            let name = cstring(&p.name)?;
-            let mut buf: Vec<u8> = Vec::new();
-            let rc = unsafe {
-                (vt.get_option)(
-                    kind,
-                    id,
-                    name.as_ptr(),
-                    collect_sink,
-                    &mut buf as *mut Vec<u8> as *mut c_void,
-                )
-            };
-            match rc {
-                0 => Ok(json!({ "value": String::from_utf8_lossy(&buf) })),
-                -2 => Err(err(
-                    ErrorCode::NoSuchObject,
-                    format!("no such option {:?}", p.name),
-                )),
-                _ => Err(err(ErrorCode::NoSuchObject, "no such target")),
-            }
-        }
-        "set_option" => {
-            #[derive(Deserialize)]
-            struct SetOptionParams {
-                #[serde(default)]
-                scope: OptionScope,
-                name: String,
-                value: String,
-            }
-            let p: SetOptionParams = params(req.params)?;
-            let (kind, id) = p.scope.to_kind()?;
-            let vt = vtable()?;
-            let name = cstring(&p.name)?;
-            let value = cstring(&p.value)?;
-            let rc = unsafe {
-                (vt.set_option)(kind, id, name.as_ptr(), value.as_ptr())
-            };
-            match rc {
-                0 => Ok(json!({})),
-                -2 => Err(err(
-                    ErrorCode::Unsupported,
-                    "only @-prefixed user options can be set directly in v1",
-                )),
-                _ => Err(err(ErrorCode::NoSuchObject, "no such target")),
-            }
-        }
-        "display_message" => {
-            #[derive(Deserialize)]
-            struct DisplayParams {
-                #[serde(default)]
-                client: Option<u32>,
-                message: String,
-            }
-            let p: DisplayParams = params(req.params)?;
-            let vt = vtable()?;
-            let plugin = cstring(&data.plugin)?;
-            let msg = cstring(&p.message)?;
-            let client = p.client.map_or(-1i32, |c| c as i32);
-            let rc = unsafe {
-                (vt.display_message)(client, plugin.as_ptr(), msg.as_ptr())
-            };
-            if rc != 0 {
-                return Err(err(
-                    ErrorCode::NoSuchObject,
-                    "no such attached client",
-                ));
-            }
-            Ok(json!({}))
-        }
-        "resolve" => {
-            #[derive(Deserialize)]
-            struct ResolveParams {
-                kind: String,
-                id: u32,
-            }
-            let p: ResolveParams = params(req.params)?;
-            resolve_object(kind_from_str(&p.kind)?, p.id)
-        }
-        "self" => {
-            // The instance's own identity: scope type + id.
-            Ok(json!({
-                "plugin": data.plugin,
-                "scope": data.scope.to_json(),
-                "generation": data.generation,
-            }))
-        }
-        "mode_open" => {
-            #[derive(Deserialize)]
-            struct ModeOpenParams {
-                #[serde(default)]
-                window: Option<u32>,
-                width: u32,
-                height: u32,
-                #[serde(default)]
-                x: Option<u32>,
-                #[serde(default)]
-                y: Option<u32>,
-                #[serde(default)]
-                title: Option<String>,
-            }
-            let p: ModeOpenParams = params(req.params)?;
-            if p.width == 0 || p.height == 0 {
-                return Err(err(ErrorCode::BadRequest, "zero mode size"));
-            }
-            let window = mode_target_window(data, p.window)?;
-            let vt = vtable()?;
-            let title = match &p.title {
-                Some(t) => Some(cstring(t)?),
-                None => None,
-            };
-            let to_off = |v: Option<u32>| -> Result<i32, HostError> {
-                match v {
-                    None => Ok(-1),
-                    Some(n) => i32::try_from(n).map_err(|_| {
-                        err(ErrorCode::BadRequest, "position out of range")
-                    }),
-                }
-            };
-            let rc = unsafe {
-                (vt.mode_open)(
-                    window,
-                    p.width,
-                    p.height,
-                    to_off(p.x)?,
-                    to_off(p.y)?,
-                    title.as_ref().map_or(std::ptr::null(), |t| t.as_ptr()),
-                )
-            };
-            match rc {
-                id if id > 0 => {
-                    crate::modes::register(
-                        id as u64,
-                        &data.plugin,
-                        data.scope,
-                        data.generation,
-                    );
-                    Ok(json!({ "mode": id as u64 }))
-                }
-                -1 => Err(err(
-                    ErrorCode::NoSuchObject,
-                    format!("no such window @{window}"),
-                )),
-                -3 => Err(err(ErrorCode::Host, "mode init failed")),
-                _ => Err(err(ErrorCode::Host, "failed to spawn mode pane")),
-            }
-        }
-        "mode_write" => {
-            #[derive(Deserialize)]
-            struct ModeWriteParams {
-                mode: u64,
-                data_b64: String,
-            }
-            const MAX_MODE_WRITE_BYTES: usize = 256 * 1024;
-            let p: ModeWriteParams = params(req.params)?;
-            if !crate::modes::owned_by(p.mode, data) {
-                return Err(err(
-                    ErrorCode::NoSuchObject,
-                    format!("no such mode {}", p.mode),
-                ));
-            }
-            use base64::Engine as _;
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(&p.data_b64)
-                .map_err(|e| {
-                    err(ErrorCode::BadRequest, format!("bad base64: {e}"))
-                })?;
-            if bytes.len() > MAX_MODE_WRITE_BYTES {
-                return Err(err(
-                    ErrorCode::Limit,
-                    format!("mode_write exceeds {MAX_MODE_WRITE_BYTES} bytes"),
-                ));
-            }
-            let vt = vtable()?;
-            let rc = unsafe {
-                (vt.mode_write)(p.mode, bytes.as_ptr(), bytes.len())
-            };
-            if rc != 0 {
-                return Err(err(
-                    ErrorCode::NoSuchObject,
-                    format!("no such mode {}", p.mode),
-                ));
-            }
-            Ok(json!({}))
-        }
-        "mode_preview" => {
-            #[derive(Deserialize)]
-            struct ModePreviewParams {
-                mode: u64,
-                #[serde(default)]
-                pane: Option<u32>,
-                #[serde(default)]
-                x: u32,
-                #[serde(default)]
-                y: u32,
-                #[serde(default)]
-                w: u32,
-                #[serde(default)]
-                h: u32,
-            }
-            let p: ModePreviewParams = params(req.params)?;
-            if !crate::modes::owned_by(p.mode, data) {
-                return Err(err(
-                    ErrorCode::NoSuchObject,
-                    format!("no such mode {}", p.mode),
-                ));
-            }
-            let pane = match p.pane {
-                Some(pane) => {
-                    // Previewing mirrors another pane's content; apply the
-                    // same scope-implied targeting as capture_pane.
-                    check_pane_target(data, pane)?;
-                    if p.w == 0 || p.h == 0 {
-                        return Err(err(
-                            ErrorCode::BadRequest,
-                            "zero preview size",
-                        ));
-                    }
-                    i64::from(pane)
-                }
-                None => -1,
-            };
-            let vt = vtable()?;
-            let rc = unsafe {
-                (vt.mode_preview)(p.mode, pane, p.x, p.y, p.w, p.h)
-            };
-            match rc {
-                0 => Ok(json!({})),
-                -2 => Err(err(
-                    ErrorCode::BadRequest,
-                    "preview rect does not fit the mode screen",
-                )),
-                _ => Err(err(
-                    ErrorCode::NoSuchObject,
-                    format!("no such mode {}", p.mode),
-                )),
-            }
-        }
-        "mode_move" => {
-            #[derive(Deserialize)]
-            struct ModeMoveParams {
-                mode: u64,
-                #[serde(default)]
-                window: Option<u32>,
-                #[serde(default)]
-                x: Option<u32>,
-                #[serde(default)]
-                y: Option<u32>,
-            }
-            let p: ModeMoveParams = params(req.params)?;
-            if !crate::modes::owned_by(p.mode, data) {
-                return Err(err(
-                    ErrorCode::NoSuchObject,
-                    format!("no such mode {}", p.mode),
-                ));
-            }
-            let window = mode_target_window(data, p.window)?;
-            let to_off = |v: Option<u32>| -> Result<i32, HostError> {
-                match v {
-                    None => Ok(-1),
-                    Some(n) => i32::try_from(n).map_err(|_| {
-                        err(ErrorCode::BadRequest, "position out of range")
-                    }),
-                }
-            };
-            let vt = vtable()?;
-            let rc = unsafe {
-                (vt.mode_move)(p.mode, window, to_off(p.x)?, to_off(p.y)?)
-            };
-            match rc {
-                0 => Ok(json!({})),
-                -2 => Err(err(
-                    ErrorCode::NoSuchObject,
-                    format!("no such window @{window} (or unmovable pane)"),
-                )),
-                -3 => Err(err(
-                    ErrorCode::Limit,
-                    "move would empty the source window; close instead",
-                )),
-                _ => Err(err(
-                    ErrorCode::NoSuchObject,
-                    format!("no such mode {}", p.mode),
-                )),
-            }
-        }
-        "mode_close" => {
-            #[derive(Deserialize)]
-            struct ModeCloseParams {
-                mode: u64,
-            }
-            let p: ModeCloseParams = params(req.params)?;
-            if !crate::modes::owned_by(p.mode, data) {
-                return Err(err(
-                    ErrorCode::NoSuchObject,
-                    format!("no such mode {}", p.mode),
-                ));
-            }
-            let vt = vtable()?;
-            let rc = unsafe { (vt.mode_close)(p.mode) };
-            if rc != 0 {
-                return Err(err(
-                    ErrorCode::NoSuchObject,
-                    format!("no such mode {}", p.mode),
-                ));
-            }
-            Ok(json!({}))
-        }
-        "timer_cancel" => {
-            #[derive(Deserialize)]
-            struct CancelParams {
-                token: u64,
-            }
-            let p: CancelParams = params(req.params)?;
-            let vt = vtable()?;
-            // Taking the token also guarantees a raced, already-queued
-            // completion is dropped at drain time.
-            match crate::tokens::take(p.token) {
-                Some(pending) => {
-                    if let Some(id) = pending.timer_id {
-                        unsafe { (vt.timer_cancel)(id) };
-                    }
-                    Ok(json!({}))
-                }
-                None => Ok(json!({ "already_completed": true })),
-            }
-        }
-        other => Err(err(
-            ErrorCode::UnknownMethod,
-            format!("unknown method {other:?}"),
+        -1 => Err(err(
+            ErrorCode::NoSuchObject,
+            format!("no such window @{window}"),
         )),
+        -3 => Err(err(ErrorCode::Host, "mode init failed")),
+        _ => Err(err(ErrorCode::Host, "failed to spawn mode pane")),
     }
 }
 
-/// Dispatch one host_request (async) call: start the operation and return
-/// the token whose completion will arrive via pgh_on_async_complete.
-pub fn dispatch_async(data: &StoreData, request: &[u8]) -> Result<u64, HostError> {
-    let text = String::from_utf8_lossy(request);
-    let req: HostRequest = serde_json::from_str(&text)
-        .map_err(|e| err(ErrorCode::BadRequest, format!("bad request JSON: {e}")))?;
+pub fn mode_write(
+    mem: &mut GuestMem<'_, '_>,
+    mode: i64,
+    ptr: i32,
+    len: i32,
+) -> Result<(), HostError> {
+    check_cap(mem, crate::caps::MODE)?;
+    let mode = check_mode(mem, mode)?;
+    if len as usize > MAX_TRANSFER_BYTES {
+        return Err(err(
+            ErrorCode::Limit,
+            format!("mode_write exceeds {MAX_TRANSFER_BYTES} bytes"),
+        ));
+    }
+    let vt = vtable()?;
+    let (data, n) = mem.bytes(ptr, len)?;
+    let rc = unsafe { (vt.mode_write)(mode, data, n) };
+    if rc != 0 {
+        return Err(err(ErrorCode::NoSuchObject, format!("no such mode {mode}")));
+    }
+    Ok(())
+}
 
-    check_cap(data, &req.method)?;
-
-    let token =
-        crate::tokens::allocate(&data.plugin, data.scope, data.generation);
-    let result: Result<(), HostError> = (|| {
-        match req.method.as_str() {
-            "run_job" => {
-                #[derive(Deserialize)]
-                struct RunJobParams {
-                    cmd: String,
-                    #[serde(default)]
-                    cwd: Option<String>,
-                }
-                let p: RunJobParams = params(req.params)?;
-                // Advisory argv0 allowlist (run_job is a shell string in
-                // v1): check the first token's basename.
-                if !data.caps.argv0_allow.is_empty() {
-                    let argv0 = p
-                        .cmd
-                        .split_whitespace()
-                        .next()
-                        .map(|t| t.rsplit('/').next().unwrap_or(t))
-                        .unwrap_or("");
-                    if !data.caps.argv0_allow.iter().any(|a| a == argv0) {
-                        return Err(err(
-                            ErrorCode::CapDenied,
-                            format!("command {argv0:?} not in argv0 allowlist"),
-                        ));
-                    }
-                }
-                let vt = vtable()?;
-                let cmd = cstring(&p.cmd)?;
-                let cwd = match &p.cwd {
-                    Some(c) => Some(cstring(c)?),
-                    None => None,
-                };
-                let rc = unsafe {
-                    (vt.run_job)(
-                        cmd.as_ptr(),
-                        cwd.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
-                        token,
-                    )
-                };
-                if rc != 0 {
-                    return Err(err(ErrorCode::Host, "failed to start job"));
-                }
-                Ok(())
-            }
-            "run_command" => {
-                #[derive(Deserialize)]
-                struct RunCommandParams {
-                    command: String,
-                }
-                let p: RunCommandParams = params(req.params)?;
-                let vt = vtable()?;
-                let cmd = cstring(&p.command)?;
-                let rc = unsafe { (vt.run_command)(cmd.as_ptr(), token) };
-                if rc != 0 {
-                    return Err(err(ErrorCode::Host, "failed to queue command"));
-                }
-                Ok(())
-            }
-            "timer_start" => {
-                #[derive(Deserialize)]
-                struct TimerParams {
-                    ms: u64,
-                }
-                let p: TimerParams = params(req.params)?;
-                let vt = vtable()?;
-                let id = unsafe { (vt.timer_start)(p.ms, token) };
-                crate::tokens::set_timer_id(token, id);
-                Ok(())
-            }
-            other => Err(err(
-                ErrorCode::UnknownMethod,
-                format!("unknown async method {other:?}"),
-            )),
+pub fn mode_preview(
+    mem: &mut GuestMem<'_, '_>,
+    mode: i64,
+    pane: i64,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+) -> Result<(), HostError> {
+    check_cap(mem, crate::caps::MODE)?;
+    let mode = check_mode(mem, mode)?;
+    let pane = if pane < 0 {
+        -1
+    } else {
+        // Previewing mirrors another pane's content; apply the same
+        // scope-implied targeting as capture_pane.
+        check_pane_target(mem, pane as u32)?;
+        if w <= 0 || h <= 0 {
+            return Err(err(ErrorCode::BadRequest, "zero preview size"));
         }
-    })();
+        pane
+    };
+    let vt = vtable()?;
+    let rc = unsafe {
+        (vt.mode_preview)(
+            mode,
+            pane,
+            x.max(0) as u32,
+            y.max(0) as u32,
+            w.max(0) as u32,
+            h.max(0) as u32,
+        )
+    };
+    match rc {
+        0 => Ok(()),
+        -2 => Err(err(
+            ErrorCode::BadRequest,
+            "preview rect does not fit the mode screen",
+        )),
+        _ => Err(err(ErrorCode::NoSuchObject, format!("no such mode {mode}"))),
+    }
+}
 
-    match result {
-        Ok(()) => Ok(token),
-        Err(e) => {
-            crate::tokens::discard(token);
-            Err(e)
+pub fn mode_move(
+    mem: &mut GuestMem<'_, '_>,
+    mode: i64,
+    window: i32,
+    x: i32,
+    y: i32,
+) -> Result<(), HostError> {
+    check_cap(mem, crate::caps::MODE)?;
+    let mode = check_mode(mem, mode)?;
+    let window = mode_target_window(mem, window)?;
+    let vt = vtable()?;
+    let rc = unsafe { (vt.mode_move)(mode, window, x.max(-1), y.max(-1)) };
+    match rc {
+        0 => Ok(()),
+        -2 => Err(err(
+            ErrorCode::NoSuchObject,
+            format!("no such window @{window} (or unmovable pane)"),
+        )),
+        -3 => Err(err(
+            ErrorCode::Limit,
+            "move would empty the source window; close instead",
+        )),
+        _ => Err(err(ErrorCode::NoSuchObject, format!("no such mode {mode}"))),
+    }
+}
+
+pub fn mode_close(mem: &mut GuestMem<'_, '_>, mode: i64) -> Result<(), HostError> {
+    check_cap(mem, crate::caps::MODE)?;
+    let mode = check_mode(mem, mode)?;
+    let vt = vtable()?;
+    let rc = unsafe { (vt.mode_close)(mode) };
+    if rc != 0 {
+        return Err(err(ErrorCode::NoSuchObject, format!("no such mode {mode}")));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Async methods: start the operation and return the token whose completion
+// arrives via pgh_on_async_complete.
+// ---------------------------------------------------------------------------
+
+pub fn timer_cancel(mem: &mut GuestMem<'_, '_>, token: i64) -> Result<(), HostError> {
+    check_cap(mem, crate::caps::TIMERS)?;
+    if token <= 0 {
+        return Err(err(ErrorCode::BadRequest, "bad token"));
+    }
+    let vt = vtable()?;
+    // Taking the token also guarantees a raced, already-queued completion
+    // is dropped at drain time.
+    if let Some(pending) = crate::tokens::take(token as u64) {
+        if let Some(id) = pending.timer_id {
+            unsafe { (vt.timer_cancel)(id) };
         }
     }
+    Ok(())
+}
+
+fn alloc_token(mem: &GuestMem<'_, '_>) -> u64 {
+    let data = mem.data();
+    crate::tokens::allocate(&data.plugin, data.scope, data.generation)
+}
+
+pub fn run_job(
+    mem: &mut GuestMem<'_, '_>,
+    cmd_ptr: i32,
+    cmd_len: i32,
+    cwd_ptr: i32,
+    cwd_len: i32,
+) -> Result<i64, HostError> {
+    check_cap(mem, crate::caps::RUN_PROCESS)?;
+    // Advisory argv0 allowlist (run_job is a shell string): check the
+    // first token's basename. Only pays a copy when a list is configured.
+    if !mem.data().caps.argv0_allow.is_empty() {
+        let cmd = mem.read_str(cmd_ptr, cmd_len)?;
+        let argv0 = cmd
+            .split_whitespace()
+            .next()
+            .map(|t| t.rsplit('/').next().unwrap_or(t))
+            .unwrap_or("");
+        let allowed =
+            mem.data().caps.argv0_allow.iter().any(|a| a == argv0);
+        if !allowed {
+            return Err(err(
+                ErrorCode::CapDenied,
+                format!("command {argv0:?} not in argv0 allowlist"),
+            ));
+        }
+    }
+    let vt = vtable()?;
+    let cmd = mem.c_str(cmd_ptr, cmd_len)?;
+    let cwd = mem.c_str_opt(cwd_ptr, cwd_len)?;
+    let token = alloc_token(mem);
+    let rc = unsafe {
+        (vt.run_job)(cmd, cwd.unwrap_or(std::ptr::null()), token)
+    };
+    if rc != 0 {
+        crate::tokens::discard(token);
+        return Err(err(ErrorCode::Host, "failed to start job"));
+    }
+    Ok(token as i64)
+}
+
+pub fn run_command(
+    mem: &mut GuestMem<'_, '_>,
+    cmd_ptr: i32,
+    cmd_len: i32,
+) -> Result<i64, HostError> {
+    check_cap(mem, crate::caps::RUN_COMMAND)?;
+    let vt = vtable()?;
+    let cmd = mem.c_str(cmd_ptr, cmd_len)?;
+    let token = alloc_token(mem);
+    let rc = unsafe { (vt.run_command)(cmd, token) };
+    if rc != 0 {
+        crate::tokens::discard(token);
+        return Err(err(ErrorCode::Host, "failed to queue command"));
+    }
+    Ok(token as i64)
+}
+
+// ---------------------------------------------------------------------------
+// Filesystem: sandboxed to the plugin's data directory. Paths are raw
+// UTF-8 (host-consumed, no NUL rule). The async pair runs on the fs
+// worker thread with pinned guest buffers (zero-copy); the sync pair
+// blocks the loop for one bounded page-cache access, like tmux's own
+// file I/O.
+// ---------------------------------------------------------------------------
+
+fn fs_path(
+    mem: &GuestMem<'_, '_>,
+    ptr: i32,
+    len: i32,
+    create_dirs: bool,
+) -> Result<std::path::PathBuf, HostError> {
+    let bytes = mem.read(ptr, len)?;
+    let rel = String::from_utf8(bytes)
+        .map_err(|_| err(ErrorCode::BadRequest, "invalid UTF-8 path"))?;
+    let root = crate::fsbox::plugin_data_dir(&mem.data().plugin)
+        .map_err(|e| err(ErrorCode::Host, e))?;
+    crate::fsbox::sandboxed_path(&root, &rel, create_dirs)
+        .map_err(|e| err(ErrorCode::BadRequest, e))
+}
+
+fn check_transfer(len: i32) -> Result<(), HostError> {
+    if len < 0 || len as usize > MAX_TRANSFER_BYTES {
+        return Err(err(
+            ErrorCode::Limit,
+            format!("transfer exceeds {MAX_TRANSFER_BYTES} bytes"),
+        ));
+    }
+    Ok(())
+}
+
+pub fn fs_write_async(
+    mem: &mut GuestMem<'_, '_>,
+    path_ptr: i32,
+    path_len: i32,
+    data_ptr: i32,
+    data_len: i32,
+    append: i32,
+) -> Result<i64, HostError> {
+    check_cap(mem, crate::caps::FS_WRITE)?;
+    check_transfer(data_len)?;
+    let path = fs_path(mem, path_ptr, path_len, true)?;
+    let ptr = mem.pinned_bytes(data_ptr, data_len)?;
+    let data = mem.data();
+    let key = (data.plugin.clone(), data.scope, data.generation);
+    let token = alloc_token(mem);
+    let job = crate::fsworker::FsJob::Write {
+        token,
+        key,
+        path,
+        append: append != 0,
+        data: crate::fsworker::GuestSlice { ptr, len: data_len as usize },
+    };
+    if let Err(e) = crate::fsworker::submit(job) {
+        crate::tokens::discard(token);
+        return Err(err(ErrorCode::Host, e));
+    }
+    Ok(token as i64)
+}
+
+pub fn fs_read_async(
+    mem: &mut GuestMem<'_, '_>,
+    path_ptr: i32,
+    path_len: i32,
+    offset: i64,
+    out_ptr: i32,
+    out_cap: i32,
+) -> Result<i64, HostError> {
+    check_cap(mem, crate::caps::FS_READ)?;
+    check_transfer(out_cap)?;
+    if offset < 0 {
+        return Err(err(ErrorCode::BadRequest, "negative offset"));
+    }
+    let path = fs_path(mem, path_ptr, path_len, false)?;
+    let ptr = mem.pinned_bytes_mut(out_ptr, out_cap)?;
+    let data = mem.data();
+    let key = (data.plugin.clone(), data.scope, data.generation);
+    let token = alloc_token(mem);
+    let job = crate::fsworker::FsJob::Read {
+        token,
+        key,
+        path,
+        offset: offset as u64,
+        out: crate::fsworker::GuestSliceMut { ptr, cap: out_cap as usize },
+    };
+    if let Err(e) = crate::fsworker::submit(job) {
+        crate::tokens::discard(token);
+        return Err(err(ErrorCode::Host, e));
+    }
+    Ok(token as i64)
+}
+
+pub fn fs_write_sync(
+    mem: &mut GuestMem<'_, '_>,
+    path_ptr: i32,
+    path_len: i32,
+    data_ptr: i32,
+    data_len: i32,
+    append: i32,
+) -> Result<i64, HostError> {
+    use std::io::Write as _;
+
+    check_cap(mem, crate::caps::FS_WRITE)?;
+    check_transfer(data_len)?;
+    let path = fs_path(mem, path_ptr, path_len, true)?;
+    let bytes = mem.read(data_ptr, data_len)?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(append != 0)
+        .truncate(append == 0)
+        .open(&path)
+        .and_then(|mut f| f.write_all(&bytes))
+        .map_err(|e| err(ErrorCode::Host, format!("{}: {e}", path.display())))?;
+    Ok(bytes.len() as i64)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn fs_read_sync(
+    mem: &mut GuestMem<'_, '_>,
+    path_ptr: i32,
+    path_len: i32,
+    offset: i64,
+    out: i32,
+    cap: i32,
+    len_out: i32,
+    eof_out: i32,
+) -> Result<(), HostError> {
+    use std::io::{Read as _, Seek as _};
+
+    check_cap(mem, crate::caps::FS_READ)?;
+    check_transfer(cap)?;
+    if offset < 0 {
+        return Err(err(ErrorCode::BadRequest, "negative offset"));
+    }
+    let path = fs_path(mem, path_ptr, path_len, false)?;
+    let mut buf = vec![0u8; cap.max(0) as usize];
+    let (read, eof) = (|| -> std::io::Result<(usize, bool)> {
+        let mut f = std::fs::File::open(&path)?;
+        let size = f.metadata()?.len();
+        f.seek(std::io::SeekFrom::Start(offset as u64))?;
+        let mut read = 0;
+        while read < buf.len() {
+            let n = f.read(&mut buf[read..])?;
+            if n == 0 {
+                break;
+            }
+            read += n;
+        }
+        let eof = (offset as u64).saturating_add(read as u64) >= size;
+        Ok((read, eof))
+    })()
+    .map_err(|e| {
+        let code = if e.kind() == std::io::ErrorKind::NotFound {
+            ErrorCode::NoSuchObject
+        } else {
+            ErrorCode::Host
+        };
+        err(code, format!("{}: {e}", path.display()))
+    })?;
+    mem.write_u32_at(eof_out, u32::from(eof))?;
+    mem.write_out(&buf[..read], out, cap, len_out)
+}
+
+pub fn fs_root(
+    mem: &mut GuestMem<'_, '_>,
+    out: i32,
+    cap: i32,
+    len_out: i32,
+) -> Result<(), HostError> {
+    let root = crate::fsbox::plugin_data_dir(&mem.data().plugin)
+        .map_err(|e| err(ErrorCode::Host, e))?;
+    let text = root.to_string_lossy().into_owned();
+    mem.write_out(text.as_bytes(), out, cap, len_out)
+}
+
+pub fn timer_start(mem: &mut GuestMem<'_, '_>, ms: i64) -> Result<i64, HostError> {
+    check_cap(mem, crate::caps::TIMERS)?;
+    if ms < 0 {
+        return Err(err(ErrorCode::BadRequest, "negative delay"));
+    }
+    let vt = vtable()?;
+    let token = alloc_token(mem);
+    let id = unsafe { (vt.timer_start)(ms as u64, token) };
+    crate::tokens::set_timer_id(token, id);
+    Ok(token as i64)
 }

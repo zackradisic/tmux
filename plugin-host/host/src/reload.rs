@@ -62,7 +62,7 @@ pub fn upsert(desc: LoadDescriptor) -> Result<&'static str, String> {
         // the new module, but must not tear down instances - swap them
         // transactionally instead. load() unloads, so update def by hand.
         let engine_module = REGISTRY.with(|r| {
-            let mut reg = r.borrow_mut();
+            let reg = r.borrow_mut();
             reg.plugins.get(&desc.name)?;
             let engine = reg.engine.as_ref()?.engine.clone();
             Some((engine, reg.modules.contains_key(&new_hash)))
@@ -112,7 +112,7 @@ pub fn upsert(desc: LoadDescriptor) -> Result<&'static str, String> {
                 def.config = desc.config.clone();
             }
         });
-        apply_config(&desc.name, &desc.config.to_string());
+        apply_config(&desc.name, &crate::abi::encode_config(&desc.config));
         return Ok("config changed");
     }
 
@@ -308,7 +308,7 @@ fn swap_instances(name: &str, migrate: bool) {
 }
 
 /// Offer changed config to each instance; restart those that refuse.
-fn apply_config(name: &str, config_json: &str) {
+fn apply_config(name: &str, config: &[u8]) {
     let keys: Vec<(usize, ScopeId)> = REGISTRY.with(|r| {
         let reg = r.borrow();
         reg.instances
@@ -328,7 +328,7 @@ fn apply_config(name: &str, config_json: &str) {
         });
         let Some(mut inst) = inst else { continue };
         let absorbed =
-            inst.guest.call_on_config_changed(config_json).unwrap_or(false);
+            inst.guest.call_on_config_changed(config).unwrap_or(false);
         REGISTRY.with(|r| {
             if let Some(slot) = r.borrow_mut().instances.get_mut(key) {
                 *slot = Some(inst);

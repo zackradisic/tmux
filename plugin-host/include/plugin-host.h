@@ -91,13 +91,40 @@
 #define PGH_OBJ_CLIENT 3
 
 /**
+ * Error codes for the `err` parameter of `pgh_async_complete` (the wire
+ * numbers of tmux-plugin-abi's ErrorCode; 0 = success).
+ */
+#define PGH_ERR_BAD_REQUEST 1
+
+#define PGH_ERR_NO_SUCH_OBJECT 4
+
+#define PGH_ERR_LIMIT 6
+
+#define PGH_ERR_HOST 7
+
+#define PGH_ERR_CANCELLED 8
+
+/**
+ * Relation queries for `pgh_host_vtable.obj_relation` (scope checks).
+ */
+#define PGH_REL_PANE_WINDOW 0
+
+#define PGH_REL_SESSION_CURWIN 1
+
+#define PGH_REL_WINDOW_IN_SESSION 2
+
+#define PGH_REL_PANE_IN_WINDOW 3
+
+#define PGH_REL_PANE_IN_SESSION 4
+
+/**
  * Consecutive failures before a plugin is disabled until explicit reload.
  */
 #define MAX_FAILURES 3
 
 /**
- * Sink used wherever a string crosses the FFI from callee to caller: the
- * callee invokes the sink zero or more times with UTF-8 bytes (not
+ * Sink used wherever bytes cross the FFI from callee to caller: the
+ * callee invokes the sink zero or more times with a byte run (not
  * NUL-terminated); ownership never crosses the boundary.
  */
 typedef void (*pgh_sink)(void *ctx, const char *ptr, uintptr_t len);
@@ -114,16 +141,24 @@ typedef struct {
    */
   void (*log)(int level, const char *plugin, const char *msg);
   /**
-   * Emit a JSON array of all live objects of `kind` (PGH_OBJ_*) into the
-   * sink. Each element carries at least {"id": n}.
+   * Emit the binary object-list buffer (u32 count + records, see
+   * abi-types) for all live objects of `kind` (PGH_OBJ_*) into the sink.
    */
   void (*list_objects)(int kind, pgh_sink sink, void *ctx);
   /**
-   * Emit a JSON object describing the live object (kind, id) into the
-   * sink and return 0; return -1 without emitting if it no longer exists.
-   * This is the weak-handle validity check.
+   * Emit one binary object record describing the live object (kind, id)
+   * into the sink and return 0; return -1 without emitting if it no
+   * longer exists. This is the weak-handle validity check.
    */
   int (*resolve_object)(int kind, uint32_t id, pgh_sink sink, void *ctx);
+  /**
+   * Relation query for scope checks (PGH_REL_*): PANE_WINDOW(a=pane) ->
+   * window id; SESSION_CURWIN(a=session) -> window id;
+   * WINDOW_IN_SESSION(a=window, b=session), PANE_IN_WINDOW(a=pane,
+   * b=window), PANE_IN_SESSION(a=pane, b=session) -> 1/0.
+   * -1 = no such object.
+   */
+  int64_t (*obj_relation)(int rel, uint32_t a, uint32_t b);
   /**
    * Send keys to a pane; literal != 0 sends `keys` as UTF-8 characters,
    * otherwise `keys` is one tmux key name. 0 ok, -1 dead pane, -2 bad key.
@@ -151,7 +186,7 @@ typedef struct {
   int (*display_message)(int client_id, const char *plugin, const char *msg);
   /**
    * Start a shell command as a job; completion arrives later via
-   * pgh_async_complete(token, {"status","signalled","output"}, 0).
+   * pgh_async_complete(token, 0, status, signalled, output, len).
    * 0 started, -1 failed to start.
    */
   int (*run_job)(const char *cmd, const char *cwd, uint64_t token);
@@ -162,8 +197,8 @@ typedef struct {
    */
   int (*run_command)(const char *cmd, uint64_t token);
   /**
-   * One-shot timer; fires pgh_async_complete(token, "{}", 0). Returns a
-   * timer id usable with timer_cancel.
+   * One-shot timer; fires pgh_async_complete(token, 0, 0, 0, NULL, 0).
+   * Returns a timer id usable with timer_cancel.
    */
   uint64_t (*timer_start)(uint64_t ms, uint64_t token);
   /**
@@ -215,6 +250,12 @@ typedef struct {
    * unmovable pane, -3 the move would empty the source window.
    */
   int (*mode_move)(uint64_t mode, uint32_t window, int x, int y);
+  /**
+   * Expand a format string against a scope (kind -1 = server/global,
+   * else PGH_OBJ_SESSION/WINDOW/PANE) into the sink. Jobs (#()) are
+   * disabled. 0 ok, -1 dead/bad target.
+   */
+  int (*format_expand)(int kind, uint32_t id, const char *fmt, pgh_sink sink, void *ctx);
 } pgh_host_vtable;
 
 #ifdef __cplusplus
@@ -239,16 +280,27 @@ int pgh_init(const pgh_host_vtable *vt);
 void pgh_shutdown(void);
 
 /**
- * Load (or replace) a plugin from a JSON LoadDescriptor. Compiles and
- * validates the module synchronously (obvious errors are written to
- * `err_sink` and -1 returned); instantiation and guest init are queued for
- * the next drain. The C side should call plugin_schedule_drain() after a
- * successful return.
+ * Load (or replace) a plugin. `scope` may be NULL (defaults to server);
+ * `caps` is an array of `ncaps` capability names; `opts` is an array of
+ * `nopts` config entries ("key=value", or a bare "key" meaning true).
+ * Compiles and validates the module synchronously (obvious errors are
+ * written to `err_sink` and -1 returned); instantiation and guest init are
+ * queued for the next drain. The C side should call
+ * plugin_schedule_drain() after a successful return.
  *
  * # Safety
- * `desc_json` must be NUL-terminated; `err_sink` must be valid.
+ * All strings must be NUL-terminated; the arrays must hold the declared
+ * counts; `err_sink` must be valid.
  */
-int pgh_plugin_load(const char *desc_json, pgh_sink err_sink, void *err_ctx);
+int pgh_plugin_load(const char *name,
+                    const char *path,
+                    const char *scope,
+                    const char *const *caps,
+                    uintptr_t ncaps,
+                    const char *const *opts,
+                    uintptr_t nopts,
+                    pgh_sink err_sink,
+                    void *err_ctx);
 
 /**
  * Reconcile the managed plugin pool against the TOML manifest at
@@ -302,7 +354,8 @@ void pgh_query_log(const char *name, uint32_t limit, pgh_sink sink, void *ctx);
 int pgh_plugin_unload(const char *name);
 
 /**
- * Feed one event (JSON, see ABI.md) into the plugin event queue.
+ * Feed one binary event buffer (header + field block, see abi-types) into
+ * the plugin event queue.
  *
  * ENQUEUE ONLY: never runs plugin code, so it is legal to call from
  * anywhere on the main thread, including from inside a vtable callback
@@ -310,9 +363,20 @@ int pgh_plugin_unload(const char *name);
  * pgh_drain. The C side should call plugin_schedule_drain() afterwards.
  *
  * # Safety
- * `event_json` must be a NUL-terminated string.
+ * `event` must point at `len` readable bytes (copied before returning).
  */
-void pgh_notify(const char *event_json);
+void pgh_notify(const uint8_t *event, uintptr_t len);
+
+/**
+ * Intern a name (event name or payload key), returning its stable id
+ * (>= 1). The same table serves guests through the `intern` import, so
+ * the ids the C bridge writes into event buffers are the ids guests
+ * subscribe to and compare against.
+ *
+ * # Safety
+ * `name` must be NUL-terminated.
+ */
+uint32_t pgh_intern(const char *name);
 
 /**
  * Invalidate plugin state tied to a dead tmux object (kind = PGH_OBJ_*).
@@ -325,7 +389,9 @@ void pgh_object_destroyed(int kind, uint32_t id);
 
 /**
  * Deliver the result of an async operation started through the vtable
- * (run_job, run_command, timer_start, ...).
+ * (run_job, run_command, timer_start, ...). `err` is 0 on success or an
+ * ErrorCode number; `data`/`len` carry the per-method payload (job
+ * output; the error message when err != 0) and may be NULL/0.
  *
  * ENQUEUE ONLY, like pgh_notify: legal to call from any main-thread
  * context, including from inside vtable callbacks. Generation checks at
@@ -333,14 +399,20 @@ void pgh_object_destroyed(int kind, uint32_t id);
  * side should call plugin_schedule_drain() afterwards.
  *
  * # Safety
- * `result_json` must be NUL-terminated.
+ * `data` must point at `len` readable bytes or be NULL (copied before
+ * returning).
  */
-void pgh_async_complete(uint64_t token, const char *result_json, int is_error);
+void pgh_async_complete(uint64_t token,
+                        int err,
+                        int64_t v0,
+                        int64_t v1,
+                        const uint8_t *data,
+                        uintptr_t len);
 
 /**
  * Deliver a mode event (mode-key, mode-resize, mode-closed) for a plugin
- * UI mode opened through the mode_open vtable call. `data_json` is a JSON
- * object merged into the guest event's `data` (alongside "mode").
+ * UI mode opened through the mode_open vtable call. `event` is a complete
+ * binary event buffer built by the C side (including the mode field).
  *
  * ENQUEUE ONLY, like pgh_notify: legal to call from any main-thread
  * context, including from inside vtable callbacks. Ownership and
@@ -349,9 +421,9 @@ void pgh_async_complete(uint64_t token, const char *result_json, int is_error);
  * afterwards.
  *
  * # Safety
- * `name` and `data_json` must be NUL-terminated.
+ * `event` must point at `len` readable bytes (copied before returning).
  */
-void pgh_mode_event(uint64_t mode_id, const char *name, const char *data_json);
+void pgh_mode_event(uint64_t mode_id, const uint8_t *event, uintptr_t len);
 
 /**
  * Run queued plugin work for at most `max_us` microseconds of wall clock
@@ -362,6 +434,20 @@ void pgh_mode_event(uint64_t mode_id, const char *name, const char *data_json);
  * ONLY to be called from the command-queue drain callback (the safe point).
  */
 uint32_t pgh_drain(uint32_t max_us);
+
+/**
+ * The fs worker's pollable doorbell fd (created on first call). The C
+ * side registers a persistent read event on it whose callback calls
+ * pgh_fs_drain() then plugin_schedule_drain(). Returns -1 on failure.
+ */
+int pgh_fs_notify_fd(void);
+
+/**
+ * Move finished fs completions onto the plugin delivery queue (they are
+ * delivered to guests at the next pgh_drain). Main thread only; called
+ * from the doorbell event callback.
+ */
+void pgh_fs_drain(void);
 
 /**
  * Write a human-readable plugin listing (for `show-plugins`) into the sink.

@@ -107,16 +107,6 @@ plugin_mode_pending_take(uint64_t *mode_id)
 	return (1);
 }
 
-/* Enqueue a mode event and wake the drain machinery. */
-void
-plugin_mode_event(uint64_t mode_id, const char *name, const char *json)
-{
-	if (!plugin_enabled())
-		return;
-	pgh_mode_event(mode_id, name, json);
-	plugin_schedule_drain();
-}
-
 /* Drop a registry entry (mode teardown; unknown ids are ignored). */
 void
 plugin_mode_unregister(uint64_t mode_id)

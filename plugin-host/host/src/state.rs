@@ -16,19 +16,22 @@ use crate::registry::{Registry, ScopeId};
 
 /// A unit of queued work for pgh_drain.
 pub enum Delivery {
-    /// Raw event JSON from the C bridge; routing happens at drain time
-    /// (an event may fan out to several instances).
-    RawEvent { json: String, seq: u64 },
+    /// Raw binary event buffer from the C bridge (header + field block, see
+    /// abi-types); routing happens at drain time (an event may fan out to
+    /// several instances). `seq` is patched into the buffer at delivery.
+    RawEvent { bytes: Vec<u8>, seq: u64 },
     /// Create + init an instance of `plugin` for `scope` (queued by
     /// pgh_plugin_load so guest code never runs inside the load call).
     Instantiate { plugin: String, scope: ScopeId },
     /// Async completion from the C side; delivered to the owning instance
-    /// after a generation check (stale completions are dropped).
-    AsyncComplete { token: u64, json: String, is_error: bool },
-    /// Mode event from the C side (mode-key, mode-resize, mode-closed);
-    /// delivered only to the instance owning the mode, after a generation
-    /// check (stale events are dropped).
-    ModeEvent { mode_id: u64, name: String, json: String },
+    /// after a generation check (stale completions are dropped). `err` is 0
+    /// or an ErrorCode number; `data` is handed to the guest as an OwnedBuf
+    /// (error message bytes when err != 0).
+    AsyncComplete { token: u64, err: i32, v0: i64, v1: i64, data: Vec<u8> },
+    /// Mode event from the C side (a complete binary event buffer built by
+    /// C, including the mode field); delivered only to the instance owning
+    /// the mode, after a generation check (stale events are dropped).
+    ModeEvent { mode_id: u64, bytes: Vec<u8> },
 }
 
 pub struct EventQueue {

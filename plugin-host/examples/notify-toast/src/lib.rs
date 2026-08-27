@@ -55,6 +55,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 use serde::{Deserialize, Serialize};
+use tmux_plugin_sdk::abi::KIND_SERVER;
 use tmux_plugin_sdk::prelude::*;
 
 #[derive(Deserialize, Default)]
@@ -281,19 +282,12 @@ fn sanitize(msg: &str, max_chars: usize) -> String {
     flat.replace('\\', "\\\\")
 }
 
-fn id_array(v: &serde_json::Value, key: &str) -> Vec<u64> {
-    v.get(key)
-        .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
-        .unwrap_or_default()
+fn ids(list: &[u32]) -> Vec<u64> {
+    list.iter().map(|&v| u64::from(v)).collect()
 }
 
-fn pane_ids(window: &serde_json::Value) -> Vec<u64> {
-    id_array(window, "panes")
-}
-
-fn str_field(v: &serde_json::Value, key: &str) -> String {
-    v.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string()
+fn pane_ids(window: &tmux_plugin_sdk::WindowInfo) -> Vec<u64> {
+    ids(&window.panes)
 }
 
 /// One session as the tree needs it.
@@ -327,61 +321,37 @@ impl Topo {
     fn fetch() -> Self {
         let mut topo = Topo::default();
         if let Ok(panes) = list_panes() {
-            for p in panes.as_array().into_iter().flatten() {
-                if let (Some(id), Some(w)) = (
-                    p.get("id").and_then(|v| v.as_u64()),
-                    p.get("window").and_then(|v| v.as_u64()),
-                ) {
-                    topo.pane_window.insert(id, w);
-                }
+            for p in panes {
+                topo.pane_window
+                    .insert(u64::from(p.id), u64::from(p.window));
             }
         }
         if let Ok(windows) = list_windows() {
-            for w in windows.as_array().into_iter().flatten() {
-                let Some(id) = w.get("id").and_then(|v| v.as_u64()) else {
-                    continue;
-                };
+            for w in windows {
                 topo.windows.insert(
-                    id,
+                    u64::from(w.id),
                     WindowInfo {
-                        name: str_field(w, "name"),
-                        panes: pane_ids(w),
-                        sessions: id_array(w, "sessions"),
-                        active_pane: w
-                            .get("active_pane")
-                            .and_then(|v| v.as_u64()),
+                        panes: pane_ids(&w),
+                        sessions: ids(&w.sessions),
+                        active_pane: w.active_pane.map(u64::from),
+                        name: w.name,
                     },
                 );
             }
         }
         if let Ok(sessions) = list_sessions() {
-            for s in sessions.as_array().into_iter().flatten() {
-                let Some(id) = s.get("id").and_then(|v| v.as_u64()) else {
-                    continue;
-                };
+            for s in sessions {
                 let mut indexes = HashMap::new();
-                let links =
-                    s.get("windows").and_then(|v| v.as_array());
-                for wl in links.into_iter().flatten() {
-                    if let (Some(w), Some(i)) = (
-                        wl.get("id").and_then(|v| v.as_u64()),
-                        wl.get("index").and_then(|v| v.as_u64()),
-                    ) {
-                        indexes.insert(w, i as u32);
-                    }
+                for &(index, w) in &s.windows {
+                    indexes.insert(u64::from(w), index);
                 }
                 topo.sessions.insert(
-                    id,
+                    u64::from(s.id),
                     SessionInfo {
-                        name: str_field(s, "name"),
-                        attached: s
-                            .get("attached")
-                            .and_then(|v| v.as_bool())
-                            == Some(true),
-                        current_window: s
-                            .get("current_window")
-                            .and_then(|v| v.as_u64()),
+                        attached: s.attached,
+                        current_window: s.current_window.map(u64::from),
                         indexes,
+                        name: s.name,
                     },
                 );
             }
@@ -472,12 +442,11 @@ fn toast_line(e: &Entry, topo: &Topo, width: u64) -> String {
 fn current_windows() -> Vec<u64> {
     let mut out = Vec::new();
     let Ok(sessions) = list_sessions() else { return out };
-    let Some(sessions) = sessions.as_array() else { return out };
     for s in sessions {
-        if s.get("attached").and_then(|v| v.as_bool()) != Some(true) {
+        if !s.attached {
             continue;
         }
-        if let Some(curw) = s.get("current_window").and_then(|v| v.as_u64()) {
+        if let Some(curw) = s.current_window.map(u64::from) {
             if !out.contains(&curw) {
                 out.push(curw);
             }
@@ -549,20 +518,14 @@ async fn repaint(
         // float is excluded by its distinct title.
         if let Ok(panes) = list_panes() {
             let orphans: Vec<u64> = panes
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter(|p| {
-                            p.get("window").and_then(|v| v.as_u64())
-                                == Some(window)
-                                && p.get("title").and_then(|v| v.as_str())
-                                    == Some("notifications")
-                                && p.get("id").and_then(|v| v.as_u64()) != old
-                        })
-                        .filter_map(|p| p.get("id").and_then(|v| v.as_u64()))
-                        .collect()
+                .iter()
+                .filter(|p| {
+                    u64::from(p.window) == window
+                        && p.title == "notifications"
+                        && Some(u64::from(p.id)) != old
                 })
-                .unwrap_or_default();
+                .map(|p| u64::from(p.id))
+                .collect();
             for orphan in orphans {
                 log(&format!("repaint @{window}: killing orphan %{orphan}"));
                 let _ = run_command(&format!("kill-pane -t %{orphan}")).await;
@@ -582,10 +545,7 @@ async fn repaint(
         {
             if let (Some(p), true) = (old, pane_alive && nlines > 0) {
                 if let Ok(wi) = resolve_window(WindowId(window as u32)) {
-                    let win_width = wi
-                        .get("width")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(80);
+                    let win_width = u64::from(wi.width);
                     let x = win_width.saturating_sub(width);
                     if let Err(e) = run_command(&format!(
                         "move-pane -t %{p} -X {x} -Y 0"
@@ -630,8 +590,7 @@ async fn repaint(
         if nlines > 0 {
             let height = nlines as u64 + 3;
             if let Ok(before) = resolve_window(WindowId(window as u32)) {
-                let win_width =
-                    before.get("width").and_then(|v| v.as_u64()).unwrap_or(80);
+                let win_width = u64::from(before.width);
                 let x = win_width.saturating_sub(width);
                 let pre = pane_ids(&before);
                 let cmd = format!(
@@ -1305,10 +1264,8 @@ impl NotifyToast {
             (rows.len(), first)
         };
         let Ok(wi) = resolve_window(WindowId(window as u32)) else { return };
-        let win_w =
-            wi.get("width").and_then(|v| v.as_u64()).unwrap_or(80) as u32;
-        let win_h =
-            wi.get("height").and_then(|v| v.as_u64()).unwrap_or(24) as u32;
+        let win_w = wi.width;
+        let win_h = wi.height;
         let width = self
             .chooser_width
             .map(|s| s.resolve(win_w))
@@ -1378,23 +1335,18 @@ impl NotifyToast {
             // pressing client right now?
             let sessions: Vec<u64> = src_window
                 .and_then(|w| resolve_window(WindowId(w as u32)).ok())
-                .and_then(|wi| {
-                    wi.get("sessions").and_then(|v| v.as_array()).map(|a| {
-                        a.iter().filter_map(|v| v.as_u64()).collect()
-                    })
-                })
+                .map(|wi| ids(&wi.sessions))
                 .unwrap_or_default();
             let client_info = client.and_then(|cid| {
-                list_clients().ok()?.as_array()?.iter().find_map(|c| {
-                    (c.get("id").and_then(|v| v.as_u64()) == Some(cid))
-                        .then(|| {
-                            (
-                                c.get("name")
-                                    .and_then(|v| v.as_str())
-                                    .map(String::from),
-                                c.get("session").and_then(|v| v.as_u64()),
-                            )
-                        })
+                list_clients().ok()?.iter().find_map(|c| {
+                    (u64::from(c.id) == cid).then(|| {
+                        (
+                            // Empty string = absent (the client has no
+                            // usable name to switch by).
+                            (!c.name.is_empty()).then(|| c.name.clone()),
+                            c.session.map(u64::from),
+                        )
+                    })
                 })
             });
 
@@ -1635,7 +1587,7 @@ impl Plugin for NotifyToast {
 
     fn init(ctx: &Ctx, config: Config) -> Result<Self, String> {
         let me = self_info().map_err(|e| e.message.clone())?;
-        if me.pointer("/scope/type").and_then(|v| v.as_str()) != Some("server") {
+        if me.scope_kind != KIND_SERVER {
             return Err("notify-toast must be loaded with -s server".into());
         }
         let (duration, width, show_when_visible, chooser_width, chooser_height) =
@@ -1775,13 +1727,11 @@ impl Plugin for NotifyToast {
         let (width, keeper_secs, show_when_visible) = self.view_params();
         let state = Rc::clone(&self.state);
 
-        match event.event.as_str() {
+        match event.name().as_str() {
             "pane-notification" => {}
             // Key binding: toggle the chooser in the target window.
             "plugin-command" => {
-                if event.data.get("text").and_then(|v| v.as_str())
-                    != Some("chooser")
-                {
+                if event.get_str("text") != Some("chooser") {
                     return;
                 }
                 let Some(window) = event.scope.window.map(u64::from) else {
@@ -1806,22 +1756,20 @@ impl Plugin for NotifyToast {
             // Chooser events, targeted at this instance by mode id.
             "mode-key" => {
                 let matches = self.with_chooser(|ch| {
-                    event.data.get("mode").and_then(|v| v.as_u64())
-                        == Some(ch.mode.0)
+                    event.get_i64("mode") == Some(ch.mode.0 as i64)
                 });
                 if matches != Some(true) {
                     return;
                 }
-                let Some(key) =
-                    event.data.get("key").and_then(|v| v.as_str())
-                else {
+                let Some(key) = event.get_str("key") else {
                     return;
                 };
-                let mouse_row = event.data.pointer("/mouse/y").and_then(
-                    serde_json::Value::as_u64,
-                );
-                let client =
-                    event.data.get("client").and_then(|v| v.as_u64());
+                let mouse_row = event
+                    .get_i64("mouse_y")
+                    .and_then(|v| u64::try_from(v).ok());
+                let client = event
+                    .get_i64("client")
+                    .and_then(|v| u64::try_from(v).ok());
                 let key = key.to_string();
                 self.chooser_key(ctx, &key, mouse_row, client);
                 return;
@@ -1830,20 +1778,20 @@ impl Plugin for NotifyToast {
                 {
                     let mut st = state.borrow_mut();
                     let Some(ch) = st.chooser.as_mut() else { return };
-                    if event.data.get("mode").and_then(|v| v.as_u64())
-                        != Some(ch.mode.0)
-                    {
+                    if event.get_i64("mode") != Some(ch.mode.0 as i64) {
                         return;
                     }
-                    if let Some(w) =
-                        event.data.get("width").and_then(|v| v.as_u64())
+                    if let Some(w) = event
+                        .get_i64("width")
+                        .and_then(|v| u32::try_from(v).ok())
                     {
-                        ch.width = w as u32;
+                        ch.width = w;
                     }
-                    if let Some(h) =
-                        event.data.get("height").and_then(|v| v.as_u64())
+                    if let Some(h) = event
+                        .get_i64("height")
+                        .and_then(|v| u32::try_from(v).ok())
                     {
-                        ch.height = h as u32;
+                        ch.height = h;
                     }
                 }
                 redraw_chooser(&state);
@@ -1851,8 +1799,7 @@ impl Plugin for NotifyToast {
             }
             "mode-closed" => {
                 let mine = self.with_chooser(|ch| {
-                    event.data.get("mode").and_then(|v| v.as_u64())
-                        == Some(ch.mode.0)
+                    event.get_i64("mode") == Some(ch.mode.0 as i64)
                 });
                 if mine == Some(true) {
                     let ch = self.state.borrow_mut().chooser.take().unwrap();
@@ -1972,8 +1919,9 @@ impl Plugin for NotifyToast {
                     .find(|(_, v)| v.pane == Some(u64::from(p)))
                     .map(|(w, _)| *w);
                 let Some(window) = window else { return };
-                let return_pane =
-                    event.data.get("old_pane").and_then(|v| v.as_u64());
+                let return_pane = event
+                    .get_i64("old_pane")
+                    .and_then(|v| u64::try_from(v).ok());
                 log("notification pane clicked: opening chooser");
                 self.open_chooser(window, None, return_pane);
                 return;
@@ -1983,7 +1931,7 @@ impl Plugin for NotifyToast {
 
         let Some(src_pane) = event.scope.pane else { return };
         let src_window = event.scope.window.map(u64::from);
-        let Some(msg) = event.data.get("text").and_then(|v| v.as_str()) else {
+        let Some(msg) = event.get_str("text") else {
             return;
         };
         if msg.trim().is_empty() {

@@ -71,20 +71,25 @@ impl Plugin for Ticker {
 
     fn on_event(&mut self, _ctx: &Ctx, event: Event) {
         self.events += 1;
-        if self.panic_on.as_deref() == Some(event.event.as_str()) {
-            panic!("ticker asked to panic on {}", event.event);
+        let name = event.name();
+        if self.panic_on.as_deref() == Some(name.as_str()) {
+            panic!("ticker asked to panic on {name}");
         }
-        log(&format!("event {} (#{})", event.event, self.events));
+        log(&format!("event {name} (#{})", self.events));
     }
 
     fn snapshot(&self) -> Option<serde_json::Value> {
         Some(serde_json::json!({ "events": self.events }))
     }
 
-    fn restore(_old_version: i32, state: serde_json::Value) -> Option<Self> {
+    fn restore(
+        fresh: Self,
+        _old_version: i32,
+        state: serde_json::Value,
+    ) -> Option<Self> {
         let events = state.get("events")?.as_u64()?;
         log(&format!("restored with {events} events after reload"));
-        Some(Self { events, panic_on: None })
+        Some(Self { events, ..fresh })
     }
 
     fn on_unload(&mut self, _ctx: &Ctx) {

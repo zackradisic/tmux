@@ -49,9 +49,12 @@ static int		 plugin_initialized;
 static int		 plugin_drain_scheduled;
 static int		 plugin_in_drain;
 static struct event	 plugin_drain_timer;
+static struct event	 plugin_fs_event;
+static int		 plugin_fs_fd = -1;
 
 static enum cmd_retval	 plugin_drain_cb(struct cmdq_item *, void *);
 static void		 plugin_drain_timer_cb(int, short, void *);
+static void		 plugin_fs_cb(int, short, void *);
 
 void
 plugin_init(void)
@@ -62,6 +65,8 @@ plugin_init(void)
 	vt.log = plugin_vtable_log;
 	vt.list_objects = plugin_vtable_list_objects;
 	vt.resolve_object = plugin_vtable_resolve_object;
+	vt.obj_relation = plugin_vtable_obj_relation;
+	vt.format_expand = plugin_vtable_format_expand;
 	vt.send_keys = plugin_vtable_send_keys;
 	vt.capture_pane = plugin_vtable_capture_pane;
 	vt.get_option = plugin_vtable_get_option;
@@ -85,6 +90,18 @@ plugin_init(void)
 	evtimer_set(&plugin_drain_timer, plugin_drain_timer_cb, NULL);
 	plugin_initialized = 1;
 	plugin_events_init();
+
+	/*
+	 * The fs worker's doorbell: a pollable fd the worker thread rings
+	 * when async file completions are ready. The callback moves them
+	 * onto the plugin delivery queue and schedules a drain.
+	 */
+	plugin_fs_fd = pgh_fs_notify_fd();
+	if (plugin_fs_fd >= 0) {
+		event_set(&plugin_fs_event, plugin_fs_fd, EV_READ|EV_PERSIST,
+		    plugin_fs_cb, NULL);
+		event_add(&plugin_fs_event, NULL);
+	}
 }
 
 void
@@ -94,6 +111,10 @@ plugin_shutdown(void)
 		return;
 	plugin_initialized = 0;
 	plugin_events_shutdown();
+	if (plugin_fs_fd >= 0) {
+		event_del(&plugin_fs_event);
+		plugin_fs_fd = -1;
+	}
 	evtimer_del(&plugin_drain_timer);
 	plugin_async_shutdown();
 	plugin_mode_shutdown();
@@ -152,5 +173,12 @@ static void
 plugin_drain_timer_cb(__unused int fd, __unused short events,
     __unused void *data)
 {
+	plugin_schedule_drain();
+}
+
+static void
+plugin_fs_cb(__unused int fd, __unused short events, __unused void *data)
+{
+	pgh_fs_drain();
 	plugin_schedule_drain();
 }

@@ -19,6 +19,8 @@ slab = "0.4.12"
 blake3 = "1.8.5"
 toml = "1.1.2"
 base64 = "0.22"
+crossbeam-channel = "0.5"
+libc = "0.2"
 
 [dev-dependencies]
 wat = "1"

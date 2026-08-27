@@ -44,6 +44,12 @@ impl EngineState {
         cfg.epoch_interruption(true);
         cfg.cranelift_opt_level(OptLevel::Speed);
         cfg.max_wasm_stack(512 * 1024);
+        // Pin linear memories in place: growth may only extend, never
+        // relocate. Validated guest offsets then stay valid for the whole
+        // store lifetime (a prerequisite for handing pinned buffers to the
+        // future fs worker; also removes the moved-memory hazard behind
+        // re-entrant pgh_alloc).
+        cfg.memory_may_move(false);
         // No stack suspension (the "async" cargo feature is off): every
         // guest call runs to completion under an epoch deadline. Async is
         // completion-callback based at the ABI.

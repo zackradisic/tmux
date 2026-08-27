@@ -194,13 +194,7 @@ fn session_name(name: &str) -> String {
 /// caught before new-session runs.
 fn session_exists(name: &str) -> bool {
     list_sessions()
-        .ok()
-        .and_then(|v| {
-            v.as_array().map(|a| {
-                a.iter()
-                    .any(|s| s.get("name").and_then(|n| n.as_str()) == Some(name))
-            })
-        })
+        .map(|sessions| sessions.iter().any(|s| s.name == name))
         .unwrap_or(false)
 }
 
@@ -251,7 +245,7 @@ async fn open_form(
     // chooser, current pane otherwise).
     let cwd = target_pane
         .and_then(|p| resolve_pane(PaneId(p as u32)).ok())
-        .and_then(|v| v.get("cwd").and_then(|c| c.as_str()).map(String::from));
+        .and_then(|p| (!p.cwd.is_empty()).then_some(p.cwd));
     let repo = match kind {
         Kind::Worktree => match &cwd {
             Some(dir) => git_root(dir).await,
@@ -263,20 +257,16 @@ async fn open_form(
     // The form must open where the user is looking: the pressing
     // client's current window (the target may be in another session).
     let client_info = client.and_then(|cid| {
-        list_clients().ok()?.as_array()?.iter().find_map(|c| {
-            (c.get("id").and_then(|v| v.as_u64()) == Some(cid)).then(|| {
-                (
-                    c.get("name").and_then(|v| v.as_str()).map(String::from),
-                    c.get("session").and_then(|v| v.as_u64()),
-                )
-            })
+        list_clients().ok()?.iter().find_map(|c| {
+            (u64::from(c.id) == cid)
+                .then(|| (Some(c.name.clone()), c.session))
         })
     });
     let window = client_info
         .as_ref()
         .and_then(|(_, s)| *s)
-        .and_then(|s| resolve_session(SessionId(s as u32)).ok())
-        .and_then(|v| v.get("current_window").and_then(|w| w.as_u64()));
+        .and_then(|s| resolve_session(SessionId(s)).ok())
+        .and_then(|v| v.current_window);
     let Some(window) = window else {
         log("session_creator: cannot resolve the client's current window");
         let _ = display_message("session_creator: no client to open the form for");
@@ -284,7 +274,7 @@ async fn open_form(
     };
 
     let mode = match mode_open(&ModeOpts {
-        window: Some(WindowId(window as u32)),
+        window: Some(WindowId(window)),
         width: FORM_WIDTH,
         height: FORM_HEIGHT,
         title: Some("new session".into()),
@@ -631,9 +621,9 @@ impl Plugin for SessionCreator {
     }
 
     fn on_event(&mut self, ctx: &Ctx, event: Event) {
-        match event.event.as_str() {
+        match event.name().as_str() {
             "plugin-command" => {
-                let kind = match event.data.get("text").and_then(|v| v.as_str()) {
+                let kind = match event.get_str("text") {
                     Some("new") => Kind::Plain,
                     Some("worktree") => Kind::Worktree,
                     _ => return,
@@ -650,11 +640,10 @@ impl Plugin for SessionCreator {
             "mode-key" => {
                 let mut st = self.state.borrow_mut();
                 let Some(form) = st.form.as_mut() else { return };
-                if event.data.get("mode").and_then(|v| v.as_u64()) != Some(form.mode.0)
-                {
+                if event.get_i64("mode") != Some(form.mode.0 as i64) {
                     return;
                 }
-                let Some(key) = event.data.get("key").and_then(|v| v.as_str()) else {
+                let Some(key) = event.get_str("key") else {
                     return;
                 };
                 if form.busy {
@@ -742,14 +731,13 @@ impl Plugin for SessionCreator {
             "mode-resize" => {
                 let mut st = self.state.borrow_mut();
                 let Some(form) = st.form.as_mut() else { return };
-                if event.data.get("mode").and_then(|v| v.as_u64()) != Some(form.mode.0)
-                {
+                if event.get_i64("mode") != Some(form.mode.0 as i64) {
                     return;
                 }
-                if let Some(w) = event.data.get("width").and_then(|v| v.as_u64()) {
+                if let Some(w) = event.get_i64("width") {
                     form.width = w as u32;
                 }
-                if let Some(h) = event.data.get("height").and_then(|v| v.as_u64()) {
+                if let Some(h) = event.get_i64("height") {
                     form.height = h as u32;
                 }
                 render(form);
@@ -760,8 +748,7 @@ impl Plugin for SessionCreator {
                     .form
                     .as_ref()
                     .is_some_and(|f| {
-                        event.data.get("mode").and_then(|v| v.as_u64())
-                            == Some(f.mode.0)
+                        event.get_i64("mode") == Some(f.mode.0 as i64)
                     })
                 {
                     st.form = None;

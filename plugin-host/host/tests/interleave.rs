@@ -1,132 +1,27 @@
-//! Randomized interleavings of the pgh_* entry points with a real guest:
-//! load/unload/reload/enable/notify/destroy/async-complete/drain in
-//! arbitrary orders must never panic (= poison the host), must always
-//! converge when drained, and must never deliver stale completions (a
-//! delivery to a dead instance would trap the WAT guest, which counts
-//! failures we assert on indirectly via the poisoned check).
-//!
-//! Deterministic xorshift seeds, no fuzzing infrastructure needed.
+//! Chaos test: random interleavings of loads, binary events, drains,
+//! object teardown, async completions, unloads, reloads and mode events
+//! must never poison the host. One test function (pgh state is
+//! thread-local + a process-global vtable).
 
-use std::ffi::{c_void, CString};
+mod common;
+
+use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
 use std::sync::Mutex;
 
+use common::*;
 use plugin_host::*;
 
 static LOGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-unsafe extern "C" fn vt_log(_l: c_int, plugin: *const c_char, msg: *const c_char) {
+unsafe extern "C" fn logging_vt_log(
+    _level: c_int,
+    plugin: *const c_char,
+    msg: *const c_char,
+) {
     let plugin = std::ffi::CStr::from_ptr(plugin).to_string_lossy();
     let msg = std::ffi::CStr::from_ptr(msg).to_string_lossy();
     LOGS.lock().unwrap().push(format!("{plugin}: {msg}"));
-}
-unsafe extern "C" fn vt_list_objects(_k: c_int, sink: pgh_sink, ctx: *mut c_void) {
-    // Pretend objects 0 and 1 exist for every kind.
-    let s = r#"[{"id":0},{"id":1}]"#;
-    sink(ctx, s.as_ptr() as *const c_char, s.len());
-}
-unsafe extern "C" fn vt_resolve_object(
-    _k: c_int,
-    id: u32,
-    sink: pgh_sink,
-    ctx: *mut c_void,
-) -> c_int {
-    if id > 1 {
-        return -1;
-    }
-    let s = format!(r#"{{"id":{id},"window":0,"sessions":[0]}}"#);
-    sink(ctx, s.as_ptr() as *const c_char, s.len());
-    0
-}
-unsafe extern "C" fn vt_send_keys(_p: u32, _k: *const c_char, _l: c_int) -> c_int {
-    0
-}
-unsafe extern "C" fn vt_capture_pane(
-    _p: u32,
-    _s: c_int,
-    _e: c_int,
-    _x: c_int,
-    _sink: pgh_sink,
-    _c: *mut c_void,
-) -> c_int {
-    -1
-}
-unsafe extern "C" fn vt_get_option(
-    _k: c_int,
-    _i: u32,
-    _n: *const c_char,
-    _s: pgh_sink,
-    _c: *mut c_void,
-) -> c_int {
-    -2
-}
-unsafe extern "C" fn vt_set_option(
-    _k: c_int,
-    _i: u32,
-    _n: *const c_char,
-    _v: *const c_char,
-) -> c_int {
-    0
-}
-unsafe extern "C" fn vt_display_message(
-    _c: c_int,
-    _p: *const c_char,
-    _m: *const c_char,
-) -> c_int {
-    0
-}
-unsafe extern "C" fn vt_run_job(_c: *const c_char, _w: *const c_char, _t: u64) -> c_int {
-    // Started but never completes within the test: exercises token purge.
-    0
-}
-unsafe extern "C" fn vt_run_command(_c: *const c_char, _t: u64) -> c_int {
-    0
-}
-unsafe extern "C" fn vt_timer_start(_ms: u64, _t: u64) -> u64 {
-    7
-}
-unsafe extern "C" fn vt_timer_cancel(_id: u64) -> c_int {
-    0
-}
-unsafe extern "C" fn vt_state_changed(
-    _p: *const c_char,
-    _s: *const c_char,
-    _r: *const c_char,
-) {
-}
-unsafe extern "C" fn vt_mode_open(
-    _w: u32,
-    _width: u32,
-    _height: u32,
-    _x: c_int,
-    _y: c_int,
-    _t: *const c_char,
-) -> i64 {
-    9
-}
-unsafe extern "C" fn vt_mode_write(_m: u64, _d: *const u8, _l: usize) -> c_int {
-    0
-}
-unsafe extern "C" fn vt_mode_preview(
-    _m: u64,
-    _p: i64,
-    _x: u32,
-    _y: u32,
-    _w: u32,
-    _h: u32,
-) -> c_int {
-    0
-}
-unsafe extern "C" fn vt_mode_close(_m: u64) -> c_int {
-    0
-}
-unsafe extern "C" fn vt_mode_move(_m: u64, _w: u32, _x: c_int, _y: c_int) -> c_int {
-    0
-}
-
-unsafe extern "C" fn collect_sink(ctx: *mut c_void, ptr: *const c_char, len: usize) {
-    let buf = &mut *(ctx as *mut Vec<u8>);
-    buf.extend_from_slice(std::slice::from_raw_parts(ptr as *const u8, len));
 }
 
 /// Guest: conforming ABI, logs nothing, allocates by bumping.
@@ -147,7 +42,7 @@ const GUEST_WAT: &str = r#"
   (func (export "pgh_free") (param i32 i32))
   (func (export "pgh_init") (param i32 i32) (result i32) (i32.const 0))
   (func (export "pgh_on_event") (param i32 i32))
-  (func (export "pgh_on_async_complete") (param i64 i32 i32 i32))
+  (func (export "pgh_on_async_complete") (param i64 i32 i64 i64 i32 i32))
   (func (export "pgh_on_unload"))
 )
 "#;
@@ -178,26 +73,7 @@ fn random_interleavings_never_poison() {
         .join(format!("pgh-interleave-{}.wasm", std::process::id()));
     std::fs::write(&path, &wasm).unwrap();
 
-    let vt = pgh_host_vtable {
-        log: vt_log,
-        list_objects: vt_list_objects,
-        resolve_object: vt_resolve_object,
-        send_keys: vt_send_keys,
-        capture_pane: vt_capture_pane,
-        get_option: vt_get_option,
-        set_option: vt_set_option,
-        display_message: vt_display_message,
-        run_job: vt_run_job,
-        run_command: vt_run_command,
-        timer_start: vt_timer_start,
-        timer_cancel: vt_timer_cancel,
-        plugin_state_changed: vt_state_changed,
-        mode_open: vt_mode_open,
-        mode_write: vt_mode_write,
-        mode_preview: vt_mode_preview,
-        mode_close: vt_mode_close,
-        mode_move: vt_mode_move,
-    };
+    let vt = pgh_host_vtable { log: logging_vt_log, ..base_vtable() };
     assert_eq!(unsafe { pgh_init(&vt) }, 0);
 
     let names = ["alpha", "beta", "gamma"];
@@ -218,28 +94,23 @@ fn random_interleavings_never_poison() {
             match rng.next() % 11 {
                 0 | 1 => {
                     let scope = scopes[(rng.next() as usize) % scopes.len()];
-                    let desc = CString::new(format!(
-                        r#"{{"name":"{name}","path":"{}","scope":"{scope}"}}"#,
-                        path.display()
-                    ))
-                    .unwrap();
-                    let mut err: Vec<u8> = Vec::new();
-                    unsafe {
-                        pgh_plugin_load(
-                            desc.as_ptr(),
-                            collect_sink,
-                            &mut err as *mut Vec<u8> as *mut c_void,
-                        )
-                    };
+                    let _ = load_plugin(name, &path, scope, &[]);
                 }
                 2 | 3 => {
                     let ev = events[(rng.next() as usize) % events.len()];
-                    let id = rng.next() % 3;
-                    let json = CString::new(format!(
-                        r#"{{"event":"{ev}","session":{{"id":{id},"name":"s"}},"window":{{"id":{id},"name":"w"}},"pane":{{"id":{id},"window":{id}}}}}"#
-                    ))
-                    .unwrap();
-                    unsafe { pgh_notify(json.as_ptr()) };
+                    let id = (rng.next() % 3) as u32;
+                    let bytes = make_event(
+                        ev,
+                        None,
+                        Some(id),
+                        Some(id),
+                        Some(id),
+                        &[
+                            ("session_name", Field::Str("s")),
+                            ("window_name", Field::Str("w")),
+                        ],
+                    );
+                    notify(&bytes);
                 }
                 4 => {
                     pgh_drain(0);
@@ -249,12 +120,17 @@ fn random_interleavings_never_poison() {
                     pgh_object_destroyed(kind, (rng.next() % 3) as u32);
                 }
                 6 => {
-                    let payload = CString::new("{}").unwrap();
+                    // Random token, sometimes an error completion.
+                    let err = if rng.next() % 2 == 0 { 0 } else { 7 };
+                    let msg = b"chaos";
                     unsafe {
                         pgh_async_complete(
                             rng.next() % 16,
-                            payload.as_ptr(),
-                            (rng.next() % 2) as c_int,
+                            err,
+                            rng.next() as i64,
+                            0,
+                            msg.as_ptr(),
+                            msg.len(),
                         )
                     };
                 }
@@ -269,17 +145,25 @@ fn random_interleavings_never_poison() {
                         pgh_plugin_reload(
                             n.as_ptr(),
                             collect_sink,
-                            &mut err as *mut Vec<u8> as *mut c_void,
+                            &mut err as *mut Vec<u8>
+                                as *mut std::ffi::c_void,
                         )
                     };
                 }
                 9 => {
                     // Mode events for ids nothing owns: dropped silently.
-                    let ev = CString::new("mode-key").unwrap();
-                    let data = CString::new(r#"{"key":"q"}"#).unwrap();
-                    unsafe {
-                        pgh_mode_event(rng.next() % 16, ev.as_ptr(), data.as_ptr())
-                    };
+                    let bytes = make_event(
+                        "mode-key",
+                        None,
+                        None,
+                        None,
+                        None,
+                        &[
+                            ("mode", Field::I64((rng.next() % 16) as i64)),
+                            ("key", Field::Str("q")),
+                        ],
+                    );
+                    mode_event(rng.next() % 16, &bytes);
                 }
                 _ => {
                     let n = CString::new(name).unwrap();
@@ -294,15 +178,7 @@ fn random_interleavings_never_poison() {
             if step % 50 == 49 {
                 drain_until_empty();
                 // show-plugins path must stay coherent mid-chaos.
-                let mut buf: Vec<u8> = Vec::new();
-                unsafe {
-                    pgh_query_plugins(
-                        1,
-                        collect_sink,
-                        &mut buf as *mut Vec<u8> as *mut c_void,
-                    )
-                };
-                assert!(!buf.is_empty());
+                assert!(!query_plugins().is_empty());
             }
         }
         drain_until_empty();

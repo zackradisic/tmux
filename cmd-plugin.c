@@ -23,6 +23,7 @@
 
 #include "tmux.h"
 #include "plugin-host.h"
+#include "plugin-internal.h"
 
 /*
  * Plugin management commands. These only query or mutate the plugin
@@ -204,12 +205,14 @@ cmd_load_plugin_exec(struct cmd *self, struct cmdq_item *item)
 {
 	struct args		*args = cmd_get_args(self);
 	struct args_value	*av;
-	struct plugin_json	*pj;
 	struct evbuffer		*evb;
 	const char		*path = args_string(args, 0);
 	const char		*name = args_get(args, 'n');
 	const char		*scope = args_get(args, 's');
-	char			*copy = NULL, *base, *dot, *eq;
+	const char		**caps = NULL, **opts = NULL;
+	u_int			 ncaps = 0, nopts = 0;
+	char			*copy = NULL, *base, *dot;
+	int			 rc;
 
 	if (!plugin_enabled()) {
 		cmdq_error(item, "plugin support not available");
@@ -242,45 +245,34 @@ cmd_load_plugin_exec(struct cmd *self, struct cmdq_item *item)
 		name = base;
 	}
 
-	pj = plugin_json_create();
-	plugin_json_obj_start(pj, NULL);
-	plugin_json_str(pj, "name", name);
-	plugin_json_str(pj, "path", path);
-	if (scope != NULL)
-		plugin_json_str(pj, "scope", scope);
-	plugin_json_obj_start(pj, "config");
+	for (av = args_first_value(args, 'c'); av != NULL;
+	    av = args_next_value(av)) {
+		caps = xreallocarray(caps, ncaps + 1, sizeof *caps);
+		caps[ncaps++] = av->string;
+	}
 	for (av = args_first_value(args, 'o'); av != NULL;
 	    av = args_next_value(av)) {
-		if ((eq = strchr(av->string, '=')) != NULL) {
-			*eq = '\0';
-			plugin_json_str(pj, av->string, eq + 1);
-			*eq = '=';
-		} else
-			plugin_json_bool(pj, av->string, 1);
+		opts = xreallocarray(opts, nopts + 1, sizeof *opts);
+		opts[nopts++] = av->string;
 	}
-	plugin_json_obj_end(pj);
-	plugin_json_arr_start(pj, "caps");
-	for (av = args_first_value(args, 'c'); av != NULL;
-	    av = args_next_value(av))
-		plugin_json_str(pj, NULL, av->string);
-	plugin_json_arr_end(pj);
-	plugin_json_obj_end(pj);
 
 	evb = evbuffer_new();
 	if (evb == NULL)
 		fatalx("out of memory");
-	if (pgh_plugin_load(plugin_json_string(pj), cmd_plugin_sink,
-	    evb) != 0) {
+	rc = pgh_plugin_load(name, path, scope,
+	    (const char *const *)caps, ncaps, (const char *const *)opts,
+	    nopts, cmd_plugin_sink, evb);
+	free(caps);
+	free(opts);
+	if (rc != 0) {
 		evbuffer_add(evb, "", 1);
 		cmdq_error(item, "load-plugin %s: %s", name,
 		    (const char *)EVBUFFER_DATA(evb));
 		evbuffer_free(evb);
-		plugin_json_free(pj);
 		free(copy);
 		return (CMD_RETURN_ERROR);
 	}
 	evbuffer_free(evb);
-	plugin_json_free(pj);
 	free(copy);
 
 	/* Instantiation is queued; run it at the next safe point. */
@@ -318,45 +310,25 @@ cmd_plugin_command_exec(struct cmd *self, struct cmdq_item *item)
 	struct args		*args = cmd_get_args(self);
 	struct cmd_find_state	*target = cmdq_get_target(item);
 	struct client		*c = cmdq_get_client(item);
-	struct plugin_json	*pj;
+	struct plugin_buf	*pb;
 
 	if (!plugin_enabled()) {
 		cmdq_error(item, "plugin support not available");
 		return (CMD_RETURN_ERROR);
 	}
 
-	pj = plugin_json_create();
-	plugin_json_obj_start(pj, NULL);
-	plugin_json_str(pj, "event", "plugin-command");
-	plugin_json_str(pj, "plugin", args_string(args, 0));
-	plugin_json_str(pj, "text", args_string(args, 1));
-	if (c != NULL) {
-		plugin_json_obj_start(pj, "client");
-		plugin_json_num(pj, "id", c->id);
-		plugin_json_obj_end(pj);
-	}
-	if (target->s != NULL) {
-		plugin_json_obj_start(pj, "session");
-		plugin_json_num(pj, "id", target->s->id);
-		plugin_json_obj_end(pj);
-	}
-	if (target->w != NULL) {
-		plugin_json_obj_start(pj, "window");
-		plugin_json_num(pj, "id", target->w->id);
-		plugin_json_obj_end(pj);
-	}
-	if (target->wp != NULL) {
-		plugin_json_obj_start(pj, "pane");
-		plugin_json_num(pj, "id", target->wp->id);
-		if (target->w != NULL)
-			plugin_json_num(pj, "window", target->w->id);
-		plugin_json_obj_end(pj);
-	}
-	plugin_json_obj_end(pj);
-
-	pgh_notify(plugin_json_string(pj));
-	plugin_json_free(pj);
-	plugin_schedule_drain();
+	pb = plugin_event_create("plugin-command");
+	plugin_event_str(pb, "plugin", args_string(args, 0));
+	plugin_event_str(pb, "text", args_string(args, 1));
+	if (c != NULL)
+		plugin_event_scope(pb, PGH_OBJ_CLIENT, c->id);
+	if (target->s != NULL)
+		plugin_event_scope(pb, PGH_OBJ_SESSION, target->s->id);
+	if (target->w != NULL)
+		plugin_event_scope(pb, PGH_OBJ_WINDOW, target->w->id);
+	if (target->wp != NULL)
+		plugin_event_scope(pb, PGH_OBJ_PANE, target->wp->id);
+	plugin_event_send(pb);
 	return (CMD_RETURN_NORMAL);
 }
 

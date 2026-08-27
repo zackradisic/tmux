@@ -260,9 +260,9 @@ if ENABLE_PLUGINS
 dist_tmux_SOURCES += \
 	cmd-plugin.c \
 	plugin-async.c \
+	plugin-buf.c \
 	plugin-events.c \
 	plugin-internal.h \
-	plugin-json.c \
 	plugin-mode.c \
 	plugin-vtable.c \
 	plugin.c \

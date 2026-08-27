@@ -1,6 +1,11 @@
 //! Event queue processing: enqueue from the C bridge, instantiate scoped
 //! plugins, route events to guests, drain at safe points, and teardown.
 //!
+//! Events are binary buffers (header + field block, see abi-types). The
+//! host routes on the fixed header alone - event id and scope ids at fixed
+//! offsets - and never parses the field block, except to read the target
+//! plugin name of a plugin-command event.
+//!
 //! Borrow discipline: the registry borrow is NEVER held across a guest
 //! call. Instances are checked out of their slab slot, the guest runs, then
 //! the instance is checked back in (or dropped by the failure policy).
@@ -9,10 +14,14 @@
 
 use std::time::{Duration, Instant};
 
-use tmux_plugin_abi::{BridgeEvent, Event, EventScope, ScopeType};
+use tmux_plugin_abi::{
+    patch_event_seq, EventHeader, EventScope, FieldReader, KeyRef, ScopeType,
+    ValueRef,
+};
 
 use crate::abi;
 use crate::hostlog;
+use crate::intern as interner;
 use crate::registry::{Instance, InstanceStats, ScopeId};
 use crate::state::{Delivery, EVENTS, REGISTRY};
 
@@ -31,21 +40,14 @@ pub fn scope_matches(scope: ScopeId, ev: &EventScope) -> bool {
     }
 }
 
-/// Lifecycle events are delivered without an explicit subscription (a
-/// scoped instance always learns about its object's world changing).
-fn implicit_event(name: &str) -> bool {
-    name.ends_with("-created") || name.ends_with("-destroyed")
-        || name == "session-closed"
-}
-
-/// Enqueue a raw event from the C bridge. ENQUEUE ONLY - the one pgh entry
-/// point that vtable callbacks may legally re-enter.
-pub fn enqueue_raw(json: String) {
+/// Enqueue a raw binary event from the C bridge. ENQUEUE ONLY - the one
+/// pgh entry point that vtable callbacks may legally re-enter.
+pub fn enqueue_raw(bytes: Vec<u8>) {
     EVENTS.with(|e| {
         let mut q = e.borrow_mut();
         q.seq += 1;
         let seq = q.seq;
-        q.deliveries.push_back(Delivery::RawEvent { json, seq });
+        q.deliveries.push_back(Delivery::RawEvent { bytes, seq });
     });
 }
 
@@ -99,27 +101,30 @@ pub fn drain(max_us: u32) -> u32 {
         let Some(delivery) = delivery else { break };
 
         match delivery {
-            Delivery::RawEvent { json, seq } => {
-                match serde_json::from_str::<BridgeEvent>(&json) {
-                    Ok(bridge) => {
-                        let event = bridge.into_event(seq);
-                        instantiate_for_created(&event);
-                        route_event(&event);
+            Delivery::RawEvent { mut bytes, seq } => {
+                if patch_event_seq(&mut bytes, seq).is_err() {
+                    hostlog::error("host", "truncated bridge event buffer");
+                } else {
+                    match EventHeader::parse(&bytes) {
+                        Ok((header, _)) => {
+                            instantiate_for_created(&header);
+                            route_event(&header, &bytes);
+                        }
+                        Err(e) => hostlog::error(
+                            "host",
+                            &format!("bad bridge event buffer: {e}"),
+                        ),
                     }
-                    Err(err) => hostlog::error(
-                        "host",
-                        &format!("bad bridge event JSON ({err}): {json}"),
-                    ),
                 }
             }
             Delivery::Instantiate { plugin, scope } => {
                 instantiate_scope(&plugin, scope);
             }
-            Delivery::AsyncComplete { token, json, is_error } => {
-                deliver_async(token, &json, is_error);
+            Delivery::AsyncComplete { token, err, v0, v1, data } => {
+                deliver_async(token, err, v0, v1, &data);
             }
-            Delivery::ModeEvent { mode_id, name, json } => {
-                deliver_mode_event(mode_id, &name, &json);
+            Delivery::ModeEvent { mode_id, bytes } => {
+                deliver_mode_event(mode_id, bytes);
             }
         }
 
@@ -167,6 +172,14 @@ fn process_dying() {
 /// vtable call only *schedules* the pane teardown (deferred to a safe
 /// point), so this never destroys tmux objects synchronously.
 pub fn release_instance_resources(inst: &Instance) {
+    // In-flight fs jobs touch the instance's pinned guest memory; block
+    // until they finish before anything can drop the store. Local file
+    // I/O, so bounded.
+    crate::fsworker::wait_for_instance(
+        &inst.plugin,
+        inst.scope_id,
+        inst.generation,
+    );
     let timers =
         crate::tokens::purge_instance(&inst.plugin, inst.scope_id, inst.generation);
     let modes =
@@ -184,7 +197,7 @@ pub fn release_instance_resources(inst: &Instance) {
 }
 
 /// Deliver an async completion to the owning instance, generation-checked.
-fn deliver_async(token: u64, json: &str, is_error: bool) {
+fn deliver_async(token: u64, err: i32, v0: i64, v1: i64, data: &[u8]) {
     // Unknown token: instance already torn down (tokens purged) or the
     // token was cancelled - drop silently.
     let Some(pending) = crate::tokens::take(token) else { return };
@@ -213,7 +226,7 @@ fn deliver_async(token: u64, json: &str, is_error: bool) {
         return;
     }
 
-    let outcome = inst.guest.call_on_async_complete(token, json, is_error);
+    let outcome = inst.guest.call_on_async_complete(token, err, v0, v1, data);
     inst.stats.record(&outcome);
     let trapped = outcome.trapped();
     if let Err(e) = &outcome.result {
@@ -227,13 +240,20 @@ fn deliver_async(token: u64, json: &str, is_error: bool) {
 
 /// Deliver a mode event to the instance owning the mode, generation-
 /// checked. Mode events are targeted (never broadcast) and need no
-/// subscription; they arrive as ordinary guest events with the mode id in
-/// `data.mode`.
-fn deliver_mode_event(mode_id: u64, name: &str, json: &str) {
+/// subscription; the C side builds the complete event buffer (including
+/// the mode field).
+fn deliver_mode_event(mode_id: u64, mut bytes: Vec<u8>) {
+    let header = match EventHeader::parse(&bytes) {
+        Ok((h, _)) => h,
+        Err(e) => {
+            hostlog::error("host", &format!("bad mode event buffer: {e}"));
+            return;
+        }
+    };
     // Unknown mode: owner already torn down (modes purged) or the mode was
     // closed - drop silently. mode-closed is terminal: the C-side registry
     // entry is already gone, so drop ours too.
-    let owner = if name == "mode-closed" {
+    let owner = if header.event_id == interner::intern("mode-closed") {
         crate::modes::take(mode_id)
     } else {
         crate::modes::owner_of(mode_id)
@@ -264,40 +284,21 @@ fn deliver_mode_event(mode_id: u64, name: &str, json: &str) {
         return;
     }
 
-    let mut data = match serde_json::from_str::<serde_json::Value>(json) {
-        Ok(serde_json::Value::Object(map)) => map,
-        _ => serde_json::Map::new(),
-    };
-    data.insert("mode".into(), mode_id.into());
     let seq = EVENTS.with(|e| {
         let mut q = e.borrow_mut();
         q.seq += 1;
         q.seq
     });
-    let event = Event {
-        event: name.to_string(),
-        seq,
-        scope: EventScope::default(),
-        data: serde_json::Value::Object(data),
-    };
-    let json = match serde_json::to_string(&event) {
-        Ok(j) => j,
-        Err(e) => {
-            hostlog::error("host", &format!("mode event serialize: {e}"));
-            REGISTRY.with(|r| {
-                if let Some(slot) = r.borrow_mut().instances.get_mut(key) {
-                    *slot = Some(inst);
-                }
-            });
-            return;
-        }
-    };
+    let _ = patch_event_seq(&mut bytes, seq);
 
-    let outcome = inst.guest.call_on_event(&json);
+    let outcome = inst.guest.call_on_event(&bytes);
     inst.stats.record(&outcome);
     let trapped = outcome.trapped();
     if let Err(e) = &outcome.result {
-        hostlog::error(&inst.plugin, &format!("on_event({name}) trapped: {e}"));
+        hostlog::error(
+            &inst.plugin,
+            &format!("on_event(mode {mode_id}) trapped: {e}"),
+        );
     }
     check_in(key, inst, trapped, true);
 }
@@ -332,21 +333,25 @@ fn check_in(key: usize, inst: Instance, trapped: bool, ran: bool) {
 }
 
 /// Eagerly create scoped instances when an object-creation event arrives.
-fn instantiate_for_created(event: &Event) {
-    let (scope_type, scope) = match event.event.as_str() {
-        "session-created" => match event.scope.session {
+fn instantiate_for_created(header: &EventHeader) {
+    let id = header.event_id;
+    let (scope_type, scope) = if id == interner::intern("session-created") {
+        match header.scope.session {
             Some(id) => (ScopeType::Session, ScopeId::Session(id)),
             None => return,
-        },
-        "window-created" => match event.scope.window {
+        }
+    } else if id == interner::intern("window-created") {
+        match header.scope.window {
             Some(id) => (ScopeType::Window, ScopeId::Window(id)),
             None => return,
-        },
-        "pane-created" => match event.scope.pane {
+        }
+    } else if id == interner::intern("pane-created") {
+        match header.scope.pane {
             Some(id) => (ScopeType::Pane, ScopeId::Pane(id)),
             None => return,
-        },
-        _ => return,
+        }
+    } else {
+        return;
     };
 
     let plugins: Vec<String> = REGISTRY.with(|r| {
@@ -386,7 +391,7 @@ pub fn build_guest(
         let Some(module) = reg.modules.get(&def.hash).cloned() else {
             return Err(format!("no compiled module for {plugin}"));
         };
-        let config = def.config.to_string();
+        let config = abi::encode_config(&def.config);
         let caps = def.caps.clone();
         let Some(engine) = reg.engine.as_ref().map(|e| e.engine.clone())
         else {
@@ -462,14 +467,35 @@ fn fail(plugin: &str, what: &str) {
     });
 }
 
-/// Fan an event out to matching, subscribed instances.
-fn route_event(event: &Event) {
-    let json = match serde_json::to_string(event) {
-        Ok(j) => j,
-        Err(e) => {
-            hostlog::error("host", &format!("event serialize: {e}"));
-            return;
+/// For a plugin-command event, read the target plugin name from the field
+/// block (the one field the host ever reads out of an event).
+fn plugin_command_target(bytes: &[u8]) -> Option<String> {
+    let (_, cursor) = EventHeader::parse(bytes).ok()?;
+    let plugin_key = interner::intern("plugin");
+    for field in FieldReader::from_cursor(cursor).ok()? {
+        let (key, value) = field.ok()?;
+        if key == KeyRef::Id(plugin_key) {
+            if let ValueRef::Str(s) = value {
+                return Some(s.to_string());
+            }
         }
+    }
+    None
+}
+
+/// Fan an event out to matching, subscribed instances.
+fn route_event(header: &EventHeader, bytes: &[u8]) {
+    let implicit = interner::implicit(header.event_id);
+    // plugin-command events are addressed to one plugin by name; others
+    // must not see them even when subscribed.
+    let command_target = if header.event_id == interner::intern("plugin-command")
+    {
+        match plugin_command_target(bytes) {
+            Some(t) => Some(t),
+            None => return, // malformed: no target, deliver to nobody
+        }
+    } else {
+        None
     };
 
     let keys: Vec<usize> = REGISTRY.with(|r| {
@@ -478,7 +504,7 @@ fn route_event(event: &Event) {
             .iter()
             .filter(|(_, slot)| {
                 slot.as_ref()
-                    .is_some_and(|i| scope_matches(i.scope_id, &event.scope))
+                    .is_some_and(|i| scope_matches(i.scope_id, &header.scope))
             })
             .map(|(k, _)| k)
             .collect()
@@ -491,24 +517,26 @@ fn route_event(event: &Event) {
         });
         let Some(mut inst) = inst else { continue };
 
-        let subscribed = implicit_event(&event.event)
-            || inst.guest.store.data().subscriptions.contains(&event.event);
-        // plugin-command events are addressed to one plugin by name;
-        // others must not see them even when subscribed.
-        let subscribed = subscribed
-            && (event.event != "plugin-command"
-                || event.data.get("plugin").and_then(|v| v.as_str())
-                    == Some(inst.plugin.as_str()));
+        let subscribed = (implicit
+            || inst
+                .guest
+                .store
+                .data()
+                .subscriptions
+                .contains(&header.event_id))
+            && command_target
+                .as_deref()
+                .is_none_or(|t| t == inst.plugin.as_str());
 
         let mut trapped = false;
         if subscribed {
-            let outcome = inst.guest.call_on_event(&json);
+            let outcome = inst.guest.call_on_event(bytes);
             inst.stats.record(&outcome);
             trapped = outcome.trapped();
             if let Err(e) = &outcome.result {
                 hostlog::error(
                     &inst.plugin,
-                    &format!("on_event({}) trapped: {e}", event.event),
+                    &format!("on_event({}) trapped: {e}", header.event_id),
                 );
             }
         }

@@ -12,7 +12,10 @@ mod dispatch;
 mod engine;
 mod events;
 mod ffi;
+mod fsbox;
+mod fsworker;
 mod hostlog;
+mod intern;
 mod manifest;
 mod modes;
 mod registry;
@@ -108,6 +111,10 @@ pub unsafe extern "C" fn pgh_init(vt: *const pgh_host_vtable) -> c_int {
 #[no_mangle]
 pub extern "C" fn pgh_shutdown() {
     ffi_guard!((), {
+        // Finish (and join) the fs worker first: its in-flight jobs read
+        // and write pinned guest memory, so the stores must still be
+        // alive here.
+        fsworker::shutdown();
         // Give every live instance its on_unload (tiny budget) before the
         // stores drop: server shutdown is a safe point like any drain.
         let mut doomed: Vec<registry::Instance> = Vec::new();
@@ -138,34 +145,72 @@ pub extern "C" fn pgh_shutdown() {
     })
 }
 
-/// Load (or replace) a plugin from a JSON LoadDescriptor. Compiles and
-/// validates the module synchronously (obvious errors are written to
-/// `err_sink` and -1 returned); instantiation and guest init are queued for
-/// the next drain. The C side should call plugin_schedule_drain() after a
-/// successful return.
+/// Load (or replace) a plugin. `scope` may be NULL (defaults to server);
+/// `caps` is an array of `ncaps` capability names; `opts` is an array of
+/// `nopts` config entries ("key=value", or a bare "key" meaning true).
+/// Compiles and validates the module synchronously (obvious errors are
+/// written to `err_sink` and -1 returned); instantiation and guest init are
+/// queued for the next drain. The C side should call
+/// plugin_schedule_drain() after a successful return.
 ///
 /// # Safety
-/// `desc_json` must be NUL-terminated; `err_sink` must be valid.
+/// All strings must be NUL-terminated; the arrays must hold the declared
+/// counts; `err_sink` must be valid.
 #[no_mangle]
 pub unsafe extern "C" fn pgh_plugin_load(
-    desc_json: *const c_char,
+    name: *const c_char,
+    path: *const c_char,
+    scope: *const c_char,
+    caps: *const *const c_char,
+    ncaps: usize,
+    opts: *const *const c_char,
+    nopts: usize,
     err_sink: pgh_sink,
     err_ctx: *mut c_void,
 ) -> c_int {
     ffi_guard!(-1, {
-        let Some(json) = cstr_lossy(desc_json) else {
-            sink_str(err_sink, err_ctx, "null descriptor");
+        let (Some(name), Some(path)) = (cstr_lossy(name), cstr_lossy(path))
+        else {
+            sink_str(err_sink, err_ctx, "null name or path");
             return -1;
         };
-        let desc: tmux_plugin_abi::LoadDescriptor =
-            match serde_json::from_str(&json) {
-                Ok(d) => d,
-                Err(e) => {
-                    sink_str(err_sink, err_ctx, &format!("bad descriptor: {e}"));
-                    return -1;
+        let scope = match cstr_lossy(scope).as_deref() {
+            None | Some("server") => tmux_plugin_abi::ScopeType::Server,
+            Some("session") => tmux_plugin_abi::ScopeType::Session,
+            Some("window") => tmux_plugin_abi::ScopeType::Window,
+            Some("pane") => tmux_plugin_abi::ScopeType::Pane,
+            Some(other) => {
+                sink_str(err_sink, err_ctx, &format!("bad scope {other:?}"));
+                return -1;
+            }
+        };
+        let read_array = |arr: *const *const c_char, n: usize| -> Vec<String> {
+            if arr.is_null() {
+                return Vec::new();
+            }
+            (0..n)
+                .filter_map(|i| cstr_lossy(*arr.add(i)))
+                .collect()
+        };
+        let caps = read_array(caps, ncaps);
+        let mut config = serde_json::Map::new();
+        for opt in read_array(opts, nopts) {
+            match opt.split_once('=') {
+                Some((k, v)) => {
+                    config.insert(k.to_string(), v.into());
                 }
-            };
-        let name = desc.name.clone();
+                None => {
+                    config.insert(opt, true.into());
+                }
+            }
+        }
+        let desc = tmux_plugin_abi::LoadDescriptor {
+            name: name.clone(),
+            path,
+            scope,
+            config: serde_json::Value::Object(config),
+            caps,
+        };
         match reload::upsert(desc) {
             Ok(outcome) => {
                 // An explicit load-plugin takes the definition out of the
@@ -306,7 +351,8 @@ pub unsafe extern "C" fn pgh_plugin_unload(name: *const c_char) -> c_int {
     })
 }
 
-/// Feed one event (JSON, see ABI.md) into the plugin event queue.
+/// Feed one binary event buffer (header + field block, see abi-types) into
+/// the plugin event queue.
 ///
 /// ENQUEUE ONLY: never runs plugin code, so it is legal to call from
 /// anywhere on the main thread, including from inside a vtable callback
@@ -314,12 +360,30 @@ pub unsafe extern "C" fn pgh_plugin_unload(name: *const c_char) -> c_int {
 /// pgh_drain. The C side should call plugin_schedule_drain() afterwards.
 ///
 /// # Safety
-/// `event_json` must be a NUL-terminated string.
+/// `event` must point at `len` readable bytes (copied before returning).
 #[no_mangle]
-pub unsafe extern "C" fn pgh_notify(event_json: *const c_char) {
+pub unsafe extern "C" fn pgh_notify(event: *const u8, len: usize) {
     ffi_guard!((), {
-        let Some(json) = cstr_lossy(event_json) else { return };
-        events::enqueue_raw(json);
+        if event.is_null() {
+            return;
+        }
+        let bytes = std::slice::from_raw_parts(event, len).to_vec();
+        events::enqueue_raw(bytes);
+    })
+}
+
+/// Intern a name (event name or payload key), returning its stable id
+/// (>= 1). The same table serves guests through the `intern` import, so
+/// the ids the C bridge writes into event buffers are the ids guests
+/// subscribe to and compare against.
+///
+/// # Safety
+/// `name` must be NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn pgh_intern(name: *const c_char) -> u32 {
+    ffi_guard!(0, {
+        let Some(name) = cstr_lossy(name) else { return 0 };
+        intern::intern(&name)
     })
 }
 
@@ -343,7 +407,9 @@ pub extern "C" fn pgh_object_destroyed(kind: c_int, id: u32) {
 }
 
 /// Deliver the result of an async operation started through the vtable
-/// (run_job, run_command, timer_start, ...).
+/// (run_job, run_command, timer_start, ...). `err` is 0 on success or an
+/// ErrorCode number; `data`/`len` carry the per-method payload (job
+/// output; the error message when err != 0) and may be NULL/0.
 ///
 /// ENQUEUE ONLY, like pgh_notify: legal to call from any main-thread
 /// context, including from inside vtable callbacks. Generation checks at
@@ -351,26 +417,34 @@ pub extern "C" fn pgh_object_destroyed(kind: c_int, id: u32) {
 /// side should call plugin_schedule_drain() afterwards.
 ///
 /// # Safety
-/// `result_json` must be NUL-terminated.
+/// `data` must point at `len` readable bytes or be NULL (copied before
+/// returning).
 #[no_mangle]
 pub unsafe extern "C" fn pgh_async_complete(
     token: u64,
-    result_json: *const c_char,
-    is_error: c_int,
+    err: c_int,
+    v0: i64,
+    v1: i64,
+    data: *const u8,
+    len: usize,
 ) {
     ffi_guard!((), {
-        let json = cstr_lossy(result_json).unwrap_or_else(|| "{}".into());
+        let data = if data.is_null() || len == 0 {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(data, len).to_vec()
+        };
         EVENTS.with(|e| {
             e.borrow_mut().deliveries.push_back(
-                state::Delivery::AsyncComplete { token, json, is_error: is_error != 0 },
+                state::Delivery::AsyncComplete { token, err, v0, v1, data },
             );
         });
     })
 }
 
 /// Deliver a mode event (mode-key, mode-resize, mode-closed) for a plugin
-/// UI mode opened through the mode_open vtable call. `data_json` is a JSON
-/// object merged into the guest event's `data` (alongside "mode").
+/// UI mode opened through the mode_open vtable call. `event` is a complete
+/// binary event buffer built by the C side (including the mode field).
 ///
 /// ENQUEUE ONLY, like pgh_notify: legal to call from any main-thread
 /// context, including from inside vtable callbacks. Ownership and
@@ -379,19 +453,21 @@ pub unsafe extern "C" fn pgh_async_complete(
 /// afterwards.
 ///
 /// # Safety
-/// `name` and `data_json` must be NUL-terminated.
+/// `event` must point at `len` readable bytes (copied before returning).
 #[no_mangle]
 pub unsafe extern "C" fn pgh_mode_event(
     mode_id: u64,
-    name: *const c_char,
-    data_json: *const c_char,
+    event: *const u8,
+    len: usize,
 ) {
     ffi_guard!((), {
-        let Some(name) = cstr_lossy(name) else { return };
-        let json = cstr_lossy(data_json).unwrap_or_else(|| "{}".into());
+        if event.is_null() {
+            return;
+        }
+        let bytes = std::slice::from_raw_parts(event, len).to_vec();
         EVENTS.with(|e| {
             e.borrow_mut().deliveries.push_back(
-                state::Delivery::ModeEvent { mode_id, name, json },
+                state::Delivery::ModeEvent { mode_id, bytes },
             );
         });
     })
@@ -406,6 +482,22 @@ pub unsafe extern "C" fn pgh_mode_event(
 #[no_mangle]
 pub extern "C" fn pgh_drain(max_us: u32) -> u32 {
     ffi_guard!(0, events::drain(max_us))
+}
+
+/// The fs worker's pollable doorbell fd (created on first call). The C
+/// side registers a persistent read event on it whose callback calls
+/// pgh_fs_drain() then plugin_schedule_drain(). Returns -1 on failure.
+#[no_mangle]
+pub extern "C" fn pgh_fs_notify_fd() -> c_int {
+    ffi_guard!(-1, fsworker::notify_fd())
+}
+
+/// Move finished fs completions onto the plugin delivery queue (they are
+/// delivered to guests at the next pgh_drain). Main thread only; called
+/// from the doorbell event callback.
+#[no_mangle]
+pub extern "C" fn pgh_fs_drain() {
+    ffi_guard!((), fsworker::drain())
 }
 
 /// Write a human-readable plugin listing (for `show-plugins`) into the sink.

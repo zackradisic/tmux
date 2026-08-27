@@ -33,9 +33,17 @@
  * observe the same vocabulary as hooks and control mode - including events
  * added upstream in the future, with no bridge changes. Sinks run
  * synchronously inside events_fire() while every payload object is still
- * alive: the payload is snapshotted to JSON on the spot and pgh_notify()
- * is enqueue-only, so this is safe anywhere on the main thread, however
- * deep in tmux internals. Guest code runs later, at the drain safe point.
+ * alive: the payload is snapshotted into a binary event buffer on the spot
+ * and pgh_notify() is enqueue-only, so this is safe anywhere on the main
+ * thread, however deep in tmux internals. Guest code runs later, at the
+ * drain safe point.
+ *
+ * The canonical payload objects (client/session/window/pane) become the
+ * event header's scope ids; their names travel as flat fields
+ * (session_name, window_name, client_name). Everything else the payload
+ * carries is forwarded flat (window_index, exit_status, command_duration,
+ * old_pane, ...). Event names and field keys are interned through
+ * pgh_intern - the same table guests use to subscribe and compare keys.
  *
  * plugin_notify() delivers events that have no bus equivalent: the OSC 9 /
  * OSC 777 pane-notification (from input.c).
@@ -64,12 +72,6 @@ static const char *plugin_obj_event[] = {
 	"window-destroyed",
 	"pane-destroyed",
 	"client-destroyed",
-};
-static const char *plugin_obj_key[] = {
-	"session",
-	"window",
-	"pane",
-	"client",
 };
 static const int plugin_obj_pgh[] = {
 	PGH_OBJ_SESSION,
@@ -113,84 +115,64 @@ static u_int			  plugin_nsinks;
 
 /* Item-walk state for one bridged event. */
 struct plugin_events_state {
-	struct plugin_json	*pj;
-	const char		*event;
+	struct plugin_buf	*pb;
 	int			 pass;
 	struct window		*window;
 	int			 have_pane;
 };
 
-static void
-plugin_events_emit_client(struct plugin_json *pj, struct client *c)
-{
-	plugin_json_obj_start(pj, "client");
-	plugin_json_num(pj, "id", c->id);
-	if (c->name != NULL)
-		plugin_json_str(pj, "name", c->name);
-	plugin_json_obj_end(pj);
-}
-
-static void
-plugin_events_emit_session(struct plugin_json *pj, struct session *s)
-{
-	plugin_json_obj_start(pj, "session");
-	plugin_json_num(pj, "id", s->id);
-	plugin_json_str(pj, "name", s->name);
-	plugin_json_obj_end(pj);
-}
-
-static void
-plugin_events_emit_window(struct plugin_json *pj, struct window *w)
-{
-	plugin_json_obj_start(pj, "window");
-	plugin_json_num(pj, "id", w->id);
-	plugin_json_str(pj, "name", w->name);
-	plugin_json_obj_end(pj);
-}
-
-static void
-plugin_events_emit_pane(struct plugin_json *pj, struct window_pane *wp)
-{
-	plugin_json_obj_start(pj, "pane");
-	plugin_json_num(pj, "id", wp->id);
-	if (wp->window != NULL)
-		plugin_json_num(pj, "window", wp->window->id);
-	plugin_json_obj_end(pj);
-}
-
 /*
- * Payload item -> bridge JSON. Pass 0 maps the canonical object items
- * (client/session/window/pane) to the object shapes the host expects;
+ * Payload item -> event buffer. Pass 0 maps the canonical object items
+ * (client/session/window/pane) to the header scope ids plus name fields;
  * pass 1 forwards everything else flat (window_index, exit_status,
- * command_duration, old_pane, ...) for the guest's event data map.
+ * command_duration, old_pane, ...) for the guest's event fields.
  */
 static void
 plugin_events_item(const char *name, const struct event_payload_value *epv,
     void *arg)
 {
 	struct plugin_events_state	*st = arg;
-	struct plugin_json		*pj = st->pj;
+	struct plugin_buf		*pb = st->pb;
 
 	if (st->pass == 0) {
 		switch (epv->type) {
 		case EVENT_PAYLOAD_CLIENT:
-			if (strcmp(name, "client") == 0)
-				plugin_events_emit_client(pj, epv->client);
+			if (strcmp(name, "client") == 0) {
+				plugin_event_scope(pb, PGH_OBJ_CLIENT,
+				    epv->client->id);
+				if (epv->client->name != NULL)
+					plugin_event_str(pb, "client_name",
+					    epv->client->name);
+			}
 			break;
 		case EVENT_PAYLOAD_SESSION:
-			if (strcmp(name, "session") == 0)
-				plugin_events_emit_session(pj, epv->session);
+			if (strcmp(name, "session") == 0) {
+				plugin_event_scope(pb, PGH_OBJ_SESSION,
+				    epv->session->id);
+				plugin_event_str(pb, "session_name",
+				    epv->session->name);
+			}
 			break;
 		case EVENT_PAYLOAD_WINDOW:
 			if (strcmp(name, "window") == 0) {
 				st->window = epv->window;
-				plugin_events_emit_window(pj, epv->window);
+				plugin_event_scope(pb, PGH_OBJ_WINDOW,
+				    epv->window->id);
+				plugin_event_str(pb, "window_name",
+				    epv->window->name);
 			}
 			break;
 		case EVENT_PAYLOAD_PANE:
 			if (strcmp(name, "pane") == 0) {
 				st->have_pane = 1;
-				plugin_events_emit_pane(pj, epv->pane);
+				plugin_event_scope(pb, PGH_OBJ_PANE,
+				    epv->pane->id);
+				if (epv->pane->window != NULL &&
+				    !plugin_event_scope_set(pb,
+				    PGH_OBJ_WINDOW)) {
+					plugin_event_scope(pb, PGH_OBJ_WINDOW,
+					    epv->pane->window->id);
+				}
 			}
 			break;
 		default:
@@ -202,39 +184,39 @@ plugin_events_item(const char *name, const struct event_payload_value *epv,
 	switch (epv->type) {
 	case EVENT_PAYLOAD_STRING:
 		if (strcmp(name, "event") != 0)
-			plugin_json_str(pj, name, epv->string);
+			plugin_event_str(pb, name, epv->string);
 		break;
 	case EVENT_PAYLOAD_INT:
-		plugin_json_num(pj, name, epv->number);
+		plugin_event_i64(pb, name, epv->number);
 		break;
 	case EVENT_PAYLOAD_UINT:
-		plugin_json_num(pj, name, epv->unsigned_number);
+		plugin_event_i64(pb, name, epv->unsigned_number);
 		break;
 	case EVENT_PAYLOAD_TIME:
-		plugin_json_num(pj, name, (long long)epv->time);
+		plugin_event_i64(pb, name, (long long)epv->time);
 		break;
 	case EVENT_PAYLOAD_CLIENT:
 		if (strcmp(name, "client") != 0)
-			plugin_json_num(pj, name, epv->client->id);
+			plugin_event_i64(pb, name, epv->client->id);
 		break;
 	case EVENT_PAYLOAD_SESSION:
 		if (strcmp(name, "session") != 0)
-			plugin_json_num(pj, name, epv->session->id);
+			plugin_event_i64(pb, name, epv->session->id);
 		break;
 	case EVENT_PAYLOAD_WINDOW:
 		if (strcmp(name, "window") != 0)
-			plugin_json_num(pj, name, epv->window->id);
+			plugin_event_i64(pb, name, epv->window->id);
 		break;
 	case EVENT_PAYLOAD_PANE:
 		if (strcmp(name, "pane") != 0)
-			plugin_json_num(pj, name, epv->pane->id);
+			plugin_event_i64(pb, name, epv->pane->id);
 		break;
 	default:
 		break;
 	}
 }
 
-/* Event sink: snapshot the payload to JSON and enqueue for the guests. */
+/* Event sink: snapshot the payload into an event buffer and enqueue. */
 static void
 plugin_events_sink(const char *name, struct event_payload *ep,
     __unused void *data)
@@ -245,11 +227,8 @@ plugin_events_sink(const char *name, struct event_payload *ep,
 		return;
 
 	memset(&st, 0, sizeof st);
-	st.pj = plugin_json_create();
-	st.event = name;
+	st.pb = plugin_event_create(name);
 
-	plugin_json_obj_start(st.pj, NULL);
-	plugin_json_str(st.pj, "event", name);
 	st.pass = 0;
 	event_payload_foreach(ep, plugin_events_item, &st);
 
@@ -259,16 +238,15 @@ plugin_events_sink(const char *name, struct event_payload *ep,
 	 * signal. (window-pane-changed already carries the pane.)
 	 */
 	if (!st.have_pane && st.window != NULL && st.window->active != NULL &&
-	    strcmp(name, "session-window-changed") == 0)
-		plugin_events_emit_pane(st.pj, st.window->active);
+	    strcmp(name, "session-window-changed") == 0) {
+		plugin_event_scope(st.pb, PGH_OBJ_PANE,
+		    st.window->active->id);
+	}
 
 	st.pass = 1;
 	event_payload_foreach(ep, plugin_events_item, &st);
-	plugin_json_obj_end(st.pj);
 
-	pgh_notify(plugin_json_string(st.pj));
-	plugin_json_free(st.pj);
-	plugin_schedule_drain();
+	plugin_event_send(st.pb);
 }
 
 /* Register a sink for every hookable event plus the extras above. */
@@ -319,29 +297,30 @@ void
 plugin_notify(const char *name, struct client *c, struct session *s,
     struct window *w, struct window_pane *wp, const char *text)
 {
-	struct plugin_json	*pj;
+	struct plugin_buf	*pb;
 
 	if (!plugin_enabled())
 		return;
 
-	pj = plugin_json_create();
-	plugin_json_obj_start(pj, NULL);
-	plugin_json_str(pj, "event", name);
-	if (c != NULL)
-		plugin_events_emit_client(pj, c);
-	if (s != NULL)
-		plugin_events_emit_session(pj, s);
-	if (w != NULL)
-		plugin_events_emit_window(pj, w);
+	pb = plugin_event_create(name);
+	if (c != NULL) {
+		plugin_event_scope(pb, PGH_OBJ_CLIENT, c->id);
+		if (c->name != NULL)
+			plugin_event_str(pb, "client_name", c->name);
+	}
+	if (s != NULL) {
+		plugin_event_scope(pb, PGH_OBJ_SESSION, s->id);
+		plugin_event_str(pb, "session_name", s->name);
+	}
+	if (w != NULL) {
+		plugin_event_scope(pb, PGH_OBJ_WINDOW, w->id);
+		plugin_event_str(pb, "window_name", w->name);
+	}
 	if (wp != NULL)
-		plugin_events_emit_pane(pj, wp);
+		plugin_event_scope(pb, PGH_OBJ_PANE, wp->id);
 	if (text != NULL)
-		plugin_json_str(pj, "text", text);
-	plugin_json_obj_end(pj);
-
-	pgh_notify(plugin_json_string(pj));
-	plugin_json_free(pj);
-	plugin_schedule_drain();
+		plugin_event_str(pb, "text", text);
+	plugin_event_send(pb);
 }
 
 /*
@@ -354,28 +333,20 @@ plugin_notify(const char *name, struct client *c, struct session *s,
 void
 plugin_object_created(enum plugin_obj_kind kind, u_int id)
 {
-	struct plugin_json	*pj;
+	struct plugin_buf	*pb;
 
 	if (!plugin_enabled())
 		return;
 
-	pj = plugin_json_create();
-	plugin_json_obj_start(pj, NULL);
-	plugin_json_str(pj, "event", plugin_obj_created_event[kind]);
-	plugin_json_obj_start(pj, plugin_obj_key[kind]);
-	plugin_json_num(pj, "id", id);
-	plugin_json_obj_end(pj);
-	plugin_json_obj_end(pj);
-
-	pgh_notify(plugin_json_string(pj));
-	plugin_json_free(pj);
-	plugin_schedule_drain();
+	pb = plugin_event_create(plugin_obj_created_event[kind]);
+	plugin_event_scope(pb, plugin_obj_pgh[kind], id);
+	plugin_event_send(pb);
 }
 
 void
 plugin_object_destroyed(enum plugin_obj_kind kind, u_int id)
 {
-	struct plugin_json	*pj;
+	struct plugin_buf	*pb;
 
 	if (!plugin_enabled())
 		return;
@@ -385,16 +356,9 @@ plugin_object_destroyed(enum plugin_obj_kind kind, u_int id)
 	 * instances are invalidated by pgh_object_destroyed below, which
 	 * also purges their queued deliveries.
 	 */
-	pj = plugin_json_create();
-	plugin_json_obj_start(pj, NULL);
-	plugin_json_str(pj, "event", plugin_obj_event[kind]);
-	plugin_json_obj_start(pj, plugin_obj_key[kind]);
-	plugin_json_num(pj, "id", id);
-	plugin_json_obj_end(pj);
-	plugin_json_obj_end(pj);
-
-	pgh_notify(plugin_json_string(pj));
-	plugin_json_free(pj);
+	pb = plugin_event_create(plugin_obj_event[kind]);
+	plugin_event_scope(pb, plugin_obj_pgh[kind], id);
+	plugin_event_send(pb);
 
 	pgh_object_destroyed(plugin_obj_pgh[kind], id);
 	plugin_schedule_drain();

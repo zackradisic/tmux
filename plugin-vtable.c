@@ -32,16 +32,26 @@
  *  - may re-enter pgh_notify but no other pgh_* entry point.
  */
 
-static void	plugin_vtable_emit_session(struct plugin_json *,
+static void	plugin_vtable_emit_session(struct plugin_buf *,
 		    struct session *);
-static void	plugin_vtable_emit_window(struct plugin_json *,
+static void	plugin_vtable_emit_window(struct plugin_buf *,
 		    struct window *);
-static void	plugin_vtable_emit_pane(struct plugin_json *,
+static void	plugin_vtable_emit_pane(struct plugin_buf *,
 		    struct window_pane *);
-static void	plugin_vtable_emit_client(struct plugin_json *,
+static void	plugin_vtable_emit_client(struct plugin_buf *,
 		    struct client *);
-static void	plugin_vtable_flush(struct plugin_json *, pgh_sink,
+static void	plugin_vtable_flush(struct plugin_buf *, pgh_sink,
 		    void *);
+
+/* Sentinel matching abi-types NONE_ID. */
+#define PLUGIN_VTABLE_NONE_ID 0xffffffffU
+
+/* Pane/client record flag bits (mirror abi-types). */
+#define PLUGIN_PANE_ACTIVE	0x1
+#define PLUGIN_PANE_FLOATING	0x2
+#define PLUGIN_PANE_DEAD	0x4
+#define PLUGIN_CLIENT_ATTACHED	0x1
+#define PLUGIN_CLIENT_CONTROL	0x2
 
 void
 plugin_vtable_log(int level, const char *plugin, const char *msg)
@@ -51,133 +61,257 @@ plugin_vtable_log(int level, const char *plugin, const char *msg)
 }
 
 static void
-plugin_vtable_flush(struct plugin_json *pj, pgh_sink sink, void *ctx)
+plugin_vtable_flush(struct plugin_buf *pb, pgh_sink sink, void *ctx)
 {
-	const char	*s;
+	const u_char	*data;
+	size_t		 len;
 
-	s = plugin_json_string(pj);
-	sink(ctx, s, strlen(s));
-	plugin_json_free(pj);
+	data = plugin_buf_data(pb, &len);
+	sink(ctx, (const char *)data, len);
+	plugin_buf_free(pb);
 }
 
 static void
-plugin_vtable_emit_session(struct plugin_json *pj, struct session *s)
+plugin_vtable_emit_session(struct plugin_buf *pb, struct session *s)
 {
 	struct winlink	*wl;
+	u_int		 n = 0;
 
-	plugin_json_obj_start(pj, NULL);
-	plugin_json_num(pj, "id", s->id);
-	plugin_json_str(pj, "name", s->name);
-	plugin_json_bool(pj, "attached", s->attached != 0);
-	if (s->curw != NULL)
-		plugin_json_num(pj, "current_window", s->curw->window->id);
-	plugin_json_arr_start(pj, "windows");
+	plugin_buf_u32(pb, s->id);
+	plugin_buf_u8(pb, s->attached != 0);
+	plugin_buf_u32(pb, s->curw != NULL ?
+	    s->curw->window->id : PLUGIN_VTABLE_NONE_ID);
+	plugin_buf_str(pb, s->name);
+	RB_FOREACH(wl, winlinks, &s->windows)
+		n++;
+	plugin_buf_u32(pb, n);
 	RB_FOREACH(wl, winlinks, &s->windows) {
-		plugin_json_obj_start(pj, NULL);
-		plugin_json_num(pj, "index", wl->idx);
-		plugin_json_num(pj, "id", wl->window->id);
-		plugin_json_obj_end(pj);
+		plugin_buf_u32(pb, wl->idx);
+		plugin_buf_u32(pb, wl->window->id);
 	}
-	plugin_json_arr_end(pj);
-	plugin_json_obj_end(pj);
 }
 
 static void
-plugin_vtable_emit_window(struct plugin_json *pj, struct window *w)
+plugin_vtable_emit_window(struct plugin_buf *pb, struct window *w)
 {
 	struct winlink		*wl;
 	struct window_pane	*wp;
+	u_int			 n;
 
-	plugin_json_obj_start(pj, NULL);
-	plugin_json_num(pj, "id", w->id);
-	plugin_json_str(pj, "name", w->name);
-	plugin_json_num(pj, "width", w->sx);
-	plugin_json_num(pj, "height", w->sy);
-	plugin_json_arr_start(pj, "sessions");
+	plugin_buf_u32(pb, w->id);
+	plugin_buf_u32(pb, w->sx);
+	plugin_buf_u32(pb, w->sy);
+	plugin_buf_u32(pb, w->active != NULL ?
+	    w->active->id : PLUGIN_VTABLE_NONE_ID);
+	plugin_buf_str(pb, w->name);
+	n = 0;
 	TAILQ_FOREACH(wl, &w->winlinks, wentry)
-		plugin_json_num(pj, NULL, wl->session->id);
-	plugin_json_arr_end(pj);
-	plugin_json_arr_start(pj, "panes");
+		n++;
+	plugin_buf_u32(pb, n);
+	TAILQ_FOREACH(wl, &w->winlinks, wentry)
+		plugin_buf_u32(pb, wl->session->id);
+	n = 0;
 	TAILQ_FOREACH(wp, &w->panes, entry)
-		plugin_json_num(pj, NULL, wp->id);
-	plugin_json_arr_end(pj);
-	if (w->active != NULL)
-		plugin_json_num(pj, "active_pane", w->active->id);
-	plugin_json_obj_end(pj);
+		n++;
+	plugin_buf_u32(pb, n);
+	TAILQ_FOREACH(wp, &w->panes, entry)
+		plugin_buf_u32(pb, wp->id);
 }
 
 static void
-plugin_vtable_emit_pane(struct plugin_json *pj, struct window_pane *wp)
+plugin_vtable_emit_pane(struct plugin_buf *pb, struct window_pane *wp)
 {
-	char	*cwd;
+	char	*cwd = NULL;
+	uint8_t	 flags = 0;
 
-	plugin_json_obj_start(pj, NULL);
-	plugin_json_num(pj, "id", wp->id);
-	plugin_json_num(pj, "window", wp->window->id);
-	plugin_json_num(pj, "width", wp->sx);
-	plugin_json_num(pj, "height", wp->sy);
-	plugin_json_bool(pj, "active", wp == wp->window->active);
-	plugin_json_bool(pj, "floating", window_pane_is_floating(wp));
-	plugin_json_bool(pj, "dead", (wp->flags & PANE_EXITED) != 0);
-	if (wp->base.title != NULL)
-		plugin_json_str(pj, "title", wp->base.title);
-	if (wp->shell != NULL)
-		plugin_json_str(pj, "shell", wp->shell);
+	if (wp == wp->window->active)
+		flags |= PLUGIN_PANE_ACTIVE;
+	if (window_pane_is_floating(wp))
+		flags |= PLUGIN_PANE_FLOATING;
+	if (wp->flags & PANE_EXITED)
+		flags |= PLUGIN_PANE_DEAD;
+
+	plugin_buf_u32(pb, wp->id);
+	plugin_buf_u32(pb, wp->window->id);
+	plugin_buf_u32(pb, wp->sx);
+	plugin_buf_u32(pb, wp->sy);
+	plugin_buf_u8(pb, flags);
+	plugin_buf_str(pb, wp->base.title);
+	plugin_buf_str(pb, wp->shell);
 	/* Same source as #{pane_current_path}; buffer is static, not freed. */
-	if (wp->fd != -1 && (cwd = osdep_get_cwd(wp->fd)) != NULL)
-		plugin_json_str(pj, "cwd", cwd);
-	plugin_json_obj_end(pj);
+	if (wp->fd != -1)
+		cwd = osdep_get_cwd(wp->fd);
+	plugin_buf_str(pb, cwd);
 }
 
 static void
-plugin_vtable_emit_client(struct plugin_json *pj, struct client *c)
+plugin_vtable_emit_client(struct plugin_buf *pb, struct client *c)
 {
-	plugin_json_obj_start(pj, NULL);
-	plugin_json_num(pj, "id", c->id);
-	plugin_json_str(pj, "name", c->name == NULL ? "" : c->name);
+	uint8_t	flags = 0;
+
 	if (c->session != NULL)
-		plugin_json_num(pj, "session", c->session->id);
-	else
-		plugin_json_null(pj, "session");
-	plugin_json_bool(pj, "attached", c->session != NULL);
-	plugin_json_bool(pj, "control", (c->flags & CLIENT_CONTROL) != 0);
-	plugin_json_obj_end(pj);
+		flags |= PLUGIN_CLIENT_ATTACHED;
+	if (c->flags & CLIENT_CONTROL)
+		flags |= PLUGIN_CLIENT_CONTROL;
+
+	plugin_buf_u32(pb, c->id);
+	plugin_buf_u32(pb, c->session != NULL ?
+	    c->session->id : PLUGIN_VTABLE_NONE_ID);
+	plugin_buf_u8(pb, flags);
+	plugin_buf_str(pb, c->name);
 }
 
 void
 plugin_vtable_list_objects(int kind, pgh_sink sink, void *ctx)
 {
-	struct plugin_json	*pj;
+	struct plugin_buf	*pb;
 	struct session		*s;
 	struct window		*w;
 	struct window_pane	*wp;
 	struct client		*c;
+	u_int			 n = 0;
 
-	pj = plugin_json_create();
-	plugin_json_arr_start(pj, NULL);
+	pb = plugin_buf_create();
 	switch (kind) {
 	case PGH_OBJ_SESSION:
 		RB_FOREACH(s, sessions, &sessions)
-			plugin_vtable_emit_session(pj, s);
+			n++;
+		plugin_buf_u32(pb, n);
+		RB_FOREACH(s, sessions, &sessions)
+			plugin_vtable_emit_session(pb, s);
 		break;
 	case PGH_OBJ_WINDOW:
 		RB_FOREACH(w, windows, &windows)
-			plugin_vtable_emit_window(pj, w);
+			n++;
+		plugin_buf_u32(pb, n);
+		RB_FOREACH(w, windows, &windows)
+			plugin_vtable_emit_window(pb, w);
 		break;
 	case PGH_OBJ_PANE:
 		RB_FOREACH(wp, window_pane_tree, &all_window_panes)
-			plugin_vtable_emit_pane(pj, wp);
+			n++;
+		plugin_buf_u32(pb, n);
+		RB_FOREACH(wp, window_pane_tree, &all_window_panes)
+			plugin_vtable_emit_pane(pb, wp);
 		break;
 	case PGH_OBJ_CLIENT:
 		TAILQ_FOREACH(c, &clients, entry) {
+			if (~c->flags & CLIENT_DEAD)
+				n++;
+		}
+		plugin_buf_u32(pb, n);
+		TAILQ_FOREACH(c, &clients, entry) {
 			if (c->flags & CLIENT_DEAD)
 				continue;
-			plugin_vtable_emit_client(pj, c);
+			plugin_vtable_emit_client(pb, c);
 		}
 		break;
+	default:
+		plugin_buf_u32(pb, 0);
+		break;
 	}
-	plugin_json_arr_end(pj);
-	plugin_vtable_flush(pj, sink, ctx);
+	plugin_vtable_flush(pb, sink, ctx);
+}
+
+/*
+ * Expand a format string against a scope (kind -1 = server/global, else
+ * PGH_OBJ_SESSION/WINDOW/PANE). FORMAT_NOJOBS: #() never spawns. The fmt
+ * string is borrowed for the call and consumed before returning.
+ * Returns 0, -1 dead/bad target.
+ */
+int
+plugin_vtable_format_expand(int kind, u_int id, const char *fmt,
+    pgh_sink sink, void *ctx)
+{
+	struct format_tree	*ft;
+	struct session		*s = NULL;
+	struct window		*w = NULL;
+	struct winlink		*wl = NULL;
+	struct window_pane	*wp = NULL;
+	char			*out;
+
+	switch (kind) {
+	case -1:
+		break;
+	case PGH_OBJ_SESSION:
+		if ((s = session_find_by_id(id)) == NULL)
+			return (-1);
+		break;
+	case PGH_OBJ_WINDOW:
+		if ((w = window_find_by_id(id)) == NULL)
+			return (-1);
+		wl = TAILQ_FIRST(&w->winlinks);
+		s = (wl != NULL) ? wl->session : NULL;
+		break;
+	case PGH_OBJ_PANE:
+		if ((wp = window_pane_find_by_id(id)) == NULL ||
+		    (wp->flags & PANE_DESTROYED))
+			return (-1);
+		w = wp->window;
+		wl = (w != NULL) ? TAILQ_FIRST(&w->winlinks) : NULL;
+		s = (wl != NULL) ? wl->session : NULL;
+		break;
+	default:
+		return (-1);
+	}
+
+	ft = format_create(NULL, NULL, FORMAT_NONE, FORMAT_NOJOBS);
+	format_defaults(ft, NULL, s, wl, wp);
+	out = format_expand(ft, fmt);
+	sink(ctx, out, strlen(out));
+	free(out);
+	format_free(ft);
+	return (0);
+}
+
+/*
+ * Relation queries for scope checks (PGH_REL_*). Returns the related id,
+ * a 0/1 membership answer, or -1 when an object is dead.
+ */
+int64_t
+plugin_vtable_obj_relation(int rel, u_int a, u_int b)
+{
+	struct window_pane	*wp;
+	struct window		*w;
+	struct session		*s;
+	struct winlink		*wl;
+
+	switch (rel) {
+	case PGH_REL_PANE_WINDOW:
+		wp = window_pane_find_by_id(a);
+		if (wp == NULL || wp->window == NULL)
+			return (-1);
+		return (wp->window->id);
+	case PGH_REL_SESSION_CURWIN:
+		s = session_find_by_id(a);
+		if (s == NULL || s->curw == NULL)
+			return (-1);
+		return (s->curw->window->id);
+	case PGH_REL_WINDOW_IN_SESSION:
+		w = window_find_by_id(a);
+		if (w == NULL)
+			return (-1);
+		TAILQ_FOREACH(wl, &w->winlinks, wentry) {
+			if (wl->session->id == b)
+				return (1);
+		}
+		return (0);
+	case PGH_REL_PANE_IN_WINDOW:
+		wp = window_pane_find_by_id(a);
+		if (wp == NULL || wp->window == NULL)
+			return (-1);
+		return (wp->window->id == b);
+	case PGH_REL_PANE_IN_SESSION:
+		wp = window_pane_find_by_id(a);
+		if (wp == NULL || wp->window == NULL)
+			return (-1);
+		TAILQ_FOREACH(wl, &wp->window->winlinks, wentry) {
+			if (wl->session->id == b)
+				return (1);
+		}
+		return (0);
+	}
+	return (-1);
 }
 
 /*
@@ -434,28 +568,28 @@ plugin_vtable_state_changed(const char *plugin, const char *state,
 int
 plugin_vtable_resolve_object(int kind, u_int id, pgh_sink sink, void *ctx)
 {
-	struct plugin_json	*pj;
+	struct plugin_buf	*pb;
 	struct session		*s;
 	struct window		*w;
 	struct window_pane	*wp;
 	struct client		*c;
 
-	pj = plugin_json_create();
+	pb = plugin_buf_create();
 	switch (kind) {
 	case PGH_OBJ_SESSION:
 		if ((s = session_find_by_id(id)) == NULL)
 			goto missing;
-		plugin_vtable_emit_session(pj, s);
+		plugin_vtable_emit_session(pb, s);
 		break;
 	case PGH_OBJ_WINDOW:
 		if ((w = window_find_by_id(id)) == NULL)
 			goto missing;
-		plugin_vtable_emit_window(pj, w);
+		plugin_vtable_emit_window(pb, w);
 		break;
 	case PGH_OBJ_PANE:
 		if ((wp = window_pane_find_by_id(id)) == NULL)
 			goto missing;
-		plugin_vtable_emit_pane(pj, wp);
+		plugin_vtable_emit_pane(pb, wp);
 		break;
 	case PGH_OBJ_CLIENT:
 		TAILQ_FOREACH(c, &clients, entry) {
@@ -464,15 +598,15 @@ plugin_vtable_resolve_object(int kind, u_int id, pgh_sink sink, void *ctx)
 		}
 		if (c == NULL)
 			goto missing;
-		plugin_vtable_emit_client(pj, c);
+		plugin_vtable_emit_client(pb, c);
 		break;
 	default:
 		goto missing;
 	}
-	plugin_vtable_flush(pj, sink, ctx);
+	plugin_vtable_flush(pb, sink, ctx);
 	return (0);
 
 missing:
-	plugin_json_free(pj);
+	plugin_buf_free(pb);
 	return (-1);
 }

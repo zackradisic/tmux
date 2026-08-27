@@ -1,172 +1,253 @@
-//! Typed wrappers over the host_call / host_request ABI.
+//! Typed wrappers over the per-method host imports.
 //!
 //! Sync functions return immediately; async functions return futures
 //! resolved by the SDK executor when the host delivers the completion.
+//! String arguments take [`impl AsTmuxStr`](crate::strings::AsTmuxStr):
+//! `c"..."` literals and [`TmuxString`](crate::strings::TmuxString) cross
+//! zero-copy, plain `&str` pays one small copy for the trailing NUL.
 
-use serde::Deserialize;
-use serde_json::{json, Value};
-use tmux_plugin_abi::{ErrorCode, HostError, HostResponse};
+use tmux_plugin_abi::{
+    parse_list, ClientInfo, Cursor, ErrorCode, HostError, PaneInfo,
+    SelfInfo, SessionInfo, WindowInfo, KIND_CLIENT, KIND_PANE, KIND_SERVER,
+    KIND_SESSION, KIND_WINDOW,
+};
 
-use crate::executor::{HostFuture, HostResult};
-use crate::ids::{ModeId, PaneId, SessionId, WindowId};
-use crate::runtime;
+use crate::event;
+use crate::executor::{Completion, HostFuture};
+use crate::ids::{ClientId, ModeId, PaneId, SessionId, WindowId};
+use crate::runtime::{self, raw, Owned};
+use crate::strings::AsTmuxStr;
 
-fn host_err(code: ErrorCode, message: impl Into<String>) -> HostError {
-    HostError { code, message: message.into(), data: Value::Null }
-}
-
-/// Synchronous host call returning the `ok` value.
-pub fn host_call(method: &str, params: Value) -> HostResult {
-    let request = json!({ "method": method, "params": params }).to_string();
-    let (status, response) = runtime::raw_host_call(&request);
-    if status > 1 {
-        return Err(host_err(ErrorCode::Host, "ABI failure in host_call"));
-    }
-    match serde_json::from_slice::<HostResponse>(&response) {
-        Ok(HostResponse::Ok(value)) => Ok(value),
-        Ok(HostResponse::Err(e)) => Err(e),
-        Err(e) => Err(host_err(ErrorCode::Host, format!("bad response: {e}"))),
-    }
-}
-
-/// Asynchronous host request; resolves with the completion payload.
-pub fn host_request(method: &str, params: Value) -> HostFuture {
-    let request = json!({ "method": method, "params": params }).to_string();
-    let token = runtime::raw_host_request(&request);
-    if token <= 0 {
-        // Synthesize an immediately-ready error future via a fake token.
-        // Token 0 is never allocated by the host. Register first, then
-        // complete, so the result lands in the registered slot.
-        let fut = HostFuture::new(0);
-        crate::executor::complete(
-            0,
-            format!(
-                "{{\"code\":\"{}\",\"message\":\"request rejected\"}}",
-                code_name(-token as i32)
+/// Fetch the host's message for the error a call just returned.
+fn host_err(rc_neg: i32) -> HostError {
+    let code = ErrorCode::from_num(-rc_neg);
+    let mut buf = vec![0u8; 256];
+    let mut message = String::new();
+    loop {
+        let mut len: u32 = 0;
+        let rc = unsafe {
+            raw::last_error(
+                buf.as_mut_ptr() as i32,
+                buf.len() as i32,
+                &mut len as *mut u32 as i32,
             )
-            .as_bytes(),
-            true,
+        };
+        if rc == 0 {
+            buf.truncate(len as usize);
+            message = String::from_utf8_lossy(&buf).into_owned();
+            break;
+        }
+        if -rc == ErrorCode::Limit.as_num() && len as usize > buf.len() {
+            buf.resize(len as usize, 0);
+            continue;
+        }
+        break;
+    }
+    HostError { code, message }
+}
+
+fn check(rc: i32) -> Result<(), HostError> {
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(host_err(rc))
+    }
+}
+
+fn check_i64(rc: i64) -> Result<i64, HostError> {
+    if rc > 0 {
+        Ok(rc)
+    } else {
+        Err(host_err(rc as i32))
+    }
+}
+
+/// Run an OutBuf-shaped call, growing the buffer on -E_LIMIT (the host
+/// reports the needed size through len_out either way).
+fn call_out(
+    initial: usize,
+    mut f: impl FnMut(i32, i32, i32) -> i32,
+) -> Result<Vec<u8>, HostError> {
+    let mut buf: Vec<u8> = vec![0; initial.max(16)];
+    loop {
+        let mut len: u32 = 0;
+        let rc = f(
+            buf.as_mut_ptr() as i32,
+            buf.len() as i32,
+            &mut len as *mut u32 as i32,
         );
-        return fut;
-    }
-    HostFuture::new(token as u64)
-}
-
-fn code_name(num: i32) -> &'static str {
-    match num {
-        1 => "E_BAD_REQUEST",
-        2 => "E_UNKNOWN_METHOD",
-        3 => "E_CAP_DENIED",
-        4 => "E_NO_SUCH_OBJECT",
-        5 => "E_OUT_OF_SCOPE",
-        6 => "E_LIMIT",
-        8 => "E_CANCELLED",
-        9 => "E_UNSUPPORTED",
-        _ => "E_HOST",
+        if rc == 0 {
+            buf.truncate(len as usize);
+            return Ok(buf);
+        }
+        if -rc == ErrorCode::Limit.as_num() && len as usize > buf.len() {
+            buf.resize(len as usize, 0);
+            continue;
+        }
+        return Err(host_err(rc));
     }
 }
 
-// ---- sync API ----
+/// Run an OwnedBuf-shaped call: the host allocates the result in guest
+/// memory and RAII owns it from the moment the call returns.
+fn call_owned(f: impl FnOnce(i32) -> i32) -> Result<Owned, HostError> {
+    let mut out: [u32; 2] = [0, 0];
+    let rc = f(out.as_mut_ptr() as i32);
+    if rc != 0 {
+        return Err(host_err(rc));
+    }
+    Ok(Owned::from_out_struct(out))
+}
 
+fn wire_err() -> HostError {
+    HostError {
+        code: ErrorCode::Host,
+        message: "malformed buffer from host".into(),
+    }
+}
+
+// ---- interning & subscriptions ----
+
+pub use crate::event::{intern, intern_name};
+
+/// Subscribe to events by name (interned once, then integer routing).
 pub fn subscribe(events: &[&str]) -> Result<(), HostError> {
-    host_call("subscribe", json!({ "events": events })).map(|_| ())
+    for name in events {
+        let id = event::intern(name);
+        check(unsafe { raw::subscribe(id as i32) })?;
+    }
+    Ok(())
 }
 
 pub fn unsubscribe(events: &[&str]) -> Result<(), HostError> {
-    host_call("unsubscribe", json!({ "events": events })).map(|_| ())
-}
-
-pub fn list_sessions() -> HostResult {
-    host_call("list_sessions", json!({}))
-}
-
-pub fn list_windows() -> HostResult {
-    host_call("list_windows", json!({}))
-}
-
-pub fn list_panes() -> HostResult {
-    host_call("list_panes", json!({}))
-}
-
-pub fn list_clients() -> HostResult {
-    host_call("list_clients", json!({}))
-}
-
-/// Send a literal string to a pane (one key per character).
-pub fn send_text(pane: PaneId, text: &str) -> Result<(), HostError> {
-    host_call(
-        "send_keys",
-        json!({ "pane": pane.0, "keys": text, "literal": true }),
-    )
-    .map(|_| ())
-}
-
-/// Send one named key ("Enter", "C-c", "M-x", ...) to a pane.
-pub fn send_key(pane: PaneId, key: &str) -> Result<(), HostError> {
-    host_call(
-        "send_keys",
-        json!({ "pane": pane.0, "keys": key, "literal": false }),
-    )
-    .map(|_| ())
-}
-
-/// Capture pane text. Rows are relative to the visible top (negative
-/// reaches history), `end` inclusive; both optional.
-pub fn capture_pane(
-    pane: PaneId,
-    start: Option<i32>,
-    end: Option<i32>,
-) -> Result<String, HostError> {
-    let mut params = json!({ "pane": pane.0 });
-    if let Some(s) = start {
-        params["start"] = s.into();
+    for name in events {
+        let id = event::intern(name);
+        check(unsafe { raw::unsubscribe(id as i32) })?;
     }
-    if let Some(e) = end {
-        params["end"] = e.into();
-    }
-    let v = host_call("capture_pane", params)?;
-    Ok(v.get("text").and_then(Value::as_str).unwrap_or("").to_string())
+    Ok(())
+}
+
+// ---- object state ----
+
+pub fn list_sessions() -> Result<Vec<SessionInfo>, HostError> {
+    let buf = call_owned(|out| unsafe { raw::list(KIND_SESSION, out) })?;
+    parse_list(&buf, SessionInfo::parse).map_err(|_| wire_err())
+}
+
+pub fn list_windows() -> Result<Vec<WindowInfo>, HostError> {
+    let buf = call_owned(|out| unsafe { raw::list(KIND_WINDOW, out) })?;
+    parse_list(&buf, WindowInfo::parse).map_err(|_| wire_err())
+}
+
+pub fn list_panes() -> Result<Vec<PaneInfo>, HostError> {
+    let buf = call_owned(|out| unsafe { raw::list(KIND_PANE, out) })?;
+    parse_list(&buf, PaneInfo::parse).map_err(|_| wire_err())
+}
+
+pub fn list_clients() -> Result<Vec<ClientInfo>, HostError> {
+    let buf = call_owned(|out| unsafe { raw::list(KIND_CLIENT, out) })?;
+    parse_list(&buf, ClientInfo::parse).map_err(|_| wire_err())
+}
+
+fn resolve_one<T>(
+    kind: i32,
+    id: u32,
+    parse: impl Fn(&mut Cursor<'_>) -> Result<T, tmux_plugin_abi::WireError>,
+) -> Result<T, HostError> {
+    let buf =
+        call_owned(|out| unsafe { raw::resolve(kind, id as i32, out) })?;
+    parse(&mut Cursor::new(&buf)).map_err(|_| wire_err())
+}
+
+/// Resolve a pane's live info. Errors with E_NO_SUCH_OBJECT once gone.
+pub fn resolve_pane(pane: PaneId) -> Result<PaneInfo, HostError> {
+    resolve_one(KIND_PANE, pane.0, PaneInfo::parse)
+}
+
+/// Resolve a window's live info. Errors with E_NO_SUCH_OBJECT once gone.
+pub fn resolve_window(window: WindowId) -> Result<WindowInfo, HostError> {
+    resolve_one(KIND_WINDOW, window.0, WindowInfo::parse)
+}
+
+/// Resolve a session's live info. Errors with E_NO_SUCH_OBJECT once gone.
+pub fn resolve_session(session: SessionId) -> Result<SessionInfo, HostError> {
+    resolve_one(KIND_SESSION, session.0, SessionInfo::parse)
+}
+
+/// Resolve a client's live info. Errors with E_NO_SUCH_OBJECT once gone.
+pub fn resolve_client(client: ClientId) -> Result<ClientInfo, HostError> {
+    resolve_one(KIND_CLIENT, client.0, ClientInfo::parse)
+}
+
+/// This instance's identity (scope kind/id + generation).
+pub fn self_info() -> Result<SelfInfo, HostError> {
+    let mut out = [0u8; tmux_plugin_abi::SELF_INFO_LEN];
+    check(unsafe { raw::self_info(out.as_mut_ptr() as i32) })?;
+    SelfInfo::from_bytes(&out).map_err(|_| wire_err())
 }
 
 /// Where an option lives.
 #[derive(Debug, Clone, Copy)]
 pub enum OptionTarget {
     Server,
-    Session(crate::ids::SessionId),
-    Window(crate::ids::WindowId),
+    Session(SessionId),
+    Window(WindowId),
     Pane(PaneId),
 }
 
 impl OptionTarget {
-    fn to_json(self) -> Value {
+    fn kind_id(self) -> (i32, u32) {
         match self {
-            OptionTarget::Server => json!({ "type": "server" }),
-            OptionTarget::Session(id) => {
-                json!({ "type": "session", "id": id.0 })
-            }
-            OptionTarget::Window(id) => json!({ "type": "window", "id": id.0 }),
-            OptionTarget::Pane(id) => json!({ "type": "pane", "id": id.0 }),
+            OptionTarget::Server => (KIND_SERVER, 0),
+            OptionTarget::Session(id) => (KIND_SESSION, id.0),
+            OptionTarget::Window(id) => (KIND_WINDOW, id.0),
+            OptionTarget::Pane(id) => (KIND_PANE, id.0),
         }
     }
 }
 
 /// Get an option (server/global scope) as a string.
-pub fn get_option(name: &str) -> Result<String, HostError> {
+pub fn get_option(name: impl AsTmuxStr) -> Result<String, HostError> {
     get_option_in(OptionTarget::Server, name)
 }
 
 /// Set a user (@-prefixed) option at server/global scope.
-pub fn set_option(name: &str, value: &str) -> Result<(), HostError> {
+pub fn set_option(
+    name: impl AsTmuxStr,
+    value: impl AsTmuxStr,
+) -> Result<(), HostError> {
     set_option_in(OptionTarget::Server, name, value)
 }
 
 /// Get an option from a specific scope (inherits along the option tree).
-pub fn get_option_in(target: OptionTarget, name: &str) -> Result<String, HostError> {
-    let v = host_call(
-        "get_option",
-        json!({ "scope": target.to_json(), "name": name }),
-    )?;
-    Ok(v.get("value").and_then(Value::as_str).unwrap_or("").to_string())
+pub fn get_option_in(
+    target: OptionTarget,
+    name: impl AsTmuxStr,
+) -> Result<String, HostError> {
+    let (kind, id) = target.kind_id();
+    let name = name.to_tmux();
+    let (np, nl) = name.parts();
+    let buf = call_out(64, |out, cap, len_out| unsafe {
+        raw::get_option(kind, id as i32, np, nl, out, cap, len_out)
+    })?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Expand a tmux format string (`#{...}`) against a scope. Jobs (`#()`)
+/// are disabled. This is the way to read anything the object records do
+/// not carry: `#{window_layout}`, `#{pane_current_command}`,
+/// `#{history_size}`, ...
+pub fn format_expand(
+    target: OptionTarget,
+    fmt: impl AsTmuxStr,
+) -> Result<String, HostError> {
+    let (kind, id) = target.kind_id();
+    let fmt = fmt.to_tmux();
+    let (fp, fl) = fmt.parts();
+    let buf = call_out(256, |out, cap, len_out| unsafe {
+        raw::format_expand(kind, id as i32, fp, fl, out, cap, len_out)
+    })?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// Set a user (@-prefixed) option on a specific scope. Options published
@@ -174,42 +255,103 @@ pub fn get_option_in(target: OptionTarget, name: &str) -> Result<String, HostErr
 /// for the active pane, then window, session, global).
 pub fn set_option_in(
     target: OptionTarget,
-    name: &str,
-    value: &str,
+    name: impl AsTmuxStr,
+    value: impl AsTmuxStr,
 ) -> Result<(), HostError> {
-    host_call(
-        "set_option",
-        json!({ "scope": target.to_json(), "name": name, "value": value }),
-    )
-    .map(|_| ())
+    let (kind, id) = target.kind_id();
+    let name = name.to_tmux();
+    let value = value.to_tmux();
+    let (np, nl) = name.parts();
+    let (vp, vl) = value.parts();
+    check(unsafe { raw::set_option(kind, id as i32, np, nl, vp, vl) })
 }
 
-/// Resolve a pane's live info: {id, window, width, height, active, floating,
-/// dead, cwd?, shell?}. Errors with E_NO_SUCH_OBJECT once the pane is gone.
-pub fn resolve_pane(pane: PaneId) -> Result<Value, HostError> {
-    host_call("resolve", json!({ "kind": "pane", "id": pane.0 }))
+/// Send a literal string to a pane (one key per character).
+pub fn send_text(pane: PaneId, text: impl AsTmuxStr) -> Result<(), HostError> {
+    let text = text.to_tmux();
+    let (p, l) = text.parts();
+    check(unsafe { raw::send_keys(pane.0 as i32, p, l, 1) })
 }
 
-/// Resolve a window's live info: {id, name, width, height, sessions, panes,
-/// active_pane?}. Errors with E_NO_SUCH_OBJECT once it is gone.
-pub fn resolve_window(window: WindowId) -> Result<Value, HostError> {
-    host_call("resolve", json!({ "kind": "window", "id": window.0 }))
+/// Send one named key ("Enter", "C-c", "M-x", ...) to a pane.
+pub fn send_key(pane: PaneId, key: impl AsTmuxStr) -> Result<(), HostError> {
+    let key = key.to_tmux();
+    let (p, l) = key.parts();
+    check(unsafe { raw::send_keys(pane.0 as i32, p, l, 0) })
 }
 
-/// Resolve a session's live info: {id, name, attached, current_window?,
-/// windows}. Errors with E_NO_SUCH_OBJECT once it is gone.
-pub fn resolve_session(session: SessionId) -> Result<Value, HostError> {
-    host_call("resolve", json!({ "kind": "session", "id": session.0 }))
+/// Capture pane text into a reusable buffer (cleared first). Rows are
+/// relative to the visible top (negative reaches history), `end`
+/// inclusive; `escapes` includes SGR/OSC sequences. At most 2000 lines
+/// per call; grow-and-retry is handled internally, so prefer paging with
+/// start/end over huge buffers.
+pub fn capture_pane_into(
+    pane: PaneId,
+    start: Option<i32>,
+    end: Option<i32>,
+    escapes: bool,
+    buf: &mut Vec<u8>,
+) -> Result<(), HostError> {
+    let start = start.unwrap_or(0);
+    let end = end.unwrap_or(i32::MAX);
+    if buf.capacity() == 0 {
+        buf.reserve(4096);
+    }
+    let cap = buf.capacity();
+    buf.clear();
+    buf.resize(cap, 0);
+    loop {
+        let mut len: u32 = 0;
+        let rc = unsafe {
+            raw::capture_pane(
+                pane.0 as i32,
+                start,
+                end,
+                i32::from(escapes),
+                buf.as_mut_ptr() as i32,
+                buf.len() as i32,
+                &mut len as *mut u32 as i32,
+            )
+        };
+        if rc == 0 {
+            buf.truncate(len as usize);
+            return Ok(());
+        }
+        if -rc == ErrorCode::Limit.as_num() && len as usize > buf.len() {
+            buf.resize(len as usize, 0);
+            continue;
+        }
+        buf.clear();
+        return Err(host_err(rc));
+    }
 }
 
-/// This instance's identity: {plugin, scope: {type, id?}, generation}.
-pub fn self_info() -> Result<Value, HostError> {
-    host_call("self", json!({}))
+/// Capture pane text (fresh allocation; see [`capture_pane_into`]).
+pub fn capture_pane(
+    pane: PaneId,
+    start: Option<i32>,
+    end: Option<i32>,
+) -> Result<String, HostError> {
+    let mut buf = Vec::new();
+    capture_pane_into(pane, start, end, false, &mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// Show a status-line message on all attached clients (and the message log).
-pub fn display_message(msg: &str) -> Result<(), HostError> {
-    host_call("display_message", json!({ "message": msg })).map(|_| ())
+pub fn display_message(msg: impl AsTmuxStr) -> Result<(), HostError> {
+    let msg = msg.to_tmux();
+    let (p, l) = msg.parts();
+    check(unsafe { raw::display_message(-1, p, l) })
+}
+
+/// Show a status-line message on one client.
+pub fn display_message_to(
+    client: ClientId,
+    msg: impl AsTmuxStr,
+) -> Result<(), HostError> {
+    let msg = msg.to_tmux();
+    let (p, l) = msg.parts();
+    check(unsafe { raw::display_message(client.0 as i32, p, l) })
 }
 
 pub fn log(msg: &str) {
@@ -246,36 +388,34 @@ pub struct PreviewRect {
 /// Open a UI mode: a freshly spawned empty floating pane owned by this
 /// instance. Render with [`mode_write`]; `mode-key` / `mode-resize` /
 /// `mode-closed` events arrive through `Plugin::on_event` with the mode id
-/// in `event.data["mode"]`.
+/// in the `mode` field.
 pub fn mode_open(opts: &ModeOpts) -> Result<ModeId, HostError> {
-    let mut params = json!({ "width": opts.width, "height": opts.height });
-    if let Some(w) = opts.window {
-        params["window"] = w.0.into();
-    }
-    if let Some(x) = opts.x {
-        params["x"] = x.into();
-    }
-    if let Some(y) = opts.y {
-        params["y"] = y.into();
-    }
-    if let Some(t) = &opts.title {
-        params["title"] = t.as_str().into();
-    }
-    let v = host_call("mode_open", params)?;
-    v.get("mode")
-        .and_then(Value::as_u64)
-        .map(ModeId)
-        .ok_or_else(|| host_err(ErrorCode::Host, "mode_open returned no id"))
+    let title = opts.title.as_deref().map(|t| t.to_tmux());
+    let (tp, tl) = title.as_ref().map_or((0, 0), |t| t.parts());
+    let window = opts.window.map_or(-1, |w| w.0 as i32);
+    let off = |v: Option<u32>| v.map_or(-1, |n| n as i32);
+    let id = check_i64(unsafe {
+        raw::mode_open(
+            window,
+            opts.width as i32,
+            opts.height as i32,
+            off(opts.x),
+            off(opts.y),
+            tp,
+            tl,
+        )
+    })?;
+    Ok(ModeId(id as u64))
 }
 
 /// Send ANSI bytes to a mode's screen (parsed server-side: cursor
 /// addressing, SGR, clears, ... - anything a terminal accepts). At most
-/// 256 KiB per call; a full-screen redraw is idiomatic.
+/// 256 KiB per call; a full-screen redraw is idiomatic. Zero-copy: the
+/// bytes are parsed straight out of plugin memory.
 pub fn mode_write(mode: ModeId, data: &[u8]) -> Result<(), HostError> {
-    use base64::Engine as _;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(data);
-    host_call("mode_write", json!({ "mode": mode.0, "data_b64": b64 }))
-        .map(|_| ())
+    check(unsafe {
+        raw::mode_write(mode.0 as i64, data.as_ptr() as i32, data.len() as i32)
+    })
 }
 
 /// Set (or clear, with `None`) a mode's retained preview rect. The host
@@ -285,14 +425,20 @@ pub fn mode_preview(
     mode: ModeId,
     rect: Option<&PreviewRect>,
 ) -> Result<(), HostError> {
-    let params = match rect {
-        Some(r) => json!({
-            "mode": mode.0, "pane": r.pane.0,
-            "x": r.x, "y": r.y, "w": r.w, "h": r.h,
-        }),
-        None => json!({ "mode": mode.0 }),
+    let rc = match rect {
+        Some(r) => unsafe {
+            raw::mode_preview(
+                mode.0 as i64,
+                i64::from(r.pane.0),
+                r.x as i32,
+                r.y as i32,
+                r.w as i32,
+                r.h as i32,
+            )
+        },
+        None => unsafe { raw::mode_preview(mode.0 as i64, -1, 0, 0, 0, 0) },
     };
-    host_call("mode_preview", params).map(|_| ())
+    check(rc)
 }
 
 /// Move a mode's floating pane to another window, keeping the mode id,
@@ -305,50 +451,198 @@ pub fn mode_move(
     mode: ModeId,
     window: Option<WindowId>,
 ) -> Result<(), HostError> {
-    let mut params = json!({ "mode": mode.0 });
-    if let Some(w) = window {
-        params["window"] = w.0.into();
-    }
-    host_call("mode_move", params).map(|_| ())
+    let w = window.map_or(-1, |w| w.0 as i32);
+    check(unsafe { raw::mode_move(mode.0 as i64, w, -1, -1) })
 }
 
 /// Close a mode. The floating pane is torn down at the next safe point;
 /// a final `mode-closed` event (reason "closed") follows.
 pub fn mode_close(mode: ModeId) -> Result<(), HostError> {
-    host_call("mode_close", json!({ "mode": mode.0 })).map(|_| ())
+    check(unsafe { raw::mode_close(mode.0 as i64) })
 }
 
 // ---- async API ----
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct JobOutput {
     /// Exit status, or the signal number if `signalled`.
     pub status: i32,
-    #[serde(default)]
     pub signalled: bool,
-    /// Combined captured output.
+    /// Combined captured output (lossy UTF-8).
     pub output: String,
 }
 
-/// Run a shell command; resolves with its output when it exits.
-pub async fn run_job(cmd: &str, cwd: Option<&str>) -> Result<JobOutput, HostError> {
-    let mut params = json!({ "cmd": cmd });
-    if let Some(c) = cwd {
-        params["cwd"] = c.into();
+/// Start an async request: the raw call returns a token (> 0) or -err.
+fn start_async(token: i64) -> Result<HostFuture, HostError> {
+    if token <= 0 {
+        return Err(host_err(token as i32));
     }
-    let v = host_request("run_job", params).await?;
-    serde_json::from_value(v)
-        .map_err(|e| host_err(ErrorCode::Host, format!("bad job output: {e}")))
+    Ok(HostFuture::new(token as u64))
 }
 
-/// Run a tmux command string through the command queue.
-pub async fn run_command(command: &str) -> Result<(), HostError> {
-    host_request("run_command", json!({ "command": command }))
-        .await
-        .map(|_| ())
+/// Run a shell command; resolves with its output when it exits.
+pub async fn run_job(
+    cmd: impl AsTmuxStr,
+    cwd: Option<&str>,
+) -> Result<JobOutput, HostError> {
+    let fut = {
+        let cmd = cmd.to_tmux();
+        let cwd = cwd.map(|c| c.to_tmux());
+        let (cp, cl) = cmd.parts();
+        let (wp, wl) = cwd.as_ref().map_or((0, 0), |c| c.parts());
+        start_async(unsafe { raw::run_job(cp, cl, wp, wl) })?
+    };
+    let Completion { v0, v1, data } = fut.await?;
+    Ok(JobOutput {
+        status: v0 as i32,
+        signalled: v1 != 0,
+        output: String::from_utf8_lossy(&data).into_owned(),
+    })
+}
+
+/// Run a tmux command string through the command queue. Note: only parse
+/// errors fail; a command that runs and errors still completes as Ok.
+pub async fn run_command(command: impl AsTmuxStr) -> Result<(), HostError> {
+    let fut = {
+        let cmd = command.to_tmux();
+        let (p, l) = cmd.parts();
+        start_async(unsafe { raw::run_command(p, l) })?
+    };
+    fut.await.map(|_| ())
 }
 
 /// Sleep for `ms` milliseconds (host timer).
 pub async fn sleep_ms(ms: u64) -> Result<(), HostError> {
-    host_request("timer_start", json!({ "ms": ms })).await.map(|_| ())
+    let fut = start_async(unsafe { raw::timer_start(ms as i64) })?;
+    fut.await.map(|_| ())
+}
+
+// ---- filesystem (capabilities: fs-read / fs-write) ----
+//
+// Paths are relative to the plugin's private data directory
+// ($XDG_DATA_HOME|~/.local/share + tmux/plugins/<name>/); absolute paths
+// and `..` are rejected. At most 256 KiB per call - page bigger data.
+// Awaited calls are fully ordered; do not keep two writes to the SAME
+// file in flight at once.
+
+/// Write (append=false truncates/creates) a file asynchronously on the
+/// host's fs worker - the tmux event loop never blocks. Zero-copy: the
+/// worker reads `data` straight out of plugin memory; the SDK keeps the
+/// buffer pinned until the completion arrives (even if the future is
+/// cancelled). Resolves with the byte count.
+pub async fn fs_write(
+    path: &str,
+    data: Vec<u8>,
+    append: bool,
+) -> Result<u64, HostError> {
+    let token = unsafe {
+        raw::fs_write(
+            path.as_ptr() as i32,
+            path.len() as i32,
+            data.as_ptr() as i32,
+            data.len() as i32,
+            i32::from(append),
+        )
+    };
+    let fut = start_async(token)?;
+    let token = token as u64;
+    crate::executor::pin_buffer(token, data);
+    let result = fut.await;
+    let _ = crate::executor::take_buffer(token);
+    result.map(|c| c.v0 as u64)
+}
+
+/// Read up to `capacity` bytes at `offset` asynchronously (fs worker;
+/// zero-copy into the returned buffer, pinned until completion).
+/// Resolves with (bytes, eof).
+pub async fn fs_read(
+    path: &str,
+    offset: u64,
+    capacity: usize,
+) -> Result<(Vec<u8>, bool), HostError> {
+    let cap = capacity
+        .clamp(1, tmux_plugin_abi::MAX_TRANSFER_BYTES);
+    let mut buf = vec![0u8; cap];
+    let token = unsafe {
+        raw::fs_read(
+            path.as_ptr() as i32,
+            path.len() as i32,
+            offset as i64,
+            buf.as_mut_ptr() as i32,
+            buf.len() as i32,
+        )
+    };
+    let fut = start_async(token)?;
+    let token = token as u64;
+    crate::executor::pin_buffer(token, buf);
+    let result = fut.await;
+    let buf = crate::executor::take_buffer(token);
+    let c = result?;
+    let mut buf = buf.unwrap_or_default();
+    buf.truncate((c.v0.max(0) as usize).min(buf.len()));
+    Ok((buf, c.v1 != 0))
+}
+
+/// The plugin's private data directory (absolute path) - where every
+/// fs_* path resolves.
+pub fn fs_root() -> Result<String, HostError> {
+    let buf = call_out(128, |out, cap, len_out| unsafe {
+        raw::fs_root(out, cap, len_out)
+    })?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Synchronous write for small files (blocks the tmux loop for one
+/// bounded page-cache access, like tmux's own file I/O).
+pub fn fs_write_sync(
+    path: &str,
+    data: &[u8],
+    append: bool,
+) -> Result<u64, HostError> {
+    let rc = unsafe {
+        raw::fs_write_sync(
+            path.as_ptr() as i32,
+            path.len() as i32,
+            data.as_ptr() as i32,
+            data.len() as i32,
+            i32::from(append),
+        )
+    };
+    check_i64(rc).map(|n| n as u64)
+}
+
+/// Synchronous read for small files. Fills `buf` up to its capacity
+/// (allocating 4096 if empty); returns eof.
+pub fn fs_read_sync(
+    path: &str,
+    offset: u64,
+    buf: &mut Vec<u8>,
+) -> Result<bool, HostError> {
+    if buf.capacity() == 0 {
+        buf.reserve(4096);
+    }
+    let cap = buf
+        .capacity()
+        .min(tmux_plugin_abi::MAX_TRANSFER_BYTES);
+    buf.clear();
+    buf.resize(cap, 0);
+    let mut len: u32 = 0;
+    let mut eof: u32 = 0;
+    let rc = unsafe {
+        raw::fs_read_sync(
+            path.as_ptr() as i32,
+            path.len() as i32,
+            offset as i64,
+            buf.as_mut_ptr() as i32,
+            buf.len() as i32,
+            &mut len as *mut u32 as i32,
+            &mut eof as *mut u32 as i32,
+        )
+    };
+    if rc != 0 {
+        buf.clear();
+        return Err(host_err(rc));
+    }
+    buf.truncate(len as usize);
+    Ok(eof != 0)
 }

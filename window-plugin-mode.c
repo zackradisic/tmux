@@ -135,16 +135,13 @@ static void
 window_plugin_free(struct window_mode_entry *wme)
 {
 	struct window_plugin_mode_data	*data = wme->data;
-	struct plugin_json		*pj;
+	struct plugin_buf		*pb;
 
-	pj = plugin_json_create();
-	plugin_json_obj_start(pj, NULL);
-	plugin_json_str(pj, "reason",
+	pb = plugin_event_create("mode-closed");
+	plugin_event_i64(pb, "mode", data->mode_id);
+	plugin_event_str(pb, "reason",
 	    data->close_reason != NULL ? data->close_reason : "killed");
-	plugin_json_obj_end(pj);
-	plugin_mode_event(data->mode_id, "mode-closed",
-	    plugin_json_string(pj));
-	plugin_json_free(pj);
+	plugin_event_send_mode(pb, data->mode_id);
 
 	plugin_mode_unregister(data->mode_id);
 
@@ -159,7 +156,7 @@ static void
 window_plugin_resize(struct window_mode_entry *wme, u_int sx, u_int sy)
 {
 	struct window_plugin_mode_data	*data = wme->data;
-	struct plugin_json		*pj;
+	struct plugin_buf		*pb;
 
 	screen_resize(&data->screen, sx, sy, 0);
 
@@ -171,14 +168,11 @@ window_plugin_resize(struct window_mode_entry *wme, u_int sx, u_int sy)
 		evtimer_del(&data->refresh);
 	}
 
-	pj = plugin_json_create();
-	plugin_json_obj_start(pj, NULL);
-	plugin_json_num(pj, "width", sx);
-	plugin_json_num(pj, "height", sy);
-	plugin_json_obj_end(pj);
-	plugin_mode_event(data->mode_id, "mode-resize",
-	    plugin_json_string(pj));
-	plugin_json_free(pj);
+	pb = plugin_event_create("mode-resize");
+	plugin_event_i64(pb, "mode", data->mode_id);
+	plugin_event_i64(pb, "width", sx);
+	plugin_event_i64(pb, "height", sy);
+	plugin_event_send_mode(pb, data->mode_id);
 }
 
 static void
@@ -187,29 +181,25 @@ window_plugin_key(struct window_mode_entry *wme, struct client *c,
     struct mouse_event *m)
 {
 	struct window_plugin_mode_data	*data = wme->data;
-	struct plugin_json		*pj;
+	struct plugin_buf		*pb;
 	u_int				 mx, my;
 
-	pj = plugin_json_create();
-	plugin_json_obj_start(pj, NULL);
+	pb = plugin_event_create("mode-key");
+	plugin_event_i64(pb, "mode", data->mode_id);
 	/* key_string_lookup_key returns a static buffer: serialized (copied)
-	 * immediately by plugin_json_str. */
-	plugin_json_str(pj, "key", key_string_lookup_key(key, 0));
+	 * immediately by plugin_event_str. */
+	plugin_event_str(pb, "key", key_string_lookup_key(key, 0));
 	/* The pressing client, so plugins can act on the right client
 	 * (e.g. switch-client for a cross-session jump). */
 	if (c != NULL)
-		plugin_json_num(pj, "client", c->id);
+		plugin_event_i64(pb, "client", c->id);
 	if (KEYC_IS_MOUSE(key) && m != NULL &&
 	    cmd_mouse_at(wme->wp, m, &mx, &my, 0) == 0) {
-		plugin_json_obj_start(pj, "mouse");
-		plugin_json_num(pj, "x", mx);
-		plugin_json_num(pj, "y", my);
-		plugin_json_num(pj, "b", m->b);
-		plugin_json_obj_end(pj);
+		plugin_event_i64(pb, "mouse_x", mx);
+		plugin_event_i64(pb, "mouse_y", my);
+		plugin_event_i64(pb, "mouse_b", m->b);
 	}
-	plugin_json_obj_end(pj);
-	plugin_mode_event(data->mode_id, "mode-key", plugin_json_string(pj));
-	plugin_json_free(pj);
+	plugin_event_send_mode(pb, data->mode_id);
 }
 
 /* Blit the preview source's live grid into the retained rect. */

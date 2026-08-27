@@ -27,11 +27,26 @@ pub const PGH_OBJ_WINDOW: c_int = 1;
 pub const PGH_OBJ_PANE: c_int = 2;
 pub const PGH_OBJ_CLIENT: c_int = 3;
 
-/// Sink used wherever a string crosses the FFI from callee to caller: the
-/// callee invokes the sink zero or more times with UTF-8 bytes (not
+/// Sink used wherever bytes cross the FFI from callee to caller: the
+/// callee invokes the sink zero or more times with a byte run (not
 /// NUL-terminated); ownership never crosses the boundary.
 pub type pgh_sink =
     unsafe extern "C" fn(ctx: *mut c_void, ptr: *const c_char, len: usize);
+
+/// Error codes for the `err` parameter of `pgh_async_complete` (the wire
+/// numbers of tmux-plugin-abi's ErrorCode; 0 = success).
+pub const PGH_ERR_BAD_REQUEST: c_int = 1;
+pub const PGH_ERR_NO_SUCH_OBJECT: c_int = 4;
+pub const PGH_ERR_LIMIT: c_int = 6;
+pub const PGH_ERR_HOST: c_int = 7;
+pub const PGH_ERR_CANCELLED: c_int = 8;
+
+/// Relation queries for `pgh_host_vtable.obj_relation` (scope checks).
+pub const PGH_REL_PANE_WINDOW: c_int = 0;
+pub const PGH_REL_SESSION_CURWIN: c_int = 1;
+pub const PGH_REL_WINDOW_IN_SESSION: c_int = 2;
+pub const PGH_REL_PANE_IN_WINDOW: c_int = 3;
+pub const PGH_REL_PANE_IN_SESSION: c_int = 4;
 
 /// Host callbacks provided by tmux at `pgh_init` time.
 ///
@@ -42,14 +57,20 @@ pub type pgh_sink =
 pub struct pgh_host_vtable {
     /// Log a message attributed to a plugin ("host" for subsystem messages).
     pub log: unsafe extern "C" fn(level: c_int, plugin: *const c_char, msg: *const c_char),
-    /// Emit a JSON array of all live objects of `kind` (PGH_OBJ_*) into the
-    /// sink. Each element carries at least {"id": n}.
+    /// Emit the binary object-list buffer (u32 count + records, see
+    /// abi-types) for all live objects of `kind` (PGH_OBJ_*) into the sink.
     pub list_objects: unsafe extern "C" fn(kind: c_int, sink: pgh_sink, ctx: *mut c_void),
-    /// Emit a JSON object describing the live object (kind, id) into the
-    /// sink and return 0; return -1 without emitting if it no longer exists.
-    /// This is the weak-handle validity check.
+    /// Emit one binary object record describing the live object (kind, id)
+    /// into the sink and return 0; return -1 without emitting if it no
+    /// longer exists. This is the weak-handle validity check.
     pub resolve_object:
         unsafe extern "C" fn(kind: c_int, id: u32, sink: pgh_sink, ctx: *mut c_void) -> c_int,
+    /// Relation query for scope checks (PGH_REL_*): PANE_WINDOW(a=pane) ->
+    /// window id; SESSION_CURWIN(a=session) -> window id;
+    /// WINDOW_IN_SESSION(a=window, b=session), PANE_IN_WINDOW(a=pane,
+    /// b=window), PANE_IN_SESSION(a=pane, b=session) -> 1/0.
+    /// -1 = no such object.
+    pub obj_relation: unsafe extern "C" fn(rel: c_int, a: u32, b: u32) -> i64,
     /// Send keys to a pane; literal != 0 sends `keys` as UTF-8 characters,
     /// otherwise `keys` is one tmux key name. 0 ok, -1 dead pane, -2 bad key.
     pub send_keys:
@@ -89,7 +110,7 @@ pub struct pgh_host_vtable {
         msg: *const c_char,
     ) -> c_int,
     /// Start a shell command as a job; completion arrives later via
-    /// pgh_async_complete(token, {"status","signalled","output"}, 0).
+    /// pgh_async_complete(token, 0, status, signalled, output, len).
     /// 0 started, -1 failed to start.
     pub run_job: unsafe extern "C" fn(
         cmd: *const c_char,
@@ -100,8 +121,8 @@ pub struct pgh_host_vtable {
     /// completion callback delivers pgh_async_complete(token, ...) after it
     /// runs (parse errors arrive as error completions). -1 internal failure.
     pub run_command: unsafe extern "C" fn(cmd: *const c_char, token: u64) -> c_int,
-    /// One-shot timer; fires pgh_async_complete(token, "{}", 0). Returns a
-    /// timer id usable with timer_cancel.
+    /// One-shot timer; fires pgh_async_complete(token, 0, 0, 0, NULL, 0).
+    /// Returns a timer id usable with timer_cancel.
     pub timer_start: unsafe extern "C" fn(ms: u64, token: u64) -> u64,
     /// Cancel a pending timer (no completion is delivered). 0 ok, -1 unknown.
     pub timer_cancel: unsafe extern "C" fn(timer_id: u64) -> c_int,
@@ -145,6 +166,16 @@ pub struct pgh_host_vtable {
     /// (-1 = centered). 0 ok, -1 no such mode, -2 no such window or
     /// unmovable pane, -3 the move would empty the source window.
     pub mode_move: unsafe extern "C" fn(mode: u64, window: u32, x: c_int, y: c_int) -> c_int,
+    /// Expand a format string against a scope (kind -1 = server/global,
+    /// else PGH_OBJ_SESSION/WINDOW/PANE) into the sink. Jobs (#()) are
+    /// disabled. 0 ok, -1 dead/bad target.
+    pub format_expand: unsafe extern "C" fn(
+        kind: c_int,
+        id: u32,
+        fmt: *const c_char,
+        sink: pgh_sink,
+        ctx: *mut c_void,
+    ) -> c_int,
 }
 
 // Function pointers are Send + Sync; the vtable is stored in a OnceLock.

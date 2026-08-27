@@ -79,7 +79,7 @@ impl GitStatus {
                 // Exit once no longer this window's active pane; the
                 // become-active triggers start a fresh loop later.
                 let Ok(info) = resolve_pane(pane) else { return };
-                if info.get("active").and_then(|v| v.as_bool()) != Some(true) {
+                if !info.active {
                     return;
                 }
                 probe_and_publish(pane, info, &in_flight).await;
@@ -111,14 +111,10 @@ impl Plugin for GitStatus {
             .max(250);
 
         let me = self_info().map_err(|e| e.message.clone())?;
-        if me.pointer("/scope/type").and_then(|v| v.as_str()) != Some("pane") {
+        if me.scope_kind != tmux_plugin_sdk::abi::KIND_PANE {
             return Err("git-status must be loaded with -s pane".into());
         }
-        let pane = PaneId(
-            me.pointer("/scope/id")
-                .and_then(|v| v.as_u64())
-                .ok_or("missing pane id in scope")? as u32,
-        );
+        let pane = PaneId(me.scope_id);
 
         ctx.subscribe(&[
             "window-pane-changed",   // became active pane (always fires)
@@ -139,10 +135,7 @@ impl Plugin for GitStatus {
         // Focus events only fire on changes, so seed the initial state: if
         // this pane is currently its window's active pane, poll until a
         // focus-out says otherwise; either way publish once now.
-        let active = resolve_pane(pane)
-            .ok()
-            .and_then(|i| i.get("active").and_then(|v| v.as_bool()))
-            .unwrap_or(false);
+        let active = resolve_pane(pane).map(|i| i.active).unwrap_or(false);
         if active {
             plugin.start_polling(ctx); // first loop iteration refreshes
         } else {
@@ -156,7 +149,7 @@ impl Plugin for GitStatus {
     }
 
     fn on_event(&mut self, ctx: &Ctx, event: Event) {
-        match event.event.as_str() {
+        match event.name().as_str() {
             // This pane became the one on display: refresh now (loop's
             // first iteration) + poll while it stays active.
             "window-pane-changed" | "session-window-changed"
@@ -181,7 +174,7 @@ async fn refresh(pane: PaneId, in_flight: &Cell<bool>) {
     // Background panes are not shown in the status line; they catch up on
     // their next focus-in or prompt-after-focus.
     let Ok(info) = resolve_pane(pane) else { return };
-    if info.get("active").and_then(|v| v.as_bool()) != Some(true) {
+    if !info.active {
         return;
     }
     probe_and_publish(pane, info, in_flight).await;
@@ -196,17 +189,17 @@ async fn refresh_even_if_inactive(pane: PaneId, in_flight: &Cell<bool>) {
 
 async fn probe_and_publish(
     pane: PaneId,
-    info: serde_json::Value,
+    info: PaneInfo,
     in_flight: &Cell<bool>,
 ) {
     if in_flight.get() {
         return; // a probe is already running; it will publish shortly
     }
-    let Some(cwd) = info.get("cwd").and_then(|v| v.as_str()).map(String::from)
-    else {
+    if info.cwd.is_empty() {
         publish(pane, "", false);
         return;
-    };
+    }
+    let cwd = info.cwd;
 
     in_flight.set(true);
     let result = run_job(GIT_PROBE, Some(&cwd)).await;

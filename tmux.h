@@ -4258,20 +4258,6 @@ void	 plugin_object_destroyed(enum plugin_obj_kind, u_int);
 
 /* window-plugin-mode.c */
 extern const struct window_mode window_plugin_mode;
-
-/* plugin-json.c */
-struct plugin_json;
-struct plugin_json	*plugin_json_create(void);
-void	 plugin_json_free(struct plugin_json *);
-const char		*plugin_json_string(struct plugin_json *);
-void	 plugin_json_obj_start(struct plugin_json *, const char *);
-void	 plugin_json_obj_end(struct plugin_json *);
-void	 plugin_json_arr_start(struct plugin_json *, const char *);
-void	 plugin_json_arr_end(struct plugin_json *);
-void	 plugin_json_str(struct plugin_json *, const char *, const char *);
-void	 plugin_json_num(struct plugin_json *, const char *, long long);
-void	 plugin_json_bool(struct plugin_json *, const char *, int);
-void	 plugin_json_null(struct plugin_json *, const char *);
 #endif
 
 #endif /* TMUX_H */

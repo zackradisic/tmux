@@ -1,5 +1,5 @@
 //! SDK for writing tmux plugins in Rust (compiled to
-//! wasm32-unknown-unknown, ABI v1).
+//! wasm32-unknown-unknown).
 //!
 //! ```ignore
 //! use tmux_plugin_sdk::prelude::*;
@@ -28,7 +28,7 @@
 //!
 //!     fn on_event(&mut self, _ctx: &Ctx, event: Event) {
 //!         self.seen += 1;
-//!         let _ = display_message(&format!("{} #{}", event.event, self.seen));
+//!         let _ = display_message(&format!("{} #{}", event.name(), self.seen));
 //!     }
 //! }
 //!
@@ -36,26 +36,39 @@
 //! ```
 
 pub mod api;
+pub mod event;
 pub mod executor;
 pub mod ids;
 pub mod runtime;
+pub mod strings;
 
 pub use api::*;
+pub use event::Event;
 pub use ids::*;
+pub use strings::{AsTmuxStr, TmuxString};
 pub use tmux_plugin_abi as abi;
-pub use tmux_plugin_abi::{Event, EventScope, HostError};
+pub use tmux_plugin_abi::{
+    ClientInfo, EventScope, HostError, PaneInfo, SelfInfo, SessionInfo,
+    WindowInfo,
+};
 
 pub mod prelude {
     pub use crate::api::*;
+    pub use crate::event::Event;
     pub use crate::ids::*;
+    pub use crate::strings::{AsTmuxStr, TmuxString};
     pub use crate::tmux_plugin;
     pub use crate::{Ctx, Plugin};
-    pub use tmux_plugin_abi::{Event, EventScope, HostError};
+    pub use tmux_plugin_abi::{
+        ClientInfo, EventScope, HostError, PaneInfo, SelfInfo, SessionInfo,
+        WindowInfo,
+    };
 }
 
 /// Re-exports used by the `tmux_plugin!` macro expansion; not public API.
 #[doc(hidden)]
 pub mod __internal {
+    pub use crate::event;
     pub use crate::executor;
     pub use crate::runtime;
     pub use serde_json;
@@ -73,7 +86,8 @@ pub trait Plugin: Sized + 'static {
     const STATE_VERSION: i32 = 1;
 
     /// Configuration shape (from `load-plugin -o key=value ...`). Use
-    /// `serde_json::Value` if you don't care.
+    /// `serde_json::Value` if you don't care. (Config crosses the ABI as
+    /// a binary field block; the SDK decodes it into JSON for serde.)
     type Config: serde::de::DeserializeOwned + Default;
 
     fn init(ctx: &Ctx, config: Self::Config) -> Result<Self, String>;
@@ -82,7 +96,8 @@ pub trait Plugin: Sized + 'static {
     fn on_event(&mut self, _ctx: &Ctx, _event: Event) {}
 
     /// State to carry across a code reload. `None` (the default) means the
-    /// plugin is stateless: reloads simply re-init.
+    /// plugin is stateless: reloads simply re-init. The bytes are opaque
+    /// to the host; serde_json is a fine choice.
     fn snapshot(&self) -> Option<serde_json::Value> {
         None
     }
@@ -149,13 +164,13 @@ impl Default for Ctx {
 }
 
 /// Register a [`Plugin`] implementation as this wasm module's plugin,
-/// generating the ABI v1 exports.
+/// generating the ABI exports.
 #[macro_export]
 macro_rules! tmux_plugin {
     ($ty:ty) => {
         mod __tmux_plugin_glue {
             use super::*;
-            use $crate::__internal::{executor, runtime, serde_json};
+            use $crate::__internal::{event, executor, runtime, serde_json};
 
             std::thread_local! {
                 static PLUGIN: std::cell::RefCell<Option<$ty>> =
@@ -220,8 +235,9 @@ macro_rules! tmux_plugin {
             #[no_mangle]
             pub extern "C" fn pgh_on_config_changed(ptr: i32, len: i32) -> i32 {
                 let bytes = runtime::take_buf(ptr, len);
+                let value = event::config_value(&bytes);
                 let config: <$ty as $crate::Plugin>::Config =
-                    match serde_json::from_slice(&bytes) {
+                    match serde_json::from_value(value) {
                         Ok(c) => c,
                         Err(_) => return 0, // restart me
                     };
@@ -250,8 +266,9 @@ macro_rules! tmux_plugin {
             pub extern "C" fn pgh_init(ptr: i32, len: i32) -> i32 {
                 runtime::install_panic_hook();
                 let bytes = runtime::take_buf(ptr, len);
+                let value = event::config_value(&bytes);
                 let config: <$ty as $crate::Plugin>::Config =
-                    serde_json::from_slice(&bytes).unwrap_or_default();
+                    serde_json::from_value(value).unwrap_or_default();
                 let ctx = $crate::Ctx::new();
                 match <$ty as $crate::Plugin>::init(&ctx, config) {
                     Ok(plugin) => {
@@ -269,10 +286,8 @@ macro_rules! tmux_plugin {
             #[no_mangle]
             pub extern "C" fn pgh_on_event(ptr: i32, len: i32) {
                 let bytes = runtime::take_buf(ptr, len);
-                let Ok(event) =
-                    serde_json::from_slice::<$crate::Event>(&bytes)
-                else {
-                    runtime::log(3, "bad event JSON from host");
+                let Some(event) = $crate::Event::parse(bytes) else {
+                    runtime::log(3, "bad event buffer from host");
                     return;
                 };
                 let ctx = $crate::Ctx::new();
@@ -287,12 +302,14 @@ macro_rules! tmux_plugin {
             #[no_mangle]
             pub extern "C" fn pgh_on_async_complete(
                 token: i64,
+                err: i32,
+                v0: i64,
+                v1: i64,
                 ptr: i32,
                 len: i32,
-                is_error: i32,
             ) {
-                let bytes = runtime::take_buf(ptr, len);
-                executor::complete(token as u64, &bytes, is_error != 0);
+                let data = runtime::take_buf(ptr, len);
+                executor::complete(token as u64, err, v0, v1, &data);
                 executor::run_until_stalled();
             }
 

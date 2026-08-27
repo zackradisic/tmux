@@ -1,6 +1,7 @@
-//! Hand-written ABI-v1 tmux plugin, used as the conformance guinea pig
-//! until the SDK exists. Logs lifecycle events and proves sync host calls
-//! (subscribe, list_sessions) work.
+//! Hand-written tmux plugin against the raw C-like ABI (no SDK), kept as
+//! the conformance guinea pig: typed per-method imports, NUL-included
+//! strings, OutBuf results with grow-on-E_LIMIT, OwnedBuf transfers and
+//! binary event buffers, all by hand.
 //!
 //! Build: cargo build -p hello-raw --target wasm32-unknown-unknown --release
 
@@ -9,41 +10,53 @@ use std::cell::RefCell;
 
 #[link(wasm_import_module = "tmux")]
 extern "C" {
-    fn host_call(req_ptr: i32, req_len: i32, out_ptr: i32, out_len_ptr: i32) -> i32;
-    fn host_log(level: i32, ptr: i32, len: i32);
+    fn intern(ptr: i32, len: i32) -> i64;
+    fn intern_name(id: i32, out: i32, cap: i32, len_out: i32) -> i32;
+    fn subscribe(id: i32) -> i32;
+    fn list(kind: i32, owned_out: i32) -> i32;
+    fn set_option(
+        kind: i32, id: i32, name_ptr: i32, name_len: i32,
+        val_ptr: i32, val_len: i32,
+    ) -> i32;
+    fn get_option(
+        kind: i32, id: i32, name_ptr: i32, name_len: i32,
+        out: i32, cap: i32, len_out: i32,
+    ) -> i32;
+    fn capture_pane(
+        pane: i32, start: i32, end: i32, escapes: i32,
+        out: i32, cap: i32, len_out: i32,
+    ) -> i32;
+    fn format_expand(
+        kind: i32, id: i32, fmt_ptr: i32, fmt_len: i32,
+        out: i32, cap: i32, len_out: i32,
+    ) -> i32;
+    fn display_message(client: i32, msg_ptr: i32, msg_len: i32) -> i32;
+    fn log(level: i32, ptr: i32, len: i32);
 }
 
 thread_local! {
     static EVENTS_SEEN: RefCell<u64> = const { RefCell::new(0) };
 }
 
-fn log(level: i32, msg: &str) {
-    unsafe { host_log(level, msg.as_ptr() as i32, msg.len() as i32) };
+fn logf(level: i32, msg: &str) {
+    unsafe { log(level, msg.as_ptr() as i32, msg.len() as i32) };
 }
 
-/// Synchronous host call; returns (status, response JSON).
-fn call(req: &str) -> (i32, String) {
-    let mut out_ptr: u32 = 0;
-    let mut out_len: u32 = 0;
-    let status = unsafe {
-        host_call(
-            req.as_ptr() as i32,
-            req.len() as i32,
-            &mut out_ptr as *mut u32 as i32,
-            &mut out_len as *mut u32 as i32,
-        )
-    };
-    if status > 1 || out_ptr == 0 {
-        return (status, String::new());
+/// A Str argument: (ptr, len) with the NUL at data[len]. c-string
+/// literals carry the NUL in the data segment already.
+fn s(cstr: &std::ffi::CStr) -> (i32, i32) {
+    let b = cstr.to_bytes_with_nul();
+    (b.as_ptr() as i32, (b.len() - 1) as i32)
+}
+
+/// Intern an event/key name.
+fn intern_str(name: &str) -> u32 {
+    let id = unsafe { intern(name.as_ptr() as i32, name.len() as i32) };
+    if id > 0 {
+        id as u32
+    } else {
+        0
     }
-    let resp = unsafe {
-        let bytes =
-            std::slice::from_raw_parts(out_ptr as *const u8, out_len as usize)
-                .to_vec();
-        pgh_free(out_ptr as i32, out_len as i32);
-        String::from_utf8_lossy(&bytes).into_owned()
-    };
-    (status, resp)
 }
 
 #[no_mangle]
@@ -75,55 +88,79 @@ pub extern "C" fn pgh_free(ptr: i32, size: i32) {
 
 #[no_mangle]
 pub extern "C" fn pgh_init(cfg_ptr: i32, cfg_len: i32) -> i32 {
-    let config = unsafe {
-        String::from_utf8_lossy(std::slice::from_raw_parts(
-            cfg_ptr as *const u8,
-            cfg_len as usize,
-        ))
-        .into_owned()
+    pgh_free(cfg_ptr, cfg_len); // config not used; free the transfer
+
+    for name in
+        ["session-created", "window-linked", "window-renamed", "pane-created"]
+    {
+        let id = intern_str(name);
+        if id == 0 || unsafe { subscribe(id as i32) } != 0 {
+            logf(3, &format!("subscribe {name} failed"));
+            return 1;
+        }
+    }
+
+    // OwnedBuf transfer: list sessions, report the byte count, free it.
+    let mut owned: [u32; 2] = [0, 0];
+    let rc = unsafe { list(0, owned.as_mut_ptr() as i32) };
+    if rc == 0 {
+        logf(1, &format!("sessions list buffer: {} bytes", owned[1]));
+        pgh_free(owned[0] as i32, owned[1] as i32);
+    }
+
+    // Sync effects: user option + status message, zero-copy strings.
+    let (np, nl) = s(c"@hello");
+    let (vp, vl) = s(c"world");
+    if unsafe { set_option(-1, 0, np, nl, vp, vl) } != 0 {
+        logf(3, "set_option failed");
+    }
+    let (mp, ml) = s(c"hello-raw is alive");
+    if unsafe { display_message(-1, mp, ml) } != 0 {
+        logf(2, "display_message failed");
+    }
+
+    // format_expand round trip at server scope.
+    let (fp, fl) = s(c"host=#{host_short} version=#{version}");
+    let mut out = vec![0u8; 256];
+    let mut flen: u32 = 0;
+    let rc = unsafe {
+        format_expand(
+            -1,
+            0,
+            fp,
+            fl,
+            out.as_mut_ptr() as i32,
+            out.len() as i32,
+            &mut flen as *mut u32 as i32,
+        )
     };
-    pgh_free(cfg_ptr, cfg_len);
-    log(1, &format!("hello-raw initialized, config: {config}"));
-
-    let (status, resp) = call(
-        r#"{"method":"subscribe","params":{"events":["session-created","window-linked","window-renamed","pane-created"]}}"#,
+    out.truncate(flen as usize);
+    logf(
+        1,
+        &format!(
+            "format_expand({rc}): {}",
+            String::from_utf8_lossy(&out)
+        ),
     );
-    if status != 0 {
-        log(3, &format!("subscribe failed: {resp}"));
-        return 1;
-    }
-
-    let (status, resp) = call(r#"{"method":"list_sessions","params":{}}"#);
-    if status == 0 {
-        log(1, &format!("sessions at startup: {resp}"));
-    }
-
-    // Exercise the sync effects: user option + status message.
-    let (status, resp) = call(
-        r#"{"method":"set_option","params":{"name":"@hello","value":"world"}}"#,
-    );
-    if status != 0 {
-        log(3, &format!("set_option failed: {resp}"));
-    }
-    let (status, resp) = call(
-        r#"{"method":"display_message","params":{"message":"hello-raw is alive"}}"#,
-    );
-    if status != 0 {
-        log(2, &format!("display_message: {resp}"));
-    }
     0
 }
 
 #[no_mangle]
 pub extern "C" fn pgh_on_event(ptr: i32, len: i32) {
-    let json = unsafe {
-        String::from_utf8_lossy(std::slice::from_raw_parts(
-            ptr as *const u8,
-            len as usize,
-        ))
-        .into_owned()
+    // Parse the binary event header by hand: u32 event id, u64 seq, four
+    // u32 scope ids (0xffffffff = none).
+    let bytes = unsafe {
+        std::slice::from_raw_parts(ptr as *const u8, len as usize).to_vec()
     };
     pgh_free(ptr, len);
+    if bytes.len() < 28 {
+        return;
+    }
+    let u32_at = |o: usize| {
+        u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap())
+    };
+    let event_id = u32_at(0);
+    let pane = u32_at(24);
 
     let count = EVENTS_SEEN.with(|c| {
         let mut c = c.borrow_mut();
@@ -131,32 +168,76 @@ pub extern "C" fn pgh_on_event(ptr: i32, len: i32) {
         *c
     });
 
-    let parsed = serde_json::from_str::<serde_json::Value>(&json).ok();
-    let name = parsed
-        .as_ref()
-        .and_then(|v| v.get("event").and_then(|e| e.as_str()).map(String::from))
-        .unwrap_or_else(|| "?".into());
-    log(1, &format!("event #{count}: {name} ({json})"));
+    // Reverse-lookup the name through an OutBuf with grow-on-E_LIMIT.
+    let mut name_buf = vec![0u8; 64];
+    let mut name = String::from("?");
+    loop {
+        let mut need: u32 = 0;
+        let rc = unsafe {
+            intern_name(
+                event_id as i32,
+                name_buf.as_mut_ptr() as i32,
+                name_buf.len() as i32,
+                &mut need as *mut u32 as i32,
+            )
+        };
+        if rc == 0 {
+            name_buf.truncate(need as usize);
+            name = String::from_utf8_lossy(&name_buf).into_owned();
+            break;
+        }
+        if rc == -6 && need as usize > name_buf.len() {
+            name_buf.resize(need as usize, 0);
+            continue;
+        }
+        break;
+    }
+    logf(1, &format!("event #{count}: {name}"));
 
     // On pane creation, prove capture_pane + get_option round-trips.
-    if name == "pane-created" {
-        if let Some(pane) = parsed
-            .as_ref()
-            .and_then(|v| v.pointer("/scope/pane").and_then(|p| p.as_u64()))
-        {
-            let (status, resp) = call(&format!(
-                r#"{{"method":"capture_pane","params":{{"pane":{pane},"start":0,"end":3}}}}"#
-            ));
-            log(1, &format!("capture({status}): {resp}"));
-        }
-        let (status, resp) =
-            call(r#"{"method":"get_option","params":{"name":"@hello"}}"#);
-        log(1, &format!("get_option @hello ({status}): {resp}"));
+    if name == "pane-created" && pane != u32::MAX {
+        let mut out = vec![0u8; 4096];
+        let mut got: u32 = 0;
+        let rc = unsafe {
+            capture_pane(
+                pane as i32,
+                0,
+                3,
+                0,
+                out.as_mut_ptr() as i32,
+                out.len() as i32,
+                &mut got as *mut u32 as i32,
+            )
+        };
+        logf(1, &format!("capture({rc}): {got} bytes"));
+
+        let (np, nl) = s(c"@hello");
+        let mut val = vec![0u8; 64];
+        let mut vlen: u32 = 0;
+        let rc = unsafe {
+            get_option(
+                -1,
+                0,
+                np,
+                nl,
+                val.as_mut_ptr() as i32,
+                val.len() as i32,
+                &mut vlen as *mut u32 as i32,
+            )
+        };
+        val.truncate(vlen as usize);
+        logf(
+            1,
+            &format!(
+                "get_option @hello ({rc}): {}",
+                String::from_utf8_lossy(&val)
+            ),
+        );
     }
 }
 
 #[no_mangle]
 pub extern "C" fn pgh_on_unload() {
     let count = EVENTS_SEEN.with(|c| *c.borrow());
-    log(1, &format!("goodbye after {count} events"));
+    logf(1, &format!("goodbye after {count} events"));
 }

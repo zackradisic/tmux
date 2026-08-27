@@ -12,16 +12,27 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
-use serde_json::Value;
 use slab::Slab;
 use tmux_plugin_abi::{ErrorCode, HostError};
 
-pub type HostResult = Result<Value, HostError>;
+/// A successful async completion: two per-method scalars plus an optional
+/// data buffer (job output; empty for commands and timers).
+#[derive(Debug, Default)]
+pub struct Completion {
+    pub v0: i64,
+    pub v1: i64,
+    pub data: Vec<u8>,
+}
+
+pub type HostResult = Result<Completion, HostError>;
 
 #[derive(Default)]
 struct TokenSlot {
     waker: Option<Waker>,
     result: Option<HostResult>,
+    /// The future was dropped before its completion arrived; the
+    /// completion cleans up (including any pinned buffer).
+    abandoned: bool,
 }
 
 #[derive(Default)]
@@ -30,6 +41,10 @@ struct Executor {
     tasks: Slab<Option<Pin<Box<dyn Future<Output = ()>>>>>,
     ready: VecDeque<usize>,
     waiting: HashMap<u64, TokenSlot>,
+    /// Buffers that must stay alive until a token's completion arrives
+    /// (async fs: the host worker reads/writes them directly). Keyed by
+    /// token; dropped here if the awaiting future was cancelled.
+    pinned: HashMap<u64, Vec<u8>>,
 }
 
 thread_local! {
@@ -53,6 +68,21 @@ pub(crate) fn register_token(token: u64) {
     });
 }
 
+/// Pin a buffer until `token`'s completion arrives (the host reads or
+/// writes it directly). The buffer's heap allocation must not move:
+/// take raw pointers BEFORE calling this (moving the Vec struct into
+/// the map does not move its heap storage).
+pub(crate) fn pin_buffer(token: u64, buf: Vec<u8>) {
+    EXEC.with(|e| {
+        e.borrow_mut().pinned.insert(token, buf);
+    });
+}
+
+/// Reclaim a pinned buffer after its completion arrived.
+pub(crate) fn take_buffer(token: u64) -> Option<Vec<u8>> {
+    EXEC.with(|e| e.borrow_mut().pinned.remove(&token))
+}
+
 /// Future resolving to a host async result.
 pub(crate) struct HostFuture {
     token: u64,
@@ -62,6 +92,27 @@ impl HostFuture {
     pub(crate) fn new(token: u64) -> Self {
         register_token(token);
         Self { token }
+    }
+}
+
+impl Drop for HostFuture {
+    fn drop(&mut self) {
+        // Cancellation: the completion has not been consumed. Mark the
+        // slot abandoned so complete() cleans up - the pinned buffer (if
+        // any) must survive until then, because the host worker may
+        // still be using it.
+        EXEC.with(|e| {
+            let mut ex = e.borrow_mut();
+            if let Some(slot) = ex.waiting.get_mut(&self.token) {
+                if slot.result.is_some() {
+                    ex.waiting.remove(&self.token);
+                    ex.pinned.remove(&self.token);
+                } else {
+                    slot.waker = None;
+                    slot.abandoned = true;
+                }
+            }
+        });
     }
 }
 
@@ -76,7 +127,6 @@ impl Future for HostFuture {
                 return Poll::Ready(Err(HostError {
                     code: ErrorCode::Cancelled,
                     message: "completion lost".into(),
-                    data: Value::Null,
                 }));
             };
             if let Some(result) = slot.result.take() {
@@ -91,21 +141,28 @@ impl Future for HostFuture {
 }
 
 /// Called from `pgh_on_async_complete`: fill the slot and wake the task.
-pub fn complete(token: u64, payload: &[u8], is_error: bool) {
-    let result: HostResult = if is_error {
-        Err(serde_json::from_slice::<HostError>(payload).unwrap_or(HostError {
-            code: ErrorCode::Host,
-            message: String::from_utf8_lossy(payload).into_owned(),
-            data: Value::Null,
-        }))
+/// `err` = 0 on success (v0/v1/data are the payload) or an ErrorCode
+/// number (data = the error message bytes).
+pub fn complete(token: u64, err: i32, v0: i64, v1: i64, data: &[u8]) {
+    let result: HostResult = if err != 0 {
+        Err(HostError {
+            code: ErrorCode::from_num(err),
+            message: String::from_utf8_lossy(data).into_owned(),
+        })
     } else {
-        Ok(serde_json::from_slice::<Value>(payload)
-            .unwrap_or(Value::Null))
+        Ok(Completion { v0, v1, data: data.to_vec() })
     };
 
     let waker = EXEC.with(|e| {
         let mut ex = e.borrow_mut();
         let slot = ex.waiting.entry(token).or_default();
+        if slot.abandoned {
+            // The future was cancelled: consume the completion and free
+            // the pinned buffer (safe now - the host is done with it).
+            ex.waiting.remove(&token);
+            ex.pinned.remove(&token);
+            return None;
+        }
         slot.result = Some(result);
         slot.waker.take()
     });
