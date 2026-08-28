@@ -611,6 +611,29 @@ pub fn mode_move(
     }
 }
 
+pub fn mode_resize(
+    mem: &mut GuestMem<'_, '_>,
+    mode: i64,
+    width: i32,
+    height: i32,
+) -> Result<(), HostError> {
+    check_cap(mem, crate::caps::MODE)?;
+    let mode = check_mode(mem, mode)?;
+    if width <= 0 || height <= 0 {
+        return Err(err(ErrorCode::BadRequest, "zero mode size"));
+    }
+    let vt = vtable()?;
+    let rc = unsafe { (vt.mode_resize)(mode, width as u32, height as u32) };
+    match rc {
+        0 => Ok(()),
+        -2 => Err(err(
+            ErrorCode::Limit,
+            "window is too small for a floating pane",
+        )),
+        _ => Err(err(ErrorCode::NoSuchObject, format!("no such mode {mode}"))),
+    }
+}
+
 pub fn mode_close(mem: &mut GuestMem<'_, '_>, mode: i64) -> Result<(), HostError> {
     check_cap(mem, crate::caps::MODE)?;
     let mode = check_mode(mem, mode)?;

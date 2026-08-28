@@ -101,6 +101,7 @@ Errors: sync imports return `0` or `-code`; value-returning imports
 | `mode_write` | `(mode: i64, data Bytes) -> i32` (≤256 KiB; raw ANSI, zero-copy) | mode |
 | `mode_preview` | `(mode: i64, pane: i64 /* -1 = clear */, x, y, w, h) -> i32` | mode |
 | `mode_move` | `(mode: i64, window /* -1 = default */, x, y) -> i32` | mode |
+| `mode_resize` | `(mode: i64, width, height) -> i32` (content cells, clamped) | mode |
 | `mode_close` | `(mode: i64) -> i32` | mode |
 | `last_error` | `(out, cap, len_out) -> i32` | none |
 | `fs_root` | `(out, cap, len_out) -> i32` — the plugin data dir's absolute path | none |
@@ -242,6 +243,15 @@ is not offered; the design for it is in [MODE-ATTACH.md](MODE-ATTACH.md).)
     `"closed"` (the plugin called `mode_close`) or `"killed"` (anything
     else: the user killed the pane, the window died, the plugin was
     reloaded or unloaded). The id is dead afterwards.
+- **Resize**: `mode_resize` sets the float's size. `width` and `height`
+  are content cells, exactly as in `mode_open`, and the border sits
+  outside them. The host clamps the size to the window and keeps the
+  float's top-left corner, so a panel that grows expands down and right
+  instead of jumping. The resize delivers a `mode-resize` event with the
+  size actually given: treat the event as the truth and the call as a
+  request, and only call it when the size you want differs from the size
+  the last event reported. Refused with `E_LIMIT` when the window is too
+  small to hold a float at all.
 - **Move**: `mode_move` relocates the float to another window, join-pane
   style: the same pane is relinked, so the mode id, the pane id, the
   rendered screen and the event stream all survive - at most a

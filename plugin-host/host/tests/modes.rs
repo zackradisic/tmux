@@ -17,6 +17,7 @@ static MODE_OPENS: Mutex<Vec<(u32, u32, u32)>> = Mutex::new(Vec::new());
 static MODE_WRITES: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 static MODE_CLOSES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 static MODE_MOVES: Mutex<Vec<(u64, u32)>> = Mutex::new(Vec::new());
+static MODE_RESIZES: Mutex<Vec<(u64, u32, u32)>> = Mutex::new(Vec::new());
 static NEXT_MODE_ID: Mutex<u64> = Mutex::new(0);
 
 unsafe extern "C" fn logging_vt_log(
@@ -64,15 +65,21 @@ unsafe extern "C" fn my_mode_move(
     0
 }
 
+unsafe extern "C" fn my_mode_resize(mode: u64, width: u32, height: u32) -> c_int {
+    MODE_RESIZES.lock().unwrap().push((mode, width, height));
+    0
+}
+
 /// Guest that opens a mode via the typed imports, writes "hi" to it
-/// (zero-copy Bytes) and moves it to window 2, all from init, and logs
-/// every event buffer it receives verbatim.
+/// (zero-copy Bytes), grows it to 10x9 and moves it to window 2, all from
+/// init, and logs every event buffer it receives verbatim.
 const GUEST_WAT: &str = r#"
 (module
   (import "tmux" "mode_open"
     (func $open (param i32 i32 i32 i32 i32 i32 i32) (result i64)))
   (import "tmux" "mode_write" (func $write (param i64 i32 i32) (result i32)))
   (import "tmux" "mode_move" (func $move (param i64 i32 i32 i32) (result i32)))
+  (import "tmux" "mode_resize" (func $resize (param i64 i32 i32) (result i32)))
   (import "tmux" "log" (func $log (param i32 i32 i32)))
   (memory (export "memory") 4)
   (global $next (mut i32) (i32.const 2048))
@@ -92,6 +99,7 @@ const GUEST_WAT: &str = r#"
     (drop (call $open (i32.const 1) (i32.const 10) (i32.const 5)
       (i32.const -1) (i32.const -1) (i32.const 0) (i32.const 0)))
     (drop (call $write (i64.const 1) (i32.const 0) (i32.const 2)))
+    (drop (call $resize (i64.const 1) (i32.const 10) (i32.const 9)))
     (drop (call $move (i64.const 1) (i32.const 2) (i32.const -1) (i32.const -1)))
     (i32.const 0))
   (func (export "pgh_on_event") (param i32 i32)
@@ -128,6 +136,7 @@ fn mode_lifecycle() {
         mode_write: my_mode_write,
         mode_close: my_mode_close,
         mode_move: my_mode_move,
+        mode_resize: my_mode_resize,
         ..base_vtable()
     };
     assert_eq!(unsafe { pgh_init(&vt) }, 0);
@@ -139,7 +148,8 @@ fn mode_lifecycle() {
     assert_eq!(pgh_drain(0), 0);
     assert_eq!(MODE_OPENS.lock().unwrap().as_slice(), &[(1, 10, 5)]);
     assert_eq!(MODE_WRITES.lock().unwrap().as_slice(), &[b"hi".to_vec()]);
-    // The move went through with the owner's id and explicit window.
+    // The resize and the move went through with the owner's mode id.
+    assert_eq!(MODE_RESIZES.lock().unwrap().as_slice(), &[(1, 10, 9)]);
     assert_eq!(MODE_MOVES.lock().unwrap().as_slice(), &[(1, 2)]);
 
     // A key event for the open mode reaches the guest, no subscription

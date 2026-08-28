@@ -113,6 +113,7 @@ pub mod exports {
 /// mode_write(mode: i64, data_ptr, data_len) -> i32
 /// mode_preview(mode: i64, pane: i64 /* -1 = clear */, x, y, w, h) -> i32
 /// mode_move(mode: i64, window /* -1 = default */, x, y) -> i32
+/// mode_resize(mode: i64, width, height) -> i32   // content cells, clamped
 /// mode_close(mode: i64) -> i32
 /// last_error(out, cap, len_out) -> i32             // message of the last error
 /// log(level, ptr, len)
@@ -153,6 +154,7 @@ pub mod imports {
     pub const MODE_WRITE: &str = "mode_write";
     pub const MODE_PREVIEW: &str = "mode_preview";
     pub const MODE_MOVE: &str = "mode_move";
+    pub const MODE_RESIZE: &str = "mode_resize";
     pub const MODE_CLOSE: &str = "mode_close";
     pub const LAST_ERROR: &str = "last_error";
     pub const LOG: &str = "log";

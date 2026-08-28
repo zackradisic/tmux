@@ -52,6 +52,7 @@ pub(crate) mod raw {
             mode: i64, pane: i64, x: i32, y: i32, w: i32, h: i32,
         ) -> i32;
         pub fn mode_move(mode: i64, window: i32, x: i32, y: i32) -> i32;
+        pub fn mode_resize(mode: i64, width: i32, height: i32) -> i32;
         pub fn mode_close(mode: i64) -> i32;
         pub fn last_error(out: i32, cap: i32, len_out: i32) -> i32;
         pub fn log(level: i32, ptr: i32, len: i32);
@@ -104,6 +105,7 @@ pub(crate) mod raw {
     pub unsafe fn mode_write(mode: i64, ptr: i32, len: i32) -> i32 { -7 }
     pub unsafe fn mode_preview(mode: i64, pane: i64, x: i32, y: i32, w: i32, h: i32) -> i32 { -7 }
     pub unsafe fn mode_move(mode: i64, window: i32, x: i32, y: i32) -> i32 { -7 }
+    pub unsafe fn mode_resize(mode: i64, width: i32, height: i32) -> i32 { -7 }
     pub unsafe fn mode_close(mode: i64) -> i32 { -7 }
     pub unsafe fn last_error(out: i32, cap: i32, len_out: i32) -> i32 { 0 }
     pub unsafe fn log(level: i32, ptr: i32, len: i32) {}

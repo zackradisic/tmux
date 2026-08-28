@@ -153,6 +153,10 @@ pub unsafe extern "C" fn vt_mode_move(
     -1
 }
 
+pub unsafe extern "C" fn vt_mode_resize(_m: u64, _w: u32, _h: u32) -> c_int {
+    -1
+}
+
 pub unsafe extern "C" fn vt_format_expand(
     _k: c_int,
     _i: u32,
@@ -185,6 +189,7 @@ pub fn base_vtable() -> pgh_host_vtable {
         mode_preview: vt_mode_preview,
         mode_close: vt_mode_close,
         mode_move: vt_mode_move,
+        mode_resize: vt_mode_resize,
         format_expand: vt_format_expand,
     }
 }

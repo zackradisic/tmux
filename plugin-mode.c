@@ -151,6 +151,33 @@ plugin_mode_find(uint64_t mode_id, struct window_mode_entry **wme_out)
 }
 
 /*
+ * Resolve a live mode id to its pane, wherever our mode sits in the pane's
+ * mode stack. Geometry operations (move, resize) act on the pane, so a
+ * stacked copy-mode must not hide it the way it does for write/preview.
+ */
+static struct window_pane *
+plugin_mode_find_any(uint64_t mode_id)
+{
+	struct plugin_mode		 find, *pm;
+	struct window_pane		*wp;
+	struct window_mode_entry	*wme;
+
+	find.id = mode_id;
+	pm = RB_FIND(plugin_modes, &plugin_modes, &find);
+	if (pm == NULL)
+		return (NULL);
+	wp = window_pane_find_by_id(pm->pane_id);
+	if (wp == NULL || (wp->flags & PANE_DESTROYED))
+		return (NULL);
+	TAILQ_FOREACH(wme, &wp->modes, entry) {
+		if (wme->mode == &window_plugin_mode &&
+		    window_plugin_mode_id(wme) == mode_id)
+			return (wp);
+	}
+	return (NULL);
+}
+
+/*
  * Open a mode: spawn an empty floating pane in the window, enter
  * window_plugin_mode on it and make it the active pane. Returns the new
  * mode id, or -1 (no such window), -2 (spawn failed), -3 (init failed).
@@ -306,33 +333,18 @@ plugin_vtable_mode_preview(uint64_t mode_id, int64_t pane, u_int x, u_int y,
 int
 plugin_vtable_mode_move(uint64_t mode_id, u_int window, int x, int y)
 {
-	struct plugin_mode		 find, *pm;
 	struct window_pane		*wp;
 	struct window			*src_w, *dst_w;
-	struct window_mode_entry	*wme;
 	struct winlink			*src_wl, *dst_wl;
 	struct layout_cell		*lc;
 	struct layout_geometry		 lg;
 	u_int				 sx, sy;
-	int				 border, xoff, yoff, found = 0;
+	int				 border, xoff, yoff;
 
-	find.id = mode_id;
-	pm = RB_FIND(plugin_modes, &plugin_modes, &find);
-	if (pm == NULL)
-		return (-1);
-	wp = window_pane_find_by_id(pm->pane_id);
-	if (wp == NULL || (wp->flags & PANE_DESTROYED))
-		return (-1);
 	/* Anywhere in the stack: the pane moves wholesale, so a stacked
 	 * copy-mode does not block the move. */
-	TAILQ_FOREACH(wme, &wp->modes, entry) {
-		if (wme->mode == &window_plugin_mode &&
-		    window_plugin_mode_id(wme) == mode_id) {
-			found = 1;
-			break;
-		}
-	}
-	if (!found)
+	wp = plugin_mode_find_any(mode_id);
+	if (wp == NULL)
 		return (-1);
 	src_w = wp->window;
 
@@ -410,6 +422,72 @@ plugin_vtable_mode_move(uint64_t mode_id, u_int window, int x, int y)
 	src_wl = TAILQ_FIRST(&src_w->winlinks);
 	window_fire_pane_moved(wp, src_w,
 	    src_wl != NULL ? src_wl->idx : -1, dst_w, dst_wl->idx);
+
+	return (0);
+}
+
+/*
+ * Resize a mode's floating pane. Width and height are content cells, as in
+ * mode_open, and the border sits outside them. The size is clamped to the
+ * window, and the float keeps its top-left corner so a growing panel
+ * expands down and right instead of jumping. The pane resize delivers a
+ * mode-resize event, so the plugin learns the size it really got.
+ *
+ * 0 ok, -1 no such mode or the pane is not floating, -2 window too small.
+ */
+int
+plugin_vtable_mode_resize(uint64_t mode_id, u_int width, u_int height)
+{
+	struct window_pane	*wp;
+	struct window		*w;
+	struct layout_cell	*lc;
+	u_int			 sx, sy;
+	int			 border;
+
+	wp = plugin_mode_find_any(mode_id);
+	if (wp == NULL)
+		return (-1);
+	lc = wp->layout_cell;
+	if (lc == NULL || (~lc->flags & LAYOUT_CELL_FLOATING))
+		return (-1);
+	w = wp->window;
+	if (w->sx <= PANE_MINIMUM + 2 || w->sy <= PANE_MINIMUM + 2)
+		return (-2);
+	border = window_get_pane_lines(w) != PANE_LINES_NONE;
+
+	/* The same clamp as mode_open: the float and its border must fit. */
+	sx = width;
+	if (sx < PANE_MINIMUM)
+		sx = PANE_MINIMUM;
+	if (sx > w->sx - 2 * border)
+		sx = w->sx - 2 * border;
+	sy = height;
+	if (sy < PANE_MINIMUM)
+		sy = PANE_MINIMUM;
+	if (sy > w->sy - 2 * border)
+		sy = w->sy - 2 * border;
+
+	if (lc->g.sx == sx && lc->g.sy == sy)
+		return (0);
+	lc->g.sx = sx;
+	lc->g.sy = sy;
+
+	/* Push the float back in-bounds if it grew past an edge. */
+	if (lc->g.xoff + (int)sx > (int)w->sx - border)
+		lc->g.xoff = (int)w->sx - border - (int)sx;
+	if (lc->g.xoff < border)
+		lc->g.xoff = border;
+	if (lc->g.yoff + (int)sy > (int)w->sy - border)
+		lc->g.yoff = (int)w->sy - border - (int)sy;
+	if (lc->g.yoff < border)
+		lc->g.yoff = border;
+
+	if (lc->parent != NULL)
+		layout_fix_offsets(w);
+	layout_fix_panes(w, NULL);
+	redraw_invalidate_scene(w);
+	server_redraw_window(w);
+	events_fire_window("window-layout-changed", w);
 
 	return (0);
 }

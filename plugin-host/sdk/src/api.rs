@@ -455,6 +455,21 @@ pub fn mode_move(
     check(unsafe { raw::mode_move(mode.0 as i64, w, -1, -1) })
 }
 
+/// Resize a mode's floating pane. `width` and `height` are content cells,
+/// exactly as in [`mode_open`]; the border sits outside them. The host
+/// clamps the size to the window, and the float keeps its top-left corner,
+/// so a panel that grows expands down and right instead of jumping.
+///
+/// A `mode-resize` event follows with the size actually given, so treat
+/// that event as the truth and this call as a request. Call it only when
+/// the size you want differs from the size the last event reported,
+/// otherwise the two chase each other.
+pub fn mode_resize(mode: ModeId, width: u32, height: u32) -> Result<(), HostError> {
+    check(unsafe {
+        raw::mode_resize(mode.0 as i64, width as i32, height as i32)
+    })
+}
+
 /// Close a mode. The floating pane is torn down at the next safe point;
 /// a final `mode-closed` event (reason "closed") follows.
 pub fn mode_close(mode: ModeId) -> Result<(), HostError> {

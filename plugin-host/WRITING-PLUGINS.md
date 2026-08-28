@@ -336,6 +336,8 @@ mode_write(ModeId, data: &[u8])                         // ANSI bytes, ≤256 Ki
 mode_preview(ModeId, Option<&PreviewRect>)              // live pane mirror
 mode_move(ModeId, window: Option<WindowId>)             // relocate the float,
                                                         // id/screen intact
+mode_resize(ModeId, width: u32, height: u32)             // grow/shrink the float;
+                                                        // a mode-resize confirms
 mode_close(ModeId)
 ```
 

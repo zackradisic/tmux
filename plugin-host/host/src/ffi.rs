@@ -166,6 +166,13 @@ pub struct pgh_host_vtable {
     /// (-1 = centered). 0 ok, -1 no such mode, -2 no such window or
     /// unmovable pane, -3 the move would empty the source window.
     pub mode_move: unsafe extern "C" fn(mode: u64, window: u32, x: c_int, y: c_int) -> c_int,
+    /// Resize a mode's floating pane. Width and height are content cells,
+    /// as in mode_open; the border sits outside them. Clamped to the
+    /// window, top-left corner kept, so a growing panel expands down and
+    /// right. A mode-resize event follows with the size actually given.
+    /// 0 ok, -1 no such mode or the pane is not floating, -2 window too
+    /// small.
+    pub mode_resize: unsafe extern "C" fn(mode: u64, width: u32, height: u32) -> c_int,
     /// Expand a format string against a scope (kind -1 = server/global,
     /// else PGH_OBJ_SESSION/WINDOW/PANE) into the sink. Jobs (#()) are
     /// disabled. 0 ok, -1 dead/bad target.

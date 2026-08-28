@@ -970,6 +970,10 @@ fn register_imports(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
         ret_i32(with_mem(&mut c, |mem| dispatch::mode_move(mem, mode, window, x, y)))
     })?;
 
+    linker.func_wrap(m, im::MODE_RESIZE, |mut c: Caller<'_, StoreData>, mode: i64, width: i32, height: i32| -> i32 {
+        ret_i32(with_mem(&mut c, |mem| dispatch::mode_resize(mem, mode, width, height)))
+    })?;
+
     linker.func_wrap(m, im::MODE_CLOSE, |mut c: Caller<'_, StoreData>, mode: i64| -> i32 {
         ret_i32(with_mem(&mut c, |mem| dispatch::mode_close(mem, mode)))
     })?;
