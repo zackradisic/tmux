@@ -131,6 +131,7 @@ dist_tmux_SOURCES = \
 	cmd-resize-pane.c \
 	cmd-resize-window.c \
 	cmd-respawn-pane.c \
+	cmd-restart-server.c \
 	cmd-respawn-window.c \
 	cmd-rotate-window.c \
 	cmd-run-shell.c \
@@ -199,6 +200,7 @@ dist_tmux_SOURCES = \
 	server-acl.c \
 	server-client.c \
 	server-fn.c \
+	server-handoff.c \
 	server.c \
 	session.c \
 	sort.c \

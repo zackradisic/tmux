@@ -40,6 +40,7 @@ struct environ	*global_environ;
 
 struct timeval	 start_time;
 const char	*socket_path;
+const char	*tmux_binary;
 int		 ptm_fd = -1;
 const char	*shell_command;
 
@@ -395,6 +396,8 @@ main(int argc, char **argv)
 	char					*path = NULL, *label = NULL;
 	char					*cause, **var;
 	const char				*s, *cwd;
+	const char				*resume_path = NULL;
+	char					 binary[PATH_MAX];
 	int					 opt, keys, feat = 0, fflag = 0;
 	uint64_t				 flags = 0;
 	const struct options_table_entry	*oe;
@@ -422,7 +425,17 @@ main(int argc, char **argv)
 		environ_set(global_environ, "PWD", 0, "%s", cwd);
 	expand_paths(TMUX_CONF, &cfg_files, &cfg_nfiles, 1);
 
-	while ((opt = getopt(argc, argv, "2c:CDdf:hlL:NqS:T:uUvV")) != -1) {
+	/*
+	 * Remember how we were run, as an absolute path while the working
+	 * directory is still the user's. server-handoff.c falls back to it
+	 * when it cannot read /proc/self/exe.
+	 */
+	if (realpath(argv[0], binary) != NULL)
+		tmux_binary = xstrdup(binary);
+	else
+		tmux_binary = argv[0];
+
+	while ((opt = getopt(argc, argv, "2c:CDdf:hlL:NqS:T:uUvVZ:")) != -1) {
 		switch (opt) {
 		case '2':
 			tty_add_features(&feat, "256", ":,");
@@ -480,6 +493,14 @@ main(int argc, char **argv)
 			break;
 		case 'v':
 			log_add_level();
+			break;
+		case 'Z':
+			/*
+			 * Undocumented: the server restarting itself in place.
+			 * server-handoff.c passes the state file it wrote
+			 * before it called execve().
+			 */
+			resume_path = optarg;
 			break;
 		default:
 			usage(1);
@@ -577,6 +598,14 @@ main(int argc, char **argv)
 	}
 	socket_path = path;
 	free(label);
+
+	/*
+	 * Resuming a server we replaced with execve(). The pty masters are
+	 * already open on the descriptors the state file names, so go straight
+	 * to the server and never touch the client code.
+	 */
+	if (resume_path != NULL)
+		server_resume(osdep_event_init(), resume_path);
 
 	/* Pass control to the client. */
 	exit(client_main(osdep_event_init(), argc, argv, flags, feat));

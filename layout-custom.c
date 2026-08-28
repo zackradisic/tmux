@@ -26,7 +26,7 @@
 static struct layout_cell	*layout_find_bottomright(struct layout_cell *);
 static u_short			 layout_checksum(const char *);
 static int			 layout_append(struct layout_cell *, char *,
-				     size_t);
+				     size_t, int);
 static int			 layout_construct(struct layout_cell *,
 				     const char **, struct layout_cell **);
 static void			 layout_assign(struct window_pane **,
@@ -60,13 +60,27 @@ layout_checksum(const char *layout)
 char *
 layout_dump(struct window *w, struct layout_cell *root)
 {
+	return (layout_dump_part(w, root, 1));
+}
+
+/*
+ * Dump layout as a string, with or without the floating panes.
+ * layout_parse() does not read the floating part, so a caller that means to
+ * parse the result again wants it left out.
+ */
+char *
+layout_dump_part(struct window *w, struct layout_cell *root, int floating)
+{
 	char			 layout[8192], *out;
 	int			 bracket = 0;
 	struct window_pane	*wp;
 
 	*layout = '\0';
-	if (layout_append(root, layout, sizeof layout) != 0)
+	if (layout_append(root, layout, sizeof layout, !floating) != 0)
 		return (NULL);
+
+	if (!floating)
+		goto done;
 
 	TAILQ_FOREACH(wp, &w->z_index, zentry) {
 		if (!window_pane_is_floating(wp))
@@ -75,20 +89,22 @@ layout_dump(struct window *w, struct layout_cell *root)
 			strlcat(layout, "<", sizeof layout);
 			bracket = 1;
 		}
-		if (layout_append(wp->layout_cell, layout, sizeof layout) != 0)
+		if (layout_append(wp->layout_cell, layout, sizeof layout,
+		    0) != 0)
 			return (NULL);
 		strlcat(layout, ",", sizeof layout);
 	}
 	if (bracket)
 		layout[strlen(layout) - 1] = '>';
 
+done:
 	xasprintf(&out, "%04hx,%s", layout_checksum(layout), layout);
 	return (out);
 }
 
 /* Append information for a single cell. */
 static int
-layout_append(struct layout_cell *lc, char *buf, size_t len)
+layout_append(struct layout_cell *lc, char *buf, size_t len, int tiled)
 {
 	struct layout_cell     *lcchild;
 	char			tmp[64];
@@ -119,7 +135,15 @@ layout_append(struct layout_cell *lc, char *buf, size_t len)
 		if (strlcat(buf, &brackets[1], len) >= len)
 			return (-1);
 		TAILQ_FOREACH(lcchild, &lc->cells, entry) {
-			if (layout_append(lcchild, buf, len) != 0)
+			/*
+			 * A floating cell sits in the tree beside the tiled
+			 * ones but takes no space, so leaving it out keeps the
+			 * sizes adding up. layout_parse() cannot read one.
+			 */
+			if (tiled && !layout_cell_is_tiled(lcchild) &&
+			    !layout_cell_has_tiled_child(lcchild))
+				continue;
+			if (layout_append(lcchild, buf, len, tiled) != 0)
 				return (-1);
 			if (strlcat(buf, ",", len) >= len)
 				return (-1);

@@ -1582,6 +1582,44 @@ option.
 .D1 Pq alias: Ic rename
 Rename the session to
 .Ar new\-name .
+.Tg restarts
+.It Xo Ic restart\-server
+.Op Fl b Ar binary
+.Xc
+.D1 Pq alias: Ic restarts
+Replace the running server with a new one, keeping the pane processes alive.
+This is how to move onto a freshly built
+.Nm
+binary without losing any work.
+.Pp
+The server saves its state, then replaces its own program image with
+.Xr execve 2 ,
+so it keeps its process id.
+The pane processes stay its children, which means
+.Xr waitpid 2 ,
+.Ic remain\-on\-exit
+and
+.Ql #{pane_dead_status}
+all keep working.
+.Fl b
+gives the binary to run; the default is the running one.
+.Pp
+Sessions, windows, panes, layouts, object ids, options at every scope,
+environments, key bindings, paste buffers and pane scrollback all come back.
+Floating panes keep their size, position and z-order, although
+.Ql #{window_layout}
+lists their cells at the end.
+Attached clients detach and reattach themselves; a control mode client only
+detaches.
+.Pp
+The following do not come back: pane modes such as copy mode, jobs,
+.Ic pipe\-pane ,
+popups, menus,
+.Ic wait\-for
+channels, and plugin guest memory.
+Plugins themselves are loaded again.
+A pane on the alternate screen keeps only that screen, and loses the
+scrollback behind it.
 .It Xo Ic server\-access
 .Op Fl adglrw
 .Op Ar user | group

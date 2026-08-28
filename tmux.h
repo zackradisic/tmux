@@ -2493,6 +2493,11 @@ struct spawn_context {
 	int			  idx;
 	const char		 *cwd;
 
+	/* SPAWN_ADOPT: an existing process to take over instead of forking. */
+	int			  adopt_fd;
+	pid_t			  adopt_pid;
+	const char		 *adopt_tty;
+
 	int			  flags;
 #define SPAWN_KILL 0x1
 #define SPAWN_DETACHED 0x2
@@ -2506,6 +2511,7 @@ struct spawn_context {
 #define SPAWN_HORIZONTAL 0x200
 #define SPAWN_SPLIT 0x400
 #define SPAWN_MODAL 0x800
+#define SPAWN_ADOPT 0x1000
 };
 
 /* Paste buffer. */
@@ -2549,6 +2555,7 @@ extern struct options	*global_w_options;
 extern struct environ	*global_environ;
 extern struct timeval	 start_time;
 extern const char	*socket_path;
+extern const char	*tmux_binary;
 extern const char	*shell_command;
 extern int		 ptm_fd;
 extern const char	*shell_command;
@@ -3283,6 +3290,16 @@ int	 server_is_marked(struct session *, struct winlink *,
 int	 server_check_marked(void);
 int	 server_start(struct tmuxproc *, uint64_t, struct event_base *, int,
 	     char *);
+void	 server_resume(struct event_base *, const char *);
+int	 server_get_socket_fd(void);
+
+/* server-handoff.c */
+int	 server_handoff_begin(const char *, char **);
+int	 server_handoff_pending(void);
+void	 server_handoff_check(void);
+int	 server_handoff_restore(const char *, int *, char **);
+void	 server_handoff_record_plugin(const char *, const char *);
+void	 server_handoff_forget_plugin(const char *);
 void	 server_update_socket(void);
 void	 server_add_accept(int);
 void printflike(1, 2) server_add_message(const char *, ...);
@@ -3727,6 +3744,9 @@ void		 window_destroy_panes(struct window *);
 struct window_pane *window_pane_find_by_id_str(const char *);
 struct window_pane *window_pane_find_by_id(u_int);
 int		 window_pane_destroy_ready(struct window_pane *);
+void		 window_get_next_ids(u_int *, u_int *);
+void		 window_set_next_id(u_int);
+void		 window_set_next_pane_id(u_int);
 void		 window_pane_resize(struct window_pane *, u_int, u_int);
 void		 window_pane_clear_resizes(struct window_pane *,
 		     struct window_pane_resize *);
@@ -3834,6 +3854,7 @@ void		 layout_make_leaf(struct layout_cell *, struct window_pane *);
 void		 layout_make_node(struct layout_cell *, enum layout_type);
 void		 layout_fix_zindexes(struct window *, struct layout_cell *);
 int		 layout_cell_is_tiled(struct layout_cell *);
+int		 layout_cell_has_tiled_child(struct layout_cell *);
 int		 layout_add_horizontal_border(struct layout_cell *,
 		     struct layout_cell *, int);
 void		 layout_fix_offsets(struct window *);
@@ -3885,6 +3906,7 @@ int		 layout_insert_tile(struct window *, struct layout_cell *);
 
 /* layout-custom.c */
 char		*layout_dump(struct window *, struct layout_cell *);
+char		*layout_dump_part(struct window *, struct layout_cell *, int);
 int		 layout_parse(struct window *, const char *, char **);
 
 /* layout-set.c */

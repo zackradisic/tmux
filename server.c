@@ -153,6 +153,13 @@ fail:
 	return (-1);
 }
 
+/* Get the listening socket, so that a restart can keep it. */
+int
+server_get_socket_fd(void)
+{
+	return (server_fd);
+}
+
 /* Tidy up every hour. */
 static void
 server_tidy_event(__unused int fd, __unused short events, __unused void *data)
@@ -267,6 +274,100 @@ server_start(struct tmuxproc *client, uint64_t flags, struct event_base *base,
 	exit(0);
 }
 
+/*
+ * Resume the server after an in-place exec. The pane processes are still
+ * running on the pty masters we inherited, and the state file says how to put
+ * the sessions back around them.
+ */
+void
+server_resume(__unused struct event_base *base, const char *state)
+{
+	sigset_t	 set, oldset;
+	char		*cause = NULL;
+	struct timeval	 tv = { .tv_sec = 3600 };
+	int		 fd = -1;
+
+	/*
+	 * Keep every signal blocked until the panes exist again. A SIGCHLD
+	 * handled before then would find no pane to put the exit status on,
+	 * and the status would be lost. Nothing is missed: the drain below
+	 * reaps whatever died in the meantime.
+	 */
+	sigfillset(&set);
+	sigprocmask(SIG_BLOCK, &set, &oldset);
+
+	server_client_flags = 0;
+	server_proc = proc_start("server");
+	proc_set_signals(server_proc, server_signal);
+
+	if (log_get_level() > 1)
+		tty_create_log();
+	if (pledge("stdio rpath wpath cpath fattr unix getpw recvfd proc exec "
+	    "tty ps", NULL) != 0)
+		fatal("pledge failed");
+
+	input_key_build();
+	utf8_update_width_cache();
+	RB_INIT(&windows);
+	RB_INIT(&all_window_panes);
+	TAILQ_INIT(&clients);
+	RB_INIT(&sessions);
+	key_bindings_init();
+	control_build_events();
+	hooks_build_events();
+	TAILQ_INIT(&message_log);
+	gettimeofday(&start_time, NULL);
+
+	/*
+	 * The configuration already ran in the image we replaced, and the
+	 * state file carries its result. Reading it again would double every
+	 * binding and load every plugin twice.
+	 */
+	cfg_finished = 1;
+
+	evtimer_set(&server_ev_tidy, server_tidy_event, NULL);
+	evtimer_add(&server_ev_tidy, &tv);
+
+	server_acl_init();
+#ifdef ENABLE_PLUGINS
+	plugin_init();
+#endif
+
+	if (server_handoff_restore(state, &fd, &cause) != 0) {
+		log_debug("%s: %s", __func__, cause);
+		fprintf(stderr, "tmux: cannot restore the server: %s\n", cause);
+		exit(1);
+	}
+	unlink(state);
+
+	if (fd == -1) {
+		/* The file had no descriptor, so start a new socket. */
+		fd = server_create_socket(server_client_flags, &cause);
+		if (fd == -1) {
+			fprintf(stderr, "tmux: %s\n", cause);
+			exit(1);
+		}
+	}
+	server_fd = fd;
+	setblocking(server_fd, 0);
+	server_update_socket();
+
+	/* Reap anything that died between the exec and the restore. */
+	server_child_signal();
+	sigprocmask(SIG_SETMASK, &oldset, NULL);
+
+	server_add_accept(0);
+	proc_loop(server_proc, server_loop);
+
+#ifdef ENABLE_PLUGINS
+	plugin_shutdown();
+#endif
+	job_kill_all();
+	prompt_save_history();
+
+	exit(0);
+}
+
 /* Server loop callback. */
 static int
 server_loop(void)
@@ -285,6 +386,10 @@ server_loop(void)
 	} while (items != 0);
 
 	server_client_loop();
+
+	/* Only returns if the exec failed. */
+	if (server_handoff_pending())
+		server_handoff_check();
 
 	if (!options_get_number(global_options, "exit-empty") && !server_exit)
 		return (0);

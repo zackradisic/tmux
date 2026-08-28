@@ -332,6 +332,24 @@ spawn_pane(struct spawn_context *sc, char **cause)
 		}
 		new_wp = sc->wp0;
 		new_wp->flags &= ~(PANE_STATUSREADY|PANE_STATUSDRAWN);
+	} else if ((sc->flags & SPAWN_ADOPT) && sc->lc == NULL) {
+		/*
+		 * Adopting a process from a server we replaced. Append the
+		 * pane and leave the layout alone: the caller applies the
+		 * saved layout with layout_parse() once every pane exists,
+		 * and that assigns cells to panes in list order. The first
+		 * pane still needs a root cell for layout_parse() to free.
+		 *
+		 * A floating pane comes with its own cell instead, made after
+		 * the layout, and falls through to the branch below.
+		 */
+		if (TAILQ_EMPTY(&w->panes)) {
+			new_wp = window_add_pane(w, NULL, hlimit, sc->flags);
+			layout_init(w, new_wp);
+		} else {
+			new_wp = window_add_pane(w, NULL, hlimit,
+			    sc->flags|SPAWN_FULLSIZE);
+		}
 	} else {
 		if (sc->lc == NULL) {
 			new_wp = window_add_pane(w, NULL, hlimit, sc->flags);
@@ -359,7 +377,8 @@ spawn_pane(struct spawn_context *sc, char **cause)
 	 * process. Work out the command and arguments and store the working
 	 * directory.
 	 */
-	if (sc->argc == 0 && (~sc->flags & SPAWN_RESPAWN)) {
+	if (sc->argc == 0 && (~sc->flags & SPAWN_RESPAWN) &&
+	    (~sc->flags & SPAWN_ADOPT)) {
 		cmd = options_get_string(s->options, "default-command");
 		if (cmd != NULL && *cmd != '\0') {
 			argc = 1;
@@ -406,8 +425,8 @@ spawn_pane(struct spawn_context *sc, char **cause)
 	if (environ_find(child, "PATH") == NULL)
 		environ_set(child, "PATH", 0, "%s", _PATH_DEFPATH);
 
-	/* Then the shell. If respawning, use the old one. */
-	if (~sc->flags & SPAWN_RESPAWN) {
+	/* Then the shell. If respawning or adopting, use the old one. */
+	if ((~sc->flags & SPAWN_RESPAWN) && (~sc->flags & SPAWN_ADOPT)) {
 		tmp = options_get_string(s->options, "default-shell");
 		if (!checkshell(tmp))
 			tmp = _PATH_BSHELL;
@@ -446,6 +465,28 @@ spawn_pane(struct spawn_context *sc, char **cause)
 		goto complete;
 	}
 	new_wp->flags &= ~PANE_EMPTY;
+
+	/*
+	 * Take over a process that is already running on its own pty. It is
+	 * still our child, because the server reached this image through
+	 * execve() and so kept its pid, so waitpid() and #{pane_dead_status}
+	 * keep working.
+	 */
+	if (sc->flags & SPAWN_ADOPT) {
+		/*
+		 * A pane whose process had already gone keeps fd -1; the
+		 * caller puts its dead flags and exit status back.
+		 */
+		if (sc->adopt_fd != -1) {
+			new_wp->fd = sc->adopt_fd;
+			new_wp->pid = sc->adopt_pid;
+		}
+		if (sc->adopt_tty != NULL) {
+			strlcpy(new_wp->tty, sc->adopt_tty,
+			    sizeof new_wp->tty);
+		}
+		goto complete;
+	}
 
 	/* Store current working directory and change to new one. */
 	if (getcwd(path, sizeof path) != NULL) {
@@ -559,7 +600,7 @@ spawn_pane(struct spawn_context *sc, char **cause)
 
 complete:
 #ifdef HAVE_UTEMPTER
-	if (~new_wp->flags & PANE_EMPTY) {
+	if ((~new_wp->flags & PANE_EMPTY) && (~sc->flags & SPAWN_ADOPT)) {
 		xasprintf(&cp, "tmux(%lu).%%%u", (long)getpid(), new_wp->id);
 		utempter_add_record(new_wp->fd, cp);
 		kill(getpid(), SIGCHLD);

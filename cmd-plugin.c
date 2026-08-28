@@ -211,7 +211,7 @@ cmd_load_plugin_exec(struct cmd *self, struct cmdq_item *item)
 	const char		*scope = args_get(args, 's');
 	const char		**caps = NULL, **opts = NULL;
 	u_int			 ncaps = 0, nopts = 0;
-	char			*copy = NULL, *base, *dot;
+	char			*copy = NULL, *base, *dot, *cmd;
 	int			 rc;
 
 	if (!plugin_enabled()) {
@@ -273,6 +273,14 @@ cmd_load_plugin_exec(struct cmd *self, struct cmdq_item *item)
 		return (CMD_RETURN_ERROR);
 	}
 	evbuffer_free(evb);
+
+	/*
+	 * Remember the command so that a server restart can load the plugin
+	 * again: guest memory does not survive the exec.
+	 */
+	cmd = cmd_print(self);
+	server_handoff_record_plugin(name, cmd);
+	free(cmd);
 	free(copy);
 
 	/* Instantiation is queued; run it at the next safe point. */
@@ -294,6 +302,7 @@ cmd_unload_plugin_exec(struct cmd *self, struct cmdq_item *item)
 		cmdq_error(item, "unknown plugin: %s", name);
 		return (CMD_RETURN_ERROR);
 	}
+	server_handoff_forget_plugin(name);
 	plugin_schedule_drain();
 	return (CMD_RETURN_NORMAL);
 }
@@ -343,6 +352,7 @@ cmd_sync_plugins_exec(struct cmd *self, struct cmdq_item *item)
 	struct args	*args = cmd_get_args(self);
 	const char	*path = args_string(args, 0);
 	struct evbuffer	*evb;
+	char		*cmd;
 
 	if (!plugin_enabled()) {
 		cmdq_error(item, "plugin support not available");
@@ -361,6 +371,15 @@ cmd_sync_plugins_exec(struct cmd *self, struct cmdq_item *item)
 	}
 	cmd_plugin_print(item, evb);
 	evbuffer_free(evb);
+
+	/*
+	 * Remember the manifest so that a server restart reconciles the same
+	 * pool again. The name is NULL because one manifest covers many
+	 * plugins, so the record is never replaced.
+	 */
+	cmd = cmd_print(self);
+	server_handoff_record_plugin(NULL, cmd);
+	free(cmd);
 
 	/* Instantiations and unloads are queued; run at the safe point. */
 	plugin_schedule_drain();

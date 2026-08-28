@@ -1197,6 +1197,30 @@ window_pane_zindex(struct window_pane *wp, u_int *i)
 	return (-1);
 }
 
+/*
+ * Get and set the next window and pane ids. server-handoff.c carries them
+ * across a restart so that object ids stay stable: it sets the counter to each
+ * saved id just before it makes that object, then puts the counters back.
+ */
+void
+window_get_next_ids(u_int *window_id, u_int *pane_id)
+{
+	*window_id = next_window_id;
+	*pane_id = next_window_pane_id;
+}
+
+void
+window_set_next_id(u_int window_id)
+{
+	next_window_id = window_id;
+}
+
+void
+window_set_next_pane_id(u_int pane_id)
+{
+	next_window_pane_id = pane_id;
+}
+
 u_int
 window_count_panes(struct window *w, int with_floating)
 {
