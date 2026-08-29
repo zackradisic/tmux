@@ -53,8 +53,9 @@ the guest's pinned buffer - one copy for the whole directory, and no
 allocation per entry on either side:
 
 ```
-record: u16 namelen | u8 kind | u8 reserved | u8 name[namelen]   (little-endian)
-kind:   0 unknown, 1 dir, 2 file, 3 symlink, 4 other
+record: u16 namelen | u8 kind | u8 reserved | i64 mtime | u8 name[namelen]
+kind:   0 unknown, 1 dir, 2 file, 3 symlink, 4 other      (little-endian)
+flags:  1 = fetch mtime, 2 = directories only
 ```
 
 The counts ride on the completion: `v0` is the bytes written, `v1` the
@@ -66,7 +67,19 @@ and no padding between records.
 telling a directory from a file costs no `stat`. A filesystem that
 answers `DT_UNKNOWN` falls back to one `stat` for that entry alone.
 
-Order is whatever the filesystem returns. Sorting belongs to the guest.
+`mtime` (seconds) is the one field that is not free, so it is opt-in:
+`getdents64` carries no timestamp, so it costs one `fstatat` per name,
+measured at 0.8us. `flags` bit 2 narrows the walk to directories first,
+which matters in a directory of ten thousand files and five
+subdirectories. A platform with a bulk metadata call - `getattrlistbulk`
+on macOS, `NtQueryDirectoryFile` on Windows - returns names and times in
+one syscall and deserves its own backend; Linux has none, so per-entry
+`statx` is the floor there.
+
+Order is whatever the filesystem returns, which on a hashed directory
+index (ext4's default) is neither creation nor name order. Sorting
+belongs to the guest - and a guest that ranks the result must rank the
+WHOLE listing, because a truncated one is an arbitrary subset.
 
 Copy floor: guest→host strings/bytes cross with zero copies (the guest is
 frozen during the call; C consumes before returning). Results cost exactly

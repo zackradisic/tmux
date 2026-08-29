@@ -49,9 +49,20 @@ const FORM_WIDTH: u32 = 76;
 const FORM_HEIGHT: u32 = 12;
 const LIST_MAX: usize = 8;
 
-/// A scan that returns more than this many directories is truncated; the
-/// form says so and asks for more typing instead of stalling.
-const SCAN_MAX: usize = 400;
+/// How many rows the picker will build.
+///
+/// The limit is the guest's CPU budget, not the host's: listing a huge
+/// directory is cheap on the fs worker, but turning every entry into a
+/// row allocates two strings each, inside one budgeted callback. Ten
+/// thousand rows traps.
+///
+/// The cut must therefore happen AFTER ranking, never before. A
+/// filesystem returns entries in hash order, so keeping "the first N"
+/// would rank an arbitrary subset and confidently name the wrong most
+/// recent directory. `scan_dir` ranks the whole listing by time while the
+/// names are still borrowed - no allocation - and only then builds rows
+/// for the survivors.
+const SCAN_MAX: usize = 2_000;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
@@ -574,26 +585,44 @@ fn detail_command(paths: &[String]) -> String {
 ///
 /// `repos_only` drops plain directories instead of showing them dim.
 async fn scan_dir(base: &str, repos_only: bool) -> (Vec<Row>, i64, bool) {
-    let Ok(listing) = fs_list(base).await else {
+    // Directories only, with their modification times: the host skips
+    // everything else before paying a stat for it.
+    let opts = ListOpts { mtime: true, dirs_only: true };
+    let Ok(listing) = fs_list_with(base, opts).await else {
         return (Vec::new(), 0, false);
     };
 
     let root = base.trim_end_matches('/');
-    let mut rows: Vec<Row> = Vec::new();
-    for entry in listing.iter() {
-        if !entry.kind.is_dir() || entry.name.starts_with('.') {
-            continue;
-        }
-        rows.push(Row::new(
-            format!("{root}/{}", entry.name),
-            entry.name.to_string(),
+
+    // Rank first, while the names still borrow the listing buffer and
+    // nothing has been allocated, then build rows only for the survivors.
+    // Doing it the other way round would either trap on the guest's CPU
+    // budget or rank an arbitrary hash-ordered subset.
+    let mut ranked: Vec<(i64, &str)> = listing
+        .iter()
+        .filter(|e| !e.name.starts_with('.'))
+        .map(|e| (e.mtime, e.name))
+        .collect();
+    let overflowed = ranked.len() > SCAN_MAX;
+    ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    ranked.truncate(SCAN_MAX);
+
+    let mut rows: Vec<Row> = Vec::with_capacity(ranked.len());
+    for (mtime, name) in ranked {
+        let mut row = Row::new(
+            format!("{root}/{name}"),
+            name.to_string(),
             RowKind::Dir,
-        ));
-        if rows.len() >= SCAN_MAX {
-            break;
-        }
+        );
+        // Enough to rank by on the first frame. The exact commit time
+        // replaces it for the rows the second probe reaches.
+        row.when = (mtime > 0).then_some(mtime);
+        rows.push(row);
     }
-    let truncated = listing.truncated() || rows.len() >= SCAN_MAX;
+    // Only the display is short, and only of the oldest entries: the
+    // ranking above saw everything, so the rows kept really are the most
+    // recently touched. Filtering searches these.
+    let truncated = listing.truncated() || overflowed;
 
     // One job for every .git/HEAD under base. A directory that answers
     // is a repo; the rest stay plain directories.
@@ -1025,15 +1054,18 @@ fn start_scan(state: &State, mode: ModeId) {
 /// Re-rank the rows against the typed fragment. Keeps the highlighted
 /// row highlighted when it survives the new filter.
 fn refilter(form: &mut Form, frag: &str) {
-    let now = form.now;
     let Some(p) = form.picker.as_mut() else { return };
     let keep = p.selected().map(|r| r.value.clone());
+    // Safe even on a truncated scan: scan_dir ranked the whole listing
+    // before cutting, so the rows in hand are genuinely the most recent.
+    let by_time = true;
     let mut scored: Vec<(u8, i64, usize)> = Vec::new();
     for (i, row) in p.rows.iter().enumerate() {
         if let Some(r) = rank(&row.label, frag) {
             // Newest first inside a rank, so the repo you touched last
             // is the one you reach first.
-            scored.push((r, -row.when.unwrap_or(0), i));
+            let when = if by_time { -row.when.unwrap_or(0) } else { 0 };
+            scored.push((r, when, i));
         }
     }
     scored.sort_by(|a, b| {
@@ -1047,7 +1079,6 @@ fn refilter(form: &mut Form, frag: &str) {
     });
     p.top = 0;
     p.scroll_to_selection();
-    let _ = now;
 }
 
 /// Take the highlighted row into its field.

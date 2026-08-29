@@ -854,6 +854,7 @@ pub fn fs_list_async(
     mem: &mut GuestMem<'_, '_>,
     path_ptr: i32,
     path_len: i32,
+    flags: i32,
     out_ptr: i32,
     out_cap: i32,
 ) -> Result<i64, HostError> {
@@ -874,6 +875,7 @@ pub fn fs_list_async(
         root,
         rel,
         reach,
+        flags: flags.max(0) as u32,
         out: crate::fsworker::GuestSliceMut { ptr, cap: out_cap as usize },
     };
     if let Err(e) = crate::fsworker::submit(job) {

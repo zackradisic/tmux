@@ -636,6 +636,29 @@ impl EntryKind {
 pub struct DirEntry<'a> {
     pub name: &'a str,
     pub kind: EntryKind,
+    /// Modification time, seconds since the epoch. Zero unless the
+    /// listing asked for [`ListOpts::mtime`].
+    pub mtime: i64,
+}
+
+/// What to fetch, and what to skip.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ListOpts {
+    /// Fetch each entry's modification time. This is the one field that
+    /// is not free - `d_type` rides along with the directory entry, but a
+    /// time costs one `fstatat` per name (about 0.8us). Ask for it only
+    /// when you will use it.
+    pub mtime: bool,
+    /// Skip everything that is not a directory, before any `mtime` cost
+    /// is paid. Worth setting in a directory of ten thousand files and
+    /// five subdirectories.
+    pub dirs_only: bool,
+}
+
+impl ListOpts {
+    fn bits(self) -> i32 {
+        (if self.mtime { 1 } else { 0 }) | (if self.dirs_only { 2 } else { 0 })
+    }
 }
 
 /// A directory listing: the packed bytes the host wrote into our memory,
@@ -669,8 +692,8 @@ impl<'a> Iterator for ListingIter<'a> {
     type Item = DirEntry<'a>;
 
     fn next(&mut self) -> Option<DirEntry<'a>> {
-        // record: u16 namelen | u8 kind | u8 reserved | name bytes
-        const HEADER: usize = 4;
+        // record: u16 namelen | u8 kind | u8 reserved | i64 mtime | name
+        const HEADER: usize = 12;
         loop {
             if self.off + HEADER > self.buf.len() {
                 return None;
@@ -680,6 +703,9 @@ impl<'a> Iterator for ListingIter<'a> {
                 self.buf[self.off + 1],
             ]) as usize;
             let kind = EntryKind::from_wire(self.buf[self.off + 2]);
+            let mut t = [0u8; 8];
+            t.copy_from_slice(&self.buf[self.off + 4..self.off + 12]);
+            let mtime = i64::from_le_bytes(t);
             let start = self.off + HEADER;
             let end = start + namelen;
             if end > self.buf.len() {
@@ -690,13 +716,13 @@ impl<'a> Iterator for ListingIter<'a> {
             // renamed: handing back a name that does not open is worse
             // than not listing it.
             if let Ok(name) = core::str::from_utf8(&self.buf[start..end]) {
-                return Some(DirEntry { name, kind });
+                return Some(DirEntry { name, kind, mtime });
             }
         }
     }
 }
 
-/// Default listing buffer. Around 1500 short names, which covers almost
+/// Default listing buffer. Around 3000 short names, which covers almost
 /// every real directory in one call.
 const LIST_BUF: usize = 64 * 1024;
 
@@ -712,10 +738,20 @@ const LIST_BUF: usize = 64 * 1024;
 /// plugin's data directory, an absolute path as given. Leaving the data
 /// directory needs the `fs-read-any` capability.
 ///
-/// If the directory does not fit the buffer the call retries once at the
-/// size the first attempt reported. A listing that is still short sets
-/// [`Listing::truncated`].
+/// If the directory does not fit the buffer the call grows and retries,
+/// so a complete listing is the normal outcome. That matters if you sort
+/// the result: a filesystem returns entries in hash order, so a truncated
+/// listing is an arbitrary subset, and sorting one by time gives a
+/// confidently wrong answer. Check [`Listing::truncated`] before ranking.
 pub async fn fs_list(path: &str) -> Result<Listing, HostError> {
+    fs_list_with(path, ListOpts::default()).await
+}
+
+/// [`fs_list`] with options - see [`ListOpts`].
+pub async fn fs_list_with(
+    path: &str,
+    opts: ListOpts,
+) -> Result<Listing, HostError> {
     let mut cap = LIST_BUF;
     loop {
         let mut buf = vec![0u8; cap];
@@ -723,6 +759,7 @@ pub async fn fs_list(path: &str) -> Result<Listing, HostError> {
             raw::fs_list(
                 path.as_ptr() as i32,
                 path.len() as i32,
+                opts.bits(),
                 buf.as_mut_ptr() as i32,
                 buf.len() as i32,
             )
@@ -738,12 +775,13 @@ pub async fn fs_list(path: &str) -> Result<Listing, HostError> {
         let total = c.v1.max(0) as u32;
         let listing = Listing { buf, used, total };
 
-        // Grow once to the size the directory actually needs. 32 bytes
-        // per entry is the average short name plus its header; the retry
-        // is exact enough that a third pass is not worth the round trip.
-        if listing.truncated() && cap < 8 * 1024 * 1024 {
-            let want = (total as usize).saturating_mul(48).max(cap * 2);
-            cap = want.min(8 * 1024 * 1024);
+        // Grow to what the directory actually needs and go again. The
+        // estimate is per-entry header plus an average name; if it is
+        // still short (very long names) the next pass doubles again.
+        const MAX: usize = 32 * 1024 * 1024;
+        if listing.truncated() && cap < MAX {
+            let want = (total as usize).saturating_mul(56).max(cap * 2);
+            cap = want.min(MAX);
             continue;
         }
         return Ok(listing);

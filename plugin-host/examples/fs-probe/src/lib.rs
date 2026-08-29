@@ -65,6 +65,23 @@ impl Plugin for FsProbe {
                 }
                 Err(e) => log(&format!("fs_list /etc refused: {e}")),
             }
+            // Directories only, with times: the host skips non-directories
+            // before paying a stat for them.
+            let opts = ListOpts { mtime: true, dirs_only: true };
+            match fs_list_with("/etc", opts).await {
+                Ok(listing) => {
+                    let newest = listing
+                        .iter()
+                        .max_by_key(|e| e.mtime)
+                        .map(|e| (e.name.to_string(), e.mtime));
+                    log(&format!(
+                        "fs_list /etc dirs+mtime: {} entries, newest {:?}",
+                        listing.iter().count(),
+                        newest
+                    ));
+                }
+                Err(e) => log(&format!("fs_list dirs+mtime failed: {e}")),
+            }
 
             let mut buf = Vec::with_capacity(64);
             match fs_read_sync("probe/sync.txt", 5, &mut buf) {

@@ -1025,9 +1025,9 @@ fn register_imports(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
         }))
     })?;
 
-    linker.func_wrap(m, im::FS_LIST, |mut c: Caller<'_, StoreData>, path_ptr: i32, path_len: i32, out_ptr: i32, out_cap: i32| -> i64 {
+    linker.func_wrap(m, im::FS_LIST, |mut c: Caller<'_, StoreData>, path_ptr: i32, path_len: i32, flags: i32, out_ptr: i32, out_cap: i32| -> i64 {
         ret_i64(with_mem(&mut c, |mem| {
-            dispatch::fs_list_async(mem, path_ptr, path_len, out_ptr, out_cap)
+            dispatch::fs_list_async(mem, path_ptr, path_len, flags, out_ptr, out_cap)
         }))
     })?;
 
