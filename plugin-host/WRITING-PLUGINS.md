@@ -326,6 +326,7 @@ display_message(msg: &str)                              // status line + log
 log(msg: &str)                                          // plugin-log only
 intern(name) -> u32 / intern_name(id) -> Option<String> // event/key name ids
 fs_root() -> Result<String, _>       // the plugin's private data dir
+home_dir() -> String                                    // for expanding a leading ~
 fs_write_sync(path, data, append) / fs_read_sync(path, offset, &mut buf)
     // small files; paths relative to fs_root; caps fs-write / fs-read
 

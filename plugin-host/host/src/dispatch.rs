@@ -956,6 +956,24 @@ pub fn fs_read_sync(
     Ok(())
 }
 
+/// The server user's home directory.
+///
+/// A guest has no environment - core wasm with no WASI means no getenv -
+/// so `~` in a path is unexpandable without asking. Without this a plugin
+/// forks a shell to print one constant. No capability: it is a path, and
+/// the plugin's own data directory normally sits under it.
+pub fn home_dir(
+    mem: &mut GuestMem<'_, '_>,
+    out: i32,
+    cap: i32,
+    len_out: i32,
+) -> Result<(), HostError> {
+    let home = std::env::var_os("HOME")
+        .map(|h| h.to_string_lossy().into_owned())
+        .ok_or_else(|| err(ErrorCode::NoSuchObject, "HOME is not set"))?;
+    mem.write_out(home.as_bytes(), out, cap, len_out)
+}
+
 pub fn fs_root(
     mem: &mut GuestMem<'_, '_>,
     out: i32,

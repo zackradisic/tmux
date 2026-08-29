@@ -197,8 +197,8 @@ struct Form {
     /// Pressing client (name, current session) for the final
     /// switch-client; resolved once when the form opens.
     client_name: Option<String>,
-    /// The client's home directory, resolved once, so a `~` in a path
-    /// field completes like any other directory.
+    /// The home directory, read once when the form opens, so a `~` in a
+    /// path field completes like any other directory.
     client_home: Option<String>,
     /// Plain: folder, name. Worktree: repo, name, dest, branch.
     fields: Vec<Field>,
@@ -819,21 +819,6 @@ async fn probe_visible(state: State, mode: ModeId, generation: u64) {
     render(form);
 }
 
-/// Expand a leading `~` using the home directory of the client, falling
-/// back to the literal path. Cached on the form so it costs one job per
-/// form, not one per scan.
-async fn expand_home(state: State, mode: ModeId) {
-    let Ok(out) = run_job("printf %s \"$HOME\"", None).await else { return };
-    let home = out.output.trim().to_string();
-    if home.is_empty() {
-        return;
-    }
-    let mut st = state.borrow_mut();
-    if let Some(form) = st.form.as_mut().filter(|f| f.mode.0 == mode.0) {
-        form.client_home = Some(home);
-    }
-}
-
 /// `~` and `~/x` against the cached home directory.
 fn expand(path: &str, state: &State) -> String {
     let home = state
@@ -930,7 +915,8 @@ async fn open_form(
         kind,
         detected: repo,
         client_name: client_info.and_then(|(name, _)| name),
-        client_home: None,
+        // Synchronous, so `~` is expandable before the first scan runs.
+        client_home: home_dir().ok().filter(|h| !h.is_empty()),
         // A prefilled first field is usually accepted as-is: start on
         // name (Up selects it to change it). An empty one must be
         // filled first: start there.
@@ -948,8 +934,6 @@ async fn open_form(
     render(&mut form);
     state.borrow_mut().form = Some(form);
 
-    let s = Rc::clone(&state);
-    spawn_task(expand_home(s, mode));
     start_scan(&state, mode);
 }
 

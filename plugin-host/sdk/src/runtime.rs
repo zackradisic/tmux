@@ -81,6 +81,7 @@ pub(crate) mod raw {
             out: i32, cap: i32, len_out: i32, eof_out: i32,
         ) -> i32;
         pub fn fs_root(out: i32, cap: i32, len_out: i32) -> i32;
+        pub fn home_dir(out: i32, cap: i32, len_out: i32) -> i32;
     }
 }
 
@@ -121,6 +122,7 @@ pub(crate) mod raw {
     pub unsafe fn fs_write_sync(path_ptr: i32, path_len: i32, data_ptr: i32, data_len: i32, append: i32) -> i64 { -7 }
     pub unsafe fn fs_read_sync(path_ptr: i32, path_len: i32, offset: i64, out: i32, cap: i32, len_out: i32, eof_out: i32) -> i32 { -7 }
     pub unsafe fn fs_root(out: i32, cap: i32, len_out: i32) -> i32 { -7 }
+    pub unsafe fn home_dir(out: i32, cap: i32, len_out: i32) -> i32 { -7 }
 }
 
 /// ABI allocator: 8-aligned, size echoed back on free.

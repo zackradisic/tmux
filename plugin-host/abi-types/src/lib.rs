@@ -134,6 +134,7 @@ pub mod exports {
 /// fs_read_sync(path_ptr, path_len, offset: i64, out, cap,
 ///              len_out, eof_out) -> i32
 /// fs_root(out, cap, len_out) -> i32              // the data dir's abs path
+/// home_dir(out, cap, len_out) -> i32            // the server user's home
 /// ```
 pub mod imports {
     pub const MODULE: &str = "tmux";
@@ -171,6 +172,7 @@ pub mod imports {
     pub const FS_WRITE_SYNC: &str = "fs_write_sync";
     pub const FS_READ_SYNC: &str = "fs_read_sync";
     pub const FS_ROOT: &str = "fs_root";
+    pub const HOME_DIR: &str = "home_dir";
 }
 
 /// Structured error codes. Sync imports return `-code`; `host_request`-style

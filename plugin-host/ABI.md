@@ -149,6 +149,7 @@ Errors: sync imports return `0` or `-code`; value-returning imports
 | `mode_close` | `(mode: i64) -> i32` | mode |
 | `last_error` | `(out, cap, len_out) -> i32` | none |
 | `fs_root` | `(out, cap, len_out) -> i32` — the plugin data dir's absolute path | none |
+| `home_dir` | `(out, cap, len_out) -> i32` — the server user's home directory | none |
 | `fs_write_sync` | `(path, data Bytes, append) -> i64` (bytes written) | fs-write |
 | `fs_read_sync` | `(path, offset: i64, out, cap, len_out, eof_out) -> i32` | fs-read |
 | `log` | `(level, ptr, len)` — raw UTF-8; 0=debug 1=info 2=warn 3=error | none |

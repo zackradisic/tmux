@@ -746,6 +746,18 @@ pub async fn fs_list(path: &str) -> Result<Listing, HostError> {
 
 /// The plugin's private data directory (absolute path) - where every
 /// fs_* path resolves.
+/// The server user's home directory, for expanding a leading `~`.
+///
+/// A guest has no environment, so this is the only way to learn it short
+/// of forking a shell to print it. Cheap and synchronous - no process, no
+/// capability.
+pub fn home_dir() -> Result<String, HostError> {
+    let buf = call_out(128, |out, cap, len_out| unsafe {
+        raw::home_dir(out, cap, len_out)
+    })?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
 pub fn fs_root() -> Result<String, HostError> {
     let buf = call_out(128, |out, cap, len_out| unsafe {
         raw::fs_root(out, cap, len_out)
