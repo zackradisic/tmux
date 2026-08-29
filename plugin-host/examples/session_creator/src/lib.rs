@@ -49,10 +49,6 @@ const FORM_WIDTH: u32 = 76;
 const FORM_HEIGHT: u32 = 12;
 const LIST_MAX: usize = 8;
 
-/// Idle time before the expensive second probe (git status, worktree
-/// count, commit time) runs for the rows now on screen.
-const PROBE_DELAY_MS: u64 = 150;
-
 /// A scan that returns more than this many directories is truncated; the
 /// form says so and asks for more typing instead of stalling.
 const SCAN_MAX: usize = 400;
@@ -457,6 +453,9 @@ fn age(now: i64, then: i64) -> String {
 
 struct Shared {
     form: Option<Form>,
+    /// A probe worker is alive. The only thing stopping a burst of key
+    /// presses from starting a job each.
+    probing: bool,
 }
 
 type State = Rc<RefCell<Shared>>;
@@ -673,7 +672,7 @@ fn parse_branches(out: &str) -> (Vec<Row>, i64) {
 /// on while the job was in flight.
 async fn scan(state: State, mode: ModeId, generation: u64, field: usize, source: Source) {
     let key = source.key();
-    let mut title = String::new();
+    let mut title;
     let (rows, now, truncated) = match source {
         Source::Dirs { base } | Source::Repos { base } => {
             let repos_only = key.starts_with("repos\t");
@@ -685,8 +684,6 @@ async fn scan(state: State, mode: ModeId, generation: u64, field: usize, source:
             let base = expand(&base, &state);
             title = base.clone();
             let mut rows = Vec::new();
-            let mut now = 0;
-            let mut truncated = false;
             if !repo.is_empty() {
                 if let Ok(out) = run_job(&worktree_command(&repo), None).await {
                     for line in out.output.lines() {
@@ -710,9 +707,7 @@ async fn scan(state: State, mode: ModeId, generation: u64, field: usize, source:
             if worktrees > 0 {
                 title = format!("{worktrees} worktrees + {base}");
             }
-            let (dirs, n, t) = scan_dir(&base, false).await;
-            now = n;
-            truncated = t;
+            let (dirs, now, truncated) = scan_dir(&base, false).await;
             for d in dirs {
                 if !rows.iter().any(|r: &Row| r.value == d.value) {
                     rows.push(d);
@@ -761,54 +756,97 @@ async fn scan(state: State, mode: ModeId, generation: u64, field: usize, source:
     drop(st);
 
     // The rows are on screen now, so fill in what git knows about them.
-    spawn_task(probe_visible(state, mode, generation));
+    kick_probe(&state, mode);
 }
 
 /// Fill dirty, worktree count, commit age and any missing branch for the
-/// rows now on screen. Runs after the keyboard goes quiet, and each row
-/// is probed once for the life of the form.
-async fn probe_visible(state: State, mode: ModeId, generation: u64) {
-    let _ = sleep_ms(PROBE_DELAY_MS).await;
-
-    let paths = {
+/// rows now on screen. Each row is asked about once for the life of the
+/// form.
+///
+/// Start a probe worker unless one is already running.
+///
+/// This is the whole rate limit. A key press does not start work; it only
+/// makes sure a worker exists. A burst of presses therefore lands inside
+/// the job the running worker is already awaiting, and costs nothing.
+/// There is no timer, so a single press starts immediately, and the
+/// pacing comes from how long git actually takes.
+fn kick_probe(state: &State, mode: ModeId) {
+    {
         let mut st = state.borrow_mut();
-        let Some(form) = st.form.as_mut().filter(|f| f.mode.0 == mode.0) else { return };
-        let Some(p) = form.picker.as_mut() else { return };
-        if p.generation != generation {
+        if st.probing {
             return;
         }
-        let mut paths = Vec::new();
-        for vi in p.top..(p.top + p.height()).min(p.view.len()) {
-            let ri = p.view[vi];
-            if p.probed[ri] || p.rows[ri].kind == RowKind::Branch {
-                continue;
-            }
-            if p.rows[ri].kind == RowKind::Dir {
-                continue; // not a repo; nothing to ask git
-            }
-            p.probed[ri] = true;
-            paths.push(p.rows[ri].value.clone());
+        st.probing = true;
+    }
+    spawn_task(probe_worker(Rc::clone(state), mode));
+}
+
+/// The one worker. It loops until the rows on screen have nothing left to
+/// ask about, so anything that scrolled into view while a job was running
+/// is picked up by the next turn. "Is there work" is read off the rows
+/// themselves rather than tracked in a flag.
+async fn probe_worker(state: State, mode: ModeId) {
+    loop {
+        let Some((paths, generation)) = probe_batch(&state, mode) else {
+            break;
+        };
+        let Ok(out) = run_job(&detail_command(&paths), None).await else {
+            break;
+        };
+        if !probe_apply(&state, mode, generation, &out.output) {
+            break;
         }
-        paths
-    };
-    if paths.is_empty() {
-        return;
     }
+    state.borrow_mut().probing = false;
+}
 
-    let Ok(out) = run_job(&detail_command(&paths), None).await else { return };
-
+/// The rows on screen that nobody has asked git about yet, marked as
+/// asked. `None` when there is nothing to do.
+fn probe_batch(state: &State, mode: ModeId) -> Option<(Vec<String>, u64)> {
     let mut st = state.borrow_mut();
-    let Some(form) = st.form.as_mut().filter(|f| f.mode.0 == mode.0) else { return };
-    let Some(p) = form.picker.as_mut() else { return };
-    if p.generation != generation {
-        return;
+    let form = st.form.as_mut().filter(|f| f.mode.0 == mode.0)?;
+    let p = form.picker.as_mut()?;
+    let mut paths = Vec::new();
+    for vi in p.top..(p.top + p.height()).min(p.view.len()) {
+        let ri = p.view[vi];
+        if p.probed[ri] || p.rows[ri].kind == RowKind::Branch {
+            continue;
+        }
+        if p.rows[ri].kind == RowKind::Dir {
+            continue; // not a repo; nothing to ask git
+        }
+        p.probed[ri] = true;
+        paths.push(p.rows[ri].value.clone());
     }
-    for line in out.output.lines() {
+    (!paths.is_empty()).then(|| (paths, p.generation))
+}
+
+/// Fold one probe's output back into the rows. False means the form or
+/// the list is gone and the worker should stop.
+fn probe_apply(
+    state: &State,
+    mode: ModeId,
+    generation: u64,
+    output: &str,
+) -> bool {
+    let mut st = state.borrow_mut();
+    let Some(form) = st.form.as_mut().filter(|f| f.mode.0 == mode.0) else {
+        return false;
+    };
+    let Some(p) = form.picker.as_mut() else { return false };
+    // A newer scan owns the list now. Its own rows are unprobed, so the
+    // next turn of the loop will pick them up; only this result is stale.
+    if p.generation != generation {
+        return true;
+    }
+    for line in output.lines() {
         let f: Vec<&str> = line.split('\t').collect();
         if f.len() < 6 || f[0] != "P" {
             continue;
         }
-        let Some(row) = p.rows.iter_mut().find(|r| r.value == f[1]) else { continue };
+        let Some(row) = p.rows.iter_mut().find(|r| r.value == f[1]) else {
+            continue;
+        };
         row.dirty = Some(!f[2].trim().is_empty());
         row.trees = f[3].trim().parse().ok();
         row.when = f[4].trim().parse().ok();
@@ -817,6 +855,7 @@ async fn probe_visible(state: State, mode: ModeId, generation: u64) {
         }
     }
     render(form);
+    true
 }
 
 /// `~` and `~/x` against the cached home directory.
@@ -956,9 +995,8 @@ fn start_scan(state: &State, mode: ModeId) {
                 p.field = field;
                 refilter(form, &frag);
                 render(form);
-                let g = form.picker.as_ref().map(|p| p.generation).unwrap_or(0);
                 drop(st);
-                spawn_task(probe_visible(Rc::clone(state), mode, g));
+                kick_probe(state, mode);
                 return;
             }
         }
@@ -1449,7 +1487,9 @@ impl Plugin for SessionCreator {
 
     fn init(ctx: &Ctx, _config: Self::Config) -> Result<Self, String> {
         ctx.subscribe(&["plugin-command"]).map_err(|e| e.message.clone())?;
-        Ok(SessionCreator { state: Rc::new(RefCell::new(Shared { form: None })) })
+        Ok(SessionCreator {
+            state: Rc::new(RefCell::new(Shared { form: None, probing: false })),
+        })
     }
 
     fn on_event(&mut self, ctx: &Ctx, event: Event) {
@@ -1636,17 +1676,7 @@ impl Plugin for SessionCreator {
                 match after {
                     After::None => {}
                     After::Rescan => start_scan(&self.state, mode),
-                    After::Probe => {
-                        let g = self
-                            .state
-                            .borrow()
-                            .form
-                            .as_ref()
-                            .and_then(|f| f.picker.as_ref())
-                            .map(|p| p.generation)
-                            .unwrap_or(0);
-                        ctx.spawn(probe_visible(Rc::clone(&self.state), mode, g));
-                    }
+                    After::Probe => kick_probe(&self.state, mode),
                     After::Submit => ctx.spawn(submit(Rc::clone(&self.state))),
                     After::Detect(folder) => {
                         ctx.spawn(detect_repo(Rc::clone(&self.state), mode, folder));
