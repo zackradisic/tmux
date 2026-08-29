@@ -1677,9 +1677,15 @@ impl Plugin for SessionCreator {
                     After::None => {}
                     After::Rescan => start_scan(&self.state, mode),
                     After::Probe => kick_probe(&self.state, mode),
-                    After::Submit => ctx.spawn(submit(Rc::clone(&self.state))),
+                    After::Submit => {
+                        ctx.spawn(submit(Rc::clone(&self.state)));
+                    }
                     After::Detect(folder) => {
-                        ctx.spawn(detect_repo(Rc::clone(&self.state), mode, folder));
+                        ctx.spawn(detect_repo(
+                            Rc::clone(&self.state),
+                            mode,
+                            folder,
+                        ));
                         start_scan(&self.state, mode);
                     }
                 }

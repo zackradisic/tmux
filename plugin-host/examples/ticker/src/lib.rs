@@ -2,7 +2,9 @@
 //!
 //! Every `interval_ms` (config, default 1000) it bumps the `@ticker` user
 //! option and, every fifth tick, runs a shell job and a tmux command to
-//! prove the async paths.
+//! prove the async paths. At init it also spawns two short-lived tasks
+//! and cancels one, to prove `Ctx::cancel` stops a sleeping task without
+//! stopping its neighbour.
 //!
 //! Build: cargo build -p ticker --target wasm32-unknown-unknown --release
 
@@ -64,6 +66,25 @@ impl Plugin for Ticker {
                     .await;
                 }
             }
+        });
+
+        // Cancellation check, in two halves so both outcomes are
+        // observable in the log.
+        //
+        // The cancelled task must never reach its log line, and its host
+        // timer must never fire either - a dropped sleep calls
+        // timer_cancel, so nothing re-enters the guest for it.
+        let doomed = ctx.spawn(async {
+            let _ = sleep_ms(200).await;
+            log("cancel-check: FAILED, the cancelled task ran");
+        });
+        ctx.cancel(doomed);
+
+        // A task that is NOT cancelled still runs, so a passing result
+        // means cancel is selective rather than broken.
+        ctx.spawn(async {
+            let _ = sleep_ms(400).await;
+            log("cancel-check: ok, survivor ran and the cancelled one did not");
         });
 
         Ok(Self { events: 0, panic_on: config.panic_on })

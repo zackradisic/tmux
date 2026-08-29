@@ -7,7 +7,7 @@
 //! became ready - all within that same budgeted guest callback.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -45,19 +45,53 @@ struct Executor {
     /// (async fs: the host worker reads/writes them directly). Keyed by
     /// token; dropped here if the awaiting future was cancelled.
     pinned: HashMap<u64, Vec<u8>>,
+    /// Tasks cancelled while checked out for polling. `run_until_stalled`
+    /// drops such a future instead of parking it again.
+    cancelled: HashSet<usize>,
 }
 
 thread_local! {
     static EXEC: RefCell<Executor> = RefCell::new(Executor::default());
 }
 
+/// A spawned task. Pass it to [`cancel`] to stop the task before it
+/// finishes. Ids are not reused while a task is alive, but they ARE
+/// reused afterwards, so do not hold one past the task's completion and
+/// expect it to still mean the same task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskId(pub(crate) usize);
+
 /// Spawn a detached task. It is polled during `run_until_stalled`, which
 /// the SDK glue runs at the end of every guest callback.
-pub fn spawn(fut: impl Future<Output = ()> + 'static) {
+pub fn spawn(fut: impl Future<Output = ()> + 'static) -> TaskId {
     EXEC.with(|e| {
         let mut ex = e.borrow_mut();
         let id = ex.tasks.insert(Some(Box::pin(fut)));
         ex.ready.push_back(id);
+        TaskId(id)
+    })
+}
+
+/// Stop a task. Dropping its future drops any `HostFuture` inside it,
+/// which abandons the host operation it was waiting on: a pending timer
+/// is cancelled, and any other completion is discarded when it arrives,
+/// together with the buffer the host worker was using.
+///
+/// Cancelling a finished or unknown task does nothing. Cancelling the
+/// running task from inside itself is safe - the future is checked out
+/// of the slab while it is polled, so this only removes the empty slot
+/// and the future is dropped when the poll returns.
+pub fn cancel(id: TaskId) {
+    EXEC.with(|e| {
+        let mut ex = e.borrow_mut();
+        // Some(None) means the slot exists but the future is checked out
+        // for polling, so only the poller can drop it: leave a marker.
+        // Anything else is already dropped or already gone, and must NOT
+        // be marked - the slab reuses ids, and a stale marker would kill
+        // the next task that lands in this slot.
+        if let Some(None) = ex.tasks.try_remove(id.0) {
+            ex.cancelled.insert(id.0);
+        }
     });
 }
 
@@ -86,12 +120,22 @@ pub(crate) fn take_buffer(token: u64) -> Option<Vec<u8>> {
 /// Future resolving to a host async result.
 pub(crate) struct HostFuture {
     token: u64,
+    /// A timer token can be stopped host-side on drop. A job or command
+    /// token cannot: `timer_cancel` consumes the token, which would
+    /// strand the completion the host is still going to send.
+    timer: bool,
 }
 
 impl HostFuture {
     pub(crate) fn new(token: u64) -> Self {
         register_token(token);
-        Self { token }
+        Self { token, timer: false }
+    }
+
+    /// A future over a `timer_start` token.
+    pub(crate) fn timer(token: u64) -> Self {
+        register_token(token);
+        Self { token, timer: true }
     }
 }
 
@@ -101,18 +145,35 @@ impl Drop for HostFuture {
         // slot abandoned so complete() cleans up - the pinned buffer (if
         // any) must survive until then, because the host worker may
         // still be using it.
-        EXEC.with(|e| {
+        let stop_timer = EXEC.with(|e| {
             let mut ex = e.borrow_mut();
-            if let Some(slot) = ex.waiting.get_mut(&self.token) {
-                if slot.result.is_some() {
+            match ex.waiting.get_mut(&self.token) {
+                Some(slot) if slot.result.is_some() => {
                     ex.waiting.remove(&self.token);
                     ex.pinned.remove(&self.token);
-                } else {
+                    false
+                }
+                Some(slot) => {
                     slot.waker = None;
                     slot.abandoned = true;
+                    // Only a timer is worth stopping, and only if it has
+                    // not already fired.
+                    self.timer
                 }
+                None => false,
             }
         });
+        if stop_timer {
+            // Consumes the token host-side, so the timer never fires and
+            // never re-enters the guest. The abandoned slot is cleaned up
+            // by the next completion that names it, or at unload.
+            unsafe { crate::runtime::raw::timer_cancel(self.token as i64) };
+            EXEC.with(|e| {
+                let mut ex = e.borrow_mut();
+                ex.waiting.remove(&self.token);
+                ex.pinned.remove(&self.token);
+            });
+        }
     }
 }
 
@@ -205,15 +266,25 @@ pub fn run_until_stalled() {
         match fut.as_mut().poll(&mut cx) {
             Poll::Ready(()) => {
                 EXEC.with(|e| {
-                    e.borrow_mut().tasks.try_remove(id);
+                    let mut ex = e.borrow_mut();
+                    ex.tasks.try_remove(id);
+                    ex.cancelled.remove(&id);
                 });
             }
             Poll::Pending => {
-                EXEC.with(|e| {
-                    if let Some(slot) = e.borrow_mut().tasks.get_mut(id) {
-                        *slot = Some(fut);
-                    }
+                let park = EXEC.with(|e| {
+                    let mut ex = e.borrow_mut();
+                    // Cancelled while it was checked out: drop it here
+                    // rather than parking it again.
+                    !ex.cancelled.remove(&id)
                 });
+                if park {
+                    EXEC.with(|e| {
+                        if let Some(slot) = e.borrow_mut().tasks.get_mut(id) {
+                            *slot = Some(fut);
+                        }
+                    });
+                }
             }
         }
     }

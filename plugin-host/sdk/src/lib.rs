@@ -144,8 +144,20 @@ impl Ctx {
         api::subscribe(events)
     }
 
-    pub fn spawn(&self, fut: impl std::future::Future<Output = ()> + 'static) {
-        executor::spawn(fut);
+    /// Spawn a detached task, returning a handle. Pass the handle to
+    /// [`Ctx::cancel`] to stop the task before it finishes.
+    pub fn spawn(
+        &self,
+        fut: impl std::future::Future<Output = ()> + 'static,
+    ) -> executor::TaskId {
+        executor::spawn(fut)
+    }
+
+    /// Stop a task started by [`Ctx::spawn`]. A pending sleep is
+    /// cancelled host-side; any other host operation in flight has its
+    /// completion discarded when it arrives.
+    pub fn cancel(&self, id: executor::TaskId) {
+        executor::cancel(id);
     }
 
     pub fn log(&self, msg: &str) {

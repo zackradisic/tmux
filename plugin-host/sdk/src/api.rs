@@ -527,9 +527,15 @@ pub async fn run_command(command: impl AsTmuxStr) -> Result<(), HostError> {
 }
 
 /// Sleep for `ms` milliseconds (host timer).
+///
+/// Cancelling the task that owns this sleep stops the host timer too, so
+/// it never fires and never re-enters the guest.
 pub async fn sleep_ms(ms: u64) -> Result<(), HostError> {
-    let fut = start_async(unsafe { raw::timer_start(ms as i64) })?;
-    fut.await.map(|_| ())
+    let token = unsafe { raw::timer_start(ms as i64) };
+    if token <= 0 {
+        return Err(host_err(token as i32));
+    }
+    HostFuture::timer(token as u64).await.map(|_| ())
 }
 
 // ---- filesystem (capabilities: fs-read / fs-write) ----

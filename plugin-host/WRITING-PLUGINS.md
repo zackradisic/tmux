@@ -372,6 +372,33 @@ ctx.spawn(async move {
 });
 ```
 
+`ctx.spawn` returns a `TaskId`. Pass it to `ctx.cancel` to stop the task
+before it finishes:
+
+```rust
+let id = ctx.spawn(async { sleep_ms(200).await.ok(); do_the_thing(); });
+ctx.cancel(id);          // the task never reaches do_the_thing()
+```
+
+Cancelling drops the task's future, which drops whatever host operation it
+was awaiting. A pending `sleep_ms` is cancelled host-side, so its timer
+never fires and never re-enters the guest. Any other operation already in
+flight (a job, a command, an fs call) still runs to completion on the host
+- only its result is discarded, along with any buffer the host worker was
+using. Cancelling a finished task does nothing, and a task may cancel
+itself.
+
+Prefer *not* spawning to spawning-then-cancelling. If the question is "do
+not start a second one of these", one boolean plus a loop is simpler than
+a handle:
+
+```rust
+if !self.running {                       // one worker at a time
+    self.running = true;
+    ctx.spawn(worker());                 // worker loops until there is
+}                                        // nothing left, then clears it
+```
+
 Typed ids: `PaneId(u32)`, `WindowId(u32)`, `SessionId(u32)`, `ClientId(u32)`
 (Display as `%5`, `@3`, `$1`, `#2`).
 
