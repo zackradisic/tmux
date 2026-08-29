@@ -597,6 +597,153 @@ pub async fn fs_read(
     Ok((buf, c.v1 != 0))
 }
 
+/// What a directory entry is, from `d_type`. `Unknown` means the
+/// filesystem did not say and no `stat` was made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    Unknown,
+    Dir,
+    File,
+    Symlink,
+    Other,
+}
+
+impl EntryKind {
+    fn from_wire(v: u8) -> EntryKind {
+        match v {
+            1 => EntryKind::Dir,
+            2 => EntryKind::File,
+            3 => EntryKind::Symlink,
+            4 => EntryKind::Other,
+            _ => EntryKind::Unknown,
+        }
+    }
+
+    pub fn is_dir(self) -> bool {
+        self == EntryKind::Dir
+    }
+}
+
+/// One entry. `name` borrows the listing's buffer, so walking a directory
+/// allocates nothing per entry.
+#[derive(Debug, Clone, Copy)]
+pub struct DirEntry<'a> {
+    pub name: &'a str,
+    pub kind: EntryKind,
+}
+
+/// A directory listing: the packed bytes the host wrote into our memory,
+/// plus the totals. Iterate it with [`Listing::iter`].
+pub struct Listing {
+    buf: Vec<u8>,
+    used: usize,
+    /// Entries the directory holds. Larger than `iter().count()` means
+    /// the buffer was too small and the tail was dropped.
+    pub total: u32,
+}
+
+impl Listing {
+    /// True when the buffer could not hold every entry.
+    pub fn truncated(&self) -> bool {
+        self.iter().count() < self.total as usize
+    }
+
+    /// Walk the entries. Names borrow the buffer; nothing is copied.
+    pub fn iter(&self) -> ListingIter<'_> {
+        ListingIter { buf: &self.buf[..self.used], off: 0 }
+    }
+}
+
+pub struct ListingIter<'a> {
+    buf: &'a [u8],
+    off: usize,
+}
+
+impl<'a> Iterator for ListingIter<'a> {
+    type Item = DirEntry<'a>;
+
+    fn next(&mut self) -> Option<DirEntry<'a>> {
+        // record: u16 namelen | u8 kind | u8 reserved | name bytes
+        const HEADER: usize = 4;
+        loop {
+            if self.off + HEADER > self.buf.len() {
+                return None;
+            }
+            let namelen = u16::from_le_bytes([
+                self.buf[self.off],
+                self.buf[self.off + 1],
+            ]) as usize;
+            let kind = EntryKind::from_wire(self.buf[self.off + 2]);
+            let start = self.off + HEADER;
+            let end = start + namelen;
+            if end > self.buf.len() {
+                return None;
+            }
+            self.off = end;
+            // A name that is not UTF-8 is skipped rather than lossily
+            // renamed: handing back a name that does not open is worse
+            // than not listing it.
+            if let Ok(name) = core::str::from_utf8(&self.buf[start..end]) {
+                return Some(DirEntry { name, kind });
+            }
+        }
+    }
+}
+
+/// Default listing buffer. Around 1500 short names, which covers almost
+/// every real directory in one call.
+const LIST_BUF: usize = 64 * 1024;
+
+/// List a directory asynchronously on the host's fs worker (capability
+/// `fs-list`).
+///
+/// The host writes packed records straight into our linear memory - one
+/// copy for the whole directory, and no allocation per entry. Each entry
+/// carries its `d_type`, so telling a directory from a file costs no
+/// extra call.
+///
+/// `path` resolves like a process cwd: a relative path against the
+/// plugin's data directory, an absolute path as given. Leaving the data
+/// directory needs the `fs-read-any` capability.
+///
+/// If the directory does not fit the buffer the call retries once at the
+/// size the first attempt reported. A listing that is still short sets
+/// [`Listing::truncated`].
+pub async fn fs_list(path: &str) -> Result<Listing, HostError> {
+    let mut cap = LIST_BUF;
+    loop {
+        let mut buf = vec![0u8; cap];
+        let token = unsafe {
+            raw::fs_list(
+                path.as_ptr() as i32,
+                path.len() as i32,
+                buf.as_mut_ptr() as i32,
+                buf.len() as i32,
+            )
+        };
+        let fut = start_async(token)?;
+        let token = token as u64;
+        crate::executor::pin_buffer(token, buf);
+        let result = fut.await;
+        let buf = crate::executor::take_buffer(token);
+        let c = result?;
+        let buf = buf.unwrap_or_default();
+        let used = (c.v0.max(0) as usize).min(buf.len());
+        let total = c.v1.max(0) as u32;
+        let listing = Listing { buf, used, total };
+
+        // Grow once to the size the directory actually needs. 32 bytes
+        // per entry is the average short name plus its header; the retry
+        // is exact enough that a third pass is not worth the round trip.
+        if listing.truncated() && cap < 8 * 1024 * 1024 {
+            let want = (total as usize).saturating_mul(48).max(cap * 2);
+            cap = want.min(8 * 1024 * 1024);
+            continue;
+        }
+        return Ok(listing);
+    }
+}
+
 /// The plugin's private data directory (absolute path) - where every
 /// fs_* path resolves.
 pub fn fs_root() -> Result<String, HostError> {

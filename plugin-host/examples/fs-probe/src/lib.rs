@@ -1,5 +1,7 @@
 //! Tiny fs API probe: async write -> async read -> sync write -> sync
-//! read, logging each step. Load with -c fs-read -c fs-write.
+//! read -> list, logging each step. Load with -c fs-read -c fs-write
+//! -c fs-list, and add -c fs-read-any to let the listing leave the
+//! plugin's data directory.
 
 use tmux_plugin_sdk::prelude::*;
 
@@ -36,6 +38,34 @@ impl Plugin for FsProbe {
                 Ok(n) => log(&format!("fs_write_sync ok: {n} bytes")),
                 Err(e) => log(&format!("fs_write_sync failed: {e}")),
             }
+            // Relative: the plugin's own data directory, no escape cap
+            // needed. Names borrow the listing buffer.
+            match fs_list("probe").await {
+                Ok(listing) => {
+                    let mut names: Vec<&str> =
+                        listing.iter().map(|e| e.name).collect();
+                    names.sort();
+                    log(&format!(
+                        "fs_list probe/: total {} {:?}",
+                        listing.total, names
+                    ));
+                }
+                Err(e) => log(&format!("fs_list failed: {e}")),
+            }
+            // Absolute: needs fs-read-any, and refuses without it.
+            match fs_list("/etc").await {
+                Ok(listing) => {
+                    let dirs =
+                        listing.iter().filter(|e| e.kind.is_dir()).count();
+                    log(&format!(
+                        "fs_list /etc: total {}, {dirs} dirs, truncated {}",
+                        listing.total,
+                        listing.truncated()
+                    ));
+                }
+                Err(e) => log(&format!("fs_list /etc refused: {e}")),
+            }
+
             let mut buf = Vec::with_capacity(64);
             match fs_read_sync("probe/sync.txt", 5, &mut buf) {
                 Ok(eof) => log(&format!(

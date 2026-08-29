@@ -177,33 +177,47 @@ pub fn forget_all() {
 // Path validation: the syntactic half of containment.
 // ---------------------------------------------------------------------------
 
-/// Reject an empty, absolute or `..`-bearing relative path. The OS
-/// enforces containment again on the open; this is here for the error
-/// message and to keep the check independent of the platform.
-fn check_rel(rel: &str) -> Result<&Path, FsError> {
+/// Reject an empty path, and - at `Sandbox` reach - an absolute or
+/// `..`-bearing one. The OS enforces containment again on the open; this
+/// is here for the error message and to keep the check independent of
+/// the platform.
+///
+/// At `Anywhere` reach both are allowed, because an absolute path
+/// already reaches anywhere: refusing `../../etc/passwd` while allowing
+/// `/etc/passwd` would be the same power with more typing.
+fn check_rel(rel: &str, reach: Reach) -> Result<&Path, FsError> {
     if rel.is_empty() {
         return Err(FsError::BadPath("empty path".into()));
     }
     let path = Path::new(rel);
-    if path.is_absolute() {
-        return Err(FsError::BadPath(
-            "absolute paths are not allowed".into(),
-        ));
-    }
-    for comp in path.components() {
-        match comp {
-            Component::Normal(_) | Component::CurDir => {}
-            _ => {
-                return Err(FsError::BadPath(format!(
-                    "path escapes the sandbox: {rel:?}"
-                )))
+    if reach == Reach::Sandbox {
+        if path.is_absolute() {
+            return Err(FsError::BadPath(
+                "absolute paths are not allowed".into(),
+            ));
+        }
+        for comp in path.components() {
+            match comp {
+                Component::Normal(_) | Component::CurDir => {}
+                _ => {
+                    return Err(FsError::BadPath(format!(
+                        "path escapes the sandbox: {rel:?}"
+                    )))
+                }
             }
         }
     }
-    if path.file_name().is_none() {
-        return Err(FsError::BadPath(format!("path has no file name: {rel:?}")));
-    }
     Ok(path)
+}
+
+/// The absolute path an `Anywhere` open acts on: an absolute path as
+/// given, a relative one joined to the plugin's data directory.
+fn anywhere_path(root: &Root, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.path.join(path)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -318,6 +332,23 @@ mod beneath {
 enum Intent {
     Read,
     Write { append: bool },
+}
+
+/// How far a path may resolve.
+///
+/// `Sandbox` is the default and the only reach an ordinary plugin gets:
+/// the path is relative, `..` is refused, and the OS enforces containment
+/// during the walk.
+///
+/// `Anywhere` is granted by `fs-read-any` / `fs-write-any`. It behaves
+/// like a process cwd: a relative path still resolves against the
+/// plugin's data directory, but an absolute path means what it says and
+/// `..` may walk out. Containment is deliberately not enforced, so
+/// `RESOLVE_BENEATH` is dropped for these opens - the point is to leave.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Reach {
+    Sandbox,
+    Anywhere,
 }
 
 impl Intent {
@@ -453,18 +484,9 @@ fn open_impl(
     rel: &str,
     intent: Intent,
     allow_beneath: bool,
+    reach: Reach,
 ) -> Result<File, FsError> {
-    let path = check_rel(rel)?;
-    // check_rel guarantees a final component.
-    let name = path
-        .file_name()
-        .ok_or_else(|| FsError::BadPath("path has no file name".into()))?;
-    if allow_beneath {
-        if let Some(result) = open_beneath(root, path, name, intent) {
-            return result.map_err(|e| io_err(rel, &e));
-        }
-    }
-    let full = resolve_portable(root, path, intent.creates())?;
+    let path = check_rel(rel, reach)?;
     let mut opts = std::fs::OpenOptions::new();
     match intent {
         Intent::Read => {
@@ -477,12 +499,41 @@ fn open_impl(
                 .truncate(!append);
         }
     }
+
+    // Escaping: no containment to enforce, so no beneath-walk and no
+    // canonicalize-and-compare. Resolve like a process would and open.
+    if reach == Reach::Anywhere {
+        if path.file_name().is_none() {
+            return Err(FsError::BadPath(format!(
+                "path has no file name: {rel:?}"
+            )));
+        }
+        let full = anywhere_path(root, path);
+        if intent.creates() {
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| io_err(rel, &e))?;
+            }
+        }
+        return opts.open(&full).map_err(|e| io_err(rel, &e));
+    }
+
+    // A file open, unlike a listing, needs something to name.
+    let name = path.file_name().ok_or_else(|| {
+        FsError::BadPath(format!("path has no file name: {rel:?}"))
+    })?;
+    if allow_beneath {
+        if let Some(result) = open_beneath(root, path, name, intent) {
+            return result.map_err(|e| io_err(rel, &e));
+        }
+    }
+    let full = resolve_portable(root, path, intent.creates())?;
     opts.open(&full).map_err(|e| io_err(rel, &e))
 }
 
 /// Open `rel` for reading. Fails if it does not exist.
-pub fn open_read(root: &Root, rel: &str) -> Result<File, FsError> {
-    open_impl(root, rel, Intent::Read, true)
+pub fn open_read(root: &Root, rel: &str, reach: Reach) -> Result<File, FsError> {
+    open_impl(root, rel, Intent::Read, true, reach)
 }
 
 /// Open `rel` for writing, creating it and any missing parents.
@@ -491,8 +542,59 @@ pub fn open_write(
     root: &Root,
     rel: &str,
     append: bool,
+    reach: Reach,
 ) -> Result<File, FsError> {
-    open_impl(root, rel, Intent::Write { append }, true)
+    open_impl(root, rel, Intent::Write { append }, true, reach)
+}
+
+/// Open a directory for listing.
+///
+/// At `Sandbox` reach this goes through the same contained resolution as
+/// a file open, so a plugin cannot list its way out. At `Anywhere` reach
+/// it resolves like a process cwd. `read_dir` is used rather than a
+/// hand-rolled `getdents64` loop: it is `readdir(3)` underneath on both
+/// Linux and macOS, both of which already batch the syscall, and
+/// `DirEntry::file_type` reads `d_type` out of the entry - no `stat` per
+/// name unless the filesystem returns `DT_UNKNOWN`.
+pub fn open_dir(
+    root: &Root,
+    rel: &str,
+    reach: Reach,
+) -> Result<std::fs::ReadDir, FsError> {
+    let path = check_rel(rel, reach)?;
+    let full = if reach == Reach::Anywhere {
+        anywhere_path(root, path)
+    } else {
+        resolve_dir(root, path)?
+    };
+    std::fs::read_dir(&full).map_err(|e| io_err(rel, &e))
+}
+
+/// Resolve a contained directory path.
+///
+/// `resolve_portable` cannot serve here: it splits a path into parent and
+/// name, which is meaningless for `"."` and wrong for a directory. A
+/// directory must already exist, so canonicalize the whole thing and
+/// require it to stay under the root. That rejects a symlinked directory
+/// leading out of the data dir. As with the portable file resolver there
+/// is a window between the check and the open, and as there it is not
+/// reachable: a plugin has no way to create a symlink.
+fn resolve_dir(root: &Root, rel: &Path) -> Result<PathBuf, FsError> {
+    let full = root.path.join(rel);
+    let canon = full.canonicalize().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            FsError::NotFound(format!("no such directory {}", full.display()))
+        } else {
+            FsError::Io(format!("{}: {e}", full.display()))
+        }
+    })?;
+    if !canon.starts_with(&root.path) {
+        return Err(FsError::BadPath(format!(
+            "path escapes the sandbox: {}",
+            rel.display()
+        )));
+    }
+    Ok(canon)
 }
 
 #[cfg(test)]
@@ -505,7 +607,7 @@ mod tests {
         [("openat2", true), ("portable", false)];
 
     fn read(root: &Root, rel: &str, beneath: bool) -> Result<File, FsError> {
-        open_impl(root, rel, Intent::Read, beneath)
+        open_impl(root, rel, Intent::Read, beneath, Reach::Sandbox)
     }
 
     fn write(
@@ -514,7 +616,7 @@ mod tests {
         append: bool,
         beneath: bool,
     ) -> Result<File, FsError> {
-        open_impl(root, rel, Intent::Write { append }, beneath)
+        open_impl(root, rel, Intent::Write { append }, beneath, Reach::Sandbox)
     }
 
     /// A Root over a fresh temp directory, without touching XDG_DATA_HOME.
@@ -549,6 +651,80 @@ mod tests {
             }
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The escape hatch: with Anywhere reach an absolute path means what
+    /// it says and `..` may leave, while Sandbox reach still refuses both.
+    #[test]
+    fn anywhere_reach_escapes_and_sandbox_does_not() {
+        use std::io::Read as _;
+
+        let (r, dir) = root("reach");
+        let out = outside("reach");
+        let abs = out.join("secret");
+        let up = format!(
+            "../{}/secret",
+            out.file_name().unwrap().to_str().unwrap()
+        );
+
+        for bad in [abs.to_str().unwrap(), up.as_str()] {
+            let e = open_impl(&r, bad, Intent::Read, true, Reach::Sandbox)
+                .err()
+                .unwrap_or_else(|| panic!("sandbox accepted {bad:?}"));
+            assert_eq!(e.code(), ErrorCode::BadRequest, "{bad:?}");
+
+            let mut got = String::new();
+            open_impl(&r, bad, Intent::Read, true, Reach::Anywhere)
+                .unwrap_or_else(|e| panic!("anywhere refused {bad:?}: {e:?}"))
+                .read_to_string(&mut got)
+                .unwrap();
+            assert_eq!(got, "leak", "{bad:?}");
+        }
+
+        // A relative path still resolves against the data directory, the
+        // way a process resolves against its cwd.
+        std::fs::write(dir.join("mine"), b"ours").unwrap();
+        let mut got = String::new();
+        open_impl(&r, "mine", Intent::Read, true, Reach::Anywhere)
+            .unwrap()
+            .read_to_string(&mut got)
+            .unwrap();
+        assert_eq!(got, "ours");
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&out).ok();
+    }
+
+    #[test]
+    fn lists_a_directory_and_reports_kinds() {
+        let (r, dir) = root("list");
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a.txt"), b"x").unwrap();
+
+        let mut names: Vec<(String, bool)> = open_dir(&r, ".", Reach::Sandbox)
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                (
+                    e.file_name().to_string_lossy().into_owned(),
+                    e.file_type().unwrap().is_dir(),
+                )
+            })
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![("a.txt".to_string(), false), ("sub".to_string(), true)]
+        );
+
+        // Listing out is refused without the escape, allowed with it.
+        let out = outside("list");
+        let abs = out.to_str().unwrap();
+        assert!(open_dir(&r, abs, Reach::Sandbox).is_err());
+        assert_eq!(open_dir(&r, abs, Reach::Anywhere).unwrap().count(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&out).ok();
     }
 
     #[test]

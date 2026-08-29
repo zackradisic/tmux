@@ -24,6 +24,50 @@ Every value crossing the boundary has one of five shapes:
 | `OutBuf`   | host→guest | `out_ptr, out_cap, len_out_ptr` | caller-provided output. The host writes the data and stores the length (u32 LE) at `len_out_ptr`. Does not fit → `-E_LIMIT`, with the NEEDED size in `len_out` (grow and retry). |
 | `OwnedBuf` | host→guest | out-ptr to 8 bytes `{ptr: u32, len: u32}` LE | host allocates exactly `len` via `pgh_alloc`, guest frees `(ptr, len)` via `pgh_free` (RAII in the SDK). |
 
+## Filesystem reach
+
+`fs_read`, `fs_write` and `fs_list` resolve a path the way a process
+resolves against its cwd, with the plugin's data directory
+(`$XDG_DATA_HOME|~/.local/share` + `tmux/plugins/<plugin>/`) standing in
+for the cwd.
+
+By default the reach is **contained**: the path must be relative, `..` is
+refused syntactically, and the OS enforces containment during the walk
+(`openat2` with `RESOLVE_BENEATH` on Linux 5.6+, canonicalize-and-compare
+elsewhere).
+
+The `fs-read-any` and `fs-write-any` capabilities widen the reach to
+**anywhere**: an absolute path means what it says, and `..` may walk out.
+A relative path still resolves against the data directory. Containment is
+then deliberately not enforced, so `RESOLVE_BENEATH` is dropped for those
+opens - leaving is the point.
+
+Neither grant gives a plugin power it could not already reach through
+`run-process`, which runs an arbitrary shell. They exist so a plugin can
+read a directory *without* reaching for a shell.
+
+## Directory listing
+
+`fs_list` runs on the fs worker and writes packed records straight into
+the guest's pinned buffer - one copy for the whole directory, and no
+allocation per entry on either side:
+
+```
+record: u16 namelen | u8 kind | u8 reserved | u8 name[namelen]   (little-endian)
+kind:   0 unknown, 1 dir, 2 file, 3 symlink, 4 other
+```
+
+The counts ride on the completion: `v0` is the bytes written, `v1` the
+number of entries the directory holds. Fewer records than `v1` means the
+buffer was too small; retry with a larger one. There is no buffer header
+and no padding between records.
+
+`kind` comes from `d_type`, which arrives with the directory entry, so
+telling a directory from a file costs no `stat`. A filesystem that
+answers `DT_UNKNOWN` falls back to one `stat` for that entry alone.
+
+Order is whatever the filesystem returns. Sorting belongs to the guest.
+
 Copy floor: guest→host strings/bytes cross with zero copies (the guest is
 frozen during the call; C consumes before returning). Results cost exactly
 one copy (into guest memory). tmux copies internally only where it takes
@@ -137,6 +181,7 @@ guest frees (the error message bytes when `err != 0`; empty = none).
 | `timer_start` | `(ms: i64) -> i64` | nothing | timers |
 | `fs_write` | `(path, data, append) -> i64` | v0 = bytes written | fs-write |
 | `fs_read` | `(path, offset: i64, out_ptr, out_cap) -> i64` | v0 = bytes read, v1 = eof | fs-read |
+| `fs_list` | `(path Str, out_ptr, out_cap) -> i64` (async; v0 = bytes, v1 = entries) | fs-list |
 
 The async fs pair runs on the host's fs worker thread (the tmux loop
 never blocks) with ZERO copies: the worker reads `fs_write`'s data and

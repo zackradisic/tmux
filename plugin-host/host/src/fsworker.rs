@@ -38,7 +38,7 @@ use std::thread::JoinHandle;
 
 use tmux_plugin_abi::ErrorCode;
 
-use crate::fsbox::{FsError, Root};
+use crate::fsbox::{FsError, Reach, Root};
 use crate::registry::ScopeId;
 
 /// The instance a job belongs to, for teardown coordination.
@@ -70,6 +70,7 @@ pub enum FsJob {
         root: Arc<Root>,
         rel: String,
         append: bool,
+        reach: Reach,
         data: GuestSlice,
     },
     Read {
@@ -78,6 +79,17 @@ pub enum FsJob {
         root: Arc<Root>,
         rel: String,
         offset: u64,
+        reach: Reach,
+        out: GuestSliceMut,
+    },
+    /// List a directory, packing the entries straight into the guest's
+    /// pinned buffer. See [`do_list`] for the record format.
+    List {
+        token: u64,
+        key: InstKey,
+        root: Arc<Root>,
+        rel: String,
+        reach: Reach,
         out: GuestSliceMut,
     },
 }
@@ -203,7 +215,9 @@ pub fn notify_fd() -> RawFd {
 pub fn submit(job: FsJob) -> Result<(), String> {
     let s = state()?;
     let key = match &job {
-        FsJob::Write { key, .. } | FsJob::Read { key, .. } => key.clone(),
+        FsJob::Write { key, .. }
+        | FsJob::Read { key, .. }
+        | FsJob::List { key, .. } => key.clone(),
     };
     {
         let mut counts = inflight().counts.lock().unwrap();
@@ -334,12 +348,18 @@ fn worker_main(
 ) {
     while let Ok(job) = jobs.recv() {
         match job {
-            FsJob::Write { token, key, root, rel, append, data } => {
-                let completion = do_write(token, &root, &rel, append, &data);
+            FsJob::Write { token, key, root, rel, append, reach, data } => {
+                let completion =
+                    do_write(token, &root, &rel, append, reach, &data);
                 finish(&done, doorbell, inflight, key, completion);
             }
-            FsJob::Read { token, key, root, rel, offset, out } => {
-                let completion = do_read(token, &root, &rel, offset, &out);
+            FsJob::Read { token, key, root, rel, offset, reach, out } => {
+                let completion =
+                    do_read(token, &root, &rel, offset, reach, &out);
+                finish(&done, doorbell, inflight, key, completion);
+            }
+            FsJob::List { token, key, root, rel, reach, out } => {
+                let completion = do_list(token, &root, &rel, reach, &out);
                 finish(&done, doorbell, inflight, key, completion);
             }
         }
@@ -357,9 +377,10 @@ fn do_write(
     root: &Root,
     rel: &str,
     append: bool,
+    reach: Reach,
     data: &GuestSlice,
 ) -> FsCompletion {
-    let mut file = match crate::fsbox::open_write(root, rel, append) {
+    let mut file = match crate::fsbox::open_write(root, rel, append, reach) {
         Ok(f) => f,
         Err(e) => return open_failed(token, e),
     };
@@ -378,14 +399,103 @@ fn do_write(
     }
 }
 
+/// Directory entry kinds, as they cross the ABI. These are `d_type`
+/// values renumbered so the wire form does not depend on the platform.
+const KIND_UNKNOWN: u8 = 0;
+const KIND_DIR: u8 = 1;
+const KIND_FILE: u8 = 2;
+const KIND_SYMLINK: u8 = 3;
+const KIND_OTHER: u8 = 4;
+
+/// Bytes of record header before the name.
+const LIST_REC_HEADER: usize = 4;
+
+/// List a directory into the guest's pinned buffer.
+///
+/// Wire format, little-endian, no padding between records:
+///
+/// ```text
+///   record: u16 namelen | u8 kind | u8 reserved | u8 name[namelen]
+/// ```
+///
+/// There is no buffer header: the counts ride back on the completion
+/// (`v0` = bytes written, `v1` = entries the directory holds). A guest
+/// that sees fewer entries than `v1` was truncated and may retry with a
+/// bigger buffer.
+///
+/// The entries go straight from `readdir` into wasm linear memory - the
+/// host keeps no copy of its own, and never allocates per entry. Reading
+/// continues after the buffer fills so `v1` is the true total.
+///
+/// Order is whatever the filesystem returns. Sorting belongs to the
+/// guest, which is going to rank and filter anyway.
+fn do_list(
+    token: u64,
+    root: &Root,
+    rel: &str,
+    reach: Reach,
+    out: &GuestSliceMut,
+) -> FsCompletion {
+    let dir = match crate::fsbox::open_dir(root, rel, reach) {
+        Ok(d) => d,
+        Err(e) => return open_failed(token, e),
+    };
+    let dst = unsafe { std::slice::from_raw_parts_mut(out.ptr, out.cap) };
+    let mut off = 0usize;
+    let mut total = 0u64;
+
+    for entry in dir {
+        let entry = match entry {
+            Ok(e) => e,
+            // A racing unlink must not abort a listing.
+            Err(_) => continue,
+        };
+        total += 1;
+
+        // file_type() reads d_type out of the entry; it only falls back
+        // to a stat when the filesystem answered DT_UNKNOWN.
+        let kind = match entry.file_type() {
+            Ok(t) if t.is_dir() => KIND_DIR,
+            Ok(t) if t.is_file() => KIND_FILE,
+            Ok(t) if t.is_symlink() => KIND_SYMLINK,
+            Ok(_) => KIND_OTHER,
+            Err(_) => KIND_UNKNOWN,
+        };
+
+        let name = entry.file_name();
+        let bytes = name.as_encoded_bytes();
+        if bytes.len() > u16::MAX as usize {
+            continue;
+        }
+        let need = LIST_REC_HEADER + bytes.len();
+        if off + need > dst.len() {
+            continue; // full, but keep counting for an honest total
+        }
+        dst[off..off + 2].copy_from_slice(&(bytes.len() as u16).to_le_bytes());
+        dst[off + 2] = kind;
+        dst[off + 3] = 0;
+        dst[off + LIST_REC_HEADER..off + need].copy_from_slice(bytes);
+        off += need;
+    }
+
+    FsCompletion {
+        token,
+        err: 0,
+        v0: off as i64,
+        v1: total as i64,
+        data: Vec::new(),
+    }
+}
+
 fn do_read(
     token: u64,
     root: &Root,
     rel: &str,
     offset: u64,
+    reach: Reach,
     out: &GuestSliceMut,
 ) -> FsCompletion {
-    let mut file = match crate::fsbox::open_read(root, rel) {
+    let mut file = match crate::fsbox::open_read(root, rel, reach) {
         Ok(f) => f,
         Err(e) => return open_failed(token, e),
     };

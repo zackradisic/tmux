@@ -127,6 +127,8 @@ pub mod exports {
 /// fs_write(path_ptr, path_len, data_ptr, data_len, append) -> i64
 ///                       // async; data PINNED by the SDK future; v0 = bytes
 /// fs_read(path_ptr, path_len, offset: i64, out_ptr, out_cap) -> i64
+/// fs_list(path_ptr, path_len, out_ptr, out_cap) -> i64
+///                       // async; out PINNED; v0 = bytes, v1 = entries found
 ///                       // async; out PINNED; v0 = bytes read, v1 = eof
 /// fs_write_sync(path_ptr, path_len, data_ptr, data_len, append) -> i64
 /// fs_read_sync(path_ptr, path_len, offset: i64, out, cap,
@@ -165,6 +167,7 @@ pub mod imports {
 
     pub const FS_WRITE: &str = "fs_write";
     pub const FS_READ: &str = "fs_read";
+    pub const FS_LIST: &str = "fs_list";
     pub const FS_WRITE_SYNC: &str = "fs_write_sync";
     pub const FS_READ_SYNC: &str = "fs_read_sync";
     pub const FS_ROOT: &str = "fs_root";

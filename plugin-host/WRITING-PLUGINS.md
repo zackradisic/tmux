@@ -350,6 +350,8 @@ run_job("shell command", cwd: Option<&str>).await
 run_command("any tmux command string").await            // via command queue
 fs_write(path, data: Vec<u8>, append).await -> bytes    // fs worker thread,
 fs_read(path, offset, capacity).await -> (Vec<u8>, eof) // zero-copy, no cap
+fs_list(path) -> Listing                                // dir entries + d_type;
+                                                        // names borrow the buffer
 ```
 
 Async tasks are spawned with `ctx.spawn(async move { ... })` in `init` (or

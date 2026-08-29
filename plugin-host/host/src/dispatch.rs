@@ -756,6 +756,18 @@ fn fs_root_of(
     crate::fsbox::root_for(&mem.data().plugin).map_err(fs_err)
 }
 
+/// How far this plugin's paths may resolve for a read-ish or a write-ish
+/// operation. Without the `-any` grant a path stays inside the plugin's
+/// data directory; with it, the directory behaves like a process cwd and
+/// an absolute path means what it says.
+fn fs_reach(mem: &GuestMem<'_, '_>, escape_cap: u32) -> crate::fsbox::Reach {
+    if mem.data().caps.has(escape_cap) {
+        crate::fsbox::Reach::Anywhere
+    } else {
+        crate::fsbox::Reach::Sandbox
+    }
+}
+
 /// The guest's relative path, as an owned String (validated inside fsbox).
 fn fs_rel(
     mem: &GuestMem<'_, '_>,
@@ -776,6 +788,7 @@ pub fn fs_write_async(
     append: i32,
 ) -> Result<i64, HostError> {
     check_cap(mem, crate::caps::FS_WRITE)?;
+    let reach = fs_reach(mem, crate::caps::FS_WRITE_ANY);
     let root = fs_root_of(mem)?;
     let rel = fs_rel(mem, path_ptr, path_len)?;
     let ptr = mem.pinned_bytes(data_ptr, data_len)?;
@@ -788,6 +801,7 @@ pub fn fs_write_async(
         root,
         rel,
         append: append != 0,
+        reach,
         data: crate::fsworker::GuestSlice { ptr, len: data_len as usize },
     };
     if let Err(e) = crate::fsworker::submit(job) {
@@ -809,6 +823,7 @@ pub fn fs_read_async(
     if offset < 0 {
         return Err(err(ErrorCode::BadRequest, "negative offset"));
     }
+    let reach = fs_reach(mem, crate::caps::FS_READ_ANY);
     let root = fs_root_of(mem)?;
     let rel = fs_rel(mem, path_ptr, path_len)?;
     let ptr = mem.pinned_bytes_mut(out_ptr, out_cap)?;
@@ -821,6 +836,44 @@ pub fn fs_read_async(
         root,
         rel,
         offset: offset as u64,
+        reach,
+        out: crate::fsworker::GuestSliceMut { ptr, cap: out_cap as usize },
+    };
+    if let Err(e) = crate::fsworker::submit(job) {
+        crate::tokens::discard(token);
+        return Err(err(ErrorCode::Host, e));
+    }
+    Ok(token as i64)
+}
+
+/// List a directory into the guest's pinned buffer. Async on the fs
+/// worker, so a slow or huge directory never stalls the event loop.
+/// Completion: `v0` = bytes written, `v1` = entries the directory holds
+/// (more than fit means the guest should retry with a bigger buffer).
+pub fn fs_list_async(
+    mem: &mut GuestMem<'_, '_>,
+    path_ptr: i32,
+    path_len: i32,
+    out_ptr: i32,
+    out_cap: i32,
+) -> Result<i64, HostError> {
+    check_cap(mem, crate::caps::FS_LIST)?;
+    if out_cap <= 0 {
+        return Err(err(ErrorCode::BadRequest, "zero output buffer"));
+    }
+    let reach = fs_reach(mem, crate::caps::FS_READ_ANY);
+    let root = fs_root_of(mem)?;
+    let rel = fs_rel(mem, path_ptr, path_len)?;
+    let ptr = mem.pinned_bytes_mut(out_ptr, out_cap)?;
+    let data = mem.data();
+    let key = (data.plugin.clone(), data.scope, data.generation);
+    let token = alloc_token(mem);
+    let job = crate::fsworker::FsJob::List {
+        token,
+        key,
+        root,
+        rel,
+        reach,
         out: crate::fsworker::GuestSliceMut { ptr, cap: out_cap as usize },
     };
     if let Err(e) = crate::fsworker::submit(job) {
@@ -841,10 +894,11 @@ pub fn fs_write_sync(
     use std::io::Write as _;
 
     check_cap(mem, crate::caps::FS_WRITE)?;
+    let reach = fs_reach(mem, crate::caps::FS_WRITE_ANY);
     let root = fs_root_of(mem)?;
     let rel = fs_rel(mem, path_ptr, path_len)?;
     let mut file =
-        crate::fsbox::open_write(&root, &rel, append != 0).map_err(fs_err)?;
+        crate::fsbox::open_write(&root, &rel, append != 0, reach).map_err(fs_err)?;
     // Write straight out of guest memory: no host copy sized by the
     // guest. Nothing re-enters the guest while the borrow is live.
     let bytes = mem.byte_slice(data_ptr, data_len)?;
@@ -870,9 +924,10 @@ pub fn fs_read_sync(
     if offset < 0 {
         return Err(err(ErrorCode::BadRequest, "negative offset"));
     }
+    let reach = fs_reach(mem, crate::caps::FS_READ_ANY);
     let root = fs_root_of(mem)?;
     let rel = fs_rel(mem, path_ptr, path_len)?;
-    let mut file = crate::fsbox::open_read(&root, &rel).map_err(fs_err)?;
+    let mut file = crate::fsbox::open_read(&root, &rel, reach).map_err(fs_err)?;
     // Read straight into the guest's out-buffer: no host copy at all, and
     // the bounds check happens before anything is sized by the guest.
     // On an I/O error the guest buffer may hold a partial read - the call

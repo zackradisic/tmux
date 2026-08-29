@@ -27,6 +27,20 @@ pub const MENU: u32 = 1 << 10;
 pub const FS_READ: u32 = 1 << 11;
 pub const FS_WRITE: u32 = 1 << 12;
 pub const MODE: u32 = 1 << 13;
+pub const FS_LIST: u32 = 1 << 14;
+/// Lets fs_read and fs_list leave the sandbox: an absolute path means
+/// what it says, and `..` may walk out. Relative paths still resolve
+/// against the plugin's data directory, exactly as a process resolves
+/// against its cwd. This grants no power a plugin with `run-process`
+/// does not already have; it exists so a plugin can read a directory
+/// WITHOUT reaching for a shell.
+pub const FS_READ_ANY: u32 = 1 << 15;
+/// The same escape for fs_write. Strictly the more dangerous half, so it
+/// is a separate grant.
+pub const FS_WRITE_ANY: u32 = 1 << 16;
+
+/// Highest bit used above, for `describe`.
+const CAP_BITS: u32 = 17;
 
 /// Granted to every plugin without being asked for.
 pub const DEFAULT_CAPS: u32 = READ_STATE | DISPLAY_MESSAGE | TIMERS;
@@ -47,6 +61,9 @@ pub fn cap_from_name(name: &str) -> Option<u32> {
         "fs-read" => FS_READ,
         "fs-write" => FS_WRITE,
         "mode" => MODE,
+        "fs-list" => FS_LIST,
+        "fs-read-any" => FS_READ_ANY,
+        "fs-write-any" => FS_WRITE_ANY,
         _ => return None,
     })
 }
@@ -67,6 +84,9 @@ pub fn cap_name(flag: u32) -> &'static str {
         FS_READ => "fs-read",
         FS_WRITE => "fs-write",
         MODE => "mode",
+        FS_LIST => "fs-list",
+        FS_READ_ANY => "fs-read-any",
+        FS_WRITE_ANY => "fs-write-any",
         _ => "?",
     }
 }
@@ -88,7 +108,7 @@ impl EffectiveCaps {
     /// Human-readable list for show-plugins -v.
     pub fn describe(&self) -> String {
         let mut names = Vec::new();
-        for bit in 0..14 {
+        for bit in 0..CAP_BITS {
             let flag = 1u32 << bit;
             if self.flags & flag != 0 {
                 names.push(cap_name(flag));
