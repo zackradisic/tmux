@@ -666,15 +666,29 @@ impl ListOpts {
 pub struct Listing {
     buf: Vec<u8>,
     used: usize,
-    /// Entries the directory holds. Larger than `iter().count()` means
-    /// the buffer was too small and the tail was dropped.
+    /// Records actually in the buffer. Counted once, when the listing is
+    /// built: `truncated` is asked several times per scan, and walking
+    /// (and re-validating) the whole buffer each time is not free on a
+    /// directory of ten thousand entries.
+    count: usize,
+    /// Entries the directory holds. Larger than `count` means the buffer
+    /// was too small and the tail was dropped.
     pub total: u32,
 }
 
 impl Listing {
+    /// Records held. Cheap - no walk.
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
     /// True when the buffer could not hold every entry.
     pub fn truncated(&self) -> bool {
-        self.iter().count() < self.total as usize
+        self.count < self.total as usize
     }
 
     /// Walk the entries. Names borrow the buffer; nothing is copied.
@@ -773,7 +787,8 @@ pub async fn fs_list_with(
         let buf = buf.unwrap_or_default();
         let used = (c.v0.max(0) as usize).min(buf.len());
         let total = c.v1.max(0) as u32;
-        let listing = Listing { buf, used, total };
+        let mut listing = Listing { buf, used, count: 0, total };
+        listing.count = listing.iter().count();
 
         // Grow to what the directory actually needs and go again. The
         // estimate is per-entry header plus an average name; if it is
