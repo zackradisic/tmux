@@ -37,6 +37,7 @@
 //!
 //! Build: cargo build -p session_creator --target wasm32-unknown-unknown --release
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -54,9 +55,9 @@ const LIST_MAX: usize = 8;
 /// How many rows the picker will build.
 ///
 /// The limit is the guest's CPU budget, not the host's: listing a huge
-/// directory is cheap on the fs worker, but turning every entry into a
-/// row allocates two strings each, inside one budgeted callback. Ten
-/// thousand rows traps.
+/// directory is cheap on the fs worker, but every row allocates inside
+/// one budgeted callback. Ten thousand rows measures at about 5ms for
+/// the whole scan, with no callback reaching even the 2ms soft warning.
 ///
 /// The cut must therefore happen AFTER ranking, never before. A
 /// filesystem returns entries in hash order, so keeping "the first N"
@@ -64,7 +65,7 @@ const LIST_MAX: usize = 8;
 /// recent directory. `scan_dir` ranks the whole listing by time while the
 /// names are still borrowed - no allocation - and only then builds rows
 /// for the survivors.
-const SCAN_MAX: usize = 2_000;
+const SCAN_MAX: usize = 10_000;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
@@ -102,7 +103,14 @@ enum RowKind {
 /// fills them, so the list can render the moment the first scan lands.
 #[derive(Clone)]
 struct Row {
-    value: String,
+    /// `None` means the value is `<base>/<label>`, which is the common
+    /// case and the one worth not storing: every directory row under one
+    /// base would otherwise hold its own copy of the same prefix - 600 KB
+    /// of identical bytes for ten thousand rows - to serve six read sites
+    /// that touch at most eight rows. `Some` is for a row whose path is
+    /// not under the base: an existing worktree lives wherever git put
+    /// it, and a branch row's value is its own name.
+    value: Option<String>,
     label: String,
     /// Second column: the branch for a repo row, the upstream for a
     /// branch row.
@@ -120,7 +128,18 @@ struct Row {
 }
 
 impl Row {
+    /// A row whose value is not derivable from the base.
     fn new(value: String, label: String, kind: RowKind) -> Row {
+        Row::of(Some(value), label, kind)
+    }
+
+    /// A row under the scan's base directory: the value is the base plus
+    /// the label, so it is not stored.
+    fn under_base(label: String, kind: RowKind) -> Row {
+        Row::of(None, label, kind)
+    }
+
+    fn of(value: Option<String>, label: String, kind: RowKind) -> Row {
         Row {
             value,
             label,
@@ -132,6 +151,15 @@ impl Row {
             kind,
             enabled: true,
         }
+    }
+}
+
+/// The full path a row stands for: stored when it had to be, derived
+/// from the scan's base directory otherwise.
+fn row_value<'a>(base: &str, row: &'a Row) -> Cow<'a, str> {
+    match &row.value {
+        Some(v) => Cow::Borrowed(v.as_str()),
+        None => Cow::Owned(format!("{}/{}", base.trim_end_matches('/'), row.label)),
     }
 }
 
@@ -153,6 +181,9 @@ struct Picker {
     /// What the rule above the rows says. Built with the rows, because
     /// the key alone cannot tell a directory scan from a worktree list.
     title: String,
+    /// The directory the rows were scanned from, for resolving a row
+    /// whose value is derived rather than stored.
+    base: String,
     loading: bool,
     /// The scan was cut off at `SCAN_MAX`.
     truncated: bool,
@@ -165,6 +196,11 @@ struct Picker {
 }
 
 impl Picker {
+    /// The full path of row `i`.
+    fn value_of(&self, i: usize) -> Cow<'_, str> {
+        row_value(&self.base, &self.rows[i])
+    }
+
     fn selected(&self) -> Option<&Row> {
         let i = self.sel?;
         self.rows.get(*self.view.get(i)?)
@@ -599,8 +635,6 @@ async fn scan_dir(base: &str, repos_only: bool) -> (Vec<Row>, i64, bool) {
         return (Vec::new(), 0, false);
     };
 
-    let root = base.trim_end_matches('/');
-
     // Rank first, while the names still borrow the listing buffer and
     // nothing has been allocated, then build rows only for the survivors.
     // Doing it the other way round would either trap on the guest's CPU
@@ -622,11 +656,10 @@ async fn scan_dir(base: &str, repos_only: bool) -> (Vec<Row>, i64, bool) {
 
     let mut rows: Vec<Row> = Vec::with_capacity(ranked.len());
     for (mtime, name) in ranked {
-        let mut row = Row::new(
-            format!("{root}/{name}"),
-            name.to_string(),
-            RowKind::Dir,
-        );
+        // No path is built here: it is `root` plus this name, and `root`
+        // is the same for every row. row_value derives it for the handful
+        // of rows that are ever asked.
+        let mut row = Row::under_base(name.to_string(), RowKind::Dir);
         // Enough to rank by on the first frame. The exact commit time
         // replaces it for the rows the second probe reaches.
         row.when = (mtime > 0).then_some(mtime);
@@ -715,16 +748,22 @@ fn parse_branches(out: &str) -> (Vec<Row>, i64) {
 async fn scan(state: State, mode: ModeId, generation: u64, field: usize, source: Source) {
     let key = source.key();
     let mut title;
+    // The directory the rows hang off, so a row can derive its path
+    // instead of storing one. Empty for a branch list, whose rows all
+    // carry their own value.
+    let mut scan_base = String::new();
     let (rows, now, truncated) = match source {
         Source::Dirs { base } | Source::Repos { base } => {
             let repos_only = key.starts_with("repos\t");
             let base = expand(&base, &state);
             title = base.clone();
+            scan_base = base.clone();
             scan_dir(&base, repos_only).await
         }
         Source::Dests { base, repo } => {
             let base = expand(&base, &state);
             title = base.clone();
+            scan_base = base.clone();
             let mut rows = Vec::new();
             if !repo.is_empty() {
                 if let Ok(out) = run_job(&worktree_command(&repo), None).await {
@@ -751,7 +790,10 @@ async fn scan(state: State, mode: ModeId, generation: u64, field: usize, source:
             }
             let (dirs, now, truncated) = scan_dir(&base, false).await;
             for d in dirs {
-                if !rows.iter().any(|r: &Row| r.value == d.value) {
+                if !rows
+                    .iter()
+                    .any(|r: &Row| row_value(&base, r) == row_value(&base, &d))
+                {
                     rows.push(d);
                 }
             }
@@ -783,6 +825,7 @@ async fn scan(state: State, mode: ModeId, generation: u64, field: usize, source:
         field,
         key,
         title,
+        base: scan_base,
         rows,
         view: Vec::new(),
         sel: None,
@@ -858,7 +901,7 @@ fn probe_batch(state: &State, mode: ModeId) -> Option<(Vec<String>, u64)> {
             continue; // not a repo; nothing to ask git
         }
         p.probed[ri] = true;
-        paths.push(p.rows[ri].value.clone());
+        paths.push(p.value_of(ri).into_owned());
     }
     (!paths.is_empty()).then(|| (paths, p.generation))
 }
@@ -886,9 +929,10 @@ fn probe_apply(
         if f.len() < 6 || f[0] != "P" {
             continue;
         }
-        let Some(row) = p.rows.iter_mut().find(|r| r.value == f[1]) else {
+        let Some(i) = (0..p.rows.len()).find(|&i| p.value_of(i) == f[1]) else {
             continue;
         };
+        let row = &mut p.rows[i];
         row.dirty = Some(!f[2].trim().is_empty());
         row.trees = f[3].trim().parse().ok();
         row.when = f[4].trim().parse().ok();
@@ -1053,6 +1097,7 @@ fn start_scan(state: &State, mode: ModeId) {
             field,
             key,
             title: String::new(),
+            base: String::new(),
             rows: Vec::new(),
             view: Vec::new(),
             sel: None,
@@ -1076,7 +1121,9 @@ fn start_scan(state: &State, mode: ModeId) {
 /// row highlighted when it survives the new filter.
 fn refilter(form: &mut Form, frag: &str) {
     let Some(p) = form.picker.as_mut() else { return };
-    let keep = p.selected().map(|r| r.value.clone());
+    let keep = p.sel.and_then(|i| p.view.get(i).copied()).map(|i| {
+        p.value_of(i).into_owned()
+    });
     // Safe even on a truncated scan: scan_dir ranked the whole listing
     // before cutting, so the rows in hand are genuinely the most recent.
     let by_time = true;
@@ -1099,7 +1146,7 @@ fn refilter(form: &mut Form, frag: &str) {
     scored.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
     p.view = scored.into_iter().map(|(_, _, i)| i).collect();
     p.sel = keep.and_then(|v| {
-        p.view.iter().position(|&i| p.rows[i].value == v)
+        p.view.iter().position(|&i| p.value_of(i) == v)
     });
     p.top = 0;
     p.scroll_to_selection();
@@ -1114,7 +1161,7 @@ fn accept(form: &mut Form) -> bool {
         return false;
     }
     let field = p.field;
-    let value = row.value.clone();
+    let value = row_value(&p.base, row).into_owned();
     let kind = row.kind;
     form.fields[field].value = value;
     form.fields[field].touched = !matches!(form.fields[field].label, "repo" | "folder");
