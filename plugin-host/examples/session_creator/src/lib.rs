@@ -501,16 +501,20 @@ async fn git_root(dir: &str) -> Option<String> {
 // keyboard goes quiet.
 // ---------------------------------------------------------------------
 
-/// Cheap directory scan. Emits `T` (clock), `D` (directory) and `G`
-/// (this directory is a repo) records, then one `B` (branch) record per
-/// repo whose `.git` is a directory. A linked worktree keeps `.git` as a
-/// file, so its branch stays empty until the second probe fills it.
-fn scan_command(base: &str) -> String {
+/// Which directories under `base` are repos, and what branch each is on,
+/// in one job.
+///
+/// The `G` loop is shell builtins only - one `[ -e ]` per entry, no fork
+/// - and it marks a repo whether `.git` is a directory or, as in a linked
+/// worktree, a file. The `B` pass is a single `awk` over every
+/// `.git/HEAD`, which is a one-line file, so no `git` process runs at
+/// all. A worktree's `.git` is a file, so its branch stays empty here and
+/// the second probe fills it in.
+fn branches_command(base: &str) -> String {
     let b = quote(base);
     format!(
         "B={b}; \
          printf 'T\\t%s\\n' \"$(date +%s)\"; \
-         for d in \"$B\"/*/; do d=${{d%/}}; printf 'D\\t%s\\n' \"${{d##*/}}\"; done; \
          for g in \"$B\"/*/.git; do [ -e \"$g\" ] && \
            {{ g=${{g%/.git}}; printf 'G\\t%s\\n' \"${{g##*/}}\"; }}; done; \
          awk 'FNR==1{{n=split(FILENAME,p,\"/\"); s=$0; \
@@ -562,62 +566,76 @@ fn detail_command(paths: &[String]) -> String {
     )
 }
 
-/// Parse the cheap scan into rows. `repos_only` drops plain directories
-/// instead of showing them dim.
-fn parse_scan(
-    base: &str,
-    out: &str,
-    repos_only: bool,
-) -> (Vec<Row>, i64, bool) {
-    let mut names: Vec<String> = Vec::new();
-    let mut repos: Vec<String> = Vec::new();
-    let mut branches: Vec<(String, String)> = Vec::new();
-    let mut now = 0i64;
-
-    for line in out.lines() {
-        let mut it = line.split('\t');
-        match it.next() {
-            Some("T") => now = it.next().unwrap_or("").trim().parse().unwrap_or(0),
-            Some("D") => {
-                if let Some(n) = it.next() {
-                    if !n.is_empty() && n != "*" {
-                        names.push(n.to_string());
-                    }
-                }
-            }
-            Some("G") => {
-                if let Some(n) = it.next() {
-                    repos.push(n.to_string());
-                }
-            }
-            Some("B") => {
-                let name = it.next().unwrap_or("").to_string();
-                let br = it.next().unwrap_or("").trim().to_string();
-                if !name.is_empty() {
-                    branches.push((name, br));
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let truncated = names.len() > SCAN_MAX;
-    names.truncate(SCAN_MAX);
+/// List `base` through the host and turn it into rows.
+///
+/// The directory itself never touches a shell: `fs_list` walks it on the
+/// fs worker and hands back packed records whose names borrow the
+/// listing buffer, each already carrying its `d_type`. One shell job
+/// follows, and only to read the `.git/HEAD` of every repo at once.
+///
+/// `repos_only` drops plain directories instead of showing them dim.
+async fn scan_dir(base: &str, repos_only: bool) -> (Vec<Row>, i64, bool) {
+    let Ok(listing) = fs_list(base).await else {
+        return (Vec::new(), 0, false);
+    };
 
     let root = base.trim_end_matches('/');
-    let mut rows = Vec::with_capacity(names.len());
-    for name in names {
-        let is_repo = repos.iter().any(|r| *r == name);
-        if repos_only && !is_repo {
+    let mut rows: Vec<Row> = Vec::new();
+    for entry in listing.iter() {
+        if !entry.kind.is_dir() || entry.name.starts_with('.') {
             continue;
         }
-        let kind = if is_repo { RowKind::Repo } else { RowKind::Dir };
-        let mut row = Row::new(format!("{root}/{name}"), name.clone(), kind);
-        if let Some((_, br)) = branches.iter().find(|(n, _)| *n == name) {
-            // A detached HEAD leaves the raw object id; keep it short.
-            row.meta = if br.len() == 40 { br[..7].to_string() } else { br.clone() };
+        rows.push(Row::new(
+            format!("{root}/{}", entry.name),
+            entry.name.to_string(),
+            RowKind::Dir,
+        ));
+        if rows.len() >= SCAN_MAX {
+            break;
         }
-        rows.push(row);
+    }
+    let truncated = listing.truncated() || rows.len() >= SCAN_MAX;
+
+    // One job for every .git/HEAD under base. A directory that answers
+    // is a repo; the rest stay plain directories.
+    let mut now = 0i64;
+    if let Ok(out) = run_job(&branches_command(base), None).await {
+        for line in out.output.lines() {
+            let mut it = line.split('\t');
+            match it.next() {
+                Some("T") => {
+                    now = it.next().unwrap_or("").trim().parse().unwrap_or(0)
+                }
+                // A .git of any shape: this is a repo, branch unknown
+                // for now (a worktree's .git is a file, not a directory).
+                Some("G") => {
+                    let name = it.next().unwrap_or("");
+                    if let Some(row) = rows.iter_mut().find(|r| r.label == name)
+                    {
+                        row.kind = RowKind::Repo;
+                    }
+                }
+                Some("B") => {
+                    let name = it.next().unwrap_or("");
+                    let br = it.next().unwrap_or("").trim();
+                    let Some(row) = rows.iter_mut().find(|r| r.label == name)
+                    else {
+                        continue;
+                    };
+                    row.kind = RowKind::Repo;
+                    // A detached HEAD leaves the raw object id; shorten it.
+                    row.meta = if br.len() == 40 {
+                        br[..7].to_string()
+                    } else {
+                        br.to_string()
+                    };
+                }
+                _ => {}
+            }
+        }
+    }
+    if repos_only {
+        rows.retain(|r| r.kind == RowKind::Repo);
     }
     (rows, now, truncated)
 }
@@ -661,13 +679,7 @@ async fn scan(state: State, mode: ModeId, generation: u64, field: usize, source:
             let repos_only = key.starts_with("repos\t");
             let base = expand(&base, &state);
             title = base.clone();
-            match run_job(&scan_command(&base), None).await {
-                Ok(out) => {
-                    let (r, n, t) = parse_scan(&base, &out.output, repos_only);
-                    (r, n, t)
-                }
-                Err(_) => (Vec::new(), 0, false),
-            }
+            scan_dir(&base, repos_only).await
         }
         Source::Dests { base, repo } => {
             let base = expand(&base, &state);
@@ -698,14 +710,12 @@ async fn scan(state: State, mode: ModeId, generation: u64, field: usize, source:
             if worktrees > 0 {
                 title = format!("{worktrees} worktrees + {base}");
             }
-            if let Ok(out) = run_job(&scan_command(&base), None).await {
-                let (dirs, n, t) = parse_scan(&base, &out.output, false);
-                now = n;
-                truncated = t;
-                for d in dirs {
-                    if !rows.iter().any(|r: &Row| r.value == d.value) {
-                        rows.push(d);
-                    }
+            let (dirs, n, t) = scan_dir(&base, false).await;
+            now = n;
+            truncated = t;
+            for d in dirs {
+                if !rows.iter().any(|r: &Row| r.value == d.value) {
+                    rows.push(d);
                 }
             }
             (rows, now, truncated)
