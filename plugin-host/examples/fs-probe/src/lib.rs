@@ -7,12 +7,52 @@ use tmux_plugin_sdk::prelude::*;
 
 struct FsProbe;
 
+/// FNV-1a over the name, mixed with the time. Summing this over a
+/// listing binds every name to its own mtime: a time written into the
+/// wrong record changes the total, which a count or a maximum would
+/// not catch. That matters because the times are filled in by several
+/// tasks at once.
+fn bind(name: &str, mtime: i64) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in name.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h.wrapping_mul(mtime as u64)
+}
+
 impl Plugin for FsProbe {
     const NAME: &'static str = "fs-probe";
     type Config = serde_json::Value;
 
-    fn init(ctx: &Ctx, _config: Self::Config) -> Result<Self, String> {
-        ctx.spawn(async {
+    fn init(ctx: &Ctx, config: Self::Config) -> Result<Self, String> {
+        // `-o dir=/some/path`: list it with times and log a checksum, so
+        // a test can point this at a directory big enough to fan out.
+        let extra = config
+            .get("dir")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        ctx.spawn(async move {
+            if let Some(dir) = extra {
+                let opts = ListOpts { mtime: true, dirs_only: true };
+                match fs_list_with(&dir, opts).await {
+                    Ok(listing) => {
+                        let mut n = 0u64;
+                        let mut sum = 0u64;
+                        let mut newest = 0i64;
+                        for e in listing.iter() {
+                            n += 1;
+                            sum = sum.wrapping_add(bind(e.name, e.mtime));
+                            newest = newest.max(e.mtime);
+                        }
+                        log(&format!(
+                            "fs_list dir: {n} entries, total {}, newest {newest}, bind {sum}",
+                            listing.total
+                        ));
+                    }
+                    Err(e) => log(&format!("fs_list dir failed: {e}")),
+                }
+            }
             match fs_write("probe/hello.txt", b"hello fs".to_vec(), false)
                 .await
             {
