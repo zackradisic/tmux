@@ -56,6 +56,7 @@ static void	window_plugin_key(struct window_mode_entry *,
 		    key_code, struct mouse_event *);
 static void	window_plugin_refresh_callback(int, short, void *);
 static void	window_plugin_draw_preview(struct window_mode_entry *);
+static struct screen *window_plugin_get_screen(struct window_mode_entry *);
 
 const struct window_mode window_plugin_mode = {
 	.name = "plugin-mode",
@@ -64,6 +65,7 @@ const struct window_mode window_plugin_mode = {
 	.free = window_plugin_free,
 	.resize = window_plugin_resize,
 	.key = window_plugin_key,
+	.get_screen = window_plugin_get_screen,
 };
 
 /* Preview refresh interval while a preview rect is set. */
@@ -330,4 +332,13 @@ window_plugin_mode_preview(struct window_mode_entry *wme, int64_t pane,
 		evtimer_add(&data->refresh, &tv);
 	}
 	return (0);
+}
+
+/* The mode screen, so capture-pane -M can read what the plugin drew. */
+static struct screen *
+window_plugin_get_screen(struct window_mode_entry *wme)
+{
+	struct window_plugin_mode_data	*data = wme->data;
+
+	return (&data->screen);
 }
