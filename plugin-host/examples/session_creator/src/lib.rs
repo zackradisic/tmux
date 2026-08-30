@@ -14,7 +14,11 @@
 //! Every path and branch field completes. The list below the fields
 //! fills from a scan of the directory you are typing in, and shows the
 //! branch, a dirty marker, the age of the last commit and the number of
-//! linked worktrees. `Down` steps into the list, `Tab` accepts a row.
+//! linked worktrees. `C-j` steps into the list and `C-j`/`C-k` move in
+//! it; `Tab` completes the field with the highlighted row (or the first
+//! one) and leaves the cursor at the end. `Esc` hides the list; after
+//! that `C-j`/`C-k` move between fields, and a second `Esc` closes the
+//! form.
 //!
 //! Wire keys to it in ~/.tmux.conf:
 //!
@@ -31,7 +35,7 @@
 //! binding the target is the current pane. The form opens on the window
 //! the pressing client is actually looking at. Every field is editable —
 //! detected values are just prefills (repo shows ✓ while unchanged, C-u
-//! clears a field, C-j/C-k move between fields).
+//! clears a field, C-j/C-k move between fields when no list shows).
 //!
 //! Load server-scoped with caps `mode`, `run-process`, `run-command`.
 //!
@@ -179,6 +183,9 @@ struct Picker {
     sel: Option<usize>,
     /// First visible row of `view`.
     top: usize,
+    /// Esc put the list away. The rows stay cached; the next edit of the
+    /// field brings it back. While hidden, C-j/C-k move between fields.
+    hidden: bool,
     /// What the rule above the rows says. Built with the rows, because
     /// the key alone cannot tell a directory scan from a worktree list.
     title: String,
@@ -205,6 +212,12 @@ impl Picker {
     fn selected(&self) -> Option<&Row> {
         let i = self.sel?;
         self.rows.get(*self.view.get(i)?)
+    }
+
+    /// The list takes rows on screen: not put away, and either still
+    /// scanning or holding at least one match.
+    fn shown(&self) -> bool {
+        !self.hidden && (self.loading || !self.view.is_empty())
     }
 
     fn height(&self) -> usize {
@@ -386,7 +399,7 @@ impl Form {
     /// rows when a list is up.
     fn wanted_size(&self) -> (u32, u32) {
         let extra = match &self.picker {
-            Some(p) if p.loading || !p.view.is_empty() => 1 + p.height().max(1) as u32,
+            Some(p) if p.shown() => 1 + p.height().max(1) as u32,
             _ => 0,
         };
         (self.width, FORM_HEIGHT + extra)
@@ -849,6 +862,7 @@ async fn scan(state: State, mode: ModeId, generation: u64, field: usize, source:
         view: Vec::new(),
         sel: None,
         top: 0,
+        hidden: false,
         loading: false,
         truncated,
         generation,
@@ -1111,6 +1125,7 @@ fn start_scan(state: &State, mode: ModeId) {
         if let Some(p) = form.picker.as_mut() {
             if p.key == key {
                 p.field = field;
+                p.hidden = false;
                 refilter(form, &frag);
                 render(form);
                 drop(st);
@@ -1133,6 +1148,7 @@ fn start_scan(state: &State, mode: ModeId) {
             view: Vec::new(),
             sel: None,
             top: 0,
+            hidden: false,
             loading: true,
             truncated: false,
             generation,
@@ -1289,10 +1305,13 @@ fn render(form: &mut Form) {
         out.push_str("\r\n");
     }
     let in_list = form.picker.as_ref().is_some_and(|p| p.sel.is_some());
+    let listed = form.picker.as_ref().is_some_and(|p| p.shown());
     let hint = if in_list {
-        "Tab accept · C-n/C-p move · Enter create · Esc back"
+        "Tab accept · C-j/C-k move · Enter create · Esc hide list"
+    } else if listed {
+        "C-t swap · C-j list · Tab accept · Enter create · Esc hide list"
     } else {
-        "C-t swap · Down list · Tab next · Enter create · Esc cancel"
+        "C-t swap · C-j/C-k field · Enter create · Esc cancel"
     };
     let hint = hint.replacen("swap", other, 1);
     out.push_str(&format!("\r\n  \x1b[2m{hint}\x1b[0m"));
@@ -1302,10 +1321,7 @@ fn render(form: &mut Form) {
 /// Draw the completion list under the fields: a rule that names the
 /// source, then the visible rows.
 fn render_list(form: &Form, out: &mut String, w: usize) {
-    let Some(p) = form.picker.as_ref() else { return };
-    if !p.loading && p.view.is_empty() {
-        return;
-    }
+    let Some(p) = form.picker.as_ref().filter(|p| p.shown()) else { return };
 
     let title = if p.loading {
         " scanning… ".to_string()
@@ -1669,10 +1685,12 @@ impl Plugin for SessionCreator {
 
                 match key {
                     "Escape" => {
-                        // The list first, the form second.
-                        if form.picker.as_ref().is_some_and(|p| p.sel.is_some()) {
+                        // The list first, the form second. Hiding the
+                        // list frees C-j/C-k to move between fields.
+                        if form.picker.as_ref().is_some_and(|p| p.shown()) {
                             if let Some(p) = form.picker.as_mut() {
                                 p.sel = None;
+                                p.hidden = true;
                             }
                             form.error = None;
                             render(form);
@@ -1689,11 +1707,11 @@ impl Plugin for SessionCreator {
                             None => After::Rescan,
                         };
                     }
-                    "Down" | "C-n" => {
+                    "Down" | "C-n" | "C-j" => {
                         let listed = form
                             .picker
                             .as_ref()
-                            .is_some_and(|p| !p.view.is_empty());
+                            .is_some_and(|p| p.shown() && !p.view.is_empty());
                         if listed {
                             let p = form.picker.as_mut().unwrap();
                             p.sel = Some(match p.sel {
@@ -1711,7 +1729,7 @@ impl Plugin for SessionCreator {
                             after = After::Rescan;
                         }
                     }
-                    "Up" | "C-p" => {
+                    "Up" | "C-p" | "C-k" => {
                         // Leaving the top row puts the cursor back in the
                         // text; a second Up then moves to the field above.
                         let inlist = form
@@ -1736,21 +1754,30 @@ impl Plugin for SessionCreator {
                         }
                     }
                     "Tab" => {
-                        let took = accept(form);
-                        if took {
-                            form.focused = (form.focused + 1) % form.fields.len();
-                        } else if form.error.is_none() {
-                            form.focused = (form.focused + 1) % form.fields.len();
+                        // Complete like a shell: take the highlighted row,
+                        // or the first row when none is highlighted, and
+                        // stay in the field with the cursor at the end.
+                        // The list re-filters on the completed value.
+                        let listed = form
+                            .picker
+                            .as_ref()
+                            .is_some_and(|p| p.shown() && !p.view.is_empty());
+                        if listed {
+                            let p = form.picker.as_mut().unwrap();
+                            if p.sel.is_none() {
+                                p.sel = Some(0);
+                            }
+                            if accept(form) {
+                                form.picker.as_mut().unwrap().sel = None;
+                                after = After::Rescan;
+                            } else {
+                                render(form);
+                            }
                         }
-                        after = After::Rescan;
                     }
-                    "BTab" | "C-k" => {
+                    "BTab" => {
                         form.focused =
                             (form.focused + form.fields.len() - 1) % form.fields.len();
-                        after = After::Rescan;
-                    }
-                    "C-j" => {
-                        form.focused = (form.focused + 1) % form.fields.len();
                         after = After::Rescan;
                     }
                     "BSpace" => {
