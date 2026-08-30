@@ -39,6 +39,7 @@
 
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use tmux_plugin_sdk::executor::{
@@ -674,6 +675,21 @@ async fn scan_dir(base: &str, repos_only: bool) -> (Vec<Row>, i64, bool) {
     // is a repo; the rest stay plain directories.
     let mut now = 0i64;
     if let Ok(out) = run_job(&branches_command(base), None).await {
+        // Index the rows by name first. The walk this replaces was
+        // O(rows) per line, and both counts grow with the directory: a
+        // scan of /tmp answered 1364 lines against 10000 rows, which is
+        // 13.6 million string compares in one callback and a guest that
+        // trapped on its CPU budget at 13.77ms. The names are borrowed,
+        // so the index costs no allocation per row.
+        let index: HashMap<&str, usize> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (r.label.as_str(), i))
+            .collect();
+        // Collected rather than applied as we go: `index` borrows the
+        // rows it points into, so the writes wait until the reads are
+        // finished with them.
+        let mut hits: Vec<(usize, Option<String>)> = Vec::new();
         for line in out.output.lines() {
             let mut it = line.split('\t');
             match it.next() {
@@ -684,27 +700,30 @@ async fn scan_dir(base: &str, repos_only: bool) -> (Vec<Row>, i64, bool) {
                 // for now (a worktree's .git is a file, not a directory).
                 Some("G") => {
                     let name = it.next().unwrap_or("");
-                    if let Some(row) = rows.iter_mut().find(|r| r.label == name)
-                    {
-                        row.kind = RowKind::Repo;
+                    if let Some(&i) = index.get(name) {
+                        hits.push((i, None));
                     }
                 }
                 Some("B") => {
                     let name = it.next().unwrap_or("");
                     let br = it.next().unwrap_or("").trim();
-                    let Some(row) = rows.iter_mut().find(|r| r.label == name)
-                    else {
-                        continue;
-                    };
-                    row.kind = RowKind::Repo;
+                    let Some(&i) = index.get(name) else { continue };
                     // A detached HEAD leaves the raw object id; shorten it.
-                    row.meta = if br.len() == 40 {
+                    let meta = if br.len() == 40 {
                         br[..7].to_string()
                     } else {
                         br.to_string()
                     };
+                    hits.push((i, Some(meta)));
                 }
                 _ => {}
+            }
+        }
+        drop(index);
+        for (i, meta) in hits {
+            rows[i].kind = RowKind::Repo;
+            if let Some(meta) = meta {
+                rows[i].meta = meta;
             }
         }
     }
@@ -872,13 +891,15 @@ fn kick_probe(state: &State, mode: ModeId) {
 /// themselves rather than tracked in a flag.
 async fn probe_worker(state: State, mode: ModeId) {
     loop {
-        let Some((paths, generation)) = probe_batch(&state, mode) else {
+        let Some((batch, generation)) = probe_batch(&state, mode) else {
             break;
         };
+        let paths: Vec<String> =
+            batch.iter().map(|(_, p)| p.clone()).collect();
         let Ok(out) = run_job(&detail_command(&paths), None).await else {
             break;
         };
-        if !probe_apply(&state, mode, generation, &out.output) {
+        if !probe_apply(&state, mode, generation, &batch, &out.output) {
             break;
         }
     }
@@ -887,11 +908,17 @@ async fn probe_worker(state: State, mode: ModeId) {
 
 /// The rows on screen that nobody has asked git about yet, marked as
 /// asked. `None` when there is nothing to do.
-fn probe_batch(state: &State, mode: ModeId) -> Option<(Vec<String>, u64)> {
+fn probe_batch(
+    state: &State,
+    mode: ModeId,
+) -> Option<(Vec<(usize, String)>, u64)> {
     let mut st = state.borrow_mut();
     let form = st.form.as_mut().filter(|f| f.mode.0 == mode.0)?;
     let p = form.picker.as_mut()?;
-    let mut paths = Vec::new();
+    // The row index travels with the path. Finding it again afterwards
+    // would mean walking every row and building its path to compare,
+    // which is a string allocation per row per answer.
+    let mut paths: Vec<(usize, String)> = Vec::new();
     for vi in p.top..(p.top + p.height()).min(p.view.len()) {
         let ri = p.view[vi];
         if p.probed[ri] || p.rows[ri].kind == RowKind::Branch {
@@ -901,7 +928,7 @@ fn probe_batch(state: &State, mode: ModeId) -> Option<(Vec<String>, u64)> {
             continue; // not a repo; nothing to ask git
         }
         p.probed[ri] = true;
-        paths.push(p.value_of(ri).into_owned());
+        paths.push((ri, p.value_of(ri).into_owned()));
     }
     (!paths.is_empty()).then(|| (paths, p.generation))
 }
@@ -912,6 +939,7 @@ fn probe_apply(
     state: &State,
     mode: ModeId,
     generation: u64,
+    batch: &[(usize, String)],
     output: &str,
 ) -> bool {
     let mut st = state.borrow_mut();
@@ -924,15 +952,18 @@ fn probe_apply(
     if p.generation != generation {
         return true;
     }
+    // Keyed on the batch we asked about, which is one screenful, rather
+    // than on every row: the answers come back in the order they were
+    // asked, but a lookup does not depend on that staying true.
+    let asked: HashMap<&str, usize> =
+        batch.iter().map(|(i, path)| (path.as_str(), *i)).collect();
     for line in output.lines() {
         let f: Vec<&str> = line.split('\t').collect();
         if f.len() < 6 || f[0] != "P" {
             continue;
         }
-        let Some(i) = (0..p.rows.len()).find(|&i| p.value_of(i) == f[1]) else {
-            continue;
-        };
-        let row = &mut p.rows[i];
+        let Some(&i) = asked.get(f[1]) else { continue };
+        let Some(row) = p.rows.get_mut(i) else { continue };
         row.dirty = Some(!f[2].trim().is_empty());
         row.trees = f[3].trim().parse().ok();
         row.when = f[4].trim().parse().ok();
