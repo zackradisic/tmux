@@ -357,9 +357,12 @@ caps or scope restarts. `reload-plugin` forces the transaction.
 ## Failure policy
 
 A trap (including the hard CPU budget and guest panics) tears down the
-instance and counts one failure; three consecutive failures disable the
-plugin until an explicit reload. Host API misuse returns structured errors
-and never counts. Guests never see raw host pointers: all handles are ids,
+instance and counts one failure. A trapped guest's memory is frozen
+wherever the deadline landed, so the instance is never reused: the host
+starts a fresh one for the same scope, with fresh state, if the scope
+still exists. Three failures within five minutes disable the plugin until
+`reload-plugin`, which also starts an instance for any scope that has
+none. Host API misuse returns structured errors and never counts. Guests never see raw host pointers: all handles are ids,
 validated on every call (`E_NO_SUCH_OBJECT` after death).
 
 ## Capabilities

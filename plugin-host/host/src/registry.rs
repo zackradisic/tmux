@@ -10,6 +10,7 @@ use std::ffi::c_void;
 use std::fmt::Write as _;
 use std::os::raw::c_char;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use slab::Slab;
@@ -21,8 +22,13 @@ use crate::engine::EngineState;
 use crate::ffi::{PGH_OBJ_PANE, PGH_OBJ_SESSION, PGH_OBJ_WINDOW};
 use crate::hostlog;
 
-/// Consecutive failures before a plugin is disabled until explicit reload.
-pub const MAX_FAILURES: u32 = 3;
+/// Failures within [`FAILURE_WINDOW`] before a plugin is disabled until an
+/// explicit reload. A window rather than a consecutive count: a trapped
+/// instance is restarted, and its init is a clean callback, so a plugin
+/// that traps on its first event would otherwise restart forever without
+/// ever reaching the limit.
+pub const MAX_FAILURES: usize = 3;
+pub const FAILURE_WINDOW: Duration = Duration::from_secs(5 * 60);
 
 /// The scope a concrete instance is bound to. tmux ids are monotonic u32s,
 /// never reused within a server lifetime.
@@ -61,8 +67,9 @@ pub struct PluginDef {
     pub config: Value,
     pub caps: crate::caps::EffectiveCaps,
     pub state: PluginState,
-    /// Consecutive failures; reset by any clean callback return.
-    pub failure_count: u32,
+    /// When each recent failure happened. Pruned to [`FAILURE_WINDOW`] on
+    /// every failure; cleared by an explicit reload or enable.
+    pub failures: Vec<Instant>,
     /// Owned by the manifest pool (sync-plugins): swept when the manifest
     /// no longer names it. Interactive load-plugin definitions are
     /// unmanaged.
@@ -176,7 +183,7 @@ impl Registry {
                 config: desc.config,
                 caps,
                 state: PluginState::Running,
-                failure_count: 0,
+                failures: Vec::new(),
                 managed: false,
             },
         );
@@ -238,33 +245,30 @@ impl Registry {
         }
     }
 
-    /// Record a failure for a plugin; disables it after MAX_FAILURES
-    /// consecutive ones. Returns true if the plugin was disabled.
+    /// Record a failure for a plugin. Returns true if that disabled it:
+    /// [`MAX_FAILURES`] within [`FAILURE_WINDOW`].
     pub fn record_failure(&mut self, name: &str, what: &str) -> bool {
         let Some(def) = self.plugins.get_mut(name) else {
             return false;
         };
-        def.failure_count += 1;
+        let now = Instant::now();
+        def.failures
+            .retain(|t| now.duration_since(*t) < FAILURE_WINDOW);
+        def.failures.push(now);
+        let n = def.failures.len();
+        let minutes = FAILURE_WINDOW.as_secs() / 60;
         hostlog::error(
             name,
-            &format!("{what} (failure {}/{})", def.failure_count, MAX_FAILURES),
+            &format!("{what} ({n} of {MAX_FAILURES} failures in {minutes} min)"),
         );
-        if def.failure_count >= MAX_FAILURES
-            && def.state == PluginState::Running
-        {
-            let reason = format!("{} consecutive failures", def.failure_count);
+        if n >= MAX_FAILURES && def.state == PluginState::Running {
+            let reason = format!("{n} failures in {minutes} minutes");
             def.state = PluginState::Disabled { reason: reason.clone() };
             hostlog::error(name, "disabled until explicit reload");
             notify_state_changed(name, "disabled", &reason);
             return true;
         }
         false
-    }
-
-    pub fn record_success(&mut self, name: &str) {
-        if let Some(def) = self.plugins.get_mut(name) {
-            def.failure_count = 0;
-        }
     }
 
     pub fn is_running(&self, name: &str) -> bool {
@@ -346,10 +350,8 @@ pub fn notify_state_changed(plugin: &str, state: &str, reason: &str) {
 
 /// Enumerate live object ids of a kind through the vtable.
 fn enumerate_ids(kind: i32) -> Vec<u32> {
-    #[derive(serde::Deserialize)]
-    struct IdOnly {
-        id: u32,
-    }
+    use tmux_plugin_abi::{parse_list, PaneInfo, SessionInfo, WindowInfo};
+
     unsafe extern "C" fn sink(ctx: *mut c_void, ptr: *const c_char, len: usize) {
         let buf = &mut *(ctx as *mut Vec<u8>);
         buf.extend_from_slice(std::slice::from_raw_parts(ptr as *const u8, len));
@@ -357,12 +359,25 @@ fn enumerate_ids(kind: i32) -> Vec<u32> {
     let Some(vt) = crate::vtable() else { return Vec::new() };
     let mut buf: Vec<u8> = Vec::new();
     unsafe { (vt.list_objects)(kind, sink, &mut buf as *mut Vec<u8> as *mut c_void) };
-    let parsed: Result<Vec<IdOnly>, _> =
-        serde_json::from_str(&String::from_utf8_lossy(&buf));
-    match parsed {
-        Ok(objs) => objs.into_iter().map(|o| o.id).collect(),
+    // list_objects answers in the wire form of ABI.md "Object records": a
+    // u32 count, then one record per object. Only the id is wanted, but a
+    // record is variable length, so each is parsed in full to reach the
+    // next. (This read the old JSON form until the ABI moved to records,
+    // and failed on every call since - so no object-scoped plugin got an
+    // instance at load, only from created events afterwards.)
+    let ids: Result<Vec<u32>, _> = match kind {
+        PGH_OBJ_SESSION => parse_list(&buf, SessionInfo::parse)
+            .map(|v| v.into_iter().map(|s| s.id).collect()),
+        PGH_OBJ_WINDOW => parse_list(&buf, WindowInfo::parse)
+            .map(|v| v.into_iter().map(|w| w.id).collect()),
+        PGH_OBJ_PANE => parse_list(&buf, PaneInfo::parse)
+            .map(|v| v.into_iter().map(|p| p.id).collect()),
+        _ => Ok(Vec::new()),
+    };
+    match ids {
+        Ok(ids) => ids,
         Err(e) => {
-            hostlog::error("host", &format!("enumerate objects: {e}"));
+            hostlog::error("host", &format!("enumerate objects: {e:?}"));
             Vec::new()
         }
     }

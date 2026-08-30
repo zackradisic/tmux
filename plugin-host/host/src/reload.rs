@@ -86,10 +86,11 @@ pub fn upsert(desc: LoadDescriptor) -> Result<&'static str, String> {
                 def.caps = new_caps.clone();
                 def.path = std::path::PathBuf::from(&desc.path);
                 def.state = PluginState::Running;
-                def.failure_count = 0;
+                def.failures.clear();
             }
         });
         swap_instances(&desc.name, true);
+        start_missing(&desc.name);
         return Ok("code reloaded");
     }
 
@@ -156,11 +157,25 @@ pub fn reload(name: &str) -> Result<(), String> {
         if let Some(def) = reg.plugins.get_mut(name) {
             def.hash = new_hash;
             def.state = PluginState::Running;
-            def.failure_count = 0;
+            def.failures.clear();
         }
     });
     swap_instances(name, true);
+    start_missing(name);
     Ok(())
+}
+
+/// Start an instance for every scope that has none.
+///
+/// A swap can only migrate instances that exist. After a trap there may
+/// be none - a trapped instance is torn down, and a server-scoped plugin
+/// has no object-created event to bring it back - and a reload that only
+/// swapped would then return 0 and change nothing, while `show-plugins`
+/// said "running". Instantiation skips scopes that already have an
+/// instance, so this is safe to run after every swap.
+fn start_missing(name: &str) {
+    let scopes = REGISTRY.with(|r| r.borrow().initial_scopes(name));
+    events::queue_instantiations(name, scopes);
 }
 
 /// Enable or disable a plugin. Disabling tears down instances (on_unload at
@@ -176,7 +191,7 @@ pub fn set_enabled(name: &str, enabled: bool) -> Result<(), String> {
             let mut reg = r.borrow_mut();
             if let Some(def) = reg.plugins.get_mut(name) {
                 def.state = PluginState::Running;
-                def.failure_count = 0;
+                def.failures.clear();
             }
         });
         let scopes = REGISTRY.with(|r| r.borrow().initial_scopes(name));

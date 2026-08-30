@@ -235,7 +235,7 @@ fn deliver_async(token: u64, err: i32, v0: i64, v1: i64, data: &[u8]) {
             &format!("on_async_complete trapped: {e}"),
         );
     }
-    check_in(key, inst, trapped, true);
+    check_in(key, inst, trapped);
 }
 
 /// Deliver a mode event to the instance owning the mode, generation-
@@ -300,36 +300,54 @@ fn deliver_mode_event(mode_id: u64, mut bytes: Vec<u8>) {
             &format!("on_event(mode {mode_id}) trapped: {e}"),
         );
     }
-    check_in(key, inst, trapped, true);
+    check_in(key, inst, trapped);
 }
 
 /// Return a checked-out instance to its slot, or apply the failure policy
-/// if the guest trapped. `ran` = a guest call actually happened.
-fn check_in(key: usize, inst: Instance, trapped: bool, ran: bool) {
-    REGISTRY.with(|r| {
-        let mut reg = r.borrow_mut();
-        if trapped {
-            let plugin = inst.plugin.clone();
-            reg.by_scope.remove(&(inst.plugin.clone(), inst.scope_id));
-            reg.instances.try_remove(key);
-            if let Some(engine) = &reg.engine {
-                engine.instance_removed();
-            }
-            drop(reg);
-            release_instance_resources(&inst);
-            REGISTRY.with(|r2| {
-                r2.borrow_mut()
-                    .record_failure(&plugin, "guest trap in callback");
-            });
-        } else {
-            if ran {
-                reg.record_success(&inst.plugin);
-            }
-            if let Some(slot) = reg.instances.get_mut(key) {
+/// if the guest trapped.
+fn check_in(key: usize, inst: Instance, trapped: bool) {
+    if !trapped {
+        REGISTRY.with(|r| {
+            if let Some(slot) = r.borrow_mut().instances.get_mut(key) {
                 *slot = Some(inst);
             }
+        });
+        return;
+    }
+
+    let plugin = inst.plugin.clone();
+    let scope = inst.scope_id;
+    REGISTRY.with(|r| {
+        let mut reg = r.borrow_mut();
+        reg.by_scope.remove(&(plugin.clone(), scope));
+        reg.instances.try_remove(key);
+        if let Some(engine) = &reg.engine {
+            engine.instance_removed();
         }
     });
+    // A trapped guest's memory is frozen wherever the deadline landed -
+    // mid-write, an allocator half updated - so the instance is never
+    // reused. It is torn down here and a fresh one takes its place.
+    release_instance_resources(&inst);
+    let disabled = REGISTRY.with(|r| {
+        r.borrow_mut().record_failure(&plugin, "guest trap in callback")
+    });
+    if disabled {
+        return;
+    }
+    // Start over with fresh state, so one bad callback does not leave the
+    // plugin dead until someone notices. The object it served may be gone
+    // in this same drain - its destruction can be what trapped it - so
+    // only a scope that still exists gets a new instance.
+    let still_there =
+        REGISTRY.with(|r| r.borrow().initial_scopes(&plugin).contains(&scope));
+    if still_there {
+        hostlog::warn(
+            &plugin,
+            &format!("instance {scope} restarting with fresh state"),
+        );
+        queue_instantiations(&plugin, vec![scope]);
+    }
 }
 
 /// Eagerly create scoped instances when an object-creation event arrives.
@@ -450,7 +468,6 @@ fn instantiate_scope(plugin: &str, scope: ScopeId) {
             stats,
         }));
         reg.by_scope.insert((plugin.to_string(), scope), key);
-        reg.record_success(plugin);
         if let Some(engine) = &reg.engine {
             engine.instance_added();
         }
@@ -540,6 +557,6 @@ fn route_event(header: &EventHeader, bytes: &[u8]) {
                 );
             }
         }
-        check_in(key, inst, trapped, subscribed);
+        check_in(key, inst, trapped);
     }
 }
