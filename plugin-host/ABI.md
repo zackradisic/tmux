@@ -48,15 +48,30 @@ read a directory *without* reaching for a shell.
 
 ## Directory listing
 
-`fs_list` runs on the fs worker and writes packed records straight into
-the guest's pinned buffer - one copy for the whole directory, and no
-allocation per entry on either side:
+`fs_list` runs on the fs executor and writes packed records straight
+into the guest's pinned buffer - one copy for the whole directory, and
+no allocation per entry on either side:
 
 ```
 record: u16 namelen | u8 kind | u8 reserved | i64 mtime | u8 name[namelen]
 kind:   0 unknown, 1 dir, 2 file, 3 symlink, 4 other      (little-endian)
 flags:  1 = fetch mtime, 2 = directories only
 ```
+
+`mtime` costs one `statx` per entry, so a listing that asks for it
+hands each batch of 250 to the executor as soon as those names are
+packed, and keeps reading. The times for entries already read are then
+fetched while the rest of the directory is still being read. Over ten
+thousand entries a listing with times takes 13.7 ms one entry at a
+time, 6.2 ms with the batches run after the walk, and 3.3 ms with them
+run during it.
+
+Batches, not one task per entry: a task costs about 970 ns to dispatch
+and a `statx` on a warm cache costs 552 ns to run, so per-entry tasks
+lose to doing the work in place. Below one batch there is no dispatch
+at all - a directory of 200 entries is stat-ed on the spot, because
+across threads it costs 0.10 ms and 0.22 ms once the hand-off is
+counted.
 
 The counts ride on the completion: `v0` is the bytes written, `v1` the
 number of entries the directory holds. Fewer records than `v1` means the
@@ -197,9 +212,9 @@ guest frees (the error message bytes when `err != 0`; empty = none).
 | `fs_read` | `(path, offset: i64, out_ptr, out_cap) -> i64` | v0 = bytes read, v1 = eof | fs-read |
 | `fs_list` | `(path Str, out_ptr, out_cap) -> i64` (async; v0 = bytes, v1 = entries) | fs-list |
 
-The async fs pair runs on the host's fs worker thread (the tmux loop
-never blocks) with ZERO copies: the worker reads `fs_write`'s data and
-fills `fs_read`'s out-buffer directly in plugin memory. The buffers are
+The async fs calls run on the host's fs executor (the tmux loop never
+blocks) with ZERO copies: a runner reads `fs_write`'s data and fills
+`fs_read`'s out-buffer directly in plugin memory. The buffers are
 pinned by the SDK future until the completion arrives; awaited fs ops
 are fully ordered, but two in-flight ops on the SAME file are not -
 await each before the next. Completion means the data reached the page

@@ -20,6 +20,13 @@ blake3 = "1.8.5"
 toml = "1.1.2"
 base64 = "0.22"
 crossbeam-channel = "0.5"
+# The fs side runs an executor, not a thread doing one job at a time: a
+# listing fans its per-entry stats out as tasks and awaits them, so the
+# thread that submitted them is free to run those very tasks (or another
+# plugin's job) instead of sitting in a blocking join. See fsworker.rs.
+async-executor = "1"
+async-channel = "2"
+futures-lite = "2"
 libc = "0.2"
 
 [dev-dependencies]

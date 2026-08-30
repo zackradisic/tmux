@@ -556,18 +556,41 @@ pub fn open_write(
 /// Linux and macOS, both of which already batch the syscall, and
 /// `DirEntry::file_type` reads `d_type` out of the entry - no `stat` per
 /// name unless the filesystem returns `DT_UNKNOWN`.
+// The form without a descriptor. Kept for callers that only want names,
+// and used by the tests below.
+#[allow(dead_code)]
 pub fn open_dir(
     root: &Root,
     rel: &str,
     reach: Reach,
 ) -> Result<std::fs::ReadDir, FsError> {
+    Ok(open_dir_full(root, rel, reach)?.0)
+}
+
+/// As [`open_dir`], but also hands back an open descriptor for the
+/// directory itself.
+///
+/// A caller that wants timestamps needs one: `DirEntry::metadata` builds
+/// its own `fstatat` per entry and gives no way to run those in
+/// parallel. With the descriptor in hand a worker can `statx` a name
+/// against it directly, which is the same syscall the entry would have
+/// made, minus the entry.
+pub fn open_dir_full(
+    root: &Root,
+    rel: &str,
+    reach: Reach,
+) -> Result<(std::fs::ReadDir, std::fs::File), FsError> {
     let path = check_rel(rel, reach)?;
     let full = if reach == Reach::Anywhere {
         anywhere_path(root, path)
     } else {
         resolve_dir(root, path)?
     };
-    std::fs::read_dir(&full).map_err(|e| io_err(rel, &e))
+    let dir = std::fs::read_dir(&full).map_err(|e| io_err(rel, &e))?;
+    // Reopened rather than derived from `dir`: std keeps the DIR* to
+    // itself. Same resolved path, so this reaches the same directory.
+    let fd = std::fs::File::open(&full).map_err(|e| io_err(rel, &e))?;
+    Ok((dir, fd))
 }
 
 /// Resolve a contained directory path.
