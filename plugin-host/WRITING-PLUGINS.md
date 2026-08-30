@@ -13,9 +13,10 @@ sessions appearing, disappearing, changing), and acts on tmux through host
 APIs. Rules the host enforces — your code cannot break tmux, but it can get
 itself killed:
 
-- **CPU budget**: every callback (init, event handler, async wakeup) must
-  finish in a few milliseconds. ~2 ms logs a warning; ~8 ms aborts the
-  callback. Never busy-wait; use the async APIs.
+- **CPU budget**: every callback (init, event handler, async wakeup) runs
+  on the tmux event loop, so keep it short. ~2 ms logs a warning. A
+  callback that reaches 2 s is a runaway: it traps, the instance is torn
+  down, and a fresh one starts. Never busy-wait; use the async APIs.
 - **No blocking**: there is no filesystem, network, or process access
   except through the async host APIs. `std::thread`, `std::fs`,
   `std::net` do not exist in the sandbox.

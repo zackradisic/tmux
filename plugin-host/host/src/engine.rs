@@ -22,7 +22,16 @@ pub const TICK_MS: u64 = 1;
 /// Soft budget per guest callback (warn once), in ticks.
 pub const SOFT_TICKS: u64 = 2;
 /// Hard budget per guest callback (trap), in ticks.
-pub const HARD_TICKS: u64 = 8;
+///
+/// Two seconds, not a few milliseconds. The cap does not police ordinary
+/// work: a correct callback finishes well inside the soft budget, and a
+/// legitimate burst - ranking ten thousand directory entries, say - must
+/// never die for taking 20 ms. The cap catches a runaway, and it exists
+/// only because a running callback blocks input, so the user cannot
+/// interrupt it the way C-g interrupts Elisp. Emacs, Vim and Neovim run
+/// plugin code on the UI thread with no budget at all. This is the same
+/// choice, with a backstop.
+pub const HARD_TICKS: u64 = 2000;
 
 struct TickerGate {
     stop: AtomicBool,
@@ -147,13 +156,17 @@ mod tests {
         .unwrap();
         let module = wasmtime::Module::new(&es.engine, &wasm).unwrap();
 
+        // The production budgets run to seconds; the test is about the
+        // mechanism, so it uses small ones of its own.
+        const SOFT: u64 = 2;
+        const HARD: u64 = 8;
         let mut store: Store<u32> = Store::new(&es.engine, 0);
-        store.set_epoch_deadline(SOFT_TICKS);
+        store.set_epoch_deadline(SOFT);
         store.epoch_deadline_callback(|mut ctx| {
             let softwarned = ctx.data_mut();
             if *softwarned == 0 {
                 *softwarned = 1;
-                Ok(UpdateDeadline::Continue(HARD_TICKS - SOFT_TICKS))
+                Ok(UpdateDeadline::Continue(HARD - SOFT))
             } else {
                 Err(wasmtime::Error::msg("plugin exceeded CPU budget"))
             }

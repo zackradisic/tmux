@@ -8,8 +8,11 @@ buffers. There is no JSON and no base64 anywhere on the wire.
 
 Plugins run inside the tmux server on its event loop. Every entry into the
 guest runs to completion under a CPU budget (epoch interruption, ~2 ms soft
-warning, ~8 ms hard trap). There is no stack suspension: async host
-operations complete via a callback export. The Rust SDK
+warning, 2 s hard trap). The trap catches a runaway, not ordinary work:
+Emacs, Vim and Neovim run plugin code on the UI thread with no budget at
+all, and this is the same choice with a backstop, because a running
+callback blocks the input that would otherwise interrupt it. There is no
+stack suspension: async host operations complete via a callback export. The Rust SDK
 (`plugin-host/sdk`, crate `tmux-plugin-sdk`) hides all of the below.
 
 ## Buffer taxonomy
