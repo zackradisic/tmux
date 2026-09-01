@@ -239,6 +239,22 @@ plugin_vtable_mode_open(u_int window, u_int width, u_int height, int x,
 	lg.sy = sy;
 	lg.xoff = xoff;
 	lg.yoff = yoff;
+
+	/*
+	 * Unzoom first, as layout_get_floating_cell does for new-pane (and
+	 * like new-pane, a float does not re-zoom afterwards). A zoomed
+	 * window has a throwaway layout: window_zoom parks every real cell
+	 * in saved_layout_cell and gives the active pane a lone root. A float
+	 * built into that layout is fatal: spawn_pane copies the new cell to
+	 * saved_layout_cell (the window is zoomed), then window_set_active_pane
+	 * below unzooms, frees the zoom layout - float cell included - and
+	 * restores the dangling pointer, so layout_fix_panes reads a freed
+	 * cell and resizes the float to garbage (a multi-gigabyte grid_reflow
+	 * that hangs the server). Seen with prefix+w (choose-tree -Z) open.
+	 */
+	if (window_push_zoom(w, 1, 0))
+		server_redraw_window(w);
+
 	lc = layout_floating_pane(w, w->active, &lg);
 
 	memset(&sc, 0, sizeof sc);
