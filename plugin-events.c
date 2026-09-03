@@ -316,8 +316,20 @@ plugin_notify(const char *name, struct client *c, struct session *s,
 		plugin_event_scope(pb, PGH_OBJ_WINDOW, w->id);
 		plugin_event_str(pb, "window_name", w->name);
 	}
-	if (wp != NULL)
+	if (wp != NULL) {
 		plugin_event_scope(pb, PGH_OBJ_PANE, wp->id);
+		/*
+		 * Backfill the window from the pane, as the bus path does:
+		 * a pane-scoped event must carry the window it sits in
+		 * (notify-toast jumps to the source window by this id).
+		 */
+		if (w == NULL && wp->window != NULL) {
+			plugin_event_scope(pb, PGH_OBJ_WINDOW,
+			    wp->window->id);
+			plugin_event_str(pb, "window_name",
+			    wp->window->name);
+		}
+	}
 	if (text != NULL)
 		plugin_event_str(pb, "text", text);
 	plugin_event_send(pb);

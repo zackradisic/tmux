@@ -1323,6 +1323,13 @@ impl NotifyToast {
                 .map(|e| (e.src_window, e.src_pane))
         };
         let Some((src_window, src_pane)) = target else { return };
+        // Entries saved before the event carried a window scope have
+        // none: fall back to the window the pane sits in right now.
+        let src_window = src_window.or_else(|| {
+            list_panes().ok()?.iter().find_map(|p| {
+                (u64::from(p.id) == src_pane).then(|| u64::from(p.window))
+            })
+        });
         self.close_chooser();
         // Cleared now (not at mode-closed) so the jump's own focus
         // change wins; the late mode-closed for this id is then a no-op.
