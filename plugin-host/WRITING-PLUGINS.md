@@ -359,6 +359,8 @@ fs_rename(from, to, RenameFlag).await                   // atomic in the sandbox
     // Replace | NoReplace | Exchange. Crash-safe publish: write x.tmp,
     // then fs_rename("x.tmp", "x", RenameFlag::Replace) - the worker
     // syncs data before the name moves, so a reader never sees a mix
+fs_remove(path).await                                   // unlink one file;
+    // NoSuchObject if it is already gone (ignore it for an idempotent delete)
 ```
 
 Async tasks are spawned with `ctx.spawn(async move { ... })` in `init` (or

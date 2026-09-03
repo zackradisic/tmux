@@ -106,6 +106,16 @@ pub enum FsJob {
         flags: u32,
         reach: Reach,
     },
+    /// Unlink `rel`, which must name a file (not a directory) that stays
+    /// inside the sandbox. Idempotent is the caller's job: a missing file
+    /// returns NotFound.
+    Remove {
+        token: u64,
+        key: InstKey,
+        root: Arc<Root>,
+        rel: String,
+        reach: Reach,
+    },
     /// List a directory, packing the entries straight into the guest's
     /// pinned buffer. See [`do_list`] for the record format.
     List {
@@ -273,7 +283,8 @@ pub fn submit(job: FsJob) -> Result<(), String> {
         FsJob::Write { key, .. }
         | FsJob::Read { key, .. }
         | FsJob::List { key, .. }
-        | FsJob::Rename { key, .. } => key.clone(),
+        | FsJob::Rename { key, .. }
+        | FsJob::Remove { key, .. } => key.clone(),
     };
     {
         let mut counts = inflight().counts.lock().unwrap();
@@ -429,6 +440,9 @@ async fn run_job(job: FsJob) -> FsCompletion {
         FsJob::Rename { token, key: _, root, rel_from, rel_to, flags, reach } => {
             do_rename(token, &root, &rel_from, &rel_to, flags, reach)
         }
+        FsJob::Remove { token, key: _, root, rel, reach } => {
+            do_remove(token, &root, &rel, reach)
+        }
     }
 }
 
@@ -510,6 +524,29 @@ fn do_rename(
     }
     // Persist the directory entry too, so the new name survives a crash.
     if let Some(dir) = to.parent() {
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    FsCompletion { token, err: 0, v0: 0, v1: 0, data: Vec::new() }
+}
+
+fn do_remove(
+    token: u64,
+    root: &Root,
+    rel: &str,
+    reach: Reach,
+) -> FsCompletion {
+    let path = match crate::fsbox::resolve_entry(root, rel, reach) {
+        Ok(p) => p,
+        Err(e) => return open_failed(token, e),
+    };
+    if let Err(e) = std::fs::remove_file(&path) {
+        return open_failed(token, crate::fsbox::io_err(rel, &e));
+    }
+    // Persist the directory entry's removal, so the file does not come
+    // back after a crash right after the unlink.
+    if let Some(dir) = path.parent() {
         if let Ok(d) = std::fs::File::open(dir) {
             let _ = d.sync_all();
         }

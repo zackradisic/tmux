@@ -855,6 +855,15 @@ pub async fn fs_rename(
     start_async(token)?.await.map(|_| ())
 }
 
+/// Remove a file asynchronously on the fs worker. The path stays inside
+/// the sandbox. A missing file returns [`ErrorCode::NoSuchObject`], so a
+/// caller that wants idempotence can ignore that one code.
+pub async fn fs_remove(path: &str) -> Result<(), HostError> {
+    let token =
+        unsafe { raw::fs_remove(path.as_ptr() as i32, path.len() as i32) };
+    start_async(token)?.await.map(|_| ())
+}
+
 /// Unix time in milliseconds, from the host's clock.
 pub fn now_ms() -> u64 {
     (unsafe { raw::time_now() }).max(0) as u64

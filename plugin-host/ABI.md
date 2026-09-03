@@ -216,6 +216,7 @@ guest frees (the error message bytes when `err != 0`; empty = none).
 | `fs_read` | `(path, offset: i64, out_ptr, out_cap) -> i64` | v0 = bytes read, v1 = eof | fs-read |
 | `fs_list` | `(path Str, out_ptr, out_cap) -> i64` (async; v0 = bytes, v1 = entries) | fs-list |
 | `fs_rename` | `(from Str, to Str, flags) -> i64` | nothing | fs-write |
+| `fs_remove` | `(path Str) -> i64` (async) | nothing | fs-write |
 
 The async fs calls run on the host's fs executor (the tmux loop never
 blocks) with ZERO copies: a runner reads `fs_write`'s data and fills
@@ -234,6 +235,11 @@ entry after it, so publish-a-temp-file is crash-safe: write `x.tmp`,
 rename it over `x`, and a reader (or a crash) sees the old bytes or the
 new bytes, never a mix - this one durability exception to the
 page-cache rule above is what the call is for.
+
+`fs_remove` unlinks one file under the sandbox root and syncs the parent
+directory, so the removal survives a crash. It is not a directory
+remove. A missing file returns `NoSuchObject`, so a caller that wants an
+idempotent delete can ignore that one code.
 
 ## Object records (list / resolve results)
 

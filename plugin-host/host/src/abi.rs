@@ -1037,6 +1037,12 @@ fn register_imports(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
         }))
     })?;
 
+    linker.func_wrap(m, im::FS_REMOVE, |mut c: Caller<'_, StoreData>, path_ptr: i32, path_len: i32| -> i64 {
+        ret_i64(with_mem(&mut c, |mem| {
+            dispatch::fs_remove_async(mem, path_ptr, path_len)
+        }))
+    })?;
+
     linker.func_wrap(m, im::TIME_NOW, |mut c: Caller<'_, StoreData>| -> i64 {
         with_mem(&mut c, |mem| Ok(dispatch::time_now(mem))).unwrap_or(0)
     })?;

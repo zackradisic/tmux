@@ -134,6 +134,7 @@ pub mod exports {
 /// fs_rename(from_ptr, from_len, to_ptr, to_len, flags) -> i64
 ///                       // async; atomic within one filesystem
 ///                       // flags: 0 = replace, 1 = no-replace, 2 = exchange
+/// fs_remove(path_ptr, path_len) -> i64          // async; unlink a file
 /// fs_write_sync(path_ptr, path_len, data_ptr, data_len, append) -> i64
 /// fs_read_sync(path_ptr, path_len, offset: i64, out, cap,
 ///              len_out, eof_out) -> i32
@@ -177,6 +178,7 @@ pub mod imports {
     pub const FS_WRITE_SYNC: &str = "fs_write_sync";
     pub const FS_READ_SYNC: &str = "fs_read_sync";
     pub const FS_RENAME: &str = "fs_rename";
+    pub const FS_REMOVE: &str = "fs_remove";
     pub const FS_ROOT: &str = "fs_root";
     pub const HOME_DIR: &str = "home_dir";
     pub const TIME_NOW: &str = "time_now";

@@ -923,6 +923,28 @@ pub fn fs_rename_async(
     Ok(token as i64)
 }
 
+/// Unlink `path` on the fs worker. Gated like a write: removing a file
+/// is a write to its directory.
+pub fn fs_remove_async(
+    mem: &mut GuestMem<'_, '_>,
+    path_ptr: i32,
+    path_len: i32,
+) -> Result<i64, HostError> {
+    check_cap(mem, crate::caps::FS_WRITE)?;
+    let reach = fs_reach(mem, crate::caps::FS_WRITE_ANY);
+    let root = fs_root_of(mem)?;
+    let rel = fs_rel(mem, path_ptr, path_len)?;
+    let data = mem.data();
+    let key = (data.plugin.clone(), data.scope, data.generation);
+    let token = alloc_token(mem);
+    let job = crate::fsworker::FsJob::Remove { token, key, root, rel, reach };
+    if let Err(e) = crate::fsworker::submit(job) {
+        crate::tokens::discard(token);
+        return Err(err(ErrorCode::Host, e));
+    }
+    Ok(token as i64)
+}
+
 /// Unix time in milliseconds. No capability: every process can read the
 /// clock, and a plugin already observes time through its timers.
 pub fn time_now(_mem: &GuestMem<'_, '_>) -> i64 {
