@@ -327,6 +327,7 @@ display_message(msg: &str)                              // status line + log
 log(msg: &str)                                          // plugin-log only
 intern(name) -> u32 / intern_name(id) -> Option<String> // event/key name ids
 fs_root() -> Result<String, _>       // the plugin's private data dir
+now_ms() -> u64                      // Unix time, milliseconds
 home_dir() -> String                                    // for expanding a leading ~
 fs_write_sync(path, data, append) / fs_read_sync(path, offset, &mut buf)
     // small files; paths relative to fs_root; caps fs-write / fs-read
@@ -354,6 +355,10 @@ fs_write(path, data: Vec<u8>, append).await -> bytes    // fs executor,
 fs_read(path, offset, capacity).await -> (Vec<u8>, eof) // zero-copy, no cap
 fs_list(path) -> Listing                                // dir entries + d_type;
                                                         // names borrow the buffer
+fs_rename(from, to, RenameFlag).await                   // atomic in the sandbox;
+    // Replace | NoReplace | Exchange. Crash-safe publish: write x.tmp,
+    // then fs_rename("x.tmp", "x", RenameFlag::Replace) - the worker
+    // syncs data before the name moves, so a reader never sees a mix
 ```
 
 Async tasks are spawned with `ctx.spawn(async move { ... })` in `init` (or

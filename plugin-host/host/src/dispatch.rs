@@ -885,6 +885,53 @@ pub fn fs_list_async(
     Ok(token as i64)
 }
 
+/// Rename `from` to `to` on the fs worker. Atomic within one
+/// filesystem; `flags` selects plain replace, no-replace or exchange
+/// (see fsworker's RENAME_* wire values). Gated like a write.
+pub fn fs_rename_async(
+    mem: &mut GuestMem<'_, '_>,
+    from_ptr: i32,
+    from_len: i32,
+    to_ptr: i32,
+    to_len: i32,
+    flags: i32,
+) -> Result<i64, HostError> {
+    check_cap(mem, crate::caps::FS_WRITE)?;
+    if !(0..=2).contains(&flags) {
+        return Err(err(ErrorCode::BadRequest, "bad rename flags"));
+    }
+    let reach = fs_reach(mem, crate::caps::FS_WRITE_ANY);
+    let root = fs_root_of(mem)?;
+    let rel_from = fs_rel(mem, from_ptr, from_len)?;
+    let rel_to = fs_rel(mem, to_ptr, to_len)?;
+    let data = mem.data();
+    let key = (data.plugin.clone(), data.scope, data.generation);
+    let token = alloc_token(mem);
+    let job = crate::fsworker::FsJob::Rename {
+        token,
+        key,
+        root,
+        rel_from,
+        rel_to,
+        flags: flags as u32,
+        reach,
+    };
+    if let Err(e) = crate::fsworker::submit(job) {
+        crate::tokens::discard(token);
+        return Err(err(ErrorCode::Host, e));
+    }
+    Ok(token as i64)
+}
+
+/// Unix time in milliseconds. No capability: every process can read the
+/// clock, and a plugin already observes time through its timers.
+pub fn time_now(_mem: &GuestMem<'_, '_>) -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 pub fn fs_write_sync(
     mem: &mut GuestMem<'_, '_>,
     path_ptr: i32,

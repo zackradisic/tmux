@@ -8,6 +8,12 @@
 //!   plugin-command resurrect restore   # rebuild on a fresh server
 //!   plugin-command resurrect status    # what the save file holds
 //!
+//! Autosave (manifest config): `autosave = "5m"` saves on a timer. The
+//! first autosave waits one full period, so a restore after a server
+//! restart is never overwritten by an autosave of the empty new world.
+//! `keep = "3"` rotates old snapshots into state.1.bin, state.2.bin
+//! (higher = older) before each publish. Defaults: autosave off, keep 1.
+//!
 //! Saved: sessions, windows (name, size, layout incl. floating panes,
 //! automatic-rename state), panes (cwd, running command as a note, full
 //! scrollback + screen contents with colors). Restored panes run the
@@ -24,13 +30,20 @@
 //! `plugin-command resurrect restore`.
 //!
 //! Save data lives in the plugin's sandbox
-//! (~/.local/share/tmux/plugins/resurrect/): state.json plus one raw
-//! content file per pane.
+//! (~/.local/share/tmux/plugins/resurrect/) as one container file,
+//! state.bin: an 8-byte magic, a u32 metadata length, JSON metadata
+//! carrying a Unix timestamp, then the raw pane contents as byte ranges
+//! the metadata points into. A save writes state.bin.tmp and publishes
+//! it with one atomic rename, so a reader sees the old snapshot or the
+//! new one, never a mix, and a crash mid-save loses nothing. Restore
+//! materializes the ranges back into per-pane files for the cat-wrapper
+//! (the v1 state.json layout still restores).
 
 use std::cell::Cell;
 use std::rc::Rc;
 
 use serde::{Deserialize, Serialize};
+use tmux_plugin_sdk::abi::ErrorCode;
 use tmux_plugin_sdk::prelude::*;
 
 /// Rows per capture_pane page: safely under the host's 2000-line cap
@@ -40,6 +53,12 @@ const PAGE_ROWS: i32 = 800;
 /// each write short so pane teardown never waits on a big one.
 const WRITE_CHUNK: usize = 256 * 1024;
 
+/// The live snapshot, and the temp name a save publishes from.
+const STATE_BIN: &str = "state.bin";
+const STATE_TMP: &str = "state.bin.tmp";
+/// Container magic; the trailing digit is the format version.
+const MAGIC: &[u8; 8] = b"TMUXRES2";
+
 #[derive(Serialize, Deserialize, Clone)]
 struct SavedPane {
     id: u32,
@@ -48,8 +67,14 @@ struct SavedPane {
     /// What was running at save time. Informational for now; the future
     /// process-restore feature builds on it.
     command: String,
-    /// Content file name in the data dir; None for dead panes.
+    /// v1: content file name in the data dir. v2 only sets it at
+    /// restore, after materializing the blob. None for dead panes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     content: Option<String>,
+    /// v2: (offset, length) of the content inside state.bin's blob
+    /// region (relative to the end of the metadata).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    blob: Option<(u64, u64)>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -76,21 +101,98 @@ struct SavedSession {
 #[derive(Serialize, Deserialize, Clone)]
 struct SaveFile {
     version: u32,
+    /// Unix time of the save, milliseconds. Zero in v1 files.
+    #[serde(default)]
+    saved_at_ms: u64,
     sessions: Vec<SavedSession>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ResurrectConfig {
+    /// Autosave period: "5m", "90s", "300" (seconds); "0" turns it off.
+    autosave: Option<serde_json::Value>,
+    /// Snapshots to keep. "1" = state.bin only; "3" also rotates the
+    /// two previous snapshots into state.1.bin and state.2.bin.
+    keep: Option<serde_json::Value>,
+}
+
+/// A manifest value: TOML lets the user write "5m" or plain 300.
+fn cfg_str(v: &serde_json::Value) -> String {
+    match v.as_str() {
+        Some(s) => s.to_string(),
+        None => v.to_string(),
+    }
+}
+
+/// "5m" / "90s" / "1h" / bare seconds -> milliseconds.
+fn parse_period(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    let (num, mult) = if let Some(n) = s.strip_suffix("ms") {
+        (n, 1)
+    } else if let Some(n) = s.strip_suffix('s') {
+        (n, 1000)
+    } else if let Some(n) = s.strip_suffix('m') {
+        (n, 60_000)
+    } else if let Some(n) = s.strip_suffix('h') {
+        (n, 3_600_000)
+    } else {
+        (s, 1000)
+    };
+    num.trim()
+        .parse::<u64>()
+        .map(|n| n * mult)
+        .map_err(|_| format!("bad autosave period {s:?}"))
 }
 
 struct Resurrect {
     busy: Rc<Cell<bool>>,
+    /// Snapshots to keep, 1..=8 (config `keep`).
+    keep: u32,
 }
 
 impl Plugin for Resurrect {
     const NAME: &'static str = "resurrect";
-    type Config = serde_json::Value;
+    type Config = ResurrectConfig;
 
-    fn init(ctx: &Ctx, _config: Self::Config) -> Result<Self, String> {
+    fn init(ctx: &Ctx, config: Self::Config) -> Result<Self, String> {
         ctx.subscribe(&["plugin-command"])
             .map_err(|e| e.message.clone())?;
-        Ok(Self { busy: Rc::new(Cell::new(false)) })
+        let every = match &config.autosave {
+            None => 0,
+            Some(v) => parse_period(&cfg_str(v))?,
+        };
+        let keep = match &config.keep {
+            None => 1,
+            Some(v) => cfg_str(v)
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| format!("bad keep {v}"))?
+                .clamp(1, 8),
+        };
+        let busy = Rc::new(Cell::new(false));
+        if every > 0 {
+            // Floor, so a config typo cannot hammer the server.
+            let every = every.max(10_000);
+            let busy = Rc::clone(&busy);
+            // Sleep first: after a server restart the world is empty,
+            // and an immediate autosave would overwrite the snapshot
+            // the user is about to restore.
+            ctx.spawn(async move {
+                loop {
+                    if sleep_ms(every).await.is_err() {
+                        break;
+                    }
+                    if busy.get() {
+                        continue;
+                    }
+                    busy.set(true);
+                    autosave(keep).await;
+                    busy.set(false);
+                }
+            });
+        }
+        Ok(Self { busy, keep })
     }
 
     fn on_event(&mut self, ctx: &Ctx, event: Event) {
@@ -104,10 +206,11 @@ impl Plugin for Resurrect {
         }
         self.busy.set(true);
         let busy = Rc::clone(&self.busy);
+        let keep = self.keep;
         ctx.spawn(async move {
             match verb.as_str() {
-                "save" => save(false).await,
-                "kill" => save(true).await,
+                "save" => save(false, keep).await,
+                "kill" => save(true, keep).await,
                 "restore" => restore().await,
                 "status" => status().await,
                 other => {
@@ -375,8 +478,17 @@ fn parse_floats(section: &str) -> Vec<FloatCell> {
 // Save
 // ---------------------------------------------------------------------------
 
-async fn save(kill: bool) {
-    match do_save().await {
+/// Timer-driven save: quiet on success (a toast every period is
+/// noise), loud on failure.
+async fn autosave(keep: u32) {
+    if let Err(e) = do_save(keep).await {
+        let _ =
+            display_message(&format!("resurrect: autosave failed: {e}"));
+    }
+}
+
+async fn save(kill: bool, keep: u32) {
+    match do_save(keep).await {
         Ok((sessions, panes)) => {
             let _ = display_message(&format!(
                 "resurrect: saved {sessions} sessions / {panes} panes{}",
@@ -394,7 +506,7 @@ async fn save(kill: bool) {
     }
 }
 
-async fn do_save() -> Result<(usize, usize), String> {
+async fn do_save(keep: u32) -> Result<(usize, usize), String> {
     let sessions = list_sessions().map_err(|e| e.to_string())?;
     let windows = list_windows().map_err(|e| e.to_string())?;
     let panes = list_panes().map_err(|e| e.to_string())?;
@@ -403,7 +515,12 @@ async fn do_save() -> Result<(usize, usize), String> {
     let pane_by_id: std::collections::HashMap<u32, &PaneInfo> =
         panes.iter().map(|p| (p.id, p)).collect();
 
-    let mut out = SaveFile { version: 1, sessions: Vec::new() };
+    let mut out = SaveFile {
+        version: 2,
+        saved_at_ms: now_ms(),
+        sessions: Vec::new(),
+    };
+    let mut blobs: Vec<u8> = Vec::new();
     let mut npanes = 0;
 
     for s in &sessions {
@@ -442,7 +559,7 @@ async fn do_save() -> Result<(usize, usize), String> {
             };
             for &pane_id in &w.panes {
                 let Some(p) = pane_by_id.get(&pane_id) else { continue };
-                sw.panes.push(save_pane(p).await?);
+                sw.panes.push(save_pane(p, &mut blobs)?);
                 npanes += 1;
             }
             saved.windows.push(sw);
@@ -450,21 +567,60 @@ async fn do_save() -> Result<(usize, usize), String> {
         out.sessions.push(saved);
     }
 
-    // state.json last: a truncated save fails to parse and restore
-    // aborts instead of rebuilding half a world.
-    let json =
+    let meta =
         serde_json::to_vec(&out).map_err(|e| format!("serialize: {e}"))?;
+    let mut file = Vec::with_capacity(12 + meta.len() + blobs.len());
+    file.extend_from_slice(MAGIC);
+    file.extend_from_slice(&(meta.len() as u32).to_le_bytes());
+    file.extend_from_slice(&meta);
+    file.extend_from_slice(&blobs);
     let mut first = true;
-    for chunk in json.chunks(WRITE_CHUNK) {
-        fs_write("state.json", chunk.to_vec(), !first)
+    for chunk in file.chunks(WRITE_CHUNK) {
+        fs_write(STATE_TMP, chunk.to_vec(), !first)
             .await
-            .map_err(|e| format!("state.json: {e}"))?;
+            .map_err(|e| format!("{STATE_TMP}: {e}"))?;
         first = false;
     }
+    publish(keep).await?;
     Ok((out.sessions.len(), npanes))
 }
 
-async fn save_pane(p: &PaneInfo) -> Result<SavedPane, String> {
+/// Make the temp file the live snapshot. Plain rename is the atomic
+/// replace; the exchange path keeps `state.bin` present at every
+/// instant while the previous snapshot rotates into the archive chain.
+async fn publish(keep: u32) -> Result<(), String> {
+    let name = |i: u32| format!("state.{i}.bin");
+    // `keep` counts snapshots in total: the live state.bin plus
+    // keep - 1 archives. Shift the archives oldest-last, dropping the
+    // one that falls off the end (its name is simply renamed over).
+    for i in (1..keep.saturating_sub(1)).rev() {
+        // A hole in the chain is fine: the source may not exist yet.
+        let _ = fs_rename(&name(i), &name(i + 1), RenameFlag::Replace).await;
+    }
+    if keep > 1 {
+        match fs_rename(STATE_TMP, STATE_BIN, RenameFlag::Exchange).await {
+            Ok(()) => {
+                // The temp name now holds the previous snapshot.
+                fs_rename(STATE_TMP, &name(1), RenameFlag::Replace)
+                    .await
+                    .map_err(|e| format!("archive: {}", e.message))
+            }
+            // No snapshot yet: nothing to exchange with.
+            Err(e) if e.code == ErrorCode::NoSuchObject => {
+                fs_rename(STATE_TMP, STATE_BIN, RenameFlag::Replace)
+                    .await
+                    .map_err(|e| format!("publish: {}", e.message))
+            }
+            Err(e) => Err(format!("publish: {}", e.message)),
+        }
+    } else {
+        fs_rename(STATE_TMP, STATE_BIN, RenameFlag::Replace)
+            .await
+            .map_err(|e| format!("publish: {}", e.message))
+    }
+}
+
+fn save_pane(p: &PaneInfo, blobs: &mut Vec<u8>) -> Result<SavedPane, String> {
     let pane = PaneId(p.id);
     let command =
         format_expand(OptionTarget::Pane(pane), c"#{pane_current_command}")
@@ -475,6 +631,7 @@ async fn save_pane(p: &PaneInfo) -> Result<SavedPane, String> {
         cwd: p.cwd.clone(),
         command,
         content: None,
+        blob: None,
     };
     if p.dead {
         return Ok(saved);
@@ -491,9 +648,8 @@ async fn save_pane(p: &PaneInfo) -> Result<SavedPane, String> {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
 
-    let file = format!("pane-{}.txt", p.id);
+    let start_off = blobs.len() as u64;
     let mut start = -history;
-    let mut first = true;
     let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     while start <= cursor_y {
         let end = (start + i64::from(PAGE_ROWS) - 1).min(cursor_y);
@@ -505,29 +661,10 @@ async fn save_pane(p: &PaneInfo) -> Result<SavedPane, String> {
             &mut buf,
         )
         .map_err(|e| format!("capture %{}: {e}", p.id))?;
-        let bytes = unescape(&buf);
-        // fs_write caps one transfer; split big pages.
-        if bytes.is_empty() && first {
-            fs_write(&file, Vec::new(), false)
-                .await
-                .map_err(|e| format!("{file}: {e}"))?;
-            first = false;
-        }
-        for chunk in bytes.chunks(WRITE_CHUNK) {
-            fs_write(&file, chunk.to_vec(), !first)
-                .await
-                .map_err(|e| format!("{file}: {e}"))?;
-            first = false;
-        }
+        blobs.append(&mut unescape(&buf));
         start = end + 1;
     }
-    if first {
-        // Zero pages (empty pane): still create the file for the wrapper.
-        fs_write(&file, Vec::new(), false)
-            .await
-            .map_err(|e| format!("{file}: {e}"))?;
-    }
-    saved.content = Some(file);
+    saved.blob = Some((start_off, blobs.len() as u64 - start_off));
     Ok(saved)
 }
 
@@ -554,7 +691,45 @@ async fn restore() {
     }
 }
 
-async fn read_state() -> Result<SaveFile, String> {
+/// Load the snapshot metadata. Returns the state plus the absolute file
+/// offset of the blob region in state.bin (0 for a v1 state.json save,
+/// which has no blobs).
+async fn read_state() -> Result<(SaveFile, u64), String> {
+    let hdr = match fs_read(STATE_BIN, 0, 12).await {
+        Ok((hdr, _)) => hdr,
+        // No container yet: fall back to the v1 layout.
+        Err(e) if e.code == ErrorCode::NoSuchObject => {
+            return read_state_v1().await.map(|s| (s, 0));
+        }
+        Err(e) => return Err(format!("{STATE_BIN}: {e}")),
+    };
+    if hdr.len() != 12 || &hdr[0..8] != MAGIC {
+        return Err(format!(
+            "{STATE_BIN} is unreadable (bad header); save again"
+        ));
+    }
+    let meta_len =
+        u32::from_le_bytes(hdr[8..12].try_into().unwrap()) as usize;
+    let mut meta = Vec::with_capacity(meta_len);
+    let mut offset = 12u64;
+    while meta.len() < meta_len {
+        let want = (meta_len - meta.len()).min(WRITE_CHUNK);
+        let (page, eof) = fs_read(STATE_BIN, offset, want)
+            .await
+            .map_err(|e| format!("{STATE_BIN}: {e}"))?;
+        if page.is_empty() || (eof && meta.len() + page.len() < meta_len) {
+            return Err(format!("{STATE_BIN} is truncated; save again"));
+        }
+        offset += page.len() as u64;
+        meta.extend_from_slice(&page);
+    }
+    let state = serde_json::from_slice(&meta).map_err(|e| {
+        format!("{STATE_BIN} is unreadable ({e}); save again")
+    })?;
+    Ok((state, 12 + meta_len as u64))
+}
+
+async fn read_state_v1() -> Result<SaveFile, String> {
     let mut bytes = Vec::new();
     let mut offset = 0u64;
     loop {
@@ -572,8 +747,59 @@ async fn read_state() -> Result<SaveFile, String> {
         .map_err(|e| format!("state.json is unreadable ({e}); save again"))
 }
 
+/// Copy one blob out of state.bin into `file`, so the restore wrapper
+/// can cat it. The file is a transient restore artifact, not part of
+/// the snapshot.
+async fn extract_blob(
+    mut off: u64,
+    len: u64,
+    file: &str,
+) -> Result<(), String> {
+    let mut left = len as usize;
+    let mut first = true;
+    loop {
+        let want = left.min(WRITE_CHUNK);
+        if want == 0 && !first {
+            break;
+        }
+        // A zero-length blob still writes the file (empty pane).
+        let page = if want == 0 {
+            Vec::new()
+        } else {
+            let (page, _) = fs_read(STATE_BIN, off, want)
+                .await
+                .map_err(|e| format!("{file}: {e}"))?;
+            if page.is_empty() {
+                return Err(format!("{file}: {STATE_BIN} is truncated"));
+            }
+            page
+        };
+        off += page.len() as u64;
+        left -= page.len();
+        fs_write(file, page, !first)
+            .await
+            .map_err(|e| format!("{file}: {e}"))?;
+        first = false;
+        if left == 0 {
+            break;
+        }
+    }
+    Ok(())
+}
+
 async fn do_restore() -> Result<(usize, usize), String> {
-    let state = read_state().await?;
+    let (mut state, blob_base) = read_state().await?;
+    for session in &mut state.sessions {
+        for window in &mut session.windows {
+            for pane in &mut window.panes {
+                let Some((off, len)) = pane.blob else { continue };
+                let file = format!("pane-{}.txt", pane.id);
+                extract_blob(blob_base + off, len, &file).await?;
+                pane.content = Some(file);
+            }
+        }
+    }
+    let state = state;
     let root = fs_root().map_err(|e| e.to_string())?;
 
     let existing = list_sessions().map_err(|e| e.to_string())?;
@@ -857,9 +1083,19 @@ fn window_id_of(session: &str, index: u32) -> Result<u32, String> {
 // Status
 // ---------------------------------------------------------------------------
 
+fn fmt_age(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else {
+        format!("{}h{:02}m ago", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
 async fn status() {
     match read_state().await {
-        Ok(state) => {
+        Ok((state, _)) => {
             let panes: usize =
                 state.sessions.iter().flat_map(|s| &s.windows)
                     .map(|w| w.panes.len())
@@ -869,8 +1105,15 @@ async fn status() {
                 .iter()
                 .map(|s| s.name.as_str())
                 .collect();
+            let age = if state.saved_at_ms > 0 {
+                let secs =
+                    now_ms().saturating_sub(state.saved_at_ms) / 1000;
+                format!(", saved {}", fmt_age(secs))
+            } else {
+                String::new()
+            };
             let _ = display_message(&format!(
-                "resurrect: save holds {} sessions ({}) / {panes} panes",
+                "resurrect: save holds {} sessions ({}) / {panes} panes{age}",
                 state.sessions.len(),
                 names.join(", ")
             ));

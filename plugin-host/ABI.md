@@ -183,6 +183,7 @@ Errors: sync imports return `0` or `-code`; value-returning imports
 | `home_dir` | `(out, cap, len_out) -> i32` — the server user's home directory | none |
 | `fs_write_sync` | `(path, data Bytes, append) -> i64` (bytes written) | fs-write |
 | `fs_read_sync` | `(path, offset: i64, out, cap, len_out, eof_out) -> i32` | fs-read |
+| `time_now` | `() -> i64` — Unix time, milliseconds | none |
 | `log` | `(level, ptr, len)` — raw UTF-8; 0=debug 1=info 2=warn 3=error | none |
 
 fs paths are raw UTF-8 (host-consumed - the NUL rule does not apply);
@@ -214,6 +215,7 @@ guest frees (the error message bytes when `err != 0`; empty = none).
 | `fs_write` | `(path, data, append) -> i64` | v0 = bytes written | fs-write |
 | `fs_read` | `(path, offset: i64, out_ptr, out_cap) -> i64` | v0 = bytes read, v1 = eof | fs-read |
 | `fs_list` | `(path Str, out_ptr, out_cap) -> i64` (async; v0 = bytes, v1 = entries) | fs-list |
+| `fs_rename` | `(from Str, to Str, flags) -> i64` | nothing | fs-write |
 
 The async fs calls run on the host's fs executor (the tmux loop never
 blocks) with ZERO copies: a runner reads `fs_write`'s data and fills
@@ -222,6 +224,16 @@ pinned by the SDK future until the completion arrives; awaited fs ops
 are fully ordered, but two in-flight ops on the SAME file are not -
 await each before the next. Completion means the data reached the page
 cache (survives kill-server; not a power loss).
+
+`fs_rename` flags: 0 = replace (atomic, rename(2)), 1 = fail if the
+target exists, 2 = exchange the two names (both must exist). Wire
+values, not libc's. Both paths resolve under the sandbox root, so the
+rename never crosses a filesystem and replace/exchange stay atomic. The
+worker syncs the source's data before the rename and the directory
+entry after it, so publish-a-temp-file is crash-safe: write `x.tmp`,
+rename it over `x`, and a reader (or a crash) sees the old bytes or the
+new bytes, never a mix - this one durability exception to the
+page-cache rule above is what the call is for.
 
 ## Object records (list / resolve results)
 

@@ -85,7 +85,7 @@ impl FsError {
 }
 
 /// Classify an OS error against the path it came from.
-fn io_err(rel: &str, e: &std::io::Error) -> FsError {
+pub(crate) fn io_err(rel: &str, e: &std::io::Error) -> FsError {
     match e.raw_os_error() {
         // RESOLVE_BENEATH rejects an escape with EXDEV; ELOOP is a symlink
         // loop or a magic link. Both are the guest's fault, not the host's.
@@ -591,6 +591,33 @@ pub fn open_dir_full(
     // itself. Same resolved path, so this reaches the same directory.
     let fd = std::fs::File::open(&full).map_err(|e| io_err(rel, &e))?;
     Ok((dir, fd))
+}
+
+/// Resolve a rename endpoint: the parent directory must already exist
+/// and stay inside the sandbox; the final name need not exist yet (it is
+/// a rename source or target, and rename never follows a symlink on the
+/// last component). At `Anywhere` reach the path resolves like a process
+/// cwd.
+pub fn resolve_entry(
+    root: &Root,
+    rel: &str,
+    reach: Reach,
+) -> Result<PathBuf, FsError> {
+    let path = check_rel(rel, reach)?;
+    if reach == Reach::Anywhere {
+        return Ok(anywhere_path(root, path));
+    }
+    let name = path
+        .file_name()
+        .ok_or_else(|| {
+            FsError::BadPath(format!("path has no file name: {rel:?}"))
+        })?
+        .to_owned();
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => resolve_dir(root, p)?,
+        _ => root.path.clone(),
+    };
+    Ok(parent.join(name))
 }
 
 /// Resolve a contained directory path.

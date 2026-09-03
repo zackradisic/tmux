@@ -817,6 +817,49 @@ pub fn home_dir() -> Result<String, HostError> {
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// How [`fs_rename`] treats the target name.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RenameFlag {
+    /// Replace the target if it exists (atomic, like rename(2)).
+    Replace,
+    /// Fail if the target exists.
+    NoReplace,
+    /// Swap the two names atomically; both must exist.
+    Exchange,
+}
+
+/// Rename `from` to `to` asynchronously on the fs worker. Atomic within
+/// the sandbox (one filesystem). The worker syncs the source's data
+/// before the rename, so the publish-a-temp-file pattern is crash-safe:
+/// write `x.tmp`, then `fs_rename("x.tmp", "x", RenameFlag::Replace)`.
+/// A reader of `x` sees the old bytes or the new bytes, never a mix.
+pub async fn fs_rename(
+    from: &str,
+    to: &str,
+    flag: RenameFlag,
+) -> Result<(), HostError> {
+    let flags = match flag {
+        RenameFlag::Replace => 0,
+        RenameFlag::NoReplace => 1,
+        RenameFlag::Exchange => 2,
+    };
+    let token = unsafe {
+        raw::fs_rename(
+            from.as_ptr() as i32,
+            from.len() as i32,
+            to.as_ptr() as i32,
+            to.len() as i32,
+            flags,
+        )
+    };
+    start_async(token)?.await.map(|_| ())
+}
+
+/// Unix time in milliseconds, from the host's clock.
+pub fn now_ms() -> u64 {
+    (unsafe { raw::time_now() }).max(0) as u64
+}
+
 pub fn fs_root() -> Result<String, HostError> {
     let buf = call_out(128, |out, cap, len_out| unsafe {
         raw::fs_root(out, cap, len_out)

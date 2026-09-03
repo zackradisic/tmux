@@ -14,7 +14,11 @@ TERM=screen
 [ -z "$TEST_TMUX" ] && TEST_TMUX=$(readlink -f ../tmux)
 TMUX="$TEST_TMUX -Lresurrect-test"
 WASM=$(dirname "$TEST_TMUX")/plugin-host/target/wasm32-unknown-unknown/release/resurrect.wasm
-DATA=${XDG_DATA_HOME:-$HOME/.local/share}/tmux/plugins/resurrect
+# Own data dir: never touch the user's real saves.
+XDG_DATA_HOME=$(mktemp -d)
+export XDG_DATA_HOME
+DATA=$XDG_DATA_HOME/tmux/plugins/resurrect
+trap 'rm -rf "$XDG_DATA_HOME"' EXIT
 
 fail() {
 	echo "FAIL: $*" >&2
@@ -57,9 +61,14 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
 	sleep 0.5
 done
 $TMUX ls >/dev/null 2>&1 && fail "server still alive after kill"
-[ -f "$DATA/state.json" ] || fail "state.json was not written"
-n=$(grep -l MARK "$DATA"/pane-*.txt 2>/dev/null | wc -l)
-[ "$n" -eq 6 ] || fail "expected 6 marker files, found $n"
+[ -f "$DATA/state.bin" ] || fail "state.bin was not written"
+[ -f "$DATA/state.bin.tmp" ] && fail "temp file left behind after publish"
+for mark in MARK-A0 MARK-A1 MARK-A2 MARK-A3 MARK-FLOAT MARK-B0; do
+	grep -aq "$mark" "$DATA/state.bin" ||
+	    fail "marker $mark missing from state.bin"
+done
+grep -aq '"saved_at_ms":[1-9]' "$DATA/state.bin" ||
+    fail "state.bin has no timestamp"
 
 # --- restore ---------------------------------------------------------------
 $TMUX -f/dev/null new-session -d -s bootstrap "sleep 600" ||

@@ -93,6 +93,19 @@ pub enum FsJob {
         reach: Reach,
         out: GuestSliceMut,
     },
+    /// Rename `rel_from` to `rel_to`, both under the same root. The
+    /// worker syncs the source's data first, so the name never moves
+    /// ahead of the bytes it publishes.
+    Rename {
+        token: u64,
+        key: InstKey,
+        root: Arc<Root>,
+        rel_from: String,
+        rel_to: String,
+        /// [`RENAME_REPLACE`], [`RENAME_NOREPLACE`] or [`RENAME_EXCHANGE`].
+        flags: u32,
+        reach: Reach,
+    },
     /// List a directory, packing the entries straight into the guest's
     /// pinned buffer. See [`do_list`] for the record format.
     List {
@@ -259,7 +272,8 @@ pub fn submit(job: FsJob) -> Result<(), String> {
     let key = match &job {
         FsJob::Write { key, .. }
         | FsJob::Read { key, .. }
-        | FsJob::List { key, .. } => key.clone(),
+        | FsJob::List { key, .. }
+        | FsJob::Rename { key, .. } => key.clone(),
     };
     {
         let mut counts = inflight().counts.lock().unwrap();
@@ -412,6 +426,9 @@ async fn run_job(job: FsJob) -> FsCompletion {
         FsJob::List { token, key: _, root, rel, reach, flags, out } => {
             do_list(token, &root, &rel, reach, flags, out).await
         }
+        FsJob::Rename { token, key: _, root, rel_from, rel_to, flags, reach } => {
+            do_rename(token, &root, &rel_from, &rel_to, flags, reach)
+        }
     }
 }
 
@@ -446,6 +463,102 @@ fn do_write(
             err_completion(token, ErrorCode::Host, format!("{rel}: {e}"))
         }
     }
+}
+
+/// `flags` wire values for [`do_rename`], renumbered so the wire form
+/// does not depend on libc. `RENAME_EXCHANGE` swaps two existing names
+/// atomically; plain replace is already atomic and is the right tool for
+/// the publish-a-temp-file pattern.
+pub const RENAME_REPLACE: u32 = 0;
+pub const RENAME_NOREPLACE: u32 = 1;
+pub const RENAME_EXCHANGE: u32 = 2;
+
+fn do_rename(
+    token: u64,
+    root: &Root,
+    rel_from: &str,
+    rel_to: &str,
+    flags: u32,
+    reach: Reach,
+) -> FsCompletion {
+    let from = match crate::fsbox::resolve_entry(root, rel_from, reach) {
+        Ok(p) => p,
+        Err(e) => return open_failed(token, e),
+    };
+    let to = match crate::fsbox::resolve_entry(root, rel_to, reach) {
+        Ok(p) => p,
+        Err(e) => return open_failed(token, e),
+    };
+    // Durability before visibility: flush the source's data so a crash
+    // right after the rename cannot publish a name whose bytes never
+    // reached the disk. rename orders metadata, not data.
+    match std::fs::File::open(&from) {
+        Ok(f) => {
+            if let Err(e) = f.sync_data() {
+                return open_failed(token, crate::fsbox::io_err(rel_from, &e));
+            }
+        }
+        Err(e) => {
+            return open_failed(token, crate::fsbox::io_err(rel_from, &e))
+        }
+    }
+    if let Err(e) = rename_syscall(&from, &to, flags) {
+        return open_failed(
+            token,
+            crate::fsbox::io_err(&format!("{rel_from} -> {rel_to}"), &e),
+        );
+    }
+    // Persist the directory entry too, so the new name survives a crash.
+    if let Some(dir) = to.parent() {
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    FsCompletion { token, err: 0, v0: 0, v1: 0, data: Vec::new() }
+}
+
+#[cfg(target_os = "linux")]
+fn rename_syscall(
+    from: &std::path::Path,
+    to: &std::path::Path,
+    flags: u32,
+) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let raw = match flags {
+        RENAME_NOREPLACE => libc::RENAME_NOREPLACE,
+        RENAME_EXCHANGE => libc::RENAME_EXCHANGE,
+        _ => 0,
+    };
+    let from = std::ffi::CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let to = std::ffi::CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let rc = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            raw,
+        )
+    };
+    if rc == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn rename_syscall(
+    from: &std::path::Path,
+    to: &std::path::Path,
+    flags: u32,
+) -> std::io::Result<()> {
+    if flags != RENAME_REPLACE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "rename flags need renameat2",
+        ));
+    }
+    std::fs::rename(from, to)
 }
 
 /// Directory entry kinds, as they cross the ABI. These are `d_type`
