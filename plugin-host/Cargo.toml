@@ -11,6 +11,7 @@ members = [
     "examples/notify-toast",
     "examples/resurrect",
     "examples/session_creator",
+    "examples/cron",
 ]
 default-members = ["host"]
 
