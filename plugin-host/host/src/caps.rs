@@ -38,9 +38,14 @@ pub const FS_READ_ANY: u32 = 1 << 15;
 /// The same escape for fs_write. Strictly the more dangerous half, so it
 /// is a separate grant.
 pub const FS_WRITE_ANY: u32 = 1 << 16;
+/// The plugin's own SQLite database (`db_*` imports): one file,
+/// `store.db`, inside its data directory. Bit 17 is reserved for a
+/// future `db-read` (read-only access to other plugins' databases, named
+/// in a `[caps.db] read = [...]` sidecar list that mirrors `argv0`).
+pub const DB: u32 = 1 << 17;
 
 /// Highest bit used above, for `describe`.
-const CAP_BITS: u32 = 17;
+const CAP_BITS: u32 = 18;
 
 /// Granted to every plugin without being asked for.
 pub const DEFAULT_CAPS: u32 = READ_STATE | DISPLAY_MESSAGE | TIMERS;
@@ -64,6 +69,7 @@ pub fn cap_from_name(name: &str) -> Option<u32> {
         "fs-list" => FS_LIST,
         "fs-read-any" => FS_READ_ANY,
         "fs-write-any" => FS_WRITE_ANY,
+        "db" => DB,
         _ => return None,
     })
 }
@@ -87,6 +93,7 @@ pub fn cap_name(flag: u32) -> &'static str {
         FS_LIST => "fs-list",
         FS_READ_ANY => "fs-read-any",
         FS_WRITE_ANY => "fs-write-any",
+        DB => "db",
         _ => "?",
     }
 }

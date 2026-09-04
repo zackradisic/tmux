@@ -89,6 +89,21 @@ pub(crate) mod raw {
         pub fn fs_root(out: i32, cap: i32, len_out: i32) -> i32;
         pub fn home_dir(out: i32, cap: i32, len_out: i32) -> i32;
         pub fn time_now() -> i64;
+        pub fn db_exec(
+            sql_ptr: i32, sql_len: i32, params_ptr: i32, params_len: i32,
+        ) -> i64;
+        pub fn db_query(
+            sql_ptr: i32, sql_len: i32, params_ptr: i32, params_len: i32,
+        ) -> i64;
+        pub fn db_batch(block_ptr: i32, block_len: i32) -> i64;
+        pub fn db_exec_sync(
+            sql_ptr: i32, sql_len: i32, params_ptr: i32, params_len: i32,
+            out_ptr: i32,
+        ) -> i32;
+        pub fn db_query_sync(
+            sql_ptr: i32, sql_len: i32, params_ptr: i32, params_len: i32,
+            owned_out: i32,
+        ) -> i32;
     }
 }
 
@@ -133,6 +148,11 @@ pub(crate) mod raw {
     pub unsafe fn fs_root(out: i32, cap: i32, len_out: i32) -> i32 { -7 }
     pub unsafe fn home_dir(out: i32, cap: i32, len_out: i32) -> i32 { -7 }
     pub unsafe fn time_now() -> i64 { 0 }
+    pub unsafe fn db_exec(sql_ptr: i32, sql_len: i32, params_ptr: i32, params_len: i32) -> i64 { -7 }
+    pub unsafe fn db_query(sql_ptr: i32, sql_len: i32, params_ptr: i32, params_len: i32) -> i64 { -7 }
+    pub unsafe fn db_batch(block_ptr: i32, block_len: i32) -> i64 { -7 }
+    pub unsafe fn db_exec_sync(sql_ptr: i32, sql_len: i32, params_ptr: i32, params_len: i32, out_ptr: i32) -> i32 { -7 }
+    pub unsafe fn db_query_sync(sql_ptr: i32, sql_len: i32, params_ptr: i32, params_len: i32, owned_out: i32) -> i32 { -7 }
 }
 
 /// ABI allocator: 8-aligned, size echoed back on free.

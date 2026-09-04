@@ -110,6 +110,66 @@ extend, never relocate. Debug builds of the host replace every borrowed
 pointer handed to C with a call-lifetime copy, so C code that stashes one
 becomes an ASAN-visible use-after-free in CI.
 
+## Database
+
+Every plugin owns one SQLite database: `store.db` inside its data
+directory (the directory `fs_root` names), shared by all of the plugin's
+instances. SQLite runs on the host, bundled into the plugin host; the
+guest sends SQL text and bound parameters and receives an exec result or
+a result set. The plugin owns the schema and migrates it with
+`PRAGMA user_version`. Capability: `db`.
+
+Wire formats (little-endian, packed; `str` = `u32 len` + UTF-8, no NUL):
+
+```
+value   := u8 ty, payload         one SQL value; ty is SQLite's own code
+   1 INTEGER: i64 | 2 FLOAT: f64 | 3 TEXT: str | 4 BLOB: u32 len, bytes
+   5 NULL: nothing              (TEXT that is not UTF-8 arrives as BLOB)
+params  := u16 count, count * value               guest→host, ?1..?count
+                                   a zero-length buffer = no parameters
+batch   := u16 count, count * { str sql, params }  guest→host, ONE txn
+rows    := u16 ncols, ncols * str name,           host→guest
+           u32 nrows, nrows * ncols * value       rectangular; 0 rows
+                                                  still carry names
+exec    := i64 changes, i64 last_insert_rowid     16-byte out struct
+```
+
+SQL and parameter blocks are raw bytes (host-consumed, no NUL rule) and
+are copied out of guest memory at call time, so the async calls pin
+nothing and hold off no teardown. Parameters are positional only. A
+multi-statement script is accepted only with zero parameters
+(`db_exec`); with parameters, more than one statement is
+`E_BAD_REQUEST`. `db_batch` runs its statements in one transaction and
+one worker task: the first failure rolls everything back with the
+message prefixed `statement #i: `.
+
+Two connections per plugin. The sync imports use one on the main thread
+(for `init` migrations; 500 ms statement cap, inside the CPU budget).
+The async imports use one on the worker pool: every call is one task
+that awaits the connection, so one plugin's statements run one at a
+time (30 s cap) while different plugins run in parallel. Ordering is
+the fs contract: awaited async calls are ordered, concurrent un-awaited
+calls from one plugin are not; a sync call is unordered against async
+calls in flight; a completion the guest has received is visible to a
+later sync read.
+
+Durability: WAL with `synchronous=NORMAL`. A completed write survives a
+server crash or `kill-server`; the writes of the last moments before a
+power loss may be lost as a unit. `restart-server` does not run plugin
+shutdown before it re-executes, so a transaction in flight at that
+moment is rolled back by WAL recovery on the next open.
+
+Limits: a request (SQL + params, or a batch block) is capped at 8 MiB and
+a result set at 8 MiB (`E_LIMIT`; page with `LIMIT`/`OFFSET`). Errors:
+syntax, constraint, missing table or column, type or parameter-count
+mismatch → `E_BAD_REQUEST`; size and time caps → `E_LIMIT`; busy, I/O,
+corruption → `E_HOST`. SQLite's message text is the error message.
+
+SQL sandbox: SQLite can reach the filesystem from SQL, so every
+connection denies `ATTACH`/`DETACH` (authorizer + `SQLITE_LIMIT_ATTACHED
+= 0`), runs with `SQLITE_DBCONFIG_DEFENSIVE`, refuses `VACUUM` (`VACUUM
+INTO` writes anywhere) and has no extension loading.
+
 ## Interning
 
 Event names and payload field keys are u32 ids, interned in one host table
@@ -183,6 +243,8 @@ Errors: sync imports return `0` or `-code`; value-returning imports
 | `home_dir` | `(out, cap, len_out) -> i32` — the server user's home directory | none |
 | `fs_write_sync` | `(path, data Bytes, append) -> i64` (bytes written) | fs-write |
 | `fs_read_sync` | `(path, offset: i64, out, cap, len_out, eof_out) -> i32` | fs-read |
+| `db_exec_sync` | `(sql Bytes, params Bytes, out_ptr) -> i32` — out = 16-byte exec struct; main thread, 500 ms cap | db |
+| `db_query_sync` | `(sql Bytes, params Bytes, owned_out) -> i32` — OwnedBuf = rows block | db |
 | `time_now` | `() -> i64` — Unix time, milliseconds | none |
 | `log` | `(level, ptr, len)` — raw UTF-8; 0=debug 1=info 2=warn 3=error | none |
 
@@ -217,8 +279,11 @@ guest frees (the error message bytes when `err != 0`; empty = none).
 | `fs_list` | `(path Str, out_ptr, out_cap) -> i64` (async; v0 = bytes, v1 = entries) | fs-list |
 | `fs_rename` | `(from Str, to Str, flags) -> i64` | nothing | fs-write |
 | `fs_remove` | `(path Str) -> i64` (async) | nothing | fs-write |
+| `db_exec` | `(sql Bytes, params Bytes) -> i64` | v0 = changes, v1 = last_insert_rowid | db |
+| `db_query` | `(sql Bytes, params Bytes) -> i64` | v0 = nrows, v1 = ncols, data = rows block | db |
+| `db_batch` | `(block Bytes) -> i64` — one transaction | v0 = total changes, v1 = last_insert_rowid | db |
 
-The async fs calls run on the host's fs executor (the tmux loop never
+The async fs calls run on the host's worker pool (the tmux loop never
 blocks) with ZERO copies: a runner reads `fs_write`'s data and fills
 `fs_read`'s out-buffer directly in plugin memory. The buffers are
 pinned by the SDK future until the completion arrives; awaited fs ops
@@ -396,7 +461,10 @@ Defaults always granted: `read-state`, `display-message`, `timers`. Others:
 `cross-scope`, `mode` (UI modes), `fs-read`, `fs-write` (sandboxed to the
 plugin's data directory: `$XDG_DATA_HOME|~/.local/share` +
 `tmux/plugins/<name>/`; relative paths only, no `..`, symlink escapes
-rejected), and reserved: `popup`, `menu`.
+rejected), `fs-list`, `fs-read-any`, `fs-write-any` (see Filesystem
+reach), `db` (the plugin's own SQLite database, see Database), and
+reserved: `popup`, `menu`, `db-read` (read-only access to other plugins'
+databases, to be named in a `[caps.db] read = [...]` sidecar list).
 Scope-implied targeting is enforced on top: a pane-scoped instance may only
 target its own pane, window-scoped its window's panes, session-scoped its
 session's panes; `cross-scope` lifts this.

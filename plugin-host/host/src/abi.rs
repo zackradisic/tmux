@@ -1067,5 +1067,35 @@ fn register_imports(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
         }))
     })?;
 
+    linker.func_wrap(m, im::DB_EXEC, |mut c: Caller<'_, StoreData>, sql_ptr: i32, sql_len: i32, params_ptr: i32, params_len: i32| -> i64 {
+        ret_i64(with_mem(&mut c, |mem| {
+            dispatch::db_exec_async(mem, sql_ptr, sql_len, params_ptr, params_len)
+        }))
+    })?;
+
+    linker.func_wrap(m, im::DB_QUERY, |mut c: Caller<'_, StoreData>, sql_ptr: i32, sql_len: i32, params_ptr: i32, params_len: i32| -> i64 {
+        ret_i64(with_mem(&mut c, |mem| {
+            dispatch::db_query_async(mem, sql_ptr, sql_len, params_ptr, params_len)
+        }))
+    })?;
+
+    linker.func_wrap(m, im::DB_BATCH, |mut c: Caller<'_, StoreData>, block_ptr: i32, block_len: i32| -> i64 {
+        ret_i64(with_mem(&mut c, |mem| {
+            dispatch::db_batch_async(mem, block_ptr, block_len)
+        }))
+    })?;
+
+    linker.func_wrap(m, im::DB_EXEC_SYNC, |mut c: Caller<'_, StoreData>, sql_ptr: i32, sql_len: i32, params_ptr: i32, params_len: i32, out_ptr: i32| -> i32 {
+        ret_i32(with_mem(&mut c, |mem| {
+            dispatch::db_exec_sync(mem, sql_ptr, sql_len, params_ptr, params_len, out_ptr)
+        }))
+    })?;
+
+    linker.func_wrap(m, im::DB_QUERY_SYNC, |mut c: Caller<'_, StoreData>, sql_ptr: i32, sql_len: i32, params_ptr: i32, params_len: i32, owned_out: i32| -> i32 {
+        ret_i32(with_mem(&mut c, |mem| {
+            dispatch::db_query_sync(mem, sql_ptr, sql_len, params_ptr, params_len, owned_out)
+        }))
+    })?;
+
     Ok(())
 }

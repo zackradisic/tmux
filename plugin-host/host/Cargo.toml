@@ -28,6 +28,15 @@ async-executor = "1"
 async-channel = "2"
 futures-lite = "2"
 libc = "0.2"
+# The per-plugin SQLite connection sits behind an async mutex: a
+# statement task that finds it busy parks in the executor instead of
+# holding a runner thread. See sqlite.rs.
+async-lock = "3"
+# Per-plugin SQLite database (db_* imports). Bundled: no system libsqlite3
+# is assumed. `hooks` gives the authorizer and progress handler that make
+# the SQL sandbox and the statement time cap; `limits` the ATTACH limit.
+# All rusqlite usage is confined to sqlite.rs.
+rusqlite = { version = "0.32", features = ["bundled", "hooks", "limits"] }
 
 [dev-dependencies]
 wat = "1"

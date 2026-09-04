@@ -331,6 +331,9 @@ now_ms() -> u64                      // Unix time, milliseconds
 home_dir() -> String                                    // for expanding a leading ~
 fs_write_sync(path, data, append) / fs_read_sync(path, offset, &mut buf)
     // small files; paths relative to fs_root; caps fs-write / fs-read
+db_exec_sync(sql, params![...]) -> Result<ExecResult, _>   // cap db;
+db_query_sync(sql, params![...]) -> Result<Rows, _>        // init-time
+    // migrations and one-row reads only: main thread, 500 ms cap
 
 // UI modes (capability: mode) — see the "UI modes" section
 mode_open(&ModeOpts { window?, width, height, x?, y?, title? })
@@ -361,6 +364,9 @@ fs_rename(from, to, RenameFlag).await                   // atomic in the sandbox
     // syncs data before the name moves, so a reader never sees a mix
 fs_remove(path).await                                   // unlink one file;
     // NoSuchObject if it is already gone (ignore it for an idempotent delete)
+db_exec(sql, params![...]).await -> ExecResult { changes, last_insert_rowid }
+db_query(sql, params![...]).await -> Rows               // see "Database"
+db_batch(&[(sql, params![...]), ...]).await -> ExecResult // ONE transaction
 ```
 
 Async tasks are spawned with `ctx.spawn(async move { ... })` in `init` (or
@@ -428,6 +434,9 @@ load-plugin -c send-keys -c run-process ... myplugin.wasm
 | `run-command` | `run_command` |
 | `cross-scope` | acting on objects outside the instance's scope |
 | `mode` | UI modes (`mode_open` and friends) |
+| `fs-read` / `fs-write` / `fs-list` | the `fs_*` calls, inside the data directory |
+| `fs-read-any` / `fs-write-any` | `fs_*` calls outside the data directory |
+| `db` | the plugin's own SQLite database (`db_*` calls) |
 
 Denied calls return `HostError { code: E_CAP_DENIED }` — handle errors, do
 not unwrap host results.
@@ -441,6 +450,67 @@ requests = ["run-process", "write-options"]
 [caps.run-process]
 argv0 = ["git"]
 ```
+
+## Database: a SQLite file per plugin
+
+With the `db` capability a plugin owns one SQLite database, `store.db`
+inside its data directory, shared by all of its instances. SQLite runs
+on the host (the plugin ships no SQLite code). The plugin owns the
+schema and migrates it with `PRAGMA user_version` in `init`, through
+the sync calls; everything else goes through the async calls, which run
+on the host's worker pool, one statement at a time per plugin.
+
+```rust
+const SCHEMA: &str = "
+    CREATE TABLE notes (id INTEGER PRIMARY KEY, pane INTEGER, text TEXT);
+    PRAGMA user_version = 1;";
+
+fn init(ctx: &Ctx, _cfg: Config) -> Result<Self, String> {
+    let v = db_query_sync("PRAGMA user_version", params![])
+        .map_err(|e| e.to_string())?;
+    if v.scalar().and_then(DbValue::as_i64) == Some(0) {
+        // A script: several statements, no parameters.
+        db_exec_sync(SCHEMA, params![]).map_err(|e| e.to_string())?;
+    }
+    Ok(Self {})
+}
+
+fn on_event(&mut self, ctx: &Ctx, event: Event) {
+    let pane = event.scope.pane.map(|p| i64::from(p));
+    let text = event.get_str("text").unwrap_or_default().to_string();
+    ctx.spawn(async move {
+        // `None` binds NULL; every `?N` needs one value.
+        let _ = db_exec("INSERT INTO notes (pane, text) VALUES (?1, ?2)",
+                        params![pane, text]).await;
+        if let Ok(rows) = db_query(
+            "SELECT id, text FROM notes WHERE pane = ?1 ORDER BY id DESC LIMIT 5",
+            params![pane]).await
+        {
+            for row in rows.iter() {
+                let id = row.get_named("id").and_then(DbValue::as_i64);
+                let text = row.get_named("text").and_then(DbValue::as_str);
+                log(&format!("{id:?}: {text:?}"));
+            }
+        }
+    });
+}
+```
+
+Rules of thumb:
+
+- Bind values with `params![...]`; never format them into the SQL.
+- Keep sync calls to `init`: they run on the tmux main thread with a
+  500 ms cap and count against the CPU budget.
+- Use `db_batch` for a group of writes. It is one transaction and one
+  host task; a loop of `db_exec` spawns a task per statement.
+- Page big reads with `LIMIT`/`OFFSET`; a result set over 8 MiB fails
+  with `E_LIMIT`.
+- SQLite's own errors come back as `E_BAD_REQUEST` with SQLite's message
+  (bad SQL, a UNIQUE violation, a missing table, a parameter-count
+  mismatch). Busy and I/O errors are `E_HOST`.
+- The file is WAL mode with `synchronous=NORMAL`: a completed write
+  survives a tmux crash or `kill-server`. `ATTACH` and `VACUUM` are
+  refused.
 
 ## UI modes: interactive panels
 
@@ -543,3 +613,14 @@ object. notify-toast uses this for `#{pane_current_command}` and
 async loop, jobs, tmux commands, snapshot/restore. Build it with
 `cargo build -p ticker --target wasm32-unknown-unknown --release` from
 `plugin-host/`.
+
+`plugin-host/examples/cron/` is the database example: scheduled jobs
+whose state lives entirely in `store.db`. It shows the schema and
+`PRAGMA user_version` migration in a sync `init`, `db_batch` around every
+multi-statement write (claiming a run, finalising it with retry and
+retention in one transaction), a single timer loop that re-reads the
+database on every wake, and a picker. Its regress tests
+(`regress/plugin-cron.sh`, `regress/plugin-cron-picker.sh`) assert rows
+straight from the file with python's `sqlite3` module, including the
+`interrupted` marking and catch-up runs after `kill-server` and
+`restart-server`.

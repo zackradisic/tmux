@@ -20,8 +20,10 @@ mod manifest;
 mod modes;
 mod registry;
 mod reload;
+mod sqlite;
 mod state;
 mod tokens;
+mod worker;
 
 pub use ffi::*;
 
@@ -111,13 +113,15 @@ pub unsafe extern "C" fn pgh_init(vt: *const pgh_host_vtable) -> c_int {
 #[no_mangle]
 pub extern "C" fn pgh_shutdown() {
     ffi_guard!((), {
-        // Finish (and join) the fs worker first: its in-flight jobs read
-        // and write pinned guest memory, so the stores must still be
+        // Finish (and join) the worker pool first: its in-flight fs jobs
+        // read and write pinned guest memory, so the stores must still be
         // alive here.
-        fsworker::shutdown();
-        // The worker is joined, so no job can still hold a root; drop the
-        // cached sandbox descriptors.
+        worker::shutdown();
+        // The pool is joined, so no job can still hold a root or run a
+        // statement; drop the cached sandbox descriptors and close the
+        // database connections (the last close checkpoints each WAL).
         fsbox::forget_all();
+        sqlite::forget_all();
         // Give every live instance its on_unload (tiny budget) before the
         // stores drop: server shutdown is a safe point like any drain.
         let mut doomed: Vec<registry::Instance> = Vec::new();
@@ -487,20 +491,21 @@ pub extern "C" fn pgh_drain(max_us: u32) -> u32 {
     ffi_guard!(0, events::drain(max_us))
 }
 
-/// The fs worker's pollable doorbell fd (created on first call). The C
-/// side registers a persistent read event on it whose callback calls
+/// The worker pool's pollable doorbell fd (created on first call). The
+/// C side registers a persistent read event on it whose callback calls
 /// pgh_fs_drain() then plugin_schedule_drain(). Returns -1 on failure.
+/// The name predates the pool: it carries db completions too.
 #[no_mangle]
 pub extern "C" fn pgh_fs_notify_fd() -> c_int {
-    ffi_guard!(-1, fsworker::notify_fd())
+    ffi_guard!(-1, worker::notify_fd())
 }
 
-/// Move finished fs completions onto the plugin delivery queue (they are
-/// delivered to guests at the next pgh_drain). Main thread only; called
-/// from the doorbell event callback.
+/// Move finished worker completions (fs and db) onto the plugin delivery
+/// queue (they are delivered to guests at the next pgh_drain). Main
+/// thread only; called from the doorbell event callback.
 #[no_mangle]
 pub extern "C" fn pgh_fs_drain() {
-    ffi_guard!((), fsworker::drain())
+    ffi_guard!((), worker::drain())
 }
 
 /// Write a human-readable plugin listing (for `show-plugins`) into the sink.

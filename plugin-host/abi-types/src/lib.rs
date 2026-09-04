@@ -83,6 +83,8 @@ pub mod exports {
     pub const ON_UNLOAD: &str = "pgh_on_unload";
 }
 
+pub mod db;
+
 /// Host import module name and per-method function names.
 ///
 /// Signatures (wasm core types; `u32` values travel as `i32` bit-casts):
@@ -141,6 +143,21 @@ pub mod exports {
 /// fs_root(out, cap, len_out) -> i32              // the data dir's abs path
 /// home_dir(out, cap, len_out) -> i32            // the server user's home
 /// time_now() -> i64                             // Unix time, milliseconds
+///
+/// // database (capability db; the plugin's own SQLite file; SQL and
+/// // blocks are raw bytes, host-consumed, no NUL rule; see `db`):
+/// db_exec(sql_ptr, sql_len, params_ptr, params_len) -> i64
+///                       // async; v0 = changes, v1 = last_insert_rowid
+///                       // params count 0 => multi-statement script allowed
+/// db_query(sql_ptr, sql_len, params_ptr, params_len) -> i64
+///                       // async; data = rows block, v0 = nrows, v1 = ncols
+/// db_batch(block_ptr, block_len) -> i64
+///                       // async; ONE transaction; v0 = total changes,
+///                       // v1 = last_insert_rowid after the last statement
+/// db_exec_sync(sql_ptr, sql_len, params_ptr, params_len, out_ptr) -> i32
+///                       // out_ptr -> 16-byte exec struct
+/// db_query_sync(sql_ptr, sql_len, params_ptr, params_len, owned_out) -> i32
+///                       // OwnedBuf = rows block
 /// ```
 pub mod imports {
     pub const MODULE: &str = "tmux";
@@ -182,6 +199,12 @@ pub mod imports {
     pub const FS_ROOT: &str = "fs_root";
     pub const HOME_DIR: &str = "home_dir";
     pub const TIME_NOW: &str = "time_now";
+
+    pub const DB_EXEC: &str = "db_exec";
+    pub const DB_QUERY: &str = "db_query";
+    pub const DB_BATCH: &str = "db_batch";
+    pub const DB_EXEC_SYNC: &str = "db_exec_sync";
+    pub const DB_QUERY_SYNC: &str = "db_query_sync";
 }
 
 /// Structured error codes. Sync imports return `-code`; `host_request`-style
@@ -488,6 +511,12 @@ impl<'a> Cursor<'a> {
         let len = self.u32()? as usize;
         let bytes = self.take(len)?;
         std::str::from_utf8(bytes).map_err(|_| WireError::BadUtf8)
+    }
+
+    /// u32-length-prefixed raw bytes (no UTF-8 requirement).
+    pub fn bytes(&mut self) -> Result<&'a [u8], WireError> {
+        let len = self.u32()? as usize;
+        self.take(len)
     }
 }
 
@@ -930,6 +959,14 @@ impl SelfInfo {
 pub const MAX_MODE_WRITE_BYTES: usize = 256 * 1024;
 /// Cap on captured job output carried in a completion.
 pub const MAX_JOB_OUTPUT_BYTES: usize = 256 * 1024;
+/// Cap on one database request: SQL plus params, or a whole batch block.
+/// The host copies the request out of guest memory before the statement
+/// runs on a worker thread, so this bounds that copy.
+pub const MAX_DB_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+/// Cap on one result set (the rows block). It is delivered into the
+/// guest through `pgh_alloc`; a query that needs more should page with
+/// `LIMIT`/`OFFSET`.
+pub const MAX_DB_ROWS_BYTES: usize = 8 * 1024 * 1024;
 
 #[cfg(test)]
 mod tests {

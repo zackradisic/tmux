@@ -931,3 +931,129 @@ pub fn fs_read_sync(
     buf.truncate(len as usize);
     Ok(eof != 0)
 }
+
+// ---- database (capability: db) ----
+//
+// Every plugin owns one SQLite database, `store.db` inside its data
+// directory (the same directory `fs_root` names), shared by all of the
+// plugin's instances. The host runs SQLite in WAL mode with
+// `synchronous=NORMAL`: a completed write survives a tmux crash, and the
+// last few writes before a power loss may be lost as a unit.
+//
+// The plugin owns its schema. Migrate it in `init` with `db_exec_sync`
+// and `PRAGMA user_version` (read the version, apply the steps, set the
+// new version in the same script). Keep sync calls tiny: they run on the
+// tmux main thread with a 500 ms cap and count against the instance's
+// CPU budget. Everything else goes through the async calls, which run
+// one statement at a time per plugin on the host's worker pool.
+//
+// Parameters are positional (`?1`, `?2`, ... or bare `?`) and passed as
+// [`DbValue`]s, most easily with the [`params!`](crate::params) macro.
+// A multi-statement script is allowed only when there are no
+// parameters. Awaited calls are ordered; concurrent un-awaited calls
+// from one plugin are not. For a burst of writes use [`db_batch`]: it
+// is one transaction and one worker task, where a loop of `db_exec`
+// spawns a task per statement.
+//
+// Result sets are capped at 8 MiB (`E_LIMIT`); page with LIMIT/OFFSET.
+// SQLite errors come back as `E_BAD_REQUEST` (your SQL: syntax,
+// constraint, missing table, parameter count), `E_LIMIT` (size or time
+// cap) or `E_HOST` (busy, I/O), with SQLite's message in the error.
+
+pub use tmux_plugin_abi::db::{DbValue, ExecResult, Row, Rows};
+
+/// Run a statement that returns no rows (INSERT, UPDATE, DELETE, DDL) on
+/// the host's worker pool. With no parameters, `sql` may be a whole
+/// script of `;`-separated statements; `changes` is then the total.
+pub async fn db_exec(sql: &str, params: &[DbValue]) -> Result<ExecResult, HostError> {
+    let fut = {
+        let p = tmux_plugin_abi::db::encode_params(params);
+        let token = unsafe {
+            raw::db_exec(
+                sql.as_ptr() as i32,
+                sql.len() as i32,
+                p.as_ptr() as i32,
+                p.len() as i32,
+            )
+        };
+        // The host copies sql and params before returning: nothing to pin.
+        start_async(token)?
+    };
+    let Completion { v0, v1, .. } = fut.await?;
+    Ok(ExecResult { changes: v0, last_insert_rowid: v1 })
+}
+
+/// Run one statement and collect its result set.
+pub async fn db_query(sql: &str, params: &[DbValue]) -> Result<Rows, HostError> {
+    let fut = {
+        let p = tmux_plugin_abi::db::encode_params(params);
+        let token = unsafe {
+            raw::db_query(
+                sql.as_ptr() as i32,
+                sql.len() as i32,
+                p.as_ptr() as i32,
+                p.len() as i32,
+            )
+        };
+        start_async(token)?
+    };
+    let c = fut.await?;
+    Rows::decode(&c.data).map_err(|_| wire_err())
+}
+
+/// Run several statements in ONE transaction and one worker task. The
+/// first failure rolls everything back; its message is prefixed with
+/// `statement #i: `. `changes` is the total; `last_insert_rowid` is
+/// SQLite's value after the last statement.
+pub async fn db_batch(stmts: &[(&str, &[DbValue])]) -> Result<ExecResult, HostError> {
+    let fut = {
+        let owned: Vec<tmux_plugin_abi::db::BatchStmt> = stmts
+            .iter()
+            .map(|(sql, params)| tmux_plugin_abi::db::BatchStmt {
+                sql: (*sql).to_string(),
+                params: params.to_vec(),
+            })
+            .collect();
+        let block = tmux_plugin_abi::db::encode_batch(&owned);
+        let token =
+            unsafe { raw::db_batch(block.as_ptr() as i32, block.len() as i32) };
+        start_async(token)?
+    };
+    let Completion { v0, v1, .. } = fut.await?;
+    Ok(ExecResult { changes: v0, last_insert_rowid: v1 })
+}
+
+/// Synchronous [`db_exec`] on the main thread, for `init` migrations and
+/// nothing bigger (500 ms cap, counted against the CPU budget).
+pub fn db_exec_sync(sql: &str, params: &[DbValue]) -> Result<ExecResult, HostError> {
+    let p = tmux_plugin_abi::db::encode_params(params);
+    let mut out = [0u8; tmux_plugin_abi::db::EXEC_RESULT_LEN];
+    let rc = unsafe {
+        raw::db_exec_sync(
+            sql.as_ptr() as i32,
+            sql.len() as i32,
+            p.as_ptr() as i32,
+            p.len() as i32,
+            out.as_mut_ptr() as i32,
+        )
+    };
+    check(rc)?;
+    ExecResult::from_bytes(&out).map_err(|_| wire_err())
+}
+
+/// Synchronous [`db_query`] on the main thread; same budget warning as
+/// [`db_exec_sync`]. Meant for `PRAGMA user_version` and other one-row
+/// reads during `init`.
+pub fn db_query_sync(sql: &str, params: &[DbValue]) -> Result<Rows, HostError> {
+    let p = tmux_plugin_abi::db::encode_params(params);
+    let owned = call_owned(|out| unsafe {
+        raw::db_query_sync(
+            sql.as_ptr() as i32,
+            sql.len() as i32,
+            p.as_ptr() as i32,
+            p.len() as i32,
+            out,
+        )
+    })?;
+    Rows::decode(&owned).map_err(|_| wire_err())
+}

@@ -1056,6 +1056,166 @@ pub fn fs_root(
     mem.write_out(text.as_bytes(), out, cap, len_out)
 }
 
+// ---------------------------------------------------------------------------
+// Database: the plugin's own SQLite file, `store.db` in its data
+// directory (see sqlite.rs). SQL and parameter blocks are raw bytes
+// (host-consumed, no NUL rule) and are COPIED out of guest memory at call
+// time, so the async pair pins nothing: the statement runs on a worker
+// thread against host-owned copies and the rows come back as completion
+// data. The sync pair runs on the main thread with a 500 ms cap, for
+// `init` migrations and tiny reads.
+// ---------------------------------------------------------------------------
+
+/// The SQL text, copied and UTF-8 checked. Empty is a BadRequest here
+/// rather than a SQLite error, for the message.
+fn db_sql(mem: &GuestMem<'_, '_>, ptr: i32, len: i32) -> Result<String, HostError> {
+    if len <= 0 {
+        return Err(err(ErrorCode::BadRequest, "empty SQL statement"));
+    }
+    let bytes = mem.read(ptr, len)?;
+    String::from_utf8(bytes)
+        .map_err(|_| err(ErrorCode::BadRequest, "SQL is not valid UTF-8"))
+}
+
+/// The bound parameters. `ptr 0, len 0` (or any zero-length block) means
+/// none, which also permits a multi-statement script.
+fn db_params(
+    mem: &GuestMem<'_, '_>,
+    ptr: i32,
+    len: i32,
+) -> Result<Vec<tmux_plugin_abi::db::DbValue>, HostError> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let bytes = mem.read(ptr, len)?;
+    tmux_plugin_abi::db::decode_params(&bytes)
+        .map_err(|e| err(ErrorCode::BadRequest, format!("bad params block: {e}")))
+}
+
+/// Request size cap, checked before anything is copied.
+fn db_check_size(len: i32, extra: i32) -> Result<(), HostError> {
+    let total = len.max(0) as usize + extra.max(0) as usize;
+    if total > tmux_plugin_abi::MAX_DB_REQUEST_BYTES {
+        return Err(err(
+            ErrorCode::Limit,
+            format!(
+                "request is {total} bytes, the limit is {}",
+                tmux_plugin_abi::MAX_DB_REQUEST_BYTES
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Start one async statement task: allocate the token, take the detached
+/// in-flight guard, hand the job to sqlite::submit.
+fn db_start(
+    mem: &mut GuestMem<'_, '_>,
+    job: crate::sqlite::DbJob,
+) -> Result<i64, HostError> {
+    let root = fs_root_of(mem)?;
+    let handle = crate::sqlite::handle_for(&mem.data().plugin, &root);
+    let data = mem.data();
+    let key = (data.plugin.clone(), data.scope, data.generation);
+    let token = alloc_token(mem);
+    let guard = match crate::worker::track(key, false) {
+        Ok(g) => g,
+        Err(e) => {
+            crate::tokens::discard(token);
+            return Err(err(ErrorCode::Host, e));
+        }
+    };
+    crate::sqlite::submit(
+        &handle,
+        crate::sqlite::DbRequest { token, guard, job },
+    );
+    Ok(token as i64)
+}
+
+pub fn db_exec_async(
+    mem: &mut GuestMem<'_, '_>,
+    sql_ptr: i32,
+    sql_len: i32,
+    params_ptr: i32,
+    params_len: i32,
+) -> Result<i64, HostError> {
+    check_cap(mem, crate::caps::DB)?;
+    db_check_size(sql_len, params_len)?;
+    let sql = db_sql(mem, sql_ptr, sql_len)?;
+    let params = db_params(mem, params_ptr, params_len)?;
+    db_start(mem, crate::sqlite::DbJob::Exec { sql, params })
+}
+
+pub fn db_query_async(
+    mem: &mut GuestMem<'_, '_>,
+    sql_ptr: i32,
+    sql_len: i32,
+    params_ptr: i32,
+    params_len: i32,
+) -> Result<i64, HostError> {
+    check_cap(mem, crate::caps::DB)?;
+    db_check_size(sql_len, params_len)?;
+    let sql = db_sql(mem, sql_ptr, sql_len)?;
+    let params = db_params(mem, params_ptr, params_len)?;
+    db_start(mem, crate::sqlite::DbJob::Query { sql, params })
+}
+
+pub fn db_batch_async(
+    mem: &mut GuestMem<'_, '_>,
+    block_ptr: i32,
+    block_len: i32,
+) -> Result<i64, HostError> {
+    check_cap(mem, crate::caps::DB)?;
+    db_check_size(block_len, 0)?;
+    let bytes = mem.read(block_ptr, block_len)?;
+    let stmts = tmux_plugin_abi::db::decode_batch(&bytes)
+        .map_err(|e| err(ErrorCode::BadRequest, format!("bad batch block: {e}")))?;
+    if stmts.is_empty() {
+        return Err(err(ErrorCode::BadRequest, "empty batch"));
+    }
+    db_start(mem, crate::sqlite::DbJob::Batch { stmts })
+}
+
+pub fn db_exec_sync(
+    mem: &mut GuestMem<'_, '_>,
+    sql_ptr: i32,
+    sql_len: i32,
+    params_ptr: i32,
+    params_len: i32,
+    out_ptr: i32,
+) -> Result<(), HostError> {
+    check_cap(mem, crate::caps::DB)?;
+    db_check_size(sql_len, params_len)?;
+    let sql = db_sql(mem, sql_ptr, sql_len)?;
+    let params = db_params(mem, params_ptr, params_len)?;
+    let root = fs_root_of(mem)?;
+    let result = crate::sqlite::with_sync(&mem.data().plugin, &root, |conn| {
+        crate::sqlite::exec(conn, &sql, &params)
+    })?;
+    mem.write_at(out_ptr, &result.to_bytes())
+}
+
+pub fn db_query_sync(
+    mem: &mut GuestMem<'_, '_>,
+    sql_ptr: i32,
+    sql_len: i32,
+    params_ptr: i32,
+    params_len: i32,
+    owned_out: i32,
+) -> Result<(), HostError> {
+    check_cap(mem, crate::caps::DB)?;
+    db_check_size(sql_len, params_len)?;
+    let sql = db_sql(mem, sql_ptr, sql_len)?;
+    let params = db_params(mem, params_ptr, params_len)?;
+    let root = fs_root_of(mem)?;
+    let (rows, _, _) = crate::sqlite::with_sync(&mem.data().plugin, &root, |conn| {
+        crate::sqlite::query(conn, &sql, &params)
+    })?;
+    // The connection borrow ended above; give_owned may re-enter the
+    // guest allocator now.
+    mem.give_owned(&rows, owned_out)
+}
+
 pub fn timer_start(mem: &mut GuestMem<'_, '_>, ms: i64) -> Result<i64, HostError> {
     check_cap(mem, crate::caps::TIMERS)?;
     if ms < 0 {

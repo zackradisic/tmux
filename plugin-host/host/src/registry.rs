@@ -214,9 +214,11 @@ impl Registry {
                 self.dying.push(inst);
             }
         }
-        // Release the plugin's cached sandbox root descriptor. An fs job
-        // still in flight holds its own Arc, so this cannot disturb it.
+        // Release the plugin's cached sandbox root descriptor and database
+        // connections. An fs or db job still in flight holds its own Arc,
+        // so this cannot disturb it.
         crate::fsbox::forget(name);
+        crate::sqlite::forget(name);
         hostlog::info(name, "unloaded");
         true
     }

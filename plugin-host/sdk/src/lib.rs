@@ -58,10 +58,30 @@ pub mod prelude {
     pub use crate::ids::*;
     pub use crate::strings::{AsTmuxStr, TmuxString};
     pub use crate::tmux_plugin;
-    pub use crate::{Ctx, Plugin};
+    pub use crate::{params, Ctx, Plugin};
+    pub use tmux_plugin_abi::db::{DbValue, ExecResult, Row, Rows};
     pub use tmux_plugin_abi::{
         ClientInfo, EventScope, HostError, PaneInfo, SelfInfo, SessionInfo,
         WindowInfo,
+    };
+}
+
+/// Build the bound-parameter slice for the `db_*` calls from any values
+/// that convert into [`DbValue`](tmux_plugin_abi::db::DbValue): integers,
+/// bools, f64, `&str`/`String`, byte vectors and `Option`s of those
+/// (`None` binds NULL).
+///
+/// ```ignore
+/// db_exec("INSERT INTO jobs (name, every_ms) VALUES (?1, ?2)",
+///         params!["backup", 3_600_000i64]).await?;
+/// ```
+#[macro_export]
+macro_rules! params {
+    () => {
+        &[] as &[$crate::abi::db::DbValue]
+    };
+    ($($v:expr),+ $(,)?) => {
+        &[$($crate::abi::db::DbValue::from($v)),+] as &[$crate::abi::db::DbValue]
     };
 }
 
