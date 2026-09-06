@@ -952,6 +952,10 @@ fn register_imports(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
         }))
     })?;
 
+    linker.func_wrap(m, im::PANE_PID, |mut c: Caller<'_, StoreData>, pane: i32| -> i64 {
+        ret_i64(with_mem(&mut c, |mem| dispatch::pane_pid(mem, pane)))
+    })?;
+
     linker.func_wrap(m, im::DISPLAY_MESSAGE, |mut c: Caller<'_, StoreData>, client: i32, msg_ptr: i32, msg_len: i32| -> i32 {
         ret_i32(with_mem(&mut c, |mem| {
             dispatch::display_message(mem, client, msg_ptr, msg_len)

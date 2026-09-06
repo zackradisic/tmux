@@ -183,6 +183,8 @@ pub mod imports {
     ///                       // foreground process, one per line;
     ///                       // -2 = none
     pub const PANE_FDS: &str = "pane_fds";
+    /// pane_pid(pane) -> i64  // foreground process-group pid; <=0 = gone
+    pub const PANE_PID: &str = "pane_pid";
     pub const DISPLAY_MESSAGE: &str = "display_message";
     pub const TIMER_CANCEL: &str = "timer_cancel";
     pub const MODE_OPEN: &str = "mode_open";

@@ -73,6 +73,10 @@ pub unsafe extern "C" fn vt_pane_fds(
     -1
 }
 
+pub unsafe extern "C" fn vt_pane_pid(_p: u32) -> c_int {
+    -1
+}
+
 pub unsafe extern "C" fn vt_get_option(
     _k: c_int,
     _i: u32,
@@ -195,6 +199,7 @@ pub fn base_vtable() -> pgh_host_vtable {
         capture_pane: vt_capture_pane,
         pane_env: vt_pane_env,
         pane_fds: vt_pane_fds,
+        pane_pid: vt_pane_pid,
         get_option: vt_get_option,
         set_option: vt_set_option,
         display_message: vt_display_message,

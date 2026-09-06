@@ -64,6 +64,7 @@ int	 plugin_vtable_send_keys(u_int, const char *, int);
 int	 plugin_vtable_capture_pane(u_int, int, int, int, pgh_sink, void *);
 int	 plugin_vtable_pane_env(u_int, const char *, pgh_sink, void *);
 int	 plugin_vtable_pane_fds(u_int, pgh_sink, void *);
+int	 plugin_vtable_pane_pid(u_int);
 int	 plugin_vtable_get_option(int, u_int, const char *, pgh_sink, void *);
 int	 plugin_vtable_set_option(int, u_int, const char *, const char *);
 int	 plugin_vtable_display_message(int, const char *, const char *);

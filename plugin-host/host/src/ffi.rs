@@ -101,6 +101,8 @@ pub struct pgh_host_vtable {
         sink: pgh_sink,
         ctx: *mut c_void,
     ) -> c_int,
+    /// The pid of a pane's foreground process group, or -1 if dead.
+    pub pane_pid: unsafe extern "C" fn(pane_id: u32) -> c_int,
     /// Get an option value as a string (kind -1 = server/global scope).
     /// 0 ok, -1 dead target, -2 no such option.
     pub get_option: unsafe extern "C" fn(

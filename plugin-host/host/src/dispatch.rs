@@ -476,6 +476,22 @@ pub fn pane_fds(
     }
 }
 
+pub fn pane_pid(
+    mem: &mut GuestMem<'_, '_>,
+    pane: i32,
+) -> Result<i64, HostError> {
+    // Just an integer, no more sensitive than the pane info a plugin
+    // already reads, so scope targeting is the only gate.
+    let pane = pane_id(pane)?;
+    check_pane_target(mem, pane)?;
+    let vt = vtable()?;
+    let pid = unsafe { (vt.pane_pid)(pane) };
+    if pid <= 0 {
+        return Err(err(ErrorCode::NoSuchObject, format!("no such pane %{pane}")));
+    }
+    Ok(i64::from(pid))
+}
+
 pub fn capture_pane(
     mem: &mut GuestMem<'_, '_>,
     pane: i32,

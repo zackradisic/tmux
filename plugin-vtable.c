@@ -444,6 +444,23 @@ plugin_vtable_pane_env(u_int pane_id, const char *name, pgh_sink sink,
 	return (0);
 }
 
+/* Return the pid of a pane's foreground process group, or -1. */
+int
+plugin_vtable_pane_pid(u_int pane_id)
+{
+	struct window_pane	*wp;
+	pid_t			 pgrp;
+
+	wp = window_pane_find_by_id(pane_id);
+	if (wp == NULL || (wp->flags & PANE_DESTROYED) || wp->fd == -1)
+		return (-1);
+
+	pgrp = tcgetpgrp(wp->fd);
+	if (pgrp == -1)
+		return (-1);
+	return ((int)pgrp);
+}
+
 /* Return the open-file paths of a pane's foreground process, one per line. */
 int
 plugin_vtable_pane_fds(u_int pane_id, pgh_sink sink, void *ctx)

@@ -380,6 +380,19 @@ pub fn pane_fds(pane: PaneId) -> Result<Option<Vec<String>>, HostError> {
     }
 }
 
+/// The pid of a pane's foreground process group.
+///
+/// This is the leader pid tmux uses for `#{pane_current_command}` and the
+/// like - the same pid a directly-exec'd CLI reports as its own. Returns
+/// `Ok(None)` when the pane is gone.
+pub fn pane_pid(pane: PaneId) -> Result<Option<u32>, HostError> {
+    match check_i64(unsafe { raw::pane_pid(pane.0 as i32) }) {
+        Ok(v) => Ok(Some(v as u32)),
+        Err(e) if e.code == ErrorCode::NoSuchObject => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// Show a status-line message on all attached clients (and the message log).
 pub fn display_message(msg: impl AsTmuxStr) -> Result<(), HostError> {
     let msg = msg.to_tmux();
@@ -579,6 +592,13 @@ pub async fn sleep_ms(ms: u64) -> Result<(), HostError> {
         return Err(host_err(token as i32));
     }
     HostFuture::timer(token as u64).await.map(|_| ())
+}
+
+/// Spawn a detached background task on the plugin's executor. Runs at the
+/// next drain, like [`crate::Ctx::spawn`], but callable without a `Ctx` -
+/// e.g. from inside another task.
+pub fn spawn(fut: impl core::future::Future<Output = ()> + 'static) {
+    crate::executor::spawn(fut);
 }
 
 // ---- filesystem (capabilities: fs-read / fs-write) ----

@@ -71,6 +71,7 @@ plugin_init(void)
 	vt.capture_pane = plugin_vtable_capture_pane;
 	vt.pane_env = plugin_vtable_pane_env;
 	vt.pane_fds = plugin_vtable_pane_fds;
+	vt.pane_pid = plugin_vtable_pane_pid;
 	vt.get_option = plugin_vtable_get_option;
 	vt.set_option = plugin_vtable_set_option;
 	vt.display_message = plugin_vtable_display_message;

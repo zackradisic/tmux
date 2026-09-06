@@ -176,6 +176,7 @@ typedef struct {
    */
   int (*pane_env)(uint32_t pane_id, const char *name, pgh_sink sink, void *ctx);
   int (*pane_fds)(uint32_t pane_id, pgh_sink sink, void *ctx);
+  int (*pane_pid)(uint32_t pane_id);
   /**
    * Get an option value as a string (kind -1 = server/global scope).
    * 0 ok, -1 dead target, -2 no such option.
