@@ -1072,15 +1072,28 @@ fn pick_render(p: &mut Picker) {
                     let age = fmt_age(
                         p.now_ms.saturating_sub(a.active_ms() as u64) / 1000,
                     );
-                    let name = clip(&display_name(a), 18);
-                    let task = a.task.as_deref().unwrap_or("");
+                    // kind + age are fixed columns at the right edge; the
+                    // name (with the task, when there is one) fills all the
+                    // width that is left.
+                    let right =
+                        format!("{:<8} {:>6}", clip(&a.kind, 8), age);
+                    // prefix = "▸ ● " (marker + badge), gap = 2 before right.
+                    let label_w = list_w
+                        .saturating_sub(1)
+                        .saturating_sub(4 + 2 + right.chars().count())
+                        .max(8);
+                    let mut label = display_name(a);
+                    if let Some(t) =
+                        a.task.as_deref().filter(|s| !s.is_empty())
+                    {
+                        label = format!("{label}  ·  {t}");
+                    }
+                    let label = clip(&label, label_w);
                     // The badge carries its own colour codes; keep it out
-                    // of the width budget by composing plain text first.
-                    // kind is a small tag; the resolved name leads.
-                    let plain = format!(
-                        "{marker}   {name:<18} {kind:<8} {age:>6}  {task}",
-                        kind = a.kind,
-                    );
+                    // of the width budget by composing plain text first,
+                    // then splicing the badge over the marker's gap.
+                    let plain =
+                        format!("{marker}   {label:<label_w$}  {right}");
                     let plain = clip(&plain, list_w.saturating_sub(1));
                     // Splice the coloured badge back in over the two
                     // spaces after the marker.
