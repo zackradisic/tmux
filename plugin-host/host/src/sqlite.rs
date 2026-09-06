@@ -262,6 +262,17 @@ fn running() -> &'static async_lock::Semaphore {
     })
 }
 
+/// Best-effort text of a caught panic payload.
+fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
 /// Spawn one statement task. Main thread only; the caller has already
 /// copied the request out of guest memory and taken the in-flight guard.
 pub fn submit(h: &Arc<DbHandle>, req: DbRequest) {
@@ -273,21 +284,36 @@ pub fn submit(h: &Arc<DbHandle>, req: DbRequest) {
         // Parked in the executor while another statement of this plugin
         // runs.
         let mut slot = h.conn.lock().await;
-        let result = match &mut *slot {
-            Some(conn) => run(conn, job),
-            None => match Conn::open(&h.path, ASYNC_BUSY) {
-                Ok(conn) => {
-                    let conn = slot.insert(conn);
-                    run(conn, job)
-                }
-                Err(e) => Err(e),
+        // Isolate a statement panic: catch it, so it neither kills the
+        // pool thread nor leaves this call's `.await` hung forever. The
+        // call gets an E_HOST error and the panic detail is logged.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || match &mut *slot {
+                Some(conn) => run(conn, job),
+                None => match Conn::open(&h.path, ASYNC_BUSY) {
+                    Ok(conn) => {
+                        let conn = slot.insert(conn);
+                        run(conn, job)
+                    }
+                    Err(e) => Err(e),
+                },
             },
-        };
+        ));
         drop(slot);
-        worker::post(match result {
-            Ok((v0, v1, data)) => Completion { token, err: 0, v0, v1, data },
-            Err(e) => worker::err_completion(token, e.code, e.message),
-        });
+        let completion = match result {
+            Ok(Ok((v0, v1, data))) => Completion { token, err: 0, v0, v1, data },
+            Ok(Err(e)) => worker::err_completion(token, e.code, e.message),
+            Err(panic) => {
+                let msg = panic_message(&panic);
+                worker::worker_log(format!("db statement panicked: {msg}"));
+                worker::err_completion(
+                    token,
+                    ErrorCode::Host,
+                    format!("db statement panicked: {msg}"),
+                )
+            }
+        };
+        worker::post(completion);
         // After the post: shutdown() waits on this guard, so it never
         // closes a connection mid-statement.
         drop(guard);

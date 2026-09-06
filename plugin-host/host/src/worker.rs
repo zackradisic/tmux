@@ -77,6 +77,10 @@ struct State {
     /// Every task posts its completion here.
     done: crossbeam_channel::Sender<Completion>,
     completions: crossbeam_channel::Receiver<Completion>,
+    /// Worker-thread log lines, drained onto the main-thread host log
+    /// (which is thread-local, so a worker cannot write it directly).
+    log_tx: crossbeam_channel::Sender<String>,
+    log_rx: crossbeam_channel::Receiver<String>,
     doorbell_write: RawFd,
     doorbell_read: RawFd,
     /// Closing this ends every runner's `run` future.
@@ -170,6 +174,7 @@ fn state() -> Result<Arc<State>, String> {
     }
     let (read_fd, write_fd) = make_doorbell()?;
     let (done_tx, done_rx) = crossbeam_channel::unbounded::<Completion>();
+    let (log_tx, log_rx) = crossbeam_channel::unbounded::<String>();
     let (stop_tx, stop_rx) = async_channel::bounded::<()>(1);
     let mut threads = Vec::new();
     for i in 0..runner_threads() {
@@ -183,6 +188,8 @@ fn state() -> Result<Arc<State>, String> {
     let s = Arc::new(State {
         done: done_tx,
         completions: done_rx,
+        log_tx,
+        log_rx,
         doorbell_write: write_fd,
         doorbell_read: read_fd,
         stop: stop_tx,
@@ -269,6 +276,19 @@ pub fn post(c: Completion) {
     }
 }
 
+/// Log one line from a worker thread. It reaches the main-thread host log
+/// (readable with `plugin-log`) on the next drain. Rings the doorbell on
+/// the empty->non-empty edge so a log with no completion still wakes the
+/// main thread.
+pub fn worker_log(msg: String) {
+    let s = { STATE.lock().unwrap().clone() };
+    let Some(s) = s else { return };
+    let _ = s.log_tx.send(msg);
+    if !ARMED.swap(true, Ordering::SeqCst) {
+        ring(s.doorbell_write);
+    }
+}
+
 pub fn err_completion(token: u64, code: ErrorCode, msg: String) -> Completion {
     Completion {
         token,
@@ -297,6 +317,10 @@ pub fn drain() {
     };
     ARMED.store(false, Ordering::SeqCst);
     drain_doorbell(s.doorbell_read);
+    // Surface any worker-thread log lines on the main-thread host log.
+    while let Ok(line) = s.log_rx.try_recv() {
+        crate::hostlog::error("host", &line);
+    }
     while let Ok(c) = s.completions.try_recv() {
         crate::state::EVENTS.with(|e| {
             e.borrow_mut().deliveries.push_back(
@@ -371,8 +395,31 @@ pub fn shutdown() {
 }
 
 /// One runner thread: drive the executor until the stop channel closes.
+///
+/// A task panic unwinds out of `executor().run`. Catch it so the panic
+/// does NOT kill the thread: log it and re-enter `run`, keeping the pool
+/// alive. A thread that died here was never replaced, so one panicking
+/// task used to remove a pool thread for good; enough of them emptied the
+/// pool and every later async db/fs call hung with no thread to poll it.
 fn runner_main(stop: async_channel::Receiver<()>) {
-    futures_lite::future::block_on(executor().run(async move {
-        let _ = stop.recv().await;
-    }));
+    loop {
+        let stop = stop.clone();
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            futures_lite::future::block_on(executor().run(async move {
+                let _ = stop.recv().await;
+            }));
+        }));
+        match res {
+            // The stop channel closed: a clean exit.
+            Ok(()) => return,
+            // A task panicked; the panic hook already logged the detail.
+            // Keep the thread and go back to serving the pool.
+            Err(_) => {
+                worker_log(
+                    "worker task panicked; thread recovered, pool preserved"
+                        .to_string(),
+                );
+            }
+        }
+    }
 }
