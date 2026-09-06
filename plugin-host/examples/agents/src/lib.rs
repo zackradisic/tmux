@@ -276,14 +276,9 @@ async fn classify(pane: u32, cfg: Rc<Config>) {
 /// the result (id migrations, names, statuses, real times). Runs once per
 /// picker open and per refresh - never in the background.
 async fn enrich_live(rows: &mut [Agent]) {
-    // Claude needs one directory read for the whole set; index it up front.
-    let claude = resolve::claude_index().await;
     for a in rows.iter_mut().filter(|a| a.live()) {
         let mut r = match a.kind.as_str() {
-            "claude" => a
-                .pane
-                .and_then(|p| claude.get(&(p as u32)))
-                .map(clone_resolved),
+            "claude" => resolve::claude(a).await,
             "codex" => resolve::codex(a).await,
             _ => resolve::from_source(a).await,
         }
@@ -294,19 +289,6 @@ async fn enrich_live(rows: &mut [Agent]) {
         let title = a.pane.and_then(|p| pane_title(p as u32, &a.kind));
         r.name = title.or_else(|| r.name.take());
         apply(a, r).await;
-    }
-}
-
-/// A `Resolved` is not `Clone` (it is cheap to rebuild); copy the fields
-/// out of the shared claude index entry.
-fn clone_resolved(r: &Resolved) -> Resolved {
-    Resolved {
-        real_id: r.real_id.clone(),
-        name: r.name.clone(),
-        status: r.status.clone(),
-        started_ms: r.started_ms,
-        last_active_ms: r.last_active_ms,
-        source_path: r.source_path.clone(),
     }
 }
 
@@ -686,7 +668,7 @@ impl Agents {
                 ctx.spawn(apply_life(Rc::clone(&self.picker), id, life));
             }
             PickAfter::Reload => {
-                ctx.spawn(reload_picker(Rc::clone(&self.picker)));
+                ctx.spawn(reload_picker(Rc::clone(&self.picker), false));
             }
         }
     }
@@ -848,14 +830,23 @@ async fn pick_open(
     pick_refilter(&mut p);
     pick_render(&mut p);
     *picker.borrow_mut() = Some(p);
+    // Keep times and file-sourced status fresh while the picker is open,
+    // without a costly file scan on every event.
+    spawn(refresh_timer(Rc::clone(&picker), mode));
 }
 
 /// Reload rows from the database, preserving the highlight.
-async fn reload_picker(picker: Rc<RefCell<Option<Picker>>>) {
+/// Rebuild the picker's rows. `enrich` reads the harness session files
+/// (the costly part); event-driven refreshes pass false and only re-read
+/// the DB (shim-pushed status, membership) then re-render. The enrich runs
+/// on picker open and on a slow timer.
+async fn reload_picker(picker: Rc<RefCell<Option<Picker>>>, enrich: bool) {
     let show_history =
         picker.borrow().as_ref().map(|p| p.show_history).unwrap_or(false);
     let mut rows = store::live_agents().await.unwrap_or_default();
-    enrich_live(&mut rows).await;
+    if enrich {
+        enrich_live(&mut rows).await;
+    }
     if show_history {
         rows.extend(store::history(HISTORY_MAX).await.unwrap_or_default());
     }
@@ -871,7 +862,26 @@ async fn reload_picker(picker: Rc<RefCell<Option<Picker>>>) {
 
 async fn refresh_if_open(picker: &Rc<RefCell<Option<Picker>>>) {
     if picker.borrow().is_some() {
-        reload_picker(Rc::clone(picker)).await;
+        // Events only re-read the DB; the file scan is left to the timer.
+        reload_picker(Rc::clone(picker), false).await;
+    }
+}
+
+/// While the picker stays open, re-read the harness session files on a
+/// slow cadence so times and file-sourced status stay fresh without
+/// re-scanning on every event. Ends when the picker closes or is replaced.
+const REFRESH_MS: u64 = 2000;
+async fn refresh_timer(picker: Rc<RefCell<Option<Picker>>>, mode: ModeId) {
+    loop {
+        if sleep_ms(REFRESH_MS).await.is_err() {
+            return;
+        }
+        let live =
+            picker.borrow().as_ref().is_some_and(|p| p.mode.0 == mode.0);
+        if !live {
+            return;
+        }
+        reload_picker(Rc::clone(&picker), true).await;
     }
 }
 
@@ -887,7 +897,7 @@ async fn apply_life(
             p.status = Some(format!("marked {life}"));
         }
     }
-    reload_picker(picker).await;
+    reload_picker(picker, false).await;
 }
 
 // ---------------------------------------------------------------------------

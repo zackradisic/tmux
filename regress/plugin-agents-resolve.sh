@@ -69,12 +69,16 @@ WIN=$($TMUX list-panes -t alpha -F '#{window_id}' | head -1)
 PANE=$($TMUX list-panes -t alpha -F '#{pane_id}' | head -1)
 NUM=${PANE#%}
 [ -n "$NUM" ] || fail "no pane id"
+# Name the file by the pane's foreground pid, so the plugin's direct
+# `<pid>.json` read (via pane_pid) hits without scanning the directory.
+PID=$($TMUX list-panes -t alpha -F '#{pane_pid}' | head -1)
+[ -n "$PID" ] || fail "no pane pid"
 
 # The session file Claude would write, matched to this pane by its tmux
 # field. Times are epoch ms; idle => the "waiting" band.
 now=$(date +%s)000
 started=$((now - 3600000))
-cat >"$HOME/.claude/sessions/424242.json" <<EOF
+cat >"$HOME/.claude/sessions/$PID.json" <<EOF
 {"pid":424242,"sessionId":"25a936a2-cf9b-407d-9e4e-89e04a9636e7",
  "cwd":"$HOME","startedAt":$started,"tmux":"alpha:$WIN.%$NUM",
  "name":"hyperyaml-91","status":"idle","updatedAt":$now}

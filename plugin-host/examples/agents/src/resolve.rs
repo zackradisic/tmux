@@ -16,7 +16,6 @@
 //!     opencode   hook reports the id and file once (see the plugin's
 //!                `identify` verb); the file mtime dates activity.
 
-use std::collections::HashMap;
 
 use tmux_plugin_sdk::prelude::*;
 
@@ -58,64 +57,79 @@ async fn file_mtime_ms(path: &str) -> Option<i64> {
 // claude: ~/.claude/sessions/<pid>.json, indexed by pane
 // ---------------------------------------------------------------------------
 
-/// Read every live Claude session file once and index it by the pane its
-/// `tmux` field names. Called once per render; the per-agent lookup is
-/// then a hashmap hit.
-pub async fn claude_index() -> HashMap<u32, Resolved> {
-    let mut out = HashMap::new();
-    let Some(home) = home() else { return out };
+/// Resolve a Claude agent from its own session file. The file is named by
+/// Claude's pid, so with `pane_pid` we read exactly one file directly -
+/// no directory scan. When the pid does not name the right file (Claude
+/// launched under a wrapper, or a stale pid after a restart), fall back to
+/// scanning the directory and matching the `tmux` field.
+pub async fn claude(a: &Agent) -> Option<Resolved> {
+    let pane = a.pane? as u32;
+    let home = home()?;
     let dir = format!("{home}/.claude/sessions");
-    let Ok(listing) = fs_list(&dir).await else { return out };
 
-    // Collect names first: the borrow of `listing` cannot cross an await.
+    // Direct hit: <pid>.json, verified by its tmux field.
+    if let Ok(Some(pid)) = pane_pid(PaneId(pane)) {
+        let path = format!("{dir}/{pid}.json");
+        if let Ok((bytes, _)) = fs_read(&path, 0, 16 * 1024).await {
+            if let Some((p, r)) = parse_claude(&path, &bytes) {
+                if p == pane {
+                    return Some(r);
+                }
+            }
+        }
+    }
+
+    // Fallback: scan the directory for the file whose tmux field names
+    // this pane.
+    let listing = fs_list(&dir).await.ok()?;
     let names: Vec<String> = listing
         .iter()
         .filter(|e| e.name.ends_with(".json"))
         .map(|e| e.name.to_string())
         .collect();
-
     for name in names {
         let path = format!("{dir}/{name}");
         let Ok((bytes, _)) = fs_read(&path, 0, 16 * 1024).await else {
             continue;
         };
-        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-            continue;
-        };
-        let Some(tmux) = v.get("tmux").and_then(|x| x.as_str()) else {
-            continue;
-        };
-        // tmux is "session:@window.%pane"; take the %N pane id.
-        let Some(pane) = tmux
-            .rsplit('.')
-            .next()
-            .and_then(|p| p.strip_prefix('%'))
-            .and_then(|n| n.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        let sid = v.get("sessionId").and_then(|x| x.as_str());
-        let status = match v.get("status").and_then(|x| x.as_str()) {
-            Some("busy") => Some("working".to_string()),
-            Some("idle") => Some("waiting".to_string()),
-            _ => None,
-        };
-        out.insert(
-            pane,
-            Resolved {
-                real_id: sid.map(|s| format!("claude:{s}")),
-                name: v
-                    .get("name")
-                    .and_then(|x| x.as_str())
-                    .map(str::to_string),
-                status,
-                started_ms: v.get("startedAt").and_then(|x| x.as_i64()),
-                last_active_ms: v.get("updatedAt").and_then(|x| x.as_i64()),
-                source_path: Some(path),
-            },
-        );
+        if let Some((p, r)) = parse_claude(&path, &bytes) {
+            if p == pane {
+                return Some(r);
+            }
+        }
     }
-    out
+    None
+}
+
+/// Parse one Claude session file into (pane, resolved). Returns None when
+/// the JSON is malformed or lacks a usable `tmux` field.
+fn parse_claude(path: &str, bytes: &[u8]) -> Option<(u32, Resolved)> {
+    let v = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
+    // tmux is "session:@window.%pane"; take the %N pane id.
+    let pane = v
+        .get("tmux")
+        .and_then(|x| x.as_str())?
+        .rsplit('.')
+        .next()
+        .and_then(|p| p.strip_prefix('%'))
+        .and_then(|n| n.parse::<u32>().ok())?;
+    let sid = v.get("sessionId").and_then(|x| x.as_str());
+    let status = match v.get("status").and_then(|x| x.as_str()) {
+        Some("busy") => Some("working".to_string()),
+        Some("idle") => Some("waiting".to_string()),
+        _ => None,
+    };
+    Some((
+        pane,
+        Resolved {
+            real_id: sid.map(|s| format!("claude:{s}")),
+            name: v.get("name").and_then(|x| x.as_str()).map(str::to_string),
+            status,
+            started_ms: v.get("startedAt").and_then(|x| x.as_i64()),
+            last_active_ms: v.get("updatedAt").and_then(|x| x.as_i64()),
+            source_path: Some(path.to_string()),
+        },
+    ))
 }
 
 // ---------------------------------------------------------------------------
