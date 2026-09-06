@@ -1047,7 +1047,15 @@ fn badge(a: &Agent) -> String {
 fn pick_render(p: &mut Picker) {
     let w = p.width as usize;
     let h = p.height as usize;
-    let list_w = (w * 6 / 10).clamp(30, w.saturating_sub(20));
+    // 60% of the width for the list, but never let the clamp's min exceed
+    // its max: a narrow mode (a split pane) would panic `clamp(30, <30)`
+    // and trap the guest. Below ~50 cols give the list almost everything
+    // and skip the side preview.
+    let list_w = if w <= 50 {
+        w.saturating_sub(2).max(1)
+    } else {
+        (w * 6 / 10).clamp(30, w - 20)
+    };
     let mut out = String::from("\x1b[2J\x1b[H");
 
     let live = p.rows.iter().filter(|a| a.live()).count();
