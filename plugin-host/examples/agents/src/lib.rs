@@ -2,10 +2,10 @@
 //!
 //! Press the hotkey (bind it to `plugin-command agents pick`) to open a
 //! floating chooser: one row per agent, grouped by state (needs input,
-//! waiting, working, stale, done) and, inside each group, most recently
-//! active first. A live preview of the highlighted pane sits to the
-//! right. Enter jumps to it. `s` marks an agent stale, `A` archives it,
-//! `h` folds in the finished ones, `/`-style typing filters.
+//! waiting, working, done) and, inside each group, most recently active
+//! first. A live preview of the highlighted pane sits to the right.
+//! `j`/`k` move, Enter jumps, `A` archives, `h` folds in the finished
+//! ones, and `/` starts a filter (Enter accepts it, Esc cancels).
 //!
 //! Three signals drive it, each from its own trusted source:
 //!
@@ -81,8 +81,7 @@ struct AgentsConfig {
     keep_days: Option<serde_json::Value>,
     commands: Option<Vec<String>>,
     pick_jump: Option<String>,
-    pick_stale: Option<String>,
-    pick_unstale: Option<String>,
+    pick_filter: Option<String>,
     pick_archive: Option<String>,
     pick_history: Option<String>,
     pick_close: Option<String>,
@@ -91,8 +90,7 @@ struct AgentsConfig {
 #[derive(Clone)]
 struct PickKeys {
     jump: String,
-    stale: String,
-    unstale: String,
+    filter: String,
     archive: String,
     history: String,
     close: String,
@@ -102,8 +100,7 @@ impl Default for PickKeys {
     fn default() -> Self {
         Self {
             jump: "Enter".into(),
-            stale: "s".into(),
-            unstale: "u".into(),
+            filter: "/".into(),
             archive: "A".into(),
             history: "h".into(),
             close: "Escape".into(),
@@ -146,8 +143,7 @@ impl Config {
             commands,
             keys: PickKeys {
                 jump: pick(&c.pick_jump, d.jump),
-                stale: pick(&c.pick_stale, d.stale),
-                unstale: pick(&c.pick_unstale, d.unstale),
+                filter: pick(&c.pick_filter, d.filter),
                 archive: pick(&c.pick_archive, d.archive),
                 history: pick(&c.pick_history, d.history),
                 close: pick(&c.pick_close, d.close),
@@ -605,8 +601,51 @@ impl Agents {
             p.status = None;
             let k = &p.keys.clone();
             let sel = p.view.get(p.sel).copied();
-            if key == k.close {
+            // Arrows and their control aliases move the selection in both
+            // modes; they are never text.
+            let is_down = matches!(key.as_str(), "Down" | "C-n" | "C-j");
+            let is_up = matches!(key.as_str(), "Up" | "C-p" | "C-k");
+            if p.filtering {
+                // Filter mode: keys are text, except accept / cancel / move.
+                if key == k.close {
+                    // Esc leaves filter mode and clears it (a second Esc,
+                    // now in normal mode, closes the picker).
+                    p.filtering = false;
+                    p.filter.clear();
+                    pick_refilter(p);
+                    pick_render(p);
+                } else if key == "Enter" {
+                    // Accept the filter; stay on the picker in normal mode.
+                    p.filtering = false;
+                    pick_render(p);
+                } else if is_down {
+                    move_sel(p, 1);
+                } else if is_up {
+                    move_sel(p, -1);
+                } else if key == "BSpace" {
+                    p.filter.pop();
+                    pick_refilter(p);
+                    pick_render(p);
+                } else if key == "C-u" {
+                    p.filter.clear();
+                    pick_refilter(p);
+                    pick_render(p);
+                } else if key == "Space" {
+                    p.filter.push(' ');
+                    pick_refilter(p);
+                    pick_render(p);
+                } else if key.chars().count() == 1
+                    && !key.chars().next().unwrap().is_control()
+                {
+                    p.filter.push_str(&key);
+                    pick_refilter(p);
+                    pick_render(p);
+                }
+            } else if key == k.close {
                 after = PickAfter::Close(p.mode);
+            } else if key == k.filter {
+                p.filtering = true;
+                pick_render(p);
             } else if key == k.jump {
                 if let Some(i) = sel {
                     let a = &p.rows[i];
@@ -617,53 +656,15 @@ impl Agents {
                         pick_render(p);
                     }
                 }
-            } else if key == k.stale {
-                after = life_after(p, sel, "stale");
-            } else if key == k.unstale {
-                after = life_after(p, sel, "active");
             } else if key == k.archive {
                 after = life_after(p, sel, "archived");
             } else if key == k.history {
                 p.show_history = !p.show_history;
                 after = PickAfter::Reload;
-            } else {
-                match key.as_str() {
-                    "Down" | "C-n" | "C-j" => {
-                        if !p.view.is_empty() {
-                            p.sel = (p.sel + 1).min(p.view.len() - 1);
-                            p.scroll_to_selection();
-                            pick_render(p);
-                        }
-                    }
-                    "Up" | "C-p" | "C-k" => {
-                        p.sel = p.sel.saturating_sub(1);
-                        p.scroll_to_selection();
-                        pick_render(p);
-                    }
-                    "BSpace" => {
-                        p.filter.pop();
-                        pick_refilter(p);
-                        pick_render(p);
-                    }
-                    "C-u" => {
-                        p.filter.clear();
-                        pick_refilter(p);
-                        pick_render(p);
-                    }
-                    "Space" => {
-                        p.filter.push(' ');
-                        pick_refilter(p);
-                        pick_render(p);
-                    }
-                    s if s.chars().count() == 1
-                        && !s.chars().next().unwrap().is_control() =>
-                    {
-                        p.filter.push_str(s);
-                        pick_refilter(p);
-                        pick_render(p);
-                    }
-                    _ => {}
-                }
+            } else if is_down || key == "j" {
+                move_sel(p, 1);
+            } else if is_up || key == "k" {
+                move_sel(p, -1);
             }
         }
         match after {
@@ -685,6 +686,17 @@ impl Agents {
             }
         }
     }
+}
+
+/// Move the selection by `delta` rows, clamped, then scroll and redraw.
+fn move_sel(p: &mut Picker, delta: i32) {
+    if p.view.is_empty() {
+        return;
+    }
+    let last = (p.view.len() - 1) as i32;
+    p.sel = (p.sel as i32 + delta).clamp(0, last) as usize;
+    p.scroll_to_selection();
+    pick_render(p);
 }
 
 /// Decide a lifecycle change for the highlighted row, under the borrow.
@@ -726,6 +738,7 @@ struct Picker {
     sel: usize,
     top: usize,
     filter: String,
+    filtering: bool,
     now_ms: u64,
     show_history: bool,
     keys: PickKeys,
@@ -822,6 +835,7 @@ async fn pick_open(
         sel: 0,
         top: 0,
         filter: String::new(),
+        filtering: false,
         now_ms: now_ms(),
         show_history: false,
         keys: cfg.keys.clone(),
@@ -879,19 +893,16 @@ async fn apply_life(
 
 /// The band an agent belongs to, lowest first. `needs_input` sits at the
 /// top (a human is blocking it), then the ones still in a turn, then the
-/// ones a human parked, then the finished ones.
+/// finished ones.
 fn band(a: &Agent) -> u8 {
     if !a.live() {
-        return 4; // done / history
-    }
-    if a.life == "stale" {
-        return 3;
+        return 3; // done / history
     }
     match a.status.as_str() {
         "needs_input" => 0,
         "waiting" => 1,
         "working" => 2,
-        "done" => 4,
+        "done" => 3,
         _ => 2,
     }
 }
@@ -901,7 +912,6 @@ fn band_label(b: u8) -> &'static str {
         0 => "needs input",
         1 => "waiting",
         2 => "working",
-        3 => "stale",
         _ => "done",
     }
 }
@@ -945,19 +955,19 @@ fn rank(hay: &str, needle: &str) -> Option<u8> {
     if h.contains(&n) {
         return Some(1);
     }
-    let mut chars = h.chars();
-    if n.chars().all(|c| chars.any(|x| x == c)) {
-        return Some(2);
-    }
+    // No fuzzy subsequence tier: the haystack joins the name with the
+    // kind/status/session words, whose common letters make a subsequence
+    // match almost everything. Substring is the right strictness here.
     None
 }
 
 fn haystack(a: &Agent) -> String {
     format!(
-        "{} {} {} {} {} {} {}",
+        "{} {} {} {} {} {} {} {}",
         display_name(a),
         a.kind,
         a.status,
+        a.life,
         a.session.as_deref().unwrap_or(""),
         a.window.as_deref().unwrap_or(""),
         a.task.as_deref().unwrap_or(""),
@@ -1041,10 +1051,25 @@ fn pick_render(p: &mut Picker) {
         "\x1b[1;1H\x1b[1m agents\x1b[0m \x1b[2m({live} live{})\x1b[0m",
         if p.show_history { ", +history" } else { "" }
     ));
-    out.push_str(&format!(
-        "\x1b[2;1H  \x1b[2mfilter\x1b[0m {}\x1b[7m \x1b[0m",
-        p.filter
-    ));
+    if p.filtering {
+        // Active: show the query with a block cursor.
+        out.push_str(&format!(
+            "\x1b[2;1H  \x1b[2mfilter\x1b[0m {}\x1b[7m \x1b[0m",
+            p.filter
+        ));
+    } else if p.filter.is_empty() {
+        // Idle, no query: a hint.
+        out.push_str(&format!(
+            "\x1b[2;1H  \x1b[2mfilter\x1b[0m \x1b[2m(press {} to filter)\x1b[0m",
+            keyname(&p.keys.filter),
+        ));
+    } else {
+        // Idle, query applied: show it, no cursor.
+        out.push_str(&format!(
+            "\x1b[2;1H  \x1b[2mfilter\x1b[0m {}",
+            p.filter
+        ));
+    }
     out.push_str(&format!(
         "\x1b[3;1H  \x1b[2m{}\x1b[0m",
         "─".repeat(list_w.saturating_sub(2))
@@ -1126,14 +1151,18 @@ fn pick_render(p: &mut Picker) {
         ));
     }
     let k = &p.keys;
-    let footer = format!(
-        "{} jump · {} stale · {} arch · {} hist · {} close",
-        keyname(&k.jump),
-        keyname(&k.stale),
-        keyname(&k.archive),
-        keyname(&k.history),
-        keyname(&k.close),
-    );
+    let footer = if p.filtering {
+        "type to filter · Enter accept · Esc cancel".to_string()
+    } else {
+        format!(
+            "j/k move · {} jump · {} filter · {} arch · {} hist · {} close",
+            keyname(&k.jump),
+            keyname(&k.filter),
+            keyname(&k.archive),
+            keyname(&k.history),
+            keyname(&k.close),
+        )
+    };
     out.push_str(&format!(
         "\x1b[{h};1H  \x1b[2m{}\x1b[0m",
         clip(&footer, list_w.saturating_sub(4))
