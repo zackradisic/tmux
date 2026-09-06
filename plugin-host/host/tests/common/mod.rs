@@ -56,6 +56,23 @@ pub unsafe extern "C" fn vt_capture_pane(
     -1
 }
 
+pub unsafe extern "C" fn vt_pane_env(
+    _p: u32,
+    _n: *const c_char,
+    _sink: pgh_sink,
+    _c: *mut c_void,
+) -> c_int {
+    -1
+}
+
+pub unsafe extern "C" fn vt_pane_fds(
+    _p: u32,
+    _sink: pgh_sink,
+    _c: *mut c_void,
+) -> c_int {
+    -1
+}
+
 pub unsafe extern "C" fn vt_get_option(
     _k: c_int,
     _i: u32,
@@ -176,6 +193,8 @@ pub fn base_vtable() -> pgh_host_vtable {
         obj_relation: vt_obj_relation,
         send_keys: vt_send_keys,
         capture_pane: vt_capture_pane,
+        pane_env: vt_pane_env,
+        pane_fds: vt_pane_fds,
         get_option: vt_get_option,
         set_option: vt_set_option,
         display_message: vt_display_message,

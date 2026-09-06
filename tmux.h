@@ -1340,6 +1340,9 @@ struct window_pane {
 	time_t		 cmd_end_time;
 	int		 cmd_status;
 
+	char		*cached_cmd;	/* last seen foreground command */
+	struct timeval	 cmd_check_time; /* debounce for pane-command-changed */
+
 	int		 fd;
 	struct bufferevent *event;
 
@@ -4120,6 +4123,8 @@ int		 utf8_cstrhas(const char *, const struct utf8_data *);
 /* osdep-*.c */
 char		*osdep_get_name(int, char *);
 char		*osdep_get_cwd(int);
+char		*osdep_get_env(int, const char *);
+char		*osdep_get_fds(int);
 struct event_base *osdep_event_init(void);
 
 /* utf8-combined.c */
@@ -4273,6 +4278,7 @@ enum plugin_obj_kind {
 	PLUGIN_OBJ_PANE,
 	PLUGIN_OBJ_CLIENT,
 };
+void	 plugin_pane_check_command(struct window_pane *);
 void	 plugin_notify(const char *, struct client *, struct session *,
 	     struct window *, struct window_pane *, const char *);
 void	 plugin_object_created(enum plugin_obj_kind, u_int);

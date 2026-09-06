@@ -420,6 +420,49 @@ plugin_vtable_capture_pane(u_int pane_id, int start, int end, int escapes,
 	return (0);
 }
 
+/*
+ * Read one environment variable from a pane's foreground process into
+ * the sink. Uses the pty master fd, like pane_current_command. Returns
+ * 0, -1 if the pane is dead, -2 if the variable is not set.
+ */
+int
+plugin_vtable_pane_env(u_int pane_id, const char *name, pgh_sink sink,
+    void *ctx)
+{
+	struct window_pane	*wp;
+	char			*value;
+
+	wp = window_pane_find_by_id(pane_id);
+	if (wp == NULL || (wp->flags & PANE_DESTROYED) || wp->fd == -1)
+		return (-1);
+
+	value = osdep_get_env(wp->fd, name);
+	if (value == NULL)
+		return (-2);
+	sink(ctx, value, strlen(value));
+	free(value);
+	return (0);
+}
+
+/* Return the open-file paths of a pane's foreground process, one per line. */
+int
+plugin_vtable_pane_fds(u_int pane_id, pgh_sink sink, void *ctx)
+{
+	struct window_pane	*wp;
+	char			*value;
+
+	wp = window_pane_find_by_id(pane_id);
+	if (wp == NULL || (wp->flags & PANE_DESTROYED) || wp->fd == -1)
+		return (-1);
+
+	value = osdep_get_fds(wp->fd);
+	if (value == NULL)
+		return (-2);
+	sink(ctx, value, strlen(value));
+	free(value);
+	return (0);
+}
+
 /* Resolve the options tree for a scope kind + id; NULL if dead/bad. */
 static struct options *
 plugin_vtable_options(int kind, u_int id)

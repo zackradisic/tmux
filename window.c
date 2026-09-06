@@ -1527,6 +1527,7 @@ window_pane_free(struct window_pane *wp)
 	options_free(wp->options);
 	free((void *)wp->cwd);
 	free(wp->shell);
+	free(wp->cached_cmd);
 	cmd_free_argv(wp->argc, wp->argv);
 	colour_palette_free(&wp->palette);
 	style_ranges_free(&wp->border_status_line.ranges);

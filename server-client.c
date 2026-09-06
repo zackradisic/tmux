@@ -1869,6 +1869,10 @@ server_client_loop(void)
 				server_client_check_pane_resize(wp);
 				server_client_check_pane_buffer(wp);
 			}
+#ifdef ENABLE_PLUGINS
+			if (wp->flags & PANE_ACTIVITY)
+				plugin_pane_check_command(wp);
+#endif
 			wp->flags &= ~(PANE_REDRAW|PANE_REDRAWSCROLLBAR|
 			    PANE_ACTIVITY);
 		}

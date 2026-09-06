@@ -1,0 +1,19 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "~/.config/agents/agent-status.sh working" } ] }
+    ],
+    "PreToolUse": [
+      { "hooks": [ { "type": "command", "command": "~/.config/agents/agent-status.sh working" } ] }
+    ],
+    "Notification": [
+      { "hooks": [ { "type": "command", "command": "~/.config/agents/agent-status.sh needs_input" } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "~/.config/agents/agent-status.sh waiting" } ] }
+    ],
+    "SessionEnd": [
+      { "hooks": [ { "type": "command", "command": "~/.config/agents/agent-status.sh done" } ] }
+    ]
+  }
+}

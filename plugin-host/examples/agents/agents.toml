@@ -1,0 +1,40 @@
+# Reference capability sidecar for the agents plugin.
+#
+# Only consulted in restrictive mode, where it must sit next to the
+# deployed agents.wasm as `agents.toml`. Effective caps = these requests
+# intersected with the user's `load-plugin -c ...` grants. Under
+# trust-the-user (no sidecar) every requested cap is granted, the
+# env-read allowlist is unrestricted, and fs-read reaches anywhere.
+
+[caps]
+requests = [
+  "capture-pane",
+  "run-command",
+  "mode",
+  "db",
+  "env-read",
+  "pane-fds",
+  "fs-read",
+  "fs-list",
+]
+
+# The only environment variables the roster ever reads. Everything else
+# in a pane's environment (tokens, secrets) stays unreadable. Used only
+# for detection fallback; identity comes from the harness session files.
+[caps.env-read]
+names = [
+  "AI_AGENT",
+  "OPENCODE",
+]
+
+# The only directories the roster ever reads. fs-read stays sandboxed
+# except under these prefixes, so the plugin reaches the harness session
+# files WITHOUT the blanket fs-read-any grant. `~` expands to the server
+# user's home.
+[caps.fs-read]
+paths = [
+  "~/.claude/sessions",
+  "~/.codex/sessions",
+  "~/.pi",
+  "~/.local/share/opencode",
+]

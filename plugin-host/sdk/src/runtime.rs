@@ -40,6 +40,11 @@ pub(crate) mod raw {
             pane: i32, start: i32, end: i32, escapes: i32,
             out: i32, cap: i32, len_out: i32,
         ) -> i32;
+        pub fn pane_env(
+            pane: i32, name_ptr: i32, name_len: i32,
+            out: i32, cap: i32, len_out: i32,
+        ) -> i32;
+        pub fn pane_fds(pane: i32, out: i32, cap: i32, len_out: i32) -> i32;
         pub fn display_message(client: i32, msg_ptr: i32, msg_len: i32) -> i32;
         #[allow(dead_code)]
         pub fn timer_cancel(token: i64) -> i32;
@@ -124,6 +129,8 @@ pub(crate) mod raw {
     pub unsafe fn format_expand(kind: i32, id: i32, fmt_ptr: i32, fmt_len: i32, out: i32, cap: i32, len_out: i32) -> i32 { -7 }
     pub unsafe fn send_keys(pane: i32, keys_ptr: i32, keys_len: i32, literal: i32) -> i32 { -7 }
     pub unsafe fn capture_pane(pane: i32, start: i32, end: i32, escapes: i32, out: i32, cap: i32, len_out: i32) -> i32 { -7 }
+    pub unsafe fn pane_env(pane: i32, name_ptr: i32, name_len: i32, out: i32, cap: i32, len_out: i32) -> i32 { -7 }
+    pub unsafe fn pane_fds(pane: i32, out: i32, cap: i32, len_out: i32) -> i32 { -7 }
     pub unsafe fn display_message(client: i32, msg_ptr: i32, msg_len: i32) -> i32 { -7 }
     #[allow(dead_code)]
     pub unsafe fn timer_cancel(token: i64) -> i32 { -7 }

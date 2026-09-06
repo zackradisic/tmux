@@ -220,6 +220,62 @@ fn anywhere_path(root: &Root, path: &Path) -> PathBuf {
     }
 }
 
+/// Expand a leading `~` in a manifest prefix to the server user's home.
+fn expand_home(prefix: &str) -> PathBuf {
+    if let Some(rest) = prefix.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return Path::new(&home).join(rest);
+        }
+    } else if prefix == "~" {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home);
+        }
+    }
+    PathBuf::from(prefix)
+}
+
+/// The canonical absolute path a read would act on, resolving symlinks
+/// and `..`. Canonicalizes the deepest existing ancestor, so a not-yet-
+/// existing leaf still yields a real answer.
+fn canonical_target(root: &Root, rel: &str) -> PathBuf {
+    let full = anywhere_path(root, Path::new(rel));
+    if let Ok(c) = full.canonicalize() {
+        return c;
+    }
+    if let (Some(parent), Some(name)) = (full.parent(), full.file_name()) {
+        if let Ok(c) = parent.canonicalize() {
+            return c.join(name);
+        }
+    }
+    full
+}
+
+/// Enforce a scoped read grant: the target must resolve inside the
+/// plugin's own sandbox, or under one of the manifest-named prefixes.
+/// This backs `fs-read` with a `[caps.fs-read] paths` list, a middle
+/// ground between the sandbox and the blanket `fs-read-any`.
+pub fn allowed_read(
+    root: &Root,
+    rel: &str,
+    prefixes: &[String],
+) -> Result<(), FsError> {
+    let target = canonical_target(root, rel);
+    // The sandbox itself is always reachable.
+    if target.starts_with(&root.path) {
+        return Ok(());
+    }
+    for p in prefixes {
+        let base = expand_home(p);
+        let base = base.canonicalize().unwrap_or(base);
+        if target.starts_with(&base) {
+            return Ok(());
+        }
+    }
+    Err(FsError::BadPath(format!(
+        "path {rel:?} is not under an allowed fs-read prefix"
+    )))
+}
+
 // ---------------------------------------------------------------------------
 // Linux: openat2 with RESOLVE_BENEATH.
 // ---------------------------------------------------------------------------

@@ -110,3 +110,15 @@ osdep_event_init(void)
 	unsetenv("EVENT_NOEVPORT");
 	return (base);
 }
+
+char *
+osdep_get_env(__unused int fd, __unused const char *name)
+{
+	return (NULL);
+}
+
+char *
+osdep_get_fds(__unused int fd)
+{
+	return (NULL);
+}

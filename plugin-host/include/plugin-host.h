@@ -171,6 +171,12 @@ typedef struct {
    */
   int (*capture_pane)(uint32_t pane_id, int start, int end, int escapes, pgh_sink sink, void *ctx);
   /**
+   * Read one environment variable from a pane's foreground process as a
+   * string. 0 ok, -1 dead pane, -2 no such variable.
+   */
+  int (*pane_env)(uint32_t pane_id, const char *name, pgh_sink sink, void *ctx);
+  int (*pane_fds)(uint32_t pane_id, pgh_sink sink, void *ctx);
+  /**
    * Get an option value as a string (kind -1 = server/global scope).
    * 0 ok, -1 dead target, -2 no such option.
    */

@@ -940,6 +940,18 @@ fn register_imports(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
         }))
     })?;
 
+    linker.func_wrap(m, im::PANE_ENV, |mut c: Caller<'_, StoreData>, pane: i32, name_ptr: i32, name_len: i32, out: i32, cap: i32, len_out: i32| -> i32 {
+        ret_i32(with_mem(&mut c, |mem| {
+            dispatch::pane_env(mem, pane, name_ptr, name_len, out, cap, len_out)
+        }))
+    })?;
+
+    linker.func_wrap(m, im::PANE_FDS, |mut c: Caller<'_, StoreData>, pane: i32, out: i32, cap: i32, len_out: i32| -> i32 {
+        ret_i32(with_mem(&mut c, |mem| {
+            dispatch::pane_fds(mem, pane, out, cap, len_out)
+        }))
+    })?;
+
     linker.func_wrap(m, im::DISPLAY_MESSAGE, |mut c: Caller<'_, StoreData>, client: i32, msg_ptr: i32, msg_len: i32| -> i32 {
         ret_i32(with_mem(&mut c, |mem| {
             dispatch::display_message(mem, client, msg_ptr, msg_len)

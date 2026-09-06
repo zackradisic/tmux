@@ -43,9 +43,20 @@ pub const FS_WRITE_ANY: u32 = 1 << 16;
 /// future `db-read` (read-only access to other plugins' databases, named
 /// in a `[caps.db] read = [...]` sidecar list that mirrors `argv0`).
 pub const DB: u32 = 1 << 17;
+/// Read environment variables from a pane's foreground process
+/// (`pane_env`). Restricted to the names on the `[caps.env-read] names`
+/// allowlist, because a process environment routinely holds secrets.
+pub const ENV_READ: u32 = 1 << 18;
+/// The escape hatch: read ANY variable, ignoring the allowlist. A
+/// separate grant, like `fs-read-any`.
+pub const ENV_READ_ANY: u32 = 1 << 19;
+/// Read the open-file paths of a pane's foreground process
+/// (`pane_fds`). Reveals which files a process holds open, so it is its
+/// own grant, separate from `env-read`.
+pub const PANE_FDS: u32 = 1 << 20;
 
 /// Highest bit used above, for `describe`.
-const CAP_BITS: u32 = 18;
+const CAP_BITS: u32 = 21;
 
 /// Granted to every plugin without being asked for.
 pub const DEFAULT_CAPS: u32 = READ_STATE | DISPLAY_MESSAGE | TIMERS;
@@ -70,6 +81,9 @@ pub fn cap_from_name(name: &str) -> Option<u32> {
         "fs-read-any" => FS_READ_ANY,
         "fs-write-any" => FS_WRITE_ANY,
         "db" => DB,
+        "env-read" => ENV_READ,
+        "env-read-any" => ENV_READ_ANY,
+        "pane-fds" => PANE_FDS,
         _ => return None,
     })
 }
@@ -94,6 +108,9 @@ pub fn cap_name(flag: u32) -> &'static str {
         FS_READ_ANY => "fs-read-any",
         FS_WRITE_ANY => "fs-write-any",
         DB => "db",
+        ENV_READ => "env-read",
+        ENV_READ_ANY => "env-read-any",
+        PANE_FDS => "pane-fds",
         _ => "?",
     }
 }
@@ -105,6 +122,13 @@ pub struct EffectiveCaps {
     /// Advisory in v1: run_job takes a shell string, so this checks the
     /// first token only.
     pub argv0_allow: Vec<String>,
+    /// Environment variable names `pane_env` may read (empty = none,
+    /// unless env-read-any is granted). Mirrors `argv0_allow`.
+    pub env_allow: Vec<String>,
+    /// Path prefixes `fs_read`/`fs_list` may reach outside the sandbox
+    /// (empty = sandbox only, unless fs-read-any is granted). A middle
+    /// ground: least privilege for a plugin that must read known dirs.
+    pub fs_allow: Vec<String>,
 }
 
 impl EffectiveCaps {
@@ -132,11 +156,27 @@ struct ManifestCapsRunProcess {
 }
 
 #[derive(Debug, Deserialize, Default)]
+struct ManifestCapsEnvRead {
+    #[serde(default)]
+    names: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ManifestCapsFsRead {
+    #[serde(default)]
+    paths: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
 struct ManifestCaps {
     #[serde(default)]
     requests: Vec<String>,
     #[serde(rename = "run-process", default)]
     run_process: ManifestCapsRunProcess,
+    #[serde(rename = "env-read", default)]
+    env_read: ManifestCapsEnvRead,
+    #[serde(rename = "fs-read", default)]
+    fs_read: ManifestCapsFsRead,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -172,13 +212,20 @@ pub fn compute(wasm_path: &Path, grants: &[String]) -> Result<EffectiveCaps, Str
     };
 
     match manifest {
-        None => Ok(EffectiveCaps { flags: granted, argv0_allow: Vec::new() }),
+        None => Ok(EffectiveCaps {
+            flags: granted,
+            argv0_allow: Vec::new(),
+            env_allow: Vec::new(),
+            fs_allow: Vec::new(),
+        }),
         Some(m) => {
             let requested =
                 DEFAULT_CAPS | parse_names(&m.caps.requests, "requested")?;
             Ok(EffectiveCaps {
                 flags: requested & granted,
                 argv0_allow: m.caps.run_process.argv0,
+                env_allow: m.caps.env_read.names,
+                fs_allow: m.caps.fs_read.paths,
             })
         }
     }

@@ -86,6 +86,21 @@ pub struct pgh_host_vtable {
         sink: pgh_sink,
         ctx: *mut c_void,
     ) -> c_int,
+    /// Read one environment variable from a pane's foreground process as
+    /// a string. 0 ok, -1 dead pane, -2 no such variable.
+    pub pane_env: unsafe extern "C" fn(
+        pane_id: u32,
+        name: *const c_char,
+        sink: pgh_sink,
+        ctx: *mut c_void,
+    ) -> c_int,
+    /// Emit the open-file paths of a pane's foreground process, one per
+    /// line. 0 ok, -1 dead pane, -2 none.
+    pub pane_fds: unsafe extern "C" fn(
+        pane_id: u32,
+        sink: pgh_sink,
+        ctx: *mut c_void,
+    ) -> c_int,
     /// Get an option value as a string (kind -1 = server/global scope).
     /// 0 ok, -1 dead target, -2 no such option.
     pub get_option: unsafe extern "C" fn(

@@ -20,8 +20,10 @@
 #include <sys/stat.h>
 #include <sys/param.h>
 
+#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 #include "tmux.h"
@@ -86,6 +88,100 @@ osdep_get_cwd(int fd)
 		return (target);
 	}
 	return (NULL);
+}
+
+char *
+osdep_get_env(int fd, const char *name)
+{
+	FILE	*f;
+	char	*path, *buf, *value;
+	size_t	 len, namelen;
+	int	 ch;
+	pid_t	 pgrp;
+
+	if ((pgrp = tcgetpgrp(fd)) == -1)
+		return (NULL);
+
+	xasprintf(&path, "/proc/%lld/environ", (long long) pgrp);
+	if ((f = fopen(path, "r")) == NULL) {
+		free(path);
+		return (NULL);
+	}
+	free(path);
+
+	/* /proc/<pid>/environ is NUL-separated "NAME=VALUE" entries. */
+	namelen = strlen(name);
+	len = 0;
+	buf = NULL;
+	value = NULL;
+	while ((ch = fgetc(f)) != EOF) {
+		if (ch != '\0') {
+			buf = xrealloc(buf, len + 2);
+			buf[len++] = ch;
+			continue;
+		}
+		if (buf != NULL) {
+			buf[len] = '\0';
+			if (strncmp(buf, name, namelen) == 0 &&
+			    buf[namelen] == '=') {
+				value = xstrdup(buf + namelen + 1);
+				break;
+			}
+		}
+		free(buf);
+		buf = NULL;
+		len = 0;
+	}
+	free(buf);
+
+	fclose(f);
+	return (value);
+}
+
+char *
+osdep_get_fds(int fd)
+{
+	DIR		*dir;
+	struct dirent	*ent;
+	char		*path, *out, link[MAXPATHLEN + 1];
+	size_t		 outlen;
+	ssize_t		 n;
+	pid_t		 pgrp;
+
+	if ((pgrp = tcgetpgrp(fd)) == -1)
+		return (NULL);
+
+	xasprintf(&path, "/proc/%lld/fd", (long long) pgrp);
+	dir = opendir(path);
+	free(path);
+	if (dir == NULL)
+		return (NULL);
+
+	/* Return the real path of every fd that names a file, one per line. */
+	out = NULL;
+	outlen = 0;
+	while ((ent = readdir(dir)) != NULL) {
+		if (ent->d_name[0] == '.')
+			continue;
+		xasprintf(&path, "/proc/%lld/fd/%s", (long long) pgrp,
+		    ent->d_name);
+		n = readlink(path, link, MAXPATHLEN);
+		free(path);
+		if (n <= 0)
+			continue;
+		link[n] = '\0';
+		if (link[0] != '/')	/* skip sockets, pipes, anon inodes */
+			continue;
+		out = xrealloc(out, outlen + n + 2);
+		memcpy(out + outlen, link, n);
+		outlen += n;
+		out[outlen++] = '\n';
+	}
+	if (out != NULL)
+		out[outlen] = '\0';
+
+	closedir(dir);
+	return (out);
 }
 
 struct event_base *

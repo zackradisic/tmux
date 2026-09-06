@@ -174,6 +174,15 @@ pub mod imports {
     pub const FORMAT_EXPAND: &str = "format_expand";
     pub const SEND_KEYS: &str = "send_keys";
     pub const CAPTURE_PANE: &str = "capture_pane";
+    /// pane_env(pane, name_ptr, name_len, out, cap, len_out) -> i32
+    ///                       // read one env var from the pane's
+    ///                       // foreground process; -2 = no such var
+    pub const PANE_ENV: &str = "pane_env";
+    /// pane_fds(pane, out, cap, len_out) -> i32
+    ///                       // the open-file paths of the pane's
+    ///                       // foreground process, one per line;
+    ///                       // -2 = none
+    pub const PANE_FDS: &str = "pane_fds";
     pub const DISPLAY_MESSAGE: &str = "display_message";
     pub const TIMER_CANCEL: &str = "timer_cancel";
     pub const MODE_OPEN: &str = "mode_open";

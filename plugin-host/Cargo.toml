@@ -12,6 +12,7 @@ members = [
     "examples/resurrect",
     "examples/session_creator",
     "examples/cron",
+    "examples/agents",
 ]
 default-members = ["host"]
 

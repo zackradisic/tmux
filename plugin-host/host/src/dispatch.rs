@@ -407,6 +407,75 @@ pub fn send_keys(
     }
 }
 
+pub fn pane_env(
+    mem: &mut GuestMem<'_, '_>,
+    pane: i32,
+    name_ptr: i32,
+    name_len: i32,
+    out: i32,
+    cap: i32,
+    len_out: i32,
+) -> Result<(), HostError> {
+    // Either cap grants the call; env-read-any also lifts the allowlist.
+    let any = mem.data().caps.has(crate::caps::ENV_READ_ANY);
+    if !any && !mem.data().caps.has(crate::caps::ENV_READ) {
+        return Err(err(ErrorCode::CapDenied, "env-read not granted"));
+    }
+    let pane = pane_id(pane)?;
+    check_pane_target(mem, pane)?;
+    // env-read-any lifts the allowlist. Otherwise, when an allowlist is
+    // configured the name must be on it; an empty list means unrestricted
+    // (as with run_job's argv0 list under trust-the-user).
+    if !any && !mem.data().caps.env_allow.is_empty() {
+        let name = mem.read_str(name_ptr, name_len)?;
+        let allowed =
+            mem.data().caps.env_allow.iter().any(|n| *n == name);
+        if !allowed {
+            return Err(err(
+                ErrorCode::CapDenied,
+                format!("env var {name:?} not in env-read allowlist"),
+            ));
+        }
+    }
+    let vt = vtable()?;
+    let name = mem.c_str(name_ptr, name_len)?;
+    let mut sink = mem.out_sink(out, cap)?;
+    let rc = unsafe {
+        (vt.pane_env)(pane, name, out_sink, &mut sink as *mut _ as *mut c_void)
+    };
+    match rc {
+        0 => mem.finish_out(sink, len_out),
+        -2 => Err(err(
+            ErrorCode::NoSuchObject,
+            "no such environment variable",
+        )),
+        _ => Err(err(ErrorCode::NoSuchObject, format!("no such pane %{pane}"))),
+    }
+}
+
+pub fn pane_fds(
+    mem: &mut GuestMem<'_, '_>,
+    pane: i32,
+    out: i32,
+    cap: i32,
+    len_out: i32,
+) -> Result<(), HostError> {
+    check_cap(mem, crate::caps::PANE_FDS)?;
+    let pane = pane_id(pane)?;
+    check_pane_target(mem, pane)?;
+    let vt = vtable()?;
+    let mut sink = mem.out_sink(out, cap)?;
+    let rc = unsafe {
+        (vt.pane_fds)(pane, out_sink, &mut sink as *mut _ as *mut c_void)
+    };
+    match rc {
+        // -2 means no file-backed fds: the sink stays empty, so finish_out
+        // reports a zero-length result, not an error.
+        0 | -2 => mem.finish_out(sink, len_out),
+        _ => Err(err(ErrorCode::NoSuchObject, format!("no such pane %{pane}"))),
+    }
+}
+
 pub fn capture_pane(
     mem: &mut GuestMem<'_, '_>,
     pane: i32,
@@ -768,6 +837,27 @@ fn fs_reach(mem: &GuestMem<'_, '_>, escape_cap: u32) -> crate::fsbox::Reach {
     }
 }
 
+/// How far a READ may reach for this plugin, and enforce the scoped grant
+/// along the way. `fs-read-any` reaches anywhere; a bare `fs-read` with a
+/// `[caps.fs-read] paths` list reaches those prefixes (checked here, so a
+/// path outside them is denied before any worker sees it); otherwise the
+/// read stays in the sandbox.
+fn read_reach(
+    mem: &GuestMem<'_, '_>,
+    root: &crate::fsbox::Root,
+    rel: &str,
+) -> Result<crate::fsbox::Reach, HostError> {
+    if mem.data().caps.has(crate::caps::FS_READ_ANY) {
+        return Ok(crate::fsbox::Reach::Anywhere);
+    }
+    let allow = &mem.data().caps.fs_allow;
+    if !allow.is_empty() {
+        crate::fsbox::allowed_read(root, rel, allow).map_err(fs_err)?;
+        return Ok(crate::fsbox::Reach::Anywhere);
+    }
+    Ok(crate::fsbox::Reach::Sandbox)
+}
+
 /// The guest's relative path, as an owned String (validated inside fsbox).
 fn fs_rel(
     mem: &GuestMem<'_, '_>,
@@ -823,9 +913,9 @@ pub fn fs_read_async(
     if offset < 0 {
         return Err(err(ErrorCode::BadRequest, "negative offset"));
     }
-    let reach = fs_reach(mem, crate::caps::FS_READ_ANY);
     let root = fs_root_of(mem)?;
     let rel = fs_rel(mem, path_ptr, path_len)?;
+    let reach = read_reach(mem, &root, &rel)?;
     let ptr = mem.pinned_bytes_mut(out_ptr, out_cap)?;
     let data = mem.data();
     let key = (data.plugin.clone(), data.scope, data.generation);
@@ -862,9 +952,9 @@ pub fn fs_list_async(
     if out_cap <= 0 {
         return Err(err(ErrorCode::BadRequest, "zero output buffer"));
     }
-    let reach = fs_reach(mem, crate::caps::FS_READ_ANY);
     let root = fs_root_of(mem)?;
     let rel = fs_rel(mem, path_ptr, path_len)?;
+    let reach = read_reach(mem, &root, &rel)?;
     let ptr = mem.pinned_bytes_mut(out_ptr, out_cap)?;
     let data = mem.data();
     let key = (data.plugin.clone(), data.scope, data.generation);
@@ -995,9 +1085,9 @@ pub fn fs_read_sync(
     if offset < 0 {
         return Err(err(ErrorCode::BadRequest, "negative offset"));
     }
-    let reach = fs_reach(mem, crate::caps::FS_READ_ANY);
     let root = fs_root_of(mem)?;
     let rel = fs_rel(mem, path_ptr, path_len)?;
+    let reach = read_reach(mem, &root, &rel)?;
     let mut file = crate::fsbox::open_read(&root, &rel, reach).map_err(fs_err)?;
     // Read straight into the guest's out-buffer: no host copy at all, and
     // the bounds check happens before anything is sized by the guest.

@@ -312,6 +312,10 @@ send_key(pane: PaneId, key: &str)                       // "Enter", "C-c", "M-x"
 capture_pane(pane, start: Option<i32>, end: Option<i32>) -> Result<String, _>
 capture_pane_into(pane, start, end, escapes: bool, &mut Vec<u8>) // reusable buf
     // rows relative to visible top; negative = history; ≤2000 lines/call
+pane_env(pane: PaneId, name: &str) -> Result<Option<String>, _> // env of the
+    // pane's foreground process; Ok(None) = unset or pane gone (needs env-read)
+pane_fds(pane: PaneId) -> Result<Option<Vec<String>>, _> // open-file paths of
+    // the pane's foreground process; Ok(None) = pane gone (needs pane-fds)
 resolve_pane(PaneId) -> Result<PaneInfo, _>      // id, window, size, active,
                                                  // floating, dead, title/shell/
                                                  // cwd ("" = absent)
@@ -437,6 +441,9 @@ load-plugin -c send-keys -c run-process ... myplugin.wasm
 | `fs-read` / `fs-write` / `fs-list` | the `fs_*` calls, inside the data directory |
 | `fs-read-any` / `fs-write-any` | `fs_*` calls outside the data directory |
 | `db` | the plugin's own SQLite database (`db_*` calls) |
+| `env-read` / `env-read-any` | `pane_env` (allowlisted / unrestricted) |
+| `pane-fds` | `pane_fds` (open-file paths of a pane's foreground process) |
+| `fs-read` + `[caps.fs-read] paths` | `fs_read`/`fs_list` under named prefixes only |
 
 Denied calls return `HostError { code: E_CAP_DENIED }` — handle errors, do
 not unwrap host results.

@@ -45,6 +45,15 @@ A relative path still resolves against the data directory. Containment is
 then deliberately not enforced, so `RESOLVE_BENEATH` is dropped for those
 opens - leaving is the point.
 
+A middle ground for reads: `fs-read` with a `[caps.fs-read] paths = [...]`
+list reaches **those prefixes only**. The host canonicalizes the target
+(resolving `..` and symlinks) and admits it only if it resolves inside the
+data directory or under one of the listed prefixes; anything else is
+denied before a worker sees it. `~` in a prefix expands to the server
+user's home. This is least privilege for a plugin that must read known
+directories (a harness's session files, say) without the blanket
+`fs-read-any`. An empty list keeps `fs-read` sandboxed.
+
 Neither grant gives a plugin power it could not already reach through
 `run-process`, which runs an arbitrary shell. They exist so a plugin can
 read a directory *without* reaching for a shell.
@@ -230,6 +239,8 @@ Errors: sync imports return `0` or `-code`; value-returning imports
 | `format_expand` | `(kind, id, fmt Str, out, cap, len_out) -> i32` — `#{...}` against the scope; `#()` disabled | read-state |
 | `send_keys` | `(pane, keys Str, literal) -> i32` | send-keys |
 | `capture_pane` | `(pane, start, end, escapes, out, cap, len_out) -> i32` (≤2000 lines/call) | capture-pane |
+| `pane_env` | `(pane, name Str, out, cap, len_out) -> i32` — one env var of the pane's foreground process; -2 = unset | env-read |
+| `pane_fds` | `(pane, out, cap, len_out) -> i32` — the open-file paths of the pane's foreground process, one per line; -2 = none | pane-fds |
 | `display_message` | `(client /* -1 = all */, msg Str) -> i32` | display-message |
 | `timer_cancel` | `(token: i64) -> i32` | timers |
 | `mode_open` | `(window /* -1 = default */, width, height, x, y, title Str?) -> i64` (mode id) | mode |
@@ -356,6 +367,9 @@ versions for creation (`window-created`, `pane-created`, `client-created`)
 and destruction. `pane-notification` (OSC 9;message or OSC
 777;notify;title;body — the message travels in the `text` field, ≤512
 bytes, valid UTF-8) has no bus equivalent and is delivered directly.
+`pane-command-changed` fires (debounced ~500 ms, on pane output) when a
+pane's foreground command name changes, carrying `old_command` (absent on
+the first) and `new_command`; it is pane-scoped and needs `subscribe`.
 `plugin-command` (from the tmux command of the same name) is targeted:
 only the plugin named in its `plugin` field receives it (subscription
 still required); the command string is the `text` field and the target
@@ -462,9 +476,15 @@ Defaults always granted: `read-state`, `display-message`, `timers`. Others:
 plugin's data directory: `$XDG_DATA_HOME|~/.local/share` +
 `tmux/plugins/<name>/`; relative paths only, no `..`, symlink escapes
 rejected), `fs-list`, `fs-read-any`, `fs-write-any` (see Filesystem
-reach), `db` (the plugin's own SQLite database, see Database), and
-reserved: `popup`, `menu`, `db-read` (read-only access to other plugins'
-databases, to be named in a `[caps.db] read = [...]` sidecar list).
+reach), `db` (the plugin's own SQLite database, see Database), `env-read`
+(read a pane's foreground-process environment with `pane_env`, restricted
+to a `[caps.env-read] names = [...]` allowlist — an empty list, as under
+trust-the-user, is unrestricted, like `argv0`), `env-read-any` (lift that
+allowlist), `pane-fds` (read the open-file paths of a pane's
+foreground process with `pane_fds`), and reserved: `popup`, `menu`,
+`db-read` (read-only access to
+other plugins' databases, to be named in a `[caps.db] read = [...]`
+sidecar list).
 Scope-implied targeting is enforced on top: a pane-scoped instance may only
 target its own pane, window-scoped its window's panes, session-scoped its
 session's panes; `cross-scope` lifts this.

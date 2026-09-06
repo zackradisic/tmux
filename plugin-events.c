@@ -290,6 +290,75 @@ plugin_events_shutdown(void)
 }
 
 /*
+ * Fire pane-command-changed for a pane whose foreground command changed.
+ * Pane-scoped, with the window backfilled so a server-scoped subscriber
+ * can locate it. old may be NULL (the first command seen in the pane).
+ */
+static void
+plugin_pane_command_changed(struct window_pane *wp, const char *old,
+    const char *new)
+{
+	struct plugin_buf	*pb;
+
+	pb = plugin_event_create("pane-command-changed");
+	plugin_event_scope(pb, PGH_OBJ_PANE, wp->id);
+	if (wp->window != NULL) {
+		plugin_event_scope(pb, PGH_OBJ_WINDOW, wp->window->id);
+		plugin_event_str(pb, "window_name", wp->window->name);
+	}
+	if (old != NULL)
+		plugin_event_str(pb, "old_command", old);
+	if (new != NULL)
+		plugin_event_str(pb, "new_command", new);
+	plugin_event_send(pb);
+}
+
+/*
+ * Resample a pane's foreground command (as pane_current_command does) and
+ * fire pane-command-changed when it differs from the last seen value.
+ * Called from the server loop for panes with fresh output, debounced per
+ * pane by NAME_INTERVAL so a busy pane does not hammer the OS.
+ */
+void
+plugin_pane_check_command(struct window_pane *wp)
+{
+	struct timeval	 tv, diff;
+	char		*cmd, *name;
+
+	if (!plugin_enabled() || wp->fd == -1 || wp->shell == NULL)
+		return;
+
+	gettimeofday(&tv, NULL);
+	if (timerisset(&wp->cmd_check_time)) {
+		timersub(&tv, &wp->cmd_check_time, &diff);
+		if (diff.tv_sec == 0 && diff.tv_usec < NAME_INTERVAL)
+			return;
+	}
+	wp->cmd_check_time = tv;
+
+	/* Same resolution as format_cb_current_command. */
+	cmd = osdep_get_name(wp->fd, wp->tty);
+	if (cmd == NULL || *cmd == '\0') {
+		free(cmd);
+		cmd = cmd_stringify_argv(wp->argc, wp->argv);
+		if (cmd == NULL || *cmd == '\0') {
+			free(cmd);
+			cmd = xstrdup(wp->shell);
+		}
+	}
+	name = parse_window_name(cmd);
+	free(cmd);
+
+	if (wp->cached_cmd != NULL && strcmp(wp->cached_cmd, name) == 0) {
+		free(name);
+		return;
+	}
+	plugin_pane_command_changed(wp, wp->cached_cmd, name);
+	free(wp->cached_cmd);
+	wp->cached_cmd = name;
+}
+
+/*
  * Direct delivery for events with no bus equivalent (pane-notification
  * from OSC 9/777). Objects are the caller's responsibility to have live.
  */

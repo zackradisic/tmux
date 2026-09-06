@@ -337,6 +337,49 @@ pub fn capture_pane(
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// Read one environment variable from the pane's foreground process.
+/// `Ok(None)` when the variable is not set (or the pane is gone). Needs
+/// `env-read` with the name on the `[caps.env-read] names` allowlist, or
+/// `env-read-any`.
+pub fn pane_env(
+    pane: PaneId,
+    name: impl AsTmuxStr,
+) -> Result<Option<String>, HostError> {
+    let name = name.to_tmux();
+    let (np, nl) = name.parts();
+    match call_out(64, |out, cap, len_out| unsafe {
+        raw::pane_env(pane.0 as i32, np, nl, out, cap, len_out)
+    }) {
+        Ok(buf) => Ok(Some(String::from_utf8_lossy(&buf).into_owned())),
+        Err(e) if e.code == ErrorCode::NoSuchObject => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The open-file paths of a pane's foreground process, one per entry.
+///
+/// Reveals which files the process holds open - a Codex TUI, for one,
+/// keeps its rollout transcript open, so its path names the session.
+/// Needs the `pane-fds` capability. Returns an empty list when the pane
+/// holds no file-backed descriptors; `Ok(None)` when the pane is gone.
+pub fn pane_fds(pane: PaneId) -> Result<Option<Vec<String>>, HostError> {
+    match call_out(512, |out, cap, len_out| unsafe {
+        raw::pane_fds(pane.0 as i32, out, cap, len_out)
+    }) {
+        Ok(buf) => {
+            let text = String::from_utf8_lossy(&buf);
+            Ok(Some(
+                text.lines()
+                    .filter(|l| !l.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+            ))
+        }
+        Err(e) if e.code == ErrorCode::NoSuchObject => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// Show a status-line message on all attached clients (and the message log).
 pub fn display_message(msg: impl AsTmuxStr) -> Result<(), HostError> {
     let msg = msg.to_tmux();

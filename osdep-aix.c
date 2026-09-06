@@ -37,3 +37,15 @@ osdep_event_init(void)
 {
 	return (event_init());
 }
+
+char *
+osdep_get_env(__unused int fd, __unused const char *name)
+{
+	return (NULL);
+}
+
+char *
+osdep_get_fds(__unused int fd)
+{
+	return (NULL);
+}

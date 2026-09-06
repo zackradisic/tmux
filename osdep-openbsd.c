@@ -40,6 +40,8 @@
 
 static struct kinfo_proc *cmp_procs(struct kinfo_proc *, struct kinfo_proc *);
 char			 *osdep_get_name(int, char *);
+char			*osdep_get_env(int, const char *);
+char			*osdep_get_fds(int);
 char			 *osdep_get_cwd(int);
 struct event_base	 *osdep_event_init(void);
 
@@ -155,4 +157,16 @@ struct event_base *
 osdep_event_init(void)
 {
 	return (event_init());
+}
+
+char *
+osdep_get_env(__unused int fd, __unused const char *name)
+{
+	return (NULL);
+}
+
+char *
+osdep_get_fds(__unused int fd)
+{
+	return (NULL);
 }
