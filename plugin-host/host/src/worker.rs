@@ -315,24 +315,45 @@ pub fn drain() {
             None => return,
         }
     };
-    ARMED.store(false, Ordering::SeqCst);
+    // Consume the eventfd wakeup ONCE, up front. ARMED - not the eventfd
+    // counter - is the source of truth for "work is pending", so a
+    // producer that rings after this read keeps the eventfd non-zero and
+    // libevent will call us again.
+    //
+    // Then drain in a loop: clear ARMED, drain the queues, and stop only
+    // when a full pass ends with ARMED still false. That is the invariant
+    // that avoids the stuck-flag wedge: if ARMED is false after we
+    // drained, no producer has armed since our clear, so nothing was
+    // pushed that we did not take; and any producer that pushes later will
+    // see ARMED false, ring, and wake us again. Clearing the flag AFTER a
+    // read that already consumed the ring (the old order) could leave
+    // ARMED stuck true with the eventfd at zero - no more rings, no more
+    // drains, completions stranded forever.
     drain_doorbell(s.doorbell_read);
-    // Surface any worker-thread log lines on the main-thread host log.
-    while let Ok(line) = s.log_rx.try_recv() {
-        crate::hostlog::error("host", &line);
-    }
-    while let Ok(c) = s.completions.try_recv() {
-        crate::state::EVENTS.with(|e| {
-            e.borrow_mut().deliveries.push_back(
-                crate::state::Delivery::AsyncComplete {
-                    token: c.token,
-                    err: c.err,
-                    v0: c.v0,
-                    v1: c.v1,
-                    data: c.data,
-                },
-            );
-        });
+    loop {
+        ARMED.store(false, Ordering::SeqCst);
+        // Surface any worker-thread log lines on the main-thread host log.
+        while let Ok(line) = s.log_rx.try_recv() {
+            crate::hostlog::error("host", &line);
+        }
+        while let Ok(c) = s.completions.try_recv() {
+            crate::state::EVENTS.with(|e| {
+                e.borrow_mut().deliveries.push_back(
+                    crate::state::Delivery::AsyncComplete {
+                        token: c.token,
+                        err: c.err,
+                        v0: c.v0,
+                        v1: c.v1,
+                        data: c.data,
+                    },
+                );
+            });
+        }
+        // A producer armed after our clear: drain again now rather than
+        // wait for the (already-consumed) doorbell. Otherwise we are done.
+        if !ARMED.load(Ordering::SeqCst) {
+            break;
+        }
     }
 }
 
@@ -402,6 +423,9 @@ pub fn shutdown() {
 /// task used to remove a pool thread for good; enough of them emptied the
 /// pool and every later async db/fs call hung with no thread to poll it.
 fn runner_main(stop: async_channel::Receiver<()>) {
+    // Drive the executor until the stop channel closes. A task panic
+    // unwinds out of `run`; catch it so the panic does not kill the
+    // thread (a dead runner was never replaced), log it, and re-enter.
     loop {
         let stop = stop.clone();
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -410,16 +434,11 @@ fn runner_main(stop: async_channel::Receiver<()>) {
             }));
         }));
         match res {
-            // The stop channel closed: a clean exit.
-            Ok(()) => return,
-            // A task panicked; the panic hook already logged the detail.
-            // Keep the thread and go back to serving the pool.
-            Err(_) => {
-                worker_log(
-                    "worker task panicked; thread recovered, pool preserved"
-                        .to_string(),
-                );
-            }
+            Ok(()) => return, // stop channel closed: a clean exit
+            Err(_) => worker_log(
+                "worker task panicked; thread recovered, pool preserved"
+                    .to_string(),
+            ),
         }
     }
 }
