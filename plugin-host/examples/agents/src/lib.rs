@@ -541,9 +541,13 @@ impl Agents {
         let text = event.get_str("text").unwrap_or("").trim().to_string();
         let verb = text.split_whitespace().next().unwrap_or("").to_string();
         if verb == "pick" {
-            if self.picker.borrow().is_some() {
-                let _ = display_message("agents: picker already open");
-                return;
+            // Reopen even if a picker lingers. A mode whose window or
+            // session was destroyed without a clean close leaves our
+            // state as Some with no mode-closed event; refusing then would
+            // wedge the hotkey. Drop the old one (best-effort close) and
+            // open fresh, so pressing the key always shows a picker.
+            if let Some(old) = self.picker.borrow_mut().take() {
+                let _ = mode_close(old.mode);
             }
             let cfg = Rc::clone(&self.cfg);
             let picker = Rc::clone(&self.picker);
