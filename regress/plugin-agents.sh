@@ -82,6 +82,14 @@ screen | grep -q 'claude' || fail "claude agent missing from the roster"
 screen | grep -q 'review the diff' || fail "the reported task is missing"
 screen | grep -q 'jump' || fail "footer is missing the key hints"
 
+# Archive the LAST row: this shrinks the roster, which once indexed the
+# new (shorter) rows with a stale index and trapped the guest, tearing
+# down the mode. The picker must survive and stay open.
+keys Down; keys Down; keys Down
+$TMUX send-keys -t "$FORM" a; sleep 0.6
+$TMUX list-panes -a -F '#{pane_mode}' | grep -q plugin-mode ||
+    fail "picker closed after archiving the last row"
+
 # Retire: kill the codex pane; it should leave the live list.
 $TMUX kill-session -t alpha
 sleep 0.8

@@ -4,7 +4,7 @@
 //! floating chooser: one row per agent, grouped by state (needs input,
 //! waiting, working, done) and, inside each group, most recently active
 //! first. A live preview of the highlighted pane sits to the right.
-//! `j`/`k` move, Enter jumps, `A` archives, `h` folds in the finished
+//! `j`/`k` move, Enter jumps, `a` archives, `h` folds in the finished
 //! ones, and `/` starts a filter (Enter accepts it, Esc cancels).
 //!
 //! Three signals drive it, each from its own trusted source:
@@ -101,7 +101,7 @@ impl Default for PickKeys {
         Self {
             jump: "Enter".into(),
             filter: "/".into(),
-            archive: "A".into(),
+            archive: "a".into(),
             history: "h".into(),
             close: "Escape".into(),
         }
@@ -853,9 +853,18 @@ async fn reload_picker(picker: Rc<RefCell<Option<Picker>>>, enrich: bool) {
     sort_rows(&mut rows);
     let mut b = picker.borrow_mut();
     if let Some(p) = b.as_mut() {
+        // Capture the selected agent id against the OLD rows before we
+        // swap them in, so the highlight follows the agent (and the
+        // refilter never indexes the new, possibly-shorter list with a
+        // stale index).
+        let keep = p
+            .view
+            .get(p.sel)
+            .and_then(|&i| p.rows.get(i))
+            .map(|a| a.id.clone());
         p.rows = rows;
         p.now_ms = now_ms();
-        pick_refilter(p);
+        pick_refilter_keep(p, keep);
         pick_render(p);
     }
 }
@@ -991,7 +1000,22 @@ fn haystack(a: &Agent) -> String {
 
 /// Keep the band order of `p.rows`; the filter only includes or excludes.
 fn pick_refilter(p: &mut Picker) {
-    let keep = p.view.get(p.sel).map(|&i| p.rows[i].id.clone());
+    // The currently-selected agent id, resolved against the CURRENT rows.
+    // `.get` on both sides: a stale index (rows just replaced under us)
+    // must never index out of bounds.
+    let keep = p
+        .view
+        .get(p.sel)
+        .and_then(|&i| p.rows.get(i))
+        .map(|a| a.id.clone());
+    pick_refilter_keep(p, keep);
+}
+
+/// Rebuild `view`/`sel`/`lines`, restoring the highlight to `keep`'s agent
+/// if it survived the filter. Callers that replace `rows` pass the id they
+/// captured from the OLD rows, since the internal `view`/`sel` no longer
+/// index the new set.
+fn pick_refilter_keep(p: &mut Picker, keep: Option<String>) {
     let needle = p.filter.trim();
     p.view = p
         .rows
