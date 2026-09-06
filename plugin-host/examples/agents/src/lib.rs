@@ -197,13 +197,23 @@ fn provisional_id(kind: &str, pane: u32) -> String {
 /// running command). Used as the provisional display name until a
 /// resolver supplies the harness's own name.
 fn pane_title(pane: u32, kind: &str) -> Option<String> {
-    let title = format_expand(
+    // The default pane title is the host name (an OSC title the shell
+    // never set), which is no better than the kind. Reject it, as
+    // notify-toast does, so only a title an agent actually wrote survives.
+    let expanded = format_expand(
         OptionTarget::Pane(PaneId(pane)),
-        "#{pane_title}",
+        "#{pane_title}\t#{host_short}\t#{host}",
     )
     .ok()?;
-    let title = title.trim();
-    if title.is_empty() || title.eq_ignore_ascii_case(kind) {
+    let mut parts = expanded.splitn(3, '\t');
+    let title = parts.next().unwrap_or("").trim();
+    let host_short = parts.next().unwrap_or("");
+    let host = parts.next().unwrap_or("");
+    if title.is_empty()
+        || title.eq_ignore_ascii_case(kind)
+        || title == host_short
+        || title == host
+    {
         return None;
     }
     Some(title.to_string())
@@ -273,17 +283,21 @@ async fn enrich_live(rows: &mut [Agent]) {
     // Claude needs one directory read for the whole set; index it up front.
     let claude = resolve::claude_index().await;
     for a in rows.iter_mut().filter(|a| a.live()) {
-        let r = match a.kind.as_str() {
+        let mut r = match a.kind.as_str() {
             "claude" => a
                 .pane
                 .and_then(|p| claude.get(&(p as u32)))
                 .map(clone_resolved),
             "codex" => resolve::codex(a).await,
             _ => resolve::from_source(a).await,
-        };
-        if let Some(r) = r {
-            apply(a, r).await;
         }
+        .unwrap_or_default();
+        // The live pane title tracks the conversation topic (Claude and
+        // its kin write it there), which beats the session file's slug.
+        // Prefer it; keep the harness name only as a fallback.
+        let title = a.pane.and_then(|p| pane_title(p as u32, &a.kind));
+        r.name = title.or_else(|| r.name.take());
+        apply(a, r).await;
     }
 }
 
