@@ -184,9 +184,12 @@ pub async fn id_exists(id: &str) -> Result<bool, HostError> {
 
 /// Create, revive, or rebind a live agent by its durable id, in one
 /// upsert. A new id inserts; a known id re-points at the pane, refreshes
-/// its labels, clears any ended/archived state, and (only if it had
-/// ended) resets the turn status. Keeps first_seen, task, a resolved
-/// name, and the stale/active life of a still-live agent.
+/// its labels, clears any ended state, and (only if it had ended) resets
+/// the turn status. Keeps first_seen, task, a resolved name, and the life
+/// of a still-live agent - a plain re-sighting NEVER clears an archive
+/// (that would resurrect it on every restart). A genuinely new session id
+/// clears the archive through `rename_id`; a new `working` report clears it
+/// through `unarchive_by_pane`.
 #[allow(clippy::too_many_arguments)]
 pub async fn activate(
     id: &str,
@@ -210,8 +213,6 @@ pub async fn activate(
             name = COALESCE(agents.name, excluded.name), \
             ended_ms = NULL, \
             reason = NULL, \
-            life = CASE WHEN agents.life = 'archived' \
-                        THEN 'active' ELSE agents.life END, \
             status = CASE WHEN agents.ended_ms IS NOT NULL \
                           THEN 'working' ELSE agents.status END, \
             last_status_ms = CASE WHEN agents.ended_ms IS NOT NULL \
@@ -225,10 +226,14 @@ pub async fn activate(
 }
 
 /// Rename a provisional id to the durable one, when the durable id has no
-/// row yet. Straight `UPDATE`, so the row keeps every observed fact.
+/// row yet. The row keeps every observed fact, but a new durable id means
+/// a genuinely new session took over the row, so clear any archive: the
+/// user archived the OLD session, not this one.
 pub async fn rename_id(old: &str, new: &str) -> Result<(), HostError> {
     db_exec(
-        "UPDATE agents SET id = ?2 WHERE id = ?1",
+        "UPDATE agents SET id = ?2, \
+            life = CASE WHEN life = 'archived' THEN 'active' ELSE life END \
+         WHERE id = ?1",
         params![old, new],
     )
     .await?;
@@ -311,6 +316,20 @@ pub async fn set_status(
         )
         .await?
     };
+    Ok(r.changes as u64)
+}
+
+/// Clear the archive on a pane's live row. A `working` report is a fresh
+/// turn - the user sent the agent a new message - so an archived agent
+/// comes back into the roster. Returns the rows changed (0 if it was not
+/// archived).
+pub async fn unarchive_by_pane(pane: i64) -> Result<u64, HostError> {
+    let r = db_exec(
+        "UPDATE agents SET life = 'active' \
+         WHERE pane = ?1 AND ended_ms IS NULL AND life = 'archived'",
+        params![pane],
+    )
+    .await?;
     Ok(r.changes as u64)
 }
 

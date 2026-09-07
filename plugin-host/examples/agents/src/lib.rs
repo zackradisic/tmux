@@ -6,6 +6,8 @@
 //! first. A live preview of the highlighted pane sits to the right.
 //! `j`/`k` move, Enter jumps, `a` archives, `h` folds in the finished
 //! ones, and `/` starts a filter (Enter accepts it, Esc cancels).
+//! `J`/`K` (shift) mark rows into a selection; `a` then archives the whole
+//! selection at once. Esc clears the selection before it closes the picker.
 //!
 //! Three signals drive it, each from its own trusted source:
 //!
@@ -51,6 +53,7 @@
 //!            "~/.local/share/opencode"]
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use serde::Deserialize;
@@ -388,6 +391,11 @@ async fn report(
             let _ =
                 store::set_status(pane as i64, &status, task.as_deref(), now).await;
         }
+        // A `working` report is a new turn - the user messaged the agent -
+        // so bring an archived row back into the roster.
+        if status == "working" {
+            let _ = store::unarchive_by_pane(pane as i64).await;
+        }
     }
     refresh_if_open(&picker).await;
 }
@@ -628,7 +636,15 @@ impl Agents {
                     pick_render(p);
                 }
             } else if key == k.close {
-                after = PickAfter::Close(p.mode);
+                // Esc cancels a pending selection first; a second Esc, with
+                // nothing marked, closes the picker.
+                if p.marked.is_empty() {
+                    after = PickAfter::Close(p.mode);
+                } else {
+                    p.marked.clear();
+                    p.status = Some("selection cleared".into());
+                    pick_render(p);
+                }
             } else if key == k.filter {
                 p.filtering = true;
                 pick_render(p);
@@ -643,10 +659,14 @@ impl Agents {
                     }
                 }
             } else if key == k.archive {
-                after = life_after(p, sel, "archived");
+                after = archive_after(p);
             } else if key == k.history {
                 p.show_history = !p.show_history;
                 after = PickAfter::Reload;
+            } else if key == "J" {
+                mark_and_move(p, 1);
+            } else if key == "K" {
+                mark_and_move(p, -1);
             } else if is_down || key == "j" {
                 move_sel(p, 1);
             } else if is_up || key == "k" {
@@ -664,8 +684,8 @@ impl Agents {
                     let _ = mode_close(mode);
                 });
             }
-            PickAfter::Life(id, life) => {
-                ctx.spawn(apply_life(Rc::clone(&self.picker), id, life));
+            PickAfter::Life(ids, life) => {
+                ctx.spawn(apply_life(Rc::clone(&self.picker), ids, life));
             }
             PickAfter::Reload => {
                 ctx.spawn(reload_picker(Rc::clone(&self.picker), false));
@@ -685,11 +705,36 @@ fn move_sel(p: &mut Picker, delta: i32) {
     pick_render(p);
 }
 
-/// Decide a lifecycle change for the highlighted row, under the borrow.
-fn life_after(p: &Picker, sel: Option<usize>, life: &str) -> PickAfter {
-    match sel {
-        Some(i) => PickAfter::Life(p.rows[i].id.clone(), life.to_string()),
-        None => PickAfter::None,
+/// Mark the current row into the selection, then move by `delta`. `J`/`K`
+/// build a multi-row selection this way: each press ropes in the row under
+/// the cursor and steps on, so N presses select N rows and leave the cursor
+/// just past them.
+fn mark_and_move(p: &mut Picker, delta: i32) {
+    if let Some(&i) = p.view.get(p.sel) {
+        p.marked.insert(p.rows[i].id.clone());
+    }
+    move_sel(p, delta);
+}
+
+/// The rows `a` acts on: the whole marked selection when one exists, else
+/// the single highlighted row.
+fn archive_after(p: &Picker) -> PickAfter {
+    let mut ids: Vec<String> = p
+        .view
+        .iter()
+        .filter_map(|&i| p.rows.get(i))
+        .filter(|a| p.marked.contains(&a.id))
+        .map(|a| a.id.clone())
+        .collect();
+    if ids.is_empty() {
+        if let Some(&i) = p.view.get(p.sel) {
+            ids.push(p.rows[i].id.clone());
+        }
+    }
+    if ids.is_empty() {
+        PickAfter::None
+    } else {
+        PickAfter::Life(ids, "archived".to_string())
     }
 }
 
@@ -701,7 +746,7 @@ enum PickAfter {
     None,
     Close(ModeId),
     Jump(u32, ModeId),
-    Life(String, String),
+    Life(Vec<String>, String),
     Reload,
 }
 
@@ -723,6 +768,9 @@ struct Picker {
     lines: Vec<Line>,
     sel: usize,
     top: usize,
+    /// Agent ids marked for a bulk action, keyed by id so they survive a
+    /// reload/refilter without a stale-index risk.
+    marked: HashSet<String>,
     filter: String,
     filtering: bool,
     now_ms: u64,
@@ -820,6 +868,7 @@ async fn pick_open(
         lines: Vec::new(),
         sel: 0,
         top: 0,
+        marked: HashSet::new(),
         filter: String::new(),
         filtering: false,
         now_ms: now_ms(),
@@ -896,14 +945,22 @@ async fn refresh_timer(picker: Rc<RefCell<Option<Picker>>>, mode: ModeId) {
 
 async fn apply_life(
     picker: Rc<RefCell<Option<Picker>>>,
-    id: String,
+    ids: Vec<String>,
     life: String,
 ) {
-    let _ = store::set_life(&id, &life).await;
+    for id in &ids {
+        let _ = store::set_life(id, &life).await;
+    }
     {
         let mut b = picker.borrow_mut();
         if let Some(p) = b.as_mut() {
-            p.status = Some(format!("marked {life}"));
+            p.status = Some(if ids.len() == 1 {
+                format!("marked {life}")
+            } else {
+                format!("marked {} {life}", ids.len())
+            });
+            // The bulk action consumed the selection.
+            p.marked.clear();
         }
     }
     reload_picker(picker, false).await;
@@ -1093,8 +1150,13 @@ fn pick_render(p: &mut Picker) {
     let mut out = String::from("\x1b[2J\x1b[H");
 
     let live = p.rows.iter().filter(|a| a.live()).count();
+    let selected = if p.marked.is_empty() {
+        String::new()
+    } else {
+        format!(", {} selected", p.marked.len())
+    };
     out.push_str(&format!(
-        "\x1b[1;1H\x1b[1m agents\x1b[0m \x1b[2m({live} live{})\x1b[0m",
+        "\x1b[1;1H\x1b[1m agents\x1b[0m \x1b[2m({live} live{}{selected})\x1b[0m",
         if p.show_history { ", +history" } else { "" }
     ));
     if p.filtering {
@@ -1139,6 +1201,7 @@ fn pick_render(p: &mut Picker) {
                 Line::Item(vpos) => {
                     let a = &p.rows[p.view[vpos]];
                     let cur = vpos == p.sel;
+                    let marked = p.marked.contains(&a.id);
                     let marker = if cur { "▸" } else { " " };
                     let age = fmt_age(
                         p.now_ms.saturating_sub(a.active_ms() as u64) / 1000,
@@ -1170,11 +1233,21 @@ fn pick_render(p: &mut Picker) {
                     // spaces after the marker.
                     let shown =
                         plain.replacen("   ", &format!(" {} ", badge(a)), 1);
+                    let pad = list_w.saturating_sub(1);
                     if cur {
+                        // The cursor row: reverse video across the width.
                         out.push_str(&format!(
                             "\x1b[{row};1H\x1b[7m{:<pad$}\x1b[0m",
                             strip_sgr(&shown),
-                            pad = list_w.saturating_sub(1)
+                        ));
+                    } else if marked {
+                        // A marked row: a full-width highlight band, distinct
+                        // from the cursor's reverse. Explicit fg+bg so it
+                        // reads on any theme; strip the badge colours so they
+                        // do not reset the band mid-row.
+                        out.push_str(&format!(
+                            "\x1b[{row};1H\x1b[97;44m{:<pad$}\x1b[0m",
+                            strip_sgr(&shown),
                         ));
                     } else {
                         out.push_str(&format!("\x1b[{row};1H{shown}"));
@@ -1201,7 +1274,7 @@ fn pick_render(p: &mut Picker) {
         "type to filter · Enter accept · Esc cancel".to_string()
     } else {
         format!(
-            "j/k move · {} jump · {} filter · {} arch · {} hist · {} close",
+            "j/k move · J/K sel · {} jump · {} filter · {} arch · {} hist · {} close",
             keyname(&k.jump),
             keyname(&k.filter),
             keyname(&k.archive),

@@ -82,6 +82,15 @@ screen | grep -q 'claude' || fail "claude agent missing from the roster"
 screen | grep -q 'review the diff' || fail "the reported task is missing"
 screen | grep -q 'jump' || fail "footer is missing the key hints"
 
+# Multi-select: shift-J marks the current row and steps on. The header
+# reports the count; Esc cancels the selection without closing the picker.
+$TMUX send-keys -t "$FORM" J; sleep 0.4
+screen | grep -q '1 selected' || fail "shift-J did not mark a row"
+$TMUX send-keys -t "$FORM" Escape; sleep 0.4
+screen | grep -q 'selected' && fail "Esc did not clear the selection"
+$TMUX list-panes -a -F '#{pane_mode}' | grep -q plugin-mode ||
+    fail "Esc closed the picker while a selection was pending"
+
 # Archive the LAST row: this shrinks the roster, which once indexed the
 # new (shorter) rows with a stale index and trapped the guest, tearing
 # down the mode. The picker must survive and stay open.
