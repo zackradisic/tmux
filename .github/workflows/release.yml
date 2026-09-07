@@ -148,13 +148,17 @@ jobs:
           tag='${{ steps.tag.outputs.tag }}'
           flags=''
           [ '${{ steps.tag.outputs.pre }}' = true ] && flags='--prerelease'
-          notes="tmux2 fork ($(git log -1 --format='%h %s')) with the bundled wasm plugins.
+          sha_line=$(git log -1 --format='%h %s')
+          notes=$(cat <<EOF
+          tmux2 fork ($sha_line) with the bundled wasm plugins.
 
-Install or update on a host:
+          Install or update on a host:
 
-    curl -fsSL https://github.com/${{ github.repository }}/releases/download/$tag/install-tmux2.sh | sh -s -- $tag
+              curl -fsSL https://github.com/${{ github.repository }}/releases/download/$tag/install-tmux2.sh | sh -s -- $tag
 
-Runtime deps on Linux: libevent 2.1 and ncurses (tinfo), both present wherever a stock tmux is."
+          Runtime deps on Linux: libevent 2.1 and ncurses (tinfo), both present wherever a stock tmux is.
+          EOF
+          )
           ls -la artifacts
           gh release create "$tag" $flags \
             --target "$GITHUB_SHA" \
