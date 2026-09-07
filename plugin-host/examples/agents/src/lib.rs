@@ -752,26 +752,39 @@ fn toggle_content(p: &mut Picker) {
     pick_render(p);
 }
 
-/// The rows `a` acts on: the whole marked selection when one exists, else
-/// the single highlighted row.
+/// The archive key toggles: it archives its targets, or un-archives them
+/// when they are all already archived (an archived row shows in the
+/// history view). Targets are the marked selection, else the highlighted
+/// row.
 fn archive_after(p: &Picker) -> PickAfter {
-    let mut ids: Vec<String> = p
-        .view
-        .iter()
-        .filter_map(|&i| p.rows.get(i))
-        .filter(|a| p.marked.contains(&a.id))
-        .map(|a| a.id.clone())
-        .collect();
-    if ids.is_empty() {
-        if let Some(&i) = p.view.get(p.sel) {
-            ids.push(p.rows[i].id.clone());
+    let targets: Vec<&Agent> = {
+        let marked: Vec<&Agent> = p
+            .view
+            .iter()
+            .filter_map(|&i| p.rows.get(i))
+            .filter(|a| p.marked.contains(&a.id))
+            .collect();
+        if !marked.is_empty() {
+            marked
+        } else {
+            p.view
+                .get(p.sel)
+                .and_then(|&i| p.rows.get(i))
+                .into_iter()
+                .collect()
         }
+    };
+    if targets.is_empty() {
+        return PickAfter::None;
     }
-    if ids.is_empty() {
-        PickAfter::None
+    // All targets already archived -> un-archive; otherwise archive.
+    let life = if targets.iter().all(|a| a.life == "archived") {
+        "active"
     } else {
-        PickAfter::Life(ids, "archived".to_string())
-    }
+        "archived"
+    };
+    let ids: Vec<String> = targets.iter().map(|a| a.id.clone()).collect();
+    PickAfter::Life(ids, life.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1003,10 +1016,11 @@ async fn apply_life(
     {
         let mut b = picker.borrow_mut();
         if let Some(p) = b.as_mut() {
+            let verb = if life == "active" { "unarchived" } else { "archived" };
             p.status = Some(if ids.len() == 1 {
-                format!("marked {life}")
+                verb.to_string()
             } else {
-                format!("marked {} {life}", ids.len())
+                format!("{} {verb}", ids.len())
             });
             // The bulk action consumed the selection.
             p.marked.clear();
@@ -1246,8 +1260,12 @@ fn fmt_age(secs: u64) -> String {
     }
 }
 
-/// Coloured status glyph. Dim for a finished agent.
+/// Coloured status glyph. Magenta for an archived agent, dim for a
+/// finished one.
 fn badge(a: &Agent) -> String {
+    if a.life == "archived" {
+        return "\x1b[35m◆\x1b[0m".into();
+    }
     if !a.live() {
         return "\x1b[2m·\x1b[0m".into();
     }
@@ -1347,13 +1365,17 @@ fn pick_render(p: &mut Picker) {
                         .saturating_sub(4 + 2 + right.chars().count())
                         .max(8);
                     let mut label = display_name(a);
-                    // A content-search hit shows the matching line; else
-                    // the reported task, as before.
+                    // An archived row (only in the history view) says so,
+                    // so the `a` un-archive is obvious. Otherwise a
+                    // content-search hit shows the matching line, else the
+                    // reported task.
                     let snip = a
                         .pane
                         .and_then(|pn| p.content_hits.get(&(pn as u32)))
                         .filter(|_| p.content_search);
-                    if let Some(sn) = snip {
+                    if a.life == "archived" {
+                        label = format!("{label}  ·  archived");
+                    } else if let Some(sn) = snip {
                         label = format!("{label}  ·  {}", sn.trim());
                     } else if let Some(t) =
                         a.task.as_deref().filter(|s| !s.is_empty())
@@ -1413,11 +1435,18 @@ fn pick_render(p: &mut Picker) {
     } else {
         format!("{} contents", pretty_key(&k.content))
     };
+    // The archive key un-archives when the highlighted row is archived.
+    let cursor_archived = p
+        .view
+        .get(p.sel)
+        .and_then(|&i| p.rows.get(i))
+        .is_some_and(|a| a.life == "archived");
+    let arch = if cursor_archived { "unarch" } else { "arch" };
     let footer = if p.filtering {
         format!("type to filter · {ctok} · Enter accept · Esc cancel")
     } else {
         format!(
-            "j/k move · J/K sel · {} jump · {} filter · {ctok} · {} arch · {} close",
+            "j/k move · J/K sel · {} jump · {} filter · {ctok} · {} {arch} · {} close",
             keyname(&k.jump),
             keyname(&k.filter),
             keyname(&k.archive),
