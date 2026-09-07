@@ -93,12 +93,13 @@ jobs:
           brew install autoconf automake bison libevent make ncurses pkg-config
 
       # No utf8proc: it would add a shared-library dependency the target
-      # host may not have. libevent and ncurses/tinfo stay dynamic; both
-      # are present on any host with a stock tmux.
+      # host may not have (macOS configure insists on an explicit choice).
+      # libevent and ncurses/tinfo stay dynamic; both are present on any
+      # host with a stock tmux.
       - name: build
         run: |
           sh autogen.sh
-          ./configure --enable-plugins
+          ./configure --enable-plugins --disable-utf8proc
           ${{ matrix.make }} -j"$(getconf _NPROCESSORS_ONLN)"
           strip tmux
           ./tmux -V
