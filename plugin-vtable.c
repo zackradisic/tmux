@@ -21,6 +21,7 @@
 #include <ctype.h>
 #include <regex.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "tmux.h"
 #include "plugin-host.h"
