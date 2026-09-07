@@ -1,0 +1,164 @@
+name: 'Release'
+
+# Build the tmux2 fork (tmux + wasm plugin host) and the bundled wasm
+# plugins, and publish them as a GitHub release. Install on a host with
+# scripts/install-tmux2.sh (also attached to every release).
+#
+#   git tag v3.8-wasm.1 && git push github v3.8-wasm.1   # tagged release
+#   gh workflow run release.yml --ref wasm-plugins        # dated prerelease
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (empty = dated prerelease from this commit)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tmux2-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # The wasm plugins are platform-independent: build them once. The
+  # capability sidecars (<name>.toml) ship next to their .wasm.
+  plugins:
+    name: wasm plugins
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: build
+        working-directory: plugin-host
+        run: |
+          cargo build --release --target wasm32-unknown-unknown \
+            -p notify-toast -p resurrect -p session_creator \
+            -p git-status -p cron -p agents
+      - name: bundle
+        run: |
+          out=dist/plugins
+          mkdir -p "$out"
+          cp plugin-host/target/wasm32-unknown-unknown/release/*.wasm "$out/"
+          for f in plugin-host/examples/*/*.toml; do
+            case "$f" in *Cargo.toml) ;; *) cp "$f" "$out/";; esac
+          done
+          ls -la "$out"
+          tar -C dist -czf tmux2-plugins.tar.gz plugins
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tmux2-plugins
+          path: tmux2-plugins.tar.gz
+
+  binary:
+    name: tmux ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Oldest supported glibc wins: a 22.04 build runs on 22.04+.
+          - name: linux-x86_64
+            runner: ubuntu-22.04
+            make: make
+          - name: linux-aarch64
+            runner: ubuntu-22.04-arm
+            make: make
+          - name: darwin-arm64
+            runner: macos-14
+            make: gmake
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            autoconf automake bison build-essential \
+            libevent-dev libncurses-dev pkg-config
+
+      - name: dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew install autoconf automake bison libevent make ncurses pkg-config
+
+      # No utf8proc: it would add a shared-library dependency the target
+      # host may not have. libevent and ncurses/tinfo stay dynamic; both
+      # are present on any host with a stock tmux.
+      - name: build
+        run: |
+          sh autogen.sh
+          ./configure --enable-plugins
+          ${{ matrix.make }} -j"$(getconf _NPROCESSORS_ONLN)"
+          strip tmux
+          ./tmux -V
+
+      - name: bundle
+        run: |
+          mkdir -p dist/bin
+          cp tmux dist/bin/tmux
+          tar -C dist -czf tmux2-${{ matrix.name }}.tar.gz bin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tmux2-${{ matrix.name }}
+          path: tmux2-${{ matrix.name }}.tar.gz
+
+  release:
+    name: publish
+    needs: [plugins, binary]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            tag="${GITHUB_REF#refs/tags/}"
+            pre=false
+          elif [ -n "${{ inputs.tag }}" ]; then
+            tag="${{ inputs.tag }}"
+            pre=false
+          else
+            tag="wasm-plugins-$(date -u +%Y%m%d)-${GITHUB_SHA::8}"
+            pre=true
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "pre=$pre" >> "$GITHUB_OUTPUT"
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag='${{ steps.tag.outputs.tag }}'
+          flags=''
+          [ '${{ steps.tag.outputs.pre }}' = true ] && flags='--prerelease'
+          notes="tmux2 fork ($(git log -1 --format='%h %s')) with the bundled wasm plugins.
+
+Install or update on a host:
+
+    curl -fsSL https://github.com/${{ github.repository }}/releases/download/$tag/install-tmux2.sh | sh -s -- $tag
+
+Runtime deps on Linux: libevent 2.1 and ncurses (tinfo), both present wherever a stock tmux is."
+          ls -la artifacts
+          gh release create "$tag" $flags \
+            --target "$GITHUB_SHA" \
+            --title "tmux2 $tag" \
+            --notes "$notes" \
+            artifacts/*.tar.gz \
+            scripts/install-tmux2.sh
