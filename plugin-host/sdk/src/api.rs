@@ -380,6 +380,60 @@ pub fn pane_fds(pane: PaneId) -> Result<Option<Vec<String>>, HostError> {
     }
 }
 
+/// One `panes_search` match: the pane that matched, the grid line and
+/// byte column of the hit, and the matching line as a snippet.
+#[derive(Debug, Clone)]
+pub struct SearchHit {
+    pub pane: PaneId,
+    pub line: u32,
+    pub col: u32,
+    pub snippet: String,
+}
+
+/// Grep the grids of several panes for `pattern` in one host call. The
+/// search runs in tmux over the live grid, so the pane contents never
+/// cross the ABI - only the needle in and the matches out. Soft-wrapped
+/// rows are joined, so a wrapped match is found. Only the last
+/// `max_lines` lines of each pane are searched (0 = the host default).
+/// The result holds one hit per matching pane. Needs `capture-pane`.
+pub fn panes_search(
+    panes: &[PaneId],
+    pattern: &str,
+    case_sensitive: bool,
+    max_lines: u32,
+) -> Result<Vec<SearchHit>, HostError> {
+    if panes.is_empty() || pattern.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<u32> = panes.iter().map(|p| p.0).collect();
+    let pat = pattern.to_tmux();
+    let (pp, pl) = pat.parts();
+    let mut flags = 0u32;
+    if case_sensitive {
+        flags |= tmux_plugin_abi::search_flags::CASE_SENSITIVE;
+    }
+    let buf = call_owned(|out| unsafe {
+        raw::panes_search(
+            ids.as_ptr() as i32,
+            ids.len() as i32,
+            pp,
+            pl,
+            flags as i32,
+            max_lines as i32,
+            out,
+        )
+    })?;
+    parse_list(&buf, |c| {
+        Ok(SearchHit {
+            pane: PaneId(c.u32()?),
+            line: c.u32()?,
+            col: c.u32()?,
+            snippet: String::from_utf8_lossy(c.bytes()?).into_owned(),
+        })
+    })
+    .map_err(|_| wire_err())
+}
+
 /// The pid of a pane's foreground process group.
 ///
 /// This is the leader pid tmux uses for `#{pane_current_command}` and the

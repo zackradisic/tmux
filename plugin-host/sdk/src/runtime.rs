@@ -45,6 +45,10 @@ pub(crate) mod raw {
             out: i32, cap: i32, len_out: i32,
         ) -> i32;
         pub fn pane_fds(pane: i32, out: i32, cap: i32, len_out: i32) -> i32;
+        pub fn panes_search(
+            ids_ptr: i32, ids_len: i32, pat_ptr: i32, pat_len: i32,
+            flags: i32, max_lines: i32, owned_out: i32,
+        ) -> i32;
         pub fn pane_pid(pane: i32) -> i64;
         pub fn display_message(client: i32, msg_ptr: i32, msg_len: i32) -> i32;
         #[allow(dead_code)]
@@ -132,6 +136,7 @@ pub(crate) mod raw {
     pub unsafe fn capture_pane(pane: i32, start: i32, end: i32, escapes: i32, out: i32, cap: i32, len_out: i32) -> i32 { -7 }
     pub unsafe fn pane_env(pane: i32, name_ptr: i32, name_len: i32, out: i32, cap: i32, len_out: i32) -> i32 { -7 }
     pub unsafe fn pane_fds(pane: i32, out: i32, cap: i32, len_out: i32) -> i32 { -7 }
+    pub unsafe fn panes_search(ids_ptr: i32, ids_len: i32, pat_ptr: i32, pat_len: i32, flags: i32, max_lines: i32, owned_out: i32) -> i32 { -7 }
     pub unsafe fn pane_pid(pane: i32) -> i64 { -7 }
     pub unsafe fn display_message(client: i32, msg_ptr: i32, msg_len: i32) -> i32 { -7 }
     #[allow(dead_code)]

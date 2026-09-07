@@ -101,6 +101,18 @@ pub struct pgh_host_vtable {
         sink: pgh_sink,
         ctx: *mut c_void,
     ) -> c_int,
+    /// Grep the grids of `n_ids` panes for `pattern`. Emits one match
+    /// record per matching pane through the sink; returns the match count
+    /// (>=0) or -1 on error.
+    pub panes_search: unsafe extern "C" fn(
+        ids: *const u32,
+        n_ids: u32,
+        pattern: *const c_char,
+        flags: u32,
+        max_lines: u32,
+        sink: pgh_sink,
+        ctx: *mut c_void,
+    ) -> c_int,
     /// The pid of a pane's foreground process group, or -1 if dead.
     pub pane_pid: unsafe extern "C" fn(pane_id: u32) -> c_int,
     /// Get an option value as a string (kind -1 = server/global scope).

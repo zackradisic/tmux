@@ -476,6 +476,63 @@ pub fn pane_fds(
     }
 }
 
+/// Grep the grids of a set of panes for a pattern. The needle and the
+/// pane-id array cross the ABI; the pane contents never do - the search
+/// runs in C over the live grid. The result is a `u32 count`-prefixed
+/// list of `{pane, line, col, snippet}` records (see `search_flags`).
+/// Reuses the `capture-pane` cap: reading a match is no more than
+/// capturing the pane would already allow.
+pub fn panes_search(
+    mem: &mut GuestMem<'_, '_>,
+    ids_ptr: i32,
+    ids_len: i32,
+    pat_ptr: i32,
+    pat_len: i32,
+    flags: i32,
+    max_lines: i32,
+    owned_out: i32,
+) -> Result<(), HostError> {
+    check_cap(mem, crate::caps::CAPTURE_PANE)?;
+    if ids_len < 0 || max_lines < 0 {
+        return Err(err(ErrorCode::BadRequest, "negative length"));
+    }
+    let nbytes = (ids_len as usize)
+        .checked_mul(4)
+        .ok_or_else(|| err(ErrorCode::BadRequest, "ids array overflow"))?;
+    // Copy the id array out (owned; survives the give_owned re-entry).
+    let raw = mem.read(ids_ptr, nbytes as i32)?;
+    let ids: Vec<u32> = raw
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    // Borrowed NUL-terminated needle: valid until the next guest re-entry,
+    // which happens only in give_owned, after the C search returns.
+    let pattern = mem.c_str(pat_ptr, pat_len)?;
+    let vt = vtable()?;
+    let mut buf: Vec<u8> = Vec::new();
+    let n = unsafe {
+        (vt.panes_search)(
+            ids.as_ptr(),
+            ids.len() as u32,
+            pattern,
+            flags as u32,
+            max_lines as u32,
+            collect_sink,
+            &mut buf as *mut Vec<u8> as *mut c_void,
+        )
+    };
+    if n < 0 {
+        return Err(err(
+            ErrorCode::BadRequest,
+            "panes_search failed (unsupported flag?)",
+        ));
+    }
+    // The C side streams the records; prepend the count the wire list wants.
+    let mut out = (n as u32).to_le_bytes().to_vec();
+    out.extend_from_slice(&buf);
+    mem.give_owned(&out, owned_out)
+}
+
 pub fn pane_pid(
     mem: &mut GuestMem<'_, '_>,
     pane: i32,

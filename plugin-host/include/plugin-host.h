@@ -176,6 +176,16 @@ typedef struct {
    */
   int (*pane_env)(uint32_t pane_id, const char *name, pgh_sink sink, void *ctx);
   int (*pane_fds)(uint32_t pane_id, pgh_sink sink, void *ctx);
+  /**
+   * Grep the grids of n_ids panes for a pattern. Soft-wrapped rows are
+   * joined so a wrapped match is found. Emits one match record per
+   * matching pane through the sink - {pane:u32, line:u32, col:u32,
+   * snip_len:u32, snip bytes}, all little-endian - and returns the match
+   * count (>=0), or -1 on error (e.g. an unsupported flag).
+   */
+  int (*panes_search)(const uint32_t *ids, uint32_t n_ids,
+      const char *pattern, uint32_t flags, uint32_t max_lines,
+      pgh_sink sink, void *ctx);
   int (*pane_pid)(uint32_t pane_id);
   /**
    * Get an option value as a string (kind -1 = server/global scope).

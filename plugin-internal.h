@@ -30,6 +30,17 @@
 #define PLUGIN_CAPTURE_MAX_LINES 2000
 
 /*
+ * panes_search: default and hard cap on the lines searched per pane
+ * (from the bottom up), and the longest snippet returned per match.
+ * The flag bits mirror abi-types `search_flags`; keep them in sync.
+ */
+#define PLUGIN_SEARCH_MAX_LINES 5000
+#define PLUGIN_SEARCH_SNIPPET_MAX 240
+#define PGH_SEARCH_REGEX 0x1
+#define PGH_SEARCH_CASE_SENSITIVE 0x2
+#define PGH_SEARCH_MULTILINE 0x4
+
+/*
  * Cap on job output bytes carried in one async completion (mirrors
  * abi-types MAX_JOB_OUTPUT_BYTES; keep in sync).
  */
@@ -64,6 +75,8 @@ int	 plugin_vtable_send_keys(u_int, const char *, int);
 int	 plugin_vtable_capture_pane(u_int, int, int, int, pgh_sink, void *);
 int	 plugin_vtable_pane_env(u_int, const char *, pgh_sink, void *);
 int	 plugin_vtable_pane_fds(u_int, pgh_sink, void *);
+int	 plugin_vtable_panes_search(const uint32_t *, uint32_t, const char *,
+	    uint32_t, uint32_t, pgh_sink, void *);
 int	 plugin_vtable_pane_pid(u_int);
 int	 plugin_vtable_get_option(int, u_int, const char *, pgh_sink, void *);
 int	 plugin_vtable_set_option(int, u_int, const char *, const char *);

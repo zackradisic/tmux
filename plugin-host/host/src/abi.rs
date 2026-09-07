@@ -952,6 +952,15 @@ fn register_imports(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
         }))
     })?;
 
+    linker.func_wrap(m, im::PANES_SEARCH, |mut c: Caller<'_, StoreData>, ids_ptr: i32, ids_len: i32, pat_ptr: i32, pat_len: i32, flags: i32, max_lines: i32, owned_out: i32| -> i32 {
+        ret_i32(with_mem(&mut c, |mem| {
+            dispatch::panes_search(
+                mem, ids_ptr, ids_len, pat_ptr, pat_len, flags, max_lines,
+                owned_out,
+            )
+        }))
+    })?;
+
     linker.func_wrap(m, im::PANE_PID, |mut c: Caller<'_, StoreData>, pane: i32| -> i64 {
         ret_i64(with_mem(&mut c, |mem| dispatch::pane_pid(mem, pane)))
     })?;

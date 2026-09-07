@@ -241,6 +241,7 @@ Errors: sync imports return `0` or `-code`; value-returning imports
 | `capture_pane` | `(pane, start, end, escapes, out, cap, len_out) -> i32` (≤2000 lines/call) | capture-pane |
 | `pane_env` | `(pane, name Str, out, cap, len_out) -> i32` — one env var of the pane's foreground process; -2 = unset | env-read |
 | `pane_fds` | `(pane, out, cap, len_out) -> i32` — the open-file paths of the pane's foreground process, one per line; -2 = none | pane-fds |
+| `panes_search` | `(ids_ptr, ids_len, pat_ptr, pat_len, flags, max_lines, owned_out) -> i32` — grep the grids of `ids_len` panes for a pattern; result is a `u32 count`-prefixed list of `{pane:u32, line:u32, col:u32, snippet Bytes}` records, one per matching pane. The search runs in tmux; only the needle in and the matches out cross the ABI. Soft-wrapped rows are joined, so a wrapped match is found. `flags`: bit0 regex (reserved), bit1 case-sensitive, bit2 multiline (reserved). `max_lines` bounds the lines searched per pane (0 = host default) | capture-pane |
 | `display_message` | `(client /* -1 = all */, msg Str) -> i32` | display-message |
 | `timer_cancel` | `(token: i64) -> i32` | timers |
 | `mode_open` | `(window /* -1 = default */, width, height, x, y, title Str?) -> i64` (mode id) | mode |

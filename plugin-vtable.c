@@ -420,6 +420,147 @@ plugin_vtable_capture_pane(u_int pane_id, int start, int end, int escapes,
 	return (0);
 }
 
+/* Emit a little-endian u32 through the sink. */
+static void
+plugin_search_put_u32(pgh_sink sink, void *ctx, uint32_t v)
+{
+	u_char	b[4];
+
+	b[0] = v & 0xff;
+	b[1] = (v >> 8) & 0xff;
+	b[2] = (v >> 16) & 0xff;
+	b[3] = (v >> 24) & 0xff;
+	sink(ctx, (const char *)b, sizeof b);
+}
+
+/*
+ * Search one pane's grid for the needle and, on the first hit, emit a
+ * match record {pane, line, col, snip_len, snip} through the sink.
+ * Returns 1 if it matched, 0 if not. Soft-wrapped rows are joined (no
+ * newline between them), so a match that spans a wrap is found; real line
+ * ends keep their newline. Only the last max_lines lines are searched.
+ */
+static int
+plugin_search_one(u_int pane_id, const char *needle, int icase,
+    u_int max_lines, pgh_sink sink, void *ctx)
+{
+	struct window_pane	*wp;
+	struct grid		*gd;
+	struct screen		*s;
+	struct grid_cell	*gc = NULL;
+	const struct grid_line	*gl;
+	char			*buf = NULL, *line, *hit;
+	size_t			*starts = NULL;
+	u_int			*rows = NULL;
+	size_t			 off = 0, cap = 0, hit_off, lstart, lend;
+	u_int			 sx, top, bottom, i, nlines = 0, lcap = 0, li;
+	uint32_t		 snip_len;
+	int			 matched = 0;
+
+	wp = window_pane_find_by_id(pane_id);
+	if (wp == NULL || (wp->flags & PANE_DESTROYED))
+		return (0);
+	s = &wp->base;
+	gd = wp->base.grid;
+	sx = screen_size_x(s);
+
+	if (gd->hsize + gd->sy == 0)
+		return (0);
+	bottom = gd->hsize + gd->sy - 1;
+	if (max_lines != 0 && bottom + 1 > max_lines)
+		top = bottom + 1 - max_lines;
+	else
+		top = 0;
+
+	/* Build one contiguous, wrap-joined buffer; track each row's start. */
+	for (i = top; i <= bottom; i++) {
+		size_t	llen;
+
+		line = grid_string_cells(gd, 0, i, sx, &gc,
+		    GRID_STRING_TRIM_SPACES, s);
+		llen = strlen(line);
+		while (cap < off + llen + 2) {
+			cap = (cap == 0) ? 1024 : cap * 2;
+			buf = xrealloc(buf, cap);
+		}
+		if (nlines == lcap) {
+			lcap = (lcap == 0) ? 256 : lcap * 2;
+			starts = xreallocarray(starts, lcap, sizeof *starts);
+			rows = xreallocarray(rows, lcap, sizeof *rows);
+		}
+		starts[nlines] = off;
+		rows[nlines] = i;
+		nlines++;
+		memcpy(buf + off, line, llen);
+		off += llen;
+		gl = grid_peek_line(gd, i);
+		if (gl == NULL || !(gl->flags & GRID_LINE_WRAPPED))
+			buf[off++] = '\n';
+		free(line);
+	}
+	if (buf == NULL)
+		return (0);
+	buf[off] = '\0';
+
+	hit = icase ? strcasestr(buf, needle) : strstr(buf, needle);
+	if (hit != NULL) {
+		hit_off = (size_t)(hit - buf);
+		/* The physical row that holds the hit (starts is increasing). */
+		for (li = 0; li + 1 < nlines; li++) {
+			if (starts[li + 1] > hit_off)
+				break;
+		}
+		lstart = starts[li];
+		lend = (li + 1 < nlines) ? starts[li + 1] : off;
+		while (lend > lstart && buf[lend - 1] == '\n')
+			lend--;
+		snip_len = (uint32_t)(lend - lstart);
+		if (snip_len > PLUGIN_SEARCH_SNIPPET_MAX)
+			snip_len = PLUGIN_SEARCH_SNIPPET_MAX;
+		plugin_search_put_u32(sink, ctx, pane_id);
+		plugin_search_put_u32(sink, ctx, rows[li]);
+		plugin_search_put_u32(sink, ctx, (uint32_t)(hit_off - lstart));
+		plugin_search_put_u32(sink, ctx, snip_len);
+		sink(ctx, buf + lstart, snip_len);
+		matched = 1;
+	}
+
+	free(buf);
+	free(starts);
+	free(rows);
+	return (matched);
+}
+
+/*
+ * Grep the grids of a set of panes. Emits one match record per matching
+ * pane and returns the match count, or -1 for an unsupported flag. The
+ * pane contents stay in tmux; only the needle in and the matches out
+ * cross the ABI.
+ */
+int
+plugin_vtable_panes_search(const uint32_t *ids, uint32_t n_ids,
+    const char *pattern, uint32_t flags, uint32_t max_lines, pgh_sink sink,
+    void *ctx)
+{
+	u_int	 i;
+	int	 icase, count = 0;
+
+	if (flags & PGH_SEARCH_REGEX)
+		return (-1);		/* regex not yet supported */
+	if (pattern == NULL || *pattern == '\0')
+		return (0);
+	icase = !(flags & PGH_SEARCH_CASE_SENSITIVE);
+	if (max_lines == 0 || max_lines > PLUGIN_SEARCH_MAX_LINES)
+		max_lines = PLUGIN_SEARCH_MAX_LINES;
+
+	for (i = 0; i < n_ids; i++) {
+		if (plugin_search_one(ids[i], pattern, icase, max_lines, sink,
+		    ctx))
+			count++;
+	}
+	return (count);
+}
+
 /*
  * Read one environment variable from a pane's foreground process into
  * the sink. Uses the pty master fd, like pane_current_command. Returns

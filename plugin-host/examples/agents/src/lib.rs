@@ -8,6 +8,11 @@
 //! ones, and `/` starts a filter (Enter accepts it, Esc cancels).
 //! `J`/`K` (shift) mark rows into a selection; `a` then archives the whole
 //! selection at once. Esc clears the selection before it closes the picker.
+//! `C-f` toggles content search: the filter then also greps each live
+//! agent's pane CONTENTS, not just its name and status. The grep runs in
+//! tmux over the live grid (the `panes_search` host call), so the pane
+//! text never crosses the plugin ABI - only the needle in and the matches
+//! out. A matching row shows the line it hit.
 //!
 //! Three signals drive it, each from its own trusted source:
 //!
@@ -53,7 +58,7 @@
 //!            "~/.local/share/opencode"]
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use serde::Deserialize;
@@ -68,6 +73,9 @@ const WIDTH: u32 = 110;
 const HEIGHT: u32 = 22;
 const LIST_MAX: usize = 14;
 const HISTORY_MAX: i64 = 100;
+/// Lines searched per pane (from the bottom up) by content search. 0 =
+/// the host default cap.
+const SEARCH_LINES: u32 = 5000;
 
 /// The commands that mark a pane as an agent, if none are configured.
 const DEFAULT_COMMANDS: &[&str] = &["claude", "codex", "pi", "opencode"];
@@ -88,6 +96,7 @@ struct AgentsConfig {
     pick_archive: Option<String>,
     pick_history: Option<String>,
     pick_close: Option<String>,
+    pick_content: Option<String>,
 }
 
 #[derive(Clone)]
@@ -97,6 +106,7 @@ struct PickKeys {
     archive: String,
     history: String,
     close: String,
+    content: String,
 }
 
 impl Default for PickKeys {
@@ -107,6 +117,7 @@ impl Default for PickKeys {
             archive: "a".into(),
             history: "h".into(),
             close: "Escape".into(),
+            content: "C-f".into(),
         }
     }
 }
@@ -150,6 +161,7 @@ impl Config {
                 archive: pick(&c.pick_archive, d.archive),
                 history: pick(&c.pick_history, d.history),
                 close: pick(&c.pick_close, d.close),
+                content: pick(&c.pick_content, d.content),
             },
         })
     }
@@ -628,6 +640,8 @@ impl Agents {
                     p.filter.push(' ');
                     pick_refilter(p);
                     pick_render(p);
+                } else if key == k.content {
+                    toggle_content(p);
                 } else if key.chars().count() == 1
                     && !key.chars().next().unwrap().is_control()
                 {
@@ -648,6 +662,8 @@ impl Agents {
             } else if key == k.filter {
                 p.filtering = true;
                 pick_render(p);
+            } else if key == k.content {
+                toggle_content(p);
             } else if key == k.jump {
                 if let Some(i) = sel {
                     let a = &p.rows[i];
@@ -716,6 +732,23 @@ fn mark_and_move(p: &mut Picker, delta: i32) {
     move_sel(p, delta);
 }
 
+/// Flip content search on or off, then re-filter. Turning it off drops
+/// the cached snippets. Turning it on makes the next `pick_refilter` grep
+/// the live panes.
+fn toggle_content(p: &mut Picker) {
+    p.content_search = !p.content_search;
+    if !p.content_search {
+        p.content_hits.clear();
+    }
+    p.status = Some(if p.content_search {
+        "search pane contents: on".into()
+    } else {
+        "search pane contents: off".into()
+    });
+    pick_refilter(p);
+    pick_render(p);
+}
+
 /// The rows `a` acts on: the whole marked selection when one exists, else
 /// the single highlighted row.
 fn archive_after(p: &Picker) -> PickAfter {
@@ -773,6 +806,13 @@ struct Picker {
     marked: HashSet<String>,
     filter: String,
     filtering: bool,
+    /// When on, the filter also matches live pane CONTENTS: the grid of
+    /// each live agent's pane is grep'd for the query, in tmux, through
+    /// `panes_search`. Toggled with `C-f`.
+    content_search: bool,
+    /// The matching snippet per live pane id, from the last content
+    /// search. Drives the row's snippet and the OR in the filter.
+    content_hits: HashMap<u32, String>,
     now_ms: u64,
     show_history: bool,
     keys: PickKeys,
@@ -871,6 +911,8 @@ async fn pick_open(
         marked: HashSet::new(),
         filter: String::new(),
         filtering: false,
+        content_search: false,
+        content_hits: HashMap::new(),
         now_ms: now_ms(),
         show_history: false,
         keys: cfg.keys.clone(),
@@ -1073,12 +1115,35 @@ fn pick_refilter(p: &mut Picker) {
 /// captured from the OLD rows, since the internal `view`/`sel` no longer
 /// index the new set.
 fn pick_refilter_keep(p: &mut Picker, keep: Option<String>) {
-    let needle = p.filter.trim();
+    let needle = p.filter.trim().to_string();
+    // Refresh the content-match set when content search is on. The grep
+    // runs in tmux over the live grids (`panes_search`); only the needle
+    // and the matches cross the ABI, so it is cheap enough per keystroke.
+    p.content_hits = if p.content_search && !needle.is_empty() {
+        let panes: Vec<PaneId> = p
+            .rows
+            .iter()
+            .filter(|a| a.live())
+            .filter_map(|a| a.pane.map(|x| PaneId(x as u32)))
+            .collect();
+        panes_search(&panes, &needle, false, SEARCH_LINES)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|h| (h.pane.0, h.snippet))
+            .collect()
+    } else {
+        HashMap::new()
+    };
     p.view = p
         .rows
         .iter()
         .enumerate()
-        .filter(|(_, a)| rank(&haystack(a), needle).is_some())
+        .filter(|(_, a)| {
+            rank(&haystack(a), &needle).is_some()
+                || a.pane
+                    .map(|pn| p.content_hits.contains_key(&(pn as u32)))
+                    .unwrap_or(false)
+        })
         .map(|(i, _)| i)
         .collect();
     p.sel = keep
@@ -1106,6 +1171,15 @@ fn keyname(k: &str) -> &str {
         "Escape" => "Esc",
         "Enter" => "Enter",
         other => other,
+    }
+}
+
+/// A short, readable key label: `C-f` shows as `^F`.
+fn pretty_key(k: &str) -> String {
+    if let Some(rest) = k.strip_prefix("C-") {
+        format!("^{}", rest.to_uppercase())
+    } else {
+        keyname(k).to_string()
     }
 }
 
@@ -1156,8 +1230,9 @@ fn pick_render(p: &mut Picker) {
         format!(", {} selected", p.marked.len())
     };
     out.push_str(&format!(
-        "\x1b[1;1H\x1b[1m agents\x1b[0m \x1b[2m({live} live{}{selected})\x1b[0m",
-        if p.show_history { ", +history" } else { "" }
+        "\x1b[1;1H\x1b[1m agents\x1b[0m \x1b[2m({live} live{}{}{selected})\x1b[0m",
+        if p.show_history { ", +history" } else { "" },
+        if p.content_search { ", find" } else { "" },
     ));
     if p.filtering {
         // Active: show the query with a block cursor.
@@ -1217,7 +1292,15 @@ fn pick_render(p: &mut Picker) {
                         .saturating_sub(4 + 2 + right.chars().count())
                         .max(8);
                     let mut label = display_name(a);
-                    if let Some(t) =
+                    // A content-search hit shows the matching line; else
+                    // the reported task, as before.
+                    let snip = a
+                        .pane
+                        .and_then(|pn| p.content_hits.get(&(pn as u32)))
+                        .filter(|_| p.content_search);
+                    if let Some(sn) = snip {
+                        label = format!("{label}  ·  {}", sn.trim());
+                    } else if let Some(t) =
                         a.task.as_deref().filter(|s| !s.is_empty())
                     {
                         label = format!("{label}  ·  {t}");
@@ -1270,22 +1353,26 @@ fn pick_render(p: &mut Picker) {
         ));
     }
     let k = &p.keys;
+    let ctok = format!("{} contents", pretty_key(&k.content));
     let footer = if p.filtering {
-        "type to filter · Enter accept · Esc cancel".to_string()
+        format!("type to filter · {ctok} · Enter accept · Esc cancel")
     } else {
         format!(
-            "j/k move · J/K sel · {} jump · {} filter · {} arch · {} hist · {} close",
+            "j/k move · J/K sel · {} jump · {} filter · {ctok} · {} arch · {} close",
             keyname(&k.jump),
             keyname(&k.filter),
             keyname(&k.archive),
-            keyname(&k.history),
             keyname(&k.close),
         )
     };
-    out.push_str(&format!(
-        "\x1b[{h};1H  \x1b[2m{}\x1b[0m",
-        clip(&footer, list_w.saturating_sub(4))
-    ));
+    let footer = clip(&footer, list_w.saturating_sub(4));
+    // Light up the content-search hotkey while it is on.
+    let footer = if p.content_search {
+        footer.replacen(&ctok, &format!("\x1b[0;7m{ctok}\x1b[0;2m"), 1)
+    } else {
+        footer
+    };
+    out.push_str(&format!("\x1b[{h};1H  \x1b[2m{}\x1b[0m", footer));
 
     let _ = mode_write(p.mode, out.as_bytes());
     let _ = mode_preview(p.mode, preview_rect(p, list_w).as_ref());
