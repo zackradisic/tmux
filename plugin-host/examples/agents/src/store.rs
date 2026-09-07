@@ -19,7 +19,7 @@
 
 use tmux_plugin_sdk::prelude::*;
 
-pub const USER_VERSION: i64 = 2;
+pub const USER_VERSION: i64 = 3;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS agents (
@@ -48,7 +48,10 @@ CREATE TABLE IF NOT EXISTS captures (
   id TEXT PRIMARY KEY,
   text TEXT,
   FOREIGN KEY(id) REFERENCES agents(id) ON DELETE CASCADE);
-PRAGMA user_version = 2;";
+CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY,
+  value TEXT);
+PRAGMA user_version = 3;";
 
 /// The v1 -> v2 upgrade: the resolved columns did not exist in v1.
 const MIGRATE_V2: &str = "
@@ -57,6 +60,13 @@ ALTER TABLE agents ADD COLUMN started_ms INTEGER;
 ALTER TABLE agents ADD COLUMN last_active_ms INTEGER;
 ALTER TABLE agents ADD COLUMN source_path TEXT;
 PRAGMA user_version = 2;";
+
+/// The v2 -> v3 upgrade: a key/value settings table (remembered UI size).
+const MIGRATE_V3: &str = "
+CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY,
+  value TEXT);
+PRAGMA user_version = 3;";
 
 const COLS: &str = "id, kind, status, life, pane, session, window, task, name, \
                     first_seen_ms, last_status_ms, started_ms, last_active_ms, \
@@ -139,21 +149,48 @@ pub fn migrate_sync() -> Result<(), String> {
     let v = db_query_sync("PRAGMA user_version", params![])
         .map_err(|e| format!("db: {e}"))?;
     let version = v.scalar().and_then(DbValue::as_i64).unwrap_or(0);
-    match version {
-        0 => {
-            db_exec_sync(SCHEMA, params![]).map_err(|e| format!("db: {e}"))?;
-        }
-        1 => {
+    if version > USER_VERSION {
+        return Err(format!(
+            "store.db is version {version}, this plugin understands {USER_VERSION}"
+        ));
+    }
+    // A fresh db jumps straight to the latest; an existing one upgrades in
+    // order.
+    if version == 0 {
+        db_exec_sync(SCHEMA, params![]).map_err(|e| format!("db: {e}"))?;
+    } else {
+        if version == 1 {
             db_exec_sync(MIGRATE_V2, params![])
                 .map_err(|e| format!("db: {e}"))?;
         }
-        v if v > USER_VERSION => {
-            return Err(format!(
-                "store.db is version {v}, this plugin understands {USER_VERSION}"
-            ));
+        if version <= 2 {
+            db_exec_sync(MIGRATE_V3, params![])
+                .map_err(|e| format!("db: {e}"))?;
         }
-        _ => {}
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// settings (key/value; remembered UI state)
+// ---------------------------------------------------------------------------
+
+pub async fn get_setting(key: &str) -> Result<Option<String>, HostError> {
+    let rows = db_query(
+        "SELECT value FROM settings WHERE key = ?1 LIMIT 1",
+        params![key],
+    )
+    .await?;
+    Ok(rows.scalar().and_then(DbValue::as_str).map(str::to_owned))
+}
+
+pub async fn set_setting(key: &str, value: &str) -> Result<(), HostError> {
+    db_exec(
+        "INSERT INTO settings (key, value) VALUES (?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )
+    .await?;
     Ok(())
 }
 

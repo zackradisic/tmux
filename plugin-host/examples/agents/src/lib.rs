@@ -7,7 +7,10 @@
 //! `j`/`k` move, Enter jumps, `a` archives, `h` folds in the finished
 //! ones, and `/` starts a filter (Enter accepts it, Esc cancels).
 //! `J`/`K` (shift) mark rows into a selection; `a` then archives the whole
-//! selection at once. Esc clears the selection before it closes the picker.
+//! selection at once (and un-archives when every marked row is archived).
+//! Esc clears the selection before it closes the picker. `+`/`-` grow and
+//! shrink the popup; the size is remembered across opens. The popup opens
+//! at a fraction of the window by default.
 //! `C-f` toggles content search: the filter then also greps each live
 //! agent's pane CONTENTS, not just its name and status. The grep runs in
 //! tmux over the live grid (the `panes_search` host call), so the pane
@@ -72,9 +75,19 @@ mod store;
 use resolve::Resolved;
 use store::Agent;
 
-const WIDTH: u32 = 110;
-const HEIGHT: u32 = 22;
-const LIST_MAX: usize = 14;
+/// The picker opens at a fraction of the window, clamped to this box. A
+/// manual resize (+/-) is remembered and overrides the default.
+const MAX_WIDTH: u32 = 180;
+const MAX_HEIGHT: u32 = 54;
+const MIN_WIDTH: u32 = 72;
+const MIN_HEIGHT: u32 = 16;
+/// Fraction of the window the default size fills (in tenths).
+const FILL_TENTHS: u32 = 9;
+/// The step a single +/- resize moves the width and height.
+const RESIZE_STEP_W: u32 = 12;
+const RESIZE_STEP_H: u32 = 4;
+/// Cap on rows the list draws; the window height drives the real count.
+const LIST_MAX: usize = 60;
 const HISTORY_MAX: i64 = 100;
 /// Lines searched per pane (from the bottom up) by content search. 0 =
 /// the host default cap.
@@ -686,6 +699,20 @@ impl Agents {
                 mark_and_move(p, 1);
             } else if key == "K" {
                 mark_and_move(p, -1);
+            } else if key == "+" || key == "=" {
+                let w = (p.width + RESIZE_STEP_W).min(MAX_WIDTH);
+                let h = (p.height + RESIZE_STEP_H).min(MAX_HEIGHT);
+                p.width = w;
+                p.height = h;
+                pick_render(p);
+                after = PickAfter::Resize(p.mode, w, h);
+            } else if key == "-" || key == "_" {
+                let w = p.width.saturating_sub(RESIZE_STEP_W).max(MIN_WIDTH);
+                let h = p.height.saturating_sub(RESIZE_STEP_H).max(MIN_HEIGHT);
+                p.width = w;
+                p.height = h;
+                pick_render(p);
+                after = PickAfter::Resize(p.mode, w, h);
             } else if is_down || key == "j" {
                 move_sel(p, 1);
             } else if is_up || key == "k" {
@@ -708,6 +735,14 @@ impl Agents {
             }
             PickAfter::Reload => {
                 ctx.spawn(reload_picker(Rc::clone(&self.picker), false));
+            }
+            PickAfter::Resize(mode, w, h) => {
+                // Resize the float now; remember the choice for next time.
+                let _ = mode_resize(mode, w, h);
+                ctx.spawn(async move {
+                    let _ = store::set_setting("pick_w", &w.to_string()).await;
+                    let _ = store::set_setting("pick_h", &h.to_string()).await;
+                });
             }
         }
     }
@@ -797,6 +832,7 @@ enum PickAfter {
     Jump(u32, ModeId),
     Life(Vec<String>, String),
     Reload,
+    Resize(ModeId, u32, u32),
 }
 
 /// One rendered line: a band header, or a selectable row (by its position
@@ -884,6 +920,20 @@ impl Picker {
     }
 }
 
+/// Keep a dimension within the window (2 cells spare for the border) and
+/// at or above `min`.
+fn clamp_dim(v: u32, min: u32, avail: u32) -> u32 {
+    v.min(avail.saturating_sub(2).max(min)).max(min)
+}
+
+/// The default picker size for a window: a fraction of it, clamped to the
+/// MIN/MAX box.
+fn default_size(ww: u32, wh: u32) -> (u32, u32) {
+    let w = (ww * FILL_TENTHS / 10).min(MAX_WIDTH);
+    let h = (wh * FILL_TENTHS / 10).min(MAX_HEIGHT);
+    (clamp_dim(w, MIN_WIDTH, ww), clamp_dim(h, MIN_HEIGHT, wh))
+}
+
 async fn pick_open(
     picker: Rc<RefCell<Option<Picker>>>,
     cfg: Rc<Config>,
@@ -901,13 +951,29 @@ async fn pick_open(
         let _ = display_message("agents: no window to open the picker");
         return;
     };
+    // Size to a fraction of the window (clamped to the MIN/MAX box), then
+    // let a remembered manual size override it. mode_open clamps again.
+    let (ww, wh) = resolve_window(WindowId(window))
+        .map(|wi| (wi.width, wi.height))
+        .unwrap_or((MAX_WIDTH, MAX_HEIGHT));
+    let (mut width, mut height) = default_size(ww, wh);
+    if let Ok(Some(v)) = store::get_setting("pick_w").await {
+        if let Ok(n) = v.parse::<u32>() {
+            width = clamp_dim(n, MIN_WIDTH, ww);
+        }
+    }
+    if let Ok(Some(v)) = store::get_setting("pick_h").await {
+        if let Ok(n) = v.parse::<u32>() {
+            height = clamp_dim(n, MIN_HEIGHT, wh);
+        }
+    }
     let mut rows = store::live_agents().await.unwrap_or_default();
     enrich_live(&mut rows).await;
     sort_rows(&mut rows);
     let mode = match mode_open(&ModeOpts {
         window: Some(WindowId(window)),
-        width: WIDTH,
-        height: HEIGHT,
+        width,
+        height,
         title: Some("agents".into()),
         ..Default::default()
     }) {
@@ -920,8 +986,8 @@ async fn pick_open(
     };
     let mut p = Picker {
         mode,
-        width: WIDTH,
-        height: HEIGHT,
+        width,
+        height,
         rows,
         view: Vec::new(),
         lines: Vec::new(),
@@ -1446,7 +1512,7 @@ fn pick_render(p: &mut Picker) {
         format!("type to filter · {ctok} · Enter accept · Esc cancel")
     } else {
         format!(
-            "j/k move · J/K sel · {} jump · {} filter · {ctok} · {} {arch} · {} close",
+            "j/k move · {} jump · {} filter · {ctok} · {} {arch} · +/- size · {} close",
             keyname(&k.jump),
             keyname(&k.filter),
             keyname(&k.archive),
