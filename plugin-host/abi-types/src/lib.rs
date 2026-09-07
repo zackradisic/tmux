@@ -47,16 +47,21 @@ pub const KIND_WINDOW: i32 = 1;
 pub const KIND_PANE: i32 = 2;
 pub const KIND_CLIENT: i32 = 3;
 
-/// Flags for the `panes_search` import (the `flags` word). Bit clear is
-/// the common case: a case-insensitive plain-substring search.
+/// Flags for the `panes_search` import (the `flags` word). All bits clear
+/// is the common case: a case-insensitive plain-substring search.
 pub mod search_flags {
-    /// Treat the pattern as a POSIX regex. Reserved; not yet supported
-    /// (the host returns an error until it is wired).
-    pub const REGEX: u32 = 1 << 0;
+    /// The low two bits select the matcher.
+    pub const MODE_MASK: u32 = 0x3;
+    /// Plain substring (SIMD `memmem`).
+    pub const MODE_PLAIN: u32 = 0;
+    /// POSIX extended regex (`regcomp`/`regexec`).
+    pub const MODE_REGEX: u32 = 1;
+    /// Fuzzy: score every line, return the best per pane.
+    pub const MODE_FUZZY: u32 = 2;
     /// Match case-sensitively. Default (bit clear) is case-insensitive.
-    pub const CASE_SENSITIVE: u32 = 1 << 1;
+    pub const CASE_SENSITIVE: u32 = 1 << 2;
     /// Regex only: let `.` match a newline. Reserved.
-    pub const MULTILINE: u32 = 1 << 2;
+    pub const MULTILINE: u32 = 1 << 3;
 }
 
 /// Plugin instantiation scope.
@@ -199,9 +204,11 @@ pub mod imports {
     ///              max_lines, owned_out) -> i32
     ///                       // grep the grids of ids_len panes for a
     ///                       // pattern; result is a u32-count list of
-    ///                       // {pane:u32, line:u32, col:u32, snippet}
-    ///                       // records, one per matching pane. See
-    ///                       // `search_flags` for the flags word.
+    ///                       // {pane:u32, line:u32, col:u32, score:u32,
+    ///                       // snippet} records, one per matching pane.
+    ///                       // See `search_flags` for the flags word
+    ///                       // (matcher mode + case). `score` ranks fuzzy
+    ///                       // hits; it is 0 for plain/regex.
     pub const PANES_SEARCH: &str = "panes_search";
     /// pane_pid(pane) -> i64  // foreground process-group pid; <=0 = gone
     pub const PANE_PID: &str = "pane_pid";

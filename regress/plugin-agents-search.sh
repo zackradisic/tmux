@@ -83,19 +83,32 @@ $TMUX send-keys -t "$FORM" xyzzy; sleep 0.4
 screen | grep -q '(no agents)' ||
     fail "a content-only token matched with content search off"
 
-# Turn content search ON with C-f: the header shows "find" and the row
-# returns, because the pane's grid holds the token.
+# Turn content search ON with C-f: the row returns (plain mode, the pane
+# grid holds the token), the header shows the mode, and the match line
+# shows as the snippet.
 $TMUX send-keys -t "$FORM" C-f; sleep 0.6
-screen | grep -q 'find' || fail "C-f did not turn content search on"
+screen | grep -q 'plain' || fail "content search did not report plain mode"
 screen | grep -q '(no agents)' &&
     fail "content search did not match the pane grid"
-screen | grep -q 'claude' || fail "the matched agent row is missing"
-
-# The matching line shows as the row's snippet.
 screen | grep -q 'NEEDLE_XYZZY_123' ||
     fail "the match snippet is missing from the row"
 
-# C-f again turns it back off: the row drops out once more.
+# Regex mode: a query with metacharacters is auto-detected as regex.
+$TMUX send-keys -t "$FORM" C-u; sleep 0.3
+$TMUX send-keys -t "$FORM" 'N.*findme'; sleep 0.5
+screen | grep -q 'regex' || fail "regex query was not auto-detected"
+screen | grep -q '(no agents)' && fail "regex did not match the pane"
+
+# Fuzzy fallback: a plain query that is not a substring but IS an in-order
+# subsequence falls back to fuzzy.
+$TMUX send-keys -t "$FORM" C-u; sleep 0.3
+$TMUX send-keys -t "$FORM" fdm; sleep 0.5
+screen | grep -q 'fuzzy' || fail "fuzzy fallback did not engage"
+screen | grep -q '(no agents)' && fail "fuzzy did not match the pane"
+
+# Back to a plain miss, then C-f turns content search off: row drops out.
+$TMUX send-keys -t "$FORM" C-u; sleep 0.3
+$TMUX send-keys -t "$FORM" xyzzy; sleep 0.4
 $TMUX send-keys -t "$FORM" C-f; sleep 0.6
 screen | grep -q '(no agents)' || fail "C-f did not turn content search off"
 

@@ -12,7 +12,10 @@
 //! agent's pane CONTENTS, not just its name and status. The grep runs in
 //! tmux over the live grid (the `panes_search` host call), so the pane
 //! text never crosses the plugin ABI - only the needle in and the matches
-//! out. A matching row shows the line it hit.
+//! out. A matching row shows the line it hit. The matcher is auto-detected
+//! (a query with regex metacharacters runs as a regex, else a plain
+//! substring), and falls back to fuzzy when it finds nothing; the active
+//! mode shows in the header and footer.
 //!
 //! Three signals drive it, each from its own trusted source:
 //!
@@ -813,6 +816,9 @@ struct Picker {
     /// The matching snippet per live pane id, from the last content
     /// search. Drives the row's snippet and the OR in the filter.
     content_hits: HashMap<u32, String>,
+    /// The matcher the last content search actually used (auto-detected,
+    /// with a fuzzy fallback). Shown in the footer/header.
+    content_mode: SearchMode,
     now_ms: u64,
     show_history: bool,
     keys: PickKeys,
@@ -913,6 +919,7 @@ async fn pick_open(
         filtering: false,
         content_search: false,
         content_hits: HashMap::new(),
+        content_mode: SearchMode::Plain,
         now_ms: now_ms(),
         show_history: false,
         keys: cfg.keys.clone(),
@@ -1064,6 +1071,52 @@ fn display_name(a: &Agent) -> String {
     }
 }
 
+/// Pick the matcher from the query, fff-style: a query with regex
+/// metacharacters is a regex; anything else is a plain substring. The
+/// caller falls back to fuzzy when the chosen matcher finds nothing.
+fn detect_mode(q: &str) -> SearchMode {
+    const META: &[char] =
+        &['^', '$', '*', '+', '?', '(', ')', '[', ']', '{', '}', '|', '\\'];
+    if q.chars().any(|c| META.contains(&c)) {
+        SearchMode::Regex
+    } else {
+        SearchMode::Plain
+    }
+}
+
+fn mode_label(m: SearchMode) -> &'static str {
+    match m {
+        SearchMode::Plain => "plain",
+        SearchMode::Regex => "regex",
+        SearchMode::Fuzzy => "fuzzy",
+    }
+}
+
+/// Run content search over the live panes: auto-detect the matcher, and
+/// fall back to fuzzy when it finds nothing (an unmatched query, or a
+/// half-typed regex that will not compile). Returns the mode that
+/// actually produced the hits and the snippet per matching pane.
+fn run_content_search(
+    panes: &[PaneId],
+    needle: &str,
+) -> (SearchMode, HashMap<u32, String>) {
+    let collect = |hits: Vec<SearchHit>| -> HashMap<u32, String> {
+        hits.into_iter().map(|h| (h.pane.0, h.snippet)).collect()
+    };
+    let mode = detect_mode(needle);
+    let hits = panes_search(panes, needle, mode, false, SEARCH_LINES)
+        .unwrap_or_default();
+    if !hits.is_empty() {
+        return (mode, collect(hits));
+    }
+    let fz = panes_search(panes, needle, SearchMode::Fuzzy, false, SEARCH_LINES)
+        .unwrap_or_default();
+    if !fz.is_empty() {
+        return (SearchMode::Fuzzy, collect(fz));
+    }
+    (mode, HashMap::new())
+}
+
 /// session_creator's ranking: prefix beats substring beats subsequence.
 fn rank(hay: &str, needle: &str) -> Option<u8> {
     if needle.is_empty() {
@@ -1119,21 +1172,19 @@ fn pick_refilter_keep(p: &mut Picker, keep: Option<String>) {
     // Refresh the content-match set when content search is on. The grep
     // runs in tmux over the live grids (`panes_search`); only the needle
     // and the matches cross the ABI, so it is cheap enough per keystroke.
-    p.content_hits = if p.content_search && !needle.is_empty() {
+    if p.content_search && !needle.is_empty() {
         let panes: Vec<PaneId> = p
             .rows
             .iter()
             .filter(|a| a.live())
             .filter_map(|a| a.pane.map(|x| PaneId(x as u32)))
             .collect();
-        panes_search(&panes, &needle, false, SEARCH_LINES)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|h| (h.pane.0, h.snippet))
-            .collect()
+        let (mode, hits) = run_content_search(&panes, &needle);
+        p.content_mode = mode;
+        p.content_hits = hits;
     } else {
-        HashMap::new()
-    };
+        p.content_hits = HashMap::new();
+    }
     p.view = p
         .rows
         .iter()
@@ -1229,10 +1280,14 @@ fn pick_render(p: &mut Picker) {
     } else {
         format!(", {} selected", p.marked.len())
     };
+    let content_tag = if p.content_search {
+        format!(", {}", mode_label(p.content_mode))
+    } else {
+        String::new()
+    };
     out.push_str(&format!(
-        "\x1b[1;1H\x1b[1m agents\x1b[0m \x1b[2m({live} live{}{}{selected})\x1b[0m",
+        "\x1b[1;1H\x1b[1m agents\x1b[0m \x1b[2m({live} live{}{content_tag}{selected})\x1b[0m",
         if p.show_history { ", +history" } else { "" },
-        if p.content_search { ", find" } else { "" },
     ));
     if p.filtering {
         // Active: show the query with a block cursor.
@@ -1353,7 +1408,11 @@ fn pick_render(p: &mut Picker) {
         ));
     }
     let k = &p.keys;
-    let ctok = format!("{} contents", pretty_key(&k.content));
+    let ctok = if p.content_search {
+        format!("{} {}", pretty_key(&k.content), mode_label(p.content_mode))
+    } else {
+        format!("{} contents", pretty_key(&k.content))
+    };
     let footer = if p.filtering {
         format!("type to filter · {ctok} · Enter accept · Esc cancel")
     } else {

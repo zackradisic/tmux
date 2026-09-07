@@ -18,6 +18,8 @@
 
 #include <sys/types.h>
 
+#include <ctype.h>
+#include <regex.h>
 #include <string.h>
 
 #include "tmux.h"
@@ -420,6 +422,16 @@ plugin_vtable_capture_pane(u_int pane_id, int start, int end, int escapes,
 	return (0);
 }
 
+/* ------------------------------------------------------------------------
+ * panes_search: grep pane grids INSIDE tmux (plain / regex / fuzzy).
+ *
+ * Each pane's grid is decoded ONCE into a reusable contiguous buffer (no
+ * per-line malloc), soft-wrapped rows joined so a wrapped match is found.
+ * The matcher then runs over that buffer: SSE2 memmem for plain, POSIX
+ * regexec for regex, or a greedy per-line fuzzy score. Only the needle in
+ * and the match records out cross the ABI; the pane text never does.
+ * ---------------------------------------------------------------------- */
+
 /* Emit a little-endian u32 through the sink. */
 static void
 plugin_search_put_u32(pgh_sink sink, void *ctx, uint32_t v)
@@ -434,130 +446,380 @@ plugin_search_put_u32(pgh_sink sink, void *ctx, uint32_t v)
 }
 
 /*
- * Search one pane's grid for the needle and, on the first hit, emit a
- * match record {pane, line, col, snip_len, snip} through the sink.
- * Returns 1 if it matched, 0 if not. Soft-wrapped rows are joined (no
- * newline between them), so a match that spans a wrap is found; real line
- * ends keep their newline. Only the last max_lines lines are searched.
+ * Reusable, main-thread-only scratch. Grown, never shrunk, kept across
+ * calls so a search does not re-allocate. search_buf holds the decoded
+ * text; search_fold its lowercased copy (plain, case-insensitive); the
+ * line table maps a byte offset back to a grid row for the snippet.
  */
-static int
-plugin_search_one(u_int pane_id, const char *needle, int icase,
-    u_int max_lines, pgh_sink sink, void *ctx)
+static char	*search_buf;
+static size_t	 search_bufcap;
+static char	*search_fold;
+static size_t	 search_foldcap;
+static size_t	*search_lstart;
+static u_int	*search_lrow;
+static u_int	 search_lcap;
+
+static void
+search_reserve_buf(size_t need)
 {
-	struct window_pane	*wp;
-	struct grid		*gd;
-	struct screen		*s;
-	struct grid_cell	*gc = NULL;
+	if (need <= search_bufcap)
+		return;
+	while (search_bufcap < need)
+		search_bufcap = (search_bufcap == 0) ? 4096 : search_bufcap * 2;
+	search_buf = xrealloc(search_buf, search_bufcap);
+}
+
+static void
+search_reserve_lines(u_int need)
+{
+	if (need <= search_lcap)
+		return;
+	while (search_lcap < need)
+		search_lcap = (search_lcap == 0) ? 256 : search_lcap * 2;
+	search_lstart = xreallocarray(search_lstart, search_lcap,
+	    sizeof *search_lstart);
+	search_lrow = xreallocarray(search_lrow, search_lcap,
+	    sizeof *search_lrow);
+}
+
+/*
+ * Decode the last max_lines lines of a pane's grid into search_buf, one
+ * append per cell (padding skipped, tab -> '\t'). Soft-wrapped rows are
+ * joined with no newline; a real line end gets '\n' after its trailing
+ * spaces are trimmed. Fills the line table (one entry per physical row:
+ * byte start + grid row). Returns the text length; sets *nlines_out.
+ */
+static size_t
+search_decode(struct window_pane *wp, u_int max_lines, u_int *nlines_out)
+{
+	struct grid		*gd = wp->base.grid;
+	struct screen		*s = &wp->base;
+	struct grid_cell	 gc;
 	const struct grid_line	*gl;
-	char			*buf = NULL, *line, *hit;
-	size_t			*starts = NULL;
-	u_int			*rows = NULL;
-	size_t			 off = 0, cap = 0, hit_off, lstart, lend;
-	u_int			 sx, top, bottom, i, nlines = 0, lcap = 0, li;
-	uint32_t		 snip_len;
-	int			 matched = 0;
+	u_int			 sx, top, bottom, i, xx, limit, nlines = 0;
+	size_t			 off = 0, line_start;
+	int			 wrapped;
 
-	wp = window_pane_find_by_id(pane_id);
-	if (wp == NULL || (wp->flags & PANE_DESTROYED))
-		return (0);
-	s = &wp->base;
-	gd = wp->base.grid;
 	sx = screen_size_x(s);
-
-	if (gd->hsize + gd->sy == 0)
+	if (gd->hsize + gd->sy == 0) {
+		*nlines_out = 0;
 		return (0);
+	}
 	bottom = gd->hsize + gd->sy - 1;
 	if (max_lines != 0 && bottom + 1 > max_lines)
 		top = bottom + 1 - max_lines;
 	else
 		top = 0;
 
-	/* Build one contiguous, wrap-joined buffer; track each row's start. */
 	for (i = top; i <= bottom; i++) {
-		size_t	llen;
-
-		line = grid_string_cells(gd, 0, i, sx, &gc,
-		    GRID_STRING_TRIM_SPACES, s);
-		llen = strlen(line);
-		while (cap < off + llen + 2) {
-			cap = (cap == 0) ? 1024 : cap * 2;
-			buf = xrealloc(buf, cap);
-		}
-		if (nlines == lcap) {
-			lcap = (lcap == 0) ? 256 : lcap * 2;
-			starts = xreallocarray(starts, lcap, sizeof *starts);
-			rows = xreallocarray(rows, lcap, sizeof *rows);
-		}
-		starts[nlines] = off;
-		rows[nlines] = i;
-		nlines++;
-		memcpy(buf + off, line, llen);
-		off += llen;
 		gl = grid_peek_line(gd, i);
-		if (gl == NULL || !(gl->flags & GRID_LINE_WRAPPED))
-			buf[off++] = '\n';
-		free(line);
-	}
-	if (buf == NULL)
-		return (0);
-	buf[off] = '\0';
+		wrapped = (gl != NULL) && (gl->flags & GRID_LINE_WRAPPED);
 
-	hit = icase ? strcasestr(buf, needle) : strstr(buf, needle);
-	if (hit != NULL) {
-		hit_off = (size_t)(hit - buf);
-		/* The physical row that holds the hit (starts is increasing). */
-		for (li = 0; li + 1 < nlines; li++) {
-			if (starts[li + 1] > hit_off)
-				break;
+		search_reserve_lines(nlines + 1);
+		search_lstart[nlines] = off;
+		search_lrow[nlines] = i;
+		nlines++;
+		line_start = off;
+
+		limit = (gl != NULL) ? gl->cellused : 0;
+		if (limit > sx)
+			limit = sx;
+		for (xx = 0; xx < limit; xx++) {
+			grid_get_cell(gd, xx, i, &gc);
+			if (gc.flags & GRID_FLAG_PADDING)
+				continue;
+			if (gc.flags & GRID_FLAG_TAB) {
+				search_reserve_buf(off + 1);
+				search_buf[off++] = '\t';
+			} else {
+				search_reserve_buf(off + gc.data.size);
+				memcpy(search_buf + off, gc.data.data,
+				    gc.data.size);
+				off += gc.data.size;
+			}
 		}
-		lstart = starts[li];
-		lend = (li + 1 < nlines) ? starts[li + 1] : off;
-		while (lend > lstart && buf[lend - 1] == '\n')
-			lend--;
-		snip_len = (uint32_t)(lend - lstart);
-		if (snip_len > PLUGIN_SEARCH_SNIPPET_MAX)
-			snip_len = PLUGIN_SEARCH_SNIPPET_MAX;
-		plugin_search_put_u32(sink, ctx, pane_id);
-		plugin_search_put_u32(sink, ctx, rows[li]);
-		plugin_search_put_u32(sink, ctx, (uint32_t)(hit_off - lstart));
-		plugin_search_put_u32(sink, ctx, snip_len);
-		sink(ctx, buf + lstart, snip_len);
-		matched = 1;
+		if (!wrapped) {
+			while (off > line_start && search_buf[off - 1] == ' ')
+				off--;
+			search_reserve_buf(off + 1);
+			search_buf[off++] = '\n';
+		}
+	}
+	search_reserve_buf(off + 1);
+	search_buf[off] = '\0';
+	*nlines_out = nlines;
+	return (off);
+}
+
+/* Lowercase search_buf[0..len) into search_fold (ASCII fold, 1:1 bytes). */
+static void
+search_fold_copy(size_t len)
+{
+	size_t	i;
+
+	if (len + 1 > search_foldcap) {
+		while (search_foldcap < len + 1)
+			search_foldcap =
+			    (search_foldcap == 0) ? 4096 : search_foldcap * 2;
+		search_fold = xrealloc(search_fold, search_foldcap);
+	}
+	for (i = 0; i < len; i++)
+		search_fold[i] = (char)tolower((u_char)search_buf[i]);
+	search_fold[len] = '\0';
+}
+
+/*
+ * Substring search. SSE2 where available (broadcast the needle's first
+ * and last byte, compare 16 bytes at a time, AND the masks, verify the
+ * candidates with memcmp); a scalar memmem elsewhere and on the tail.
+ */
+#if defined(__x86_64__) || defined(__i386__)
+#include <emmintrin.h>
+static const char *
+search_memmem(const char *h, size_t hn, const char *n, size_t nn)
+{
+	__m128i	first, last, bf, bl;
+	size_t	i = 0;
+	unsigned mask;
+	int	b;
+
+	if (nn == 0)
+		return (h);
+	if (nn > hn)
+		return (NULL);
+	if (nn == 1)
+		return (memchr(h, (u_char)n[0], hn));
+
+	first = _mm_set1_epi8(n[0]);
+	last = _mm_set1_epi8(n[nn - 1]);
+	for (; i + 16 + (nn - 1) <= hn; i += 16) {
+		bf = _mm_loadu_si128((const __m128i *)(const void *)(h + i));
+		bl = _mm_loadu_si128(
+		    (const __m128i *)(const void *)(h + i + nn - 1));
+		mask = (unsigned)_mm_movemask_epi8(
+		    _mm_and_si128(_mm_cmpeq_epi8(first, bf),
+		    _mm_cmpeq_epi8(last, bl)));
+		while (mask != 0) {
+			b = __builtin_ctz(mask);
+			if (memcmp(h + i + b + 1, n + 1, nn - 2) == 0)
+				return (h + i + b);
+			mask &= mask - 1;
+		}
+	}
+	if (i < hn)
+		return (memmem(h + i, hn - i, n, nn));
+	return (NULL);
+}
+#else
+static const char *
+search_memmem(const char *h, size_t hn, const char *n, size_t nn)
+{
+	return (memmem(h, hn, n, nn));
+}
+#endif
+
+/*
+ * Greedy fuzzy score of a pre-lowercased needle against a line (ASCII
+ * fold). 0 if the needle is not an in-order subsequence of the line; else
+ * a positive score that rewards contiguous runs and an early first match.
+ */
+static uint32_t
+search_fuzzy_line(const char *line, size_t len, const char *ndl, size_t nn)
+{
+	size_t		li, ni = 0;
+	uint32_t	score = 0, run = 0, pen;
+	long		first = -1;
+
+	if (nn == 0)
+		return (0);
+	for (li = 0; li < len && ni < nn; li++) {
+		if ((char)tolower((u_char)line[li]) == ndl[ni]) {
+			if (first < 0)
+				first = (long)li;
+			run++;
+			score += 1 + run;
+			ni++;
+		} else
+			run = 0;
+	}
+	if (ni < nn)
+		return (0);
+	if (first > 0) {
+		pen = (uint32_t)(first / 4);
+		score = (score > pen) ? score - pen : 1;
+	}
+	return (score == 0) ? 1 : score;
+}
+
+/* Binary-search the line table for the row that holds byte offset off. */
+static u_int
+search_row_of(size_t off, u_int nlines)
+{
+	u_int	lo = 0, hi = nlines - 1, mid;
+
+	while (lo < hi) {
+		mid = (lo + hi + 1) / 2;
+		if (search_lstart[mid] <= off)
+			lo = mid;
+		else
+			hi = mid - 1;
+	}
+	return (lo);
+}
+
+/* Emit one match record for a physical row: {pane,row,col,score,snip}. */
+static void
+search_emit(u_int pane_id, u_int row, u_int nlines, size_t len, size_t col,
+    uint32_t score, pgh_sink sink, void *ctx)
+{
+	size_t		lstart = search_lstart[row], lend;
+	uint32_t	snip_len;
+
+	lend = (row + 1 < nlines) ? search_lstart[row + 1] : len;
+	while (lend > lstart && search_buf[lend - 1] == '\n')
+		lend--;
+	snip_len = (uint32_t)(lend - lstart);
+	if (snip_len > PLUGIN_SEARCH_SNIPPET_MAX)
+		snip_len = PLUGIN_SEARCH_SNIPPET_MAX;
+	plugin_search_put_u32(sink, ctx, pane_id);
+	plugin_search_put_u32(sink, ctx, search_lrow[row]);
+	plugin_search_put_u32(sink, ctx, (uint32_t)col);
+	plugin_search_put_u32(sink, ctx, score);
+	plugin_search_put_u32(sink, ctx, snip_len);
+	sink(ctx, search_buf + lstart, snip_len);
+}
+
+/* Search one pane; emit its (best) match. Returns 1 if it matched. */
+static int
+search_pane(struct window_pane *wp, const char *needle,
+    const char *needle_fold, size_t nn, regex_t *re, int mode, int icase,
+    u_int max_lines, pgh_sink sink, void *ctx)
+{
+	u_int	nlines = 0;
+	size_t	len;
+
+	len = search_decode(wp, max_lines, &nlines);
+	if (len == 0 || nlines == 0)
+		return (0);
+
+	if (mode == PGH_SEARCH_MODE_REGEX) {
+		regmatch_t	m;
+
+		if (re == NULL || regexec(re, search_buf, 1, &m, 0) != 0)
+			return (0);
+		if (m.rm_so < 0)
+			return (0);
+		{
+			u_int	row = search_row_of((size_t)m.rm_so, nlines);
+			search_emit(wp->id, row, nlines, len,
+			    (size_t)m.rm_so - search_lstart[row], 0, sink,
+			    ctx);
+		}
+		return (1);
 	}
 
-	free(buf);
-	free(starts);
-	free(rows);
-	return (matched);
+	if (mode == PGH_SEARCH_MODE_FUZZY) {
+		u_int		li, best = 0;
+		uint32_t	bestscore = 0, sc;
+		size_t		st, en;
+
+		for (li = 0; li < nlines; li++) {
+			st = search_lstart[li];
+			en = (li + 1 < nlines) ? search_lstart[li + 1] : len;
+			while (en > st && search_buf[en - 1] == '\n')
+				en--;
+			sc = search_fuzzy_line(search_buf + st, en - st,
+			    needle_fold, nn);
+			if (sc > bestscore) {
+				bestscore = sc;
+				best = li;
+			}
+		}
+		if (bestscore == 0)
+			return (0);
+		search_emit(wp->id, best, nlines, len, 0, bestscore, sink,
+		    ctx);
+		return (1);
+	}
+
+	/* plain substring */
+	{
+		const char	*hay = search_buf, *ndl = needle, *hit;
+		size_t		 off;
+		u_int		 row;
+
+		if (icase) {
+			search_fold_copy(len);
+			hay = search_fold;
+			ndl = needle_fold;
+		}
+		hit = search_memmem(hay, len, ndl, nn);
+		if (hit == NULL)
+			return (0);
+		off = (size_t)(hit - hay);
+		row = search_row_of(off, nlines);
+		search_emit(wp->id, row, nlines, len, off - search_lstart[row],
+		    0, sink, ctx);
+		return (1);
+	}
 }
 
 /*
  * Grep the grids of a set of panes. Emits one match record per matching
- * pane and returns the match count, or -1 for an unsupported flag. The
- * pane contents stay in tmux; only the needle in and the matches out
- * cross the ABI.
+ * pane and returns the match count, or -1 on a bad regex. The pane
+ * contents stay in tmux; only the needle in and the matches out cross the
+ * ABI. Mode + case come from the flags word (see PGH_SEARCH_*).
  */
 int
 plugin_vtable_panes_search(const uint32_t *ids, uint32_t n_ids,
     const char *pattern, uint32_t flags, uint32_t max_lines, pgh_sink sink,
     void *ctx)
 {
-	u_int	 i;
-	int	 icase, count = 0;
+	u_int		 i;
+	int		 mode, icase, count = 0, have_re = 0;
+	size_t		 nn, k;
+	char		*needle_fold = NULL;
+	regex_t		 re;
 
-	if (flags & PGH_SEARCH_REGEX)
-		return (-1);		/* regex not yet supported */
 	if (pattern == NULL || *pattern == '\0')
 		return (0);
+	mode = (int)(flags & PGH_SEARCH_MODE_MASK);
 	icase = !(flags & PGH_SEARCH_CASE_SENSITIVE);
 	if (max_lines == 0 || max_lines > PLUGIN_SEARCH_MAX_LINES)
 		max_lines = PLUGIN_SEARCH_MAX_LINES;
+	nn = strlen(pattern);
+
+	if (mode == PGH_SEARCH_MODE_REGEX) {
+		int	cf = REG_EXTENDED;
+
+		if (!(flags & PGH_SEARCH_MULTILINE))
+			cf |= REG_NEWLINE;
+		if (icase)
+			cf |= REG_ICASE;
+		if (regcomp(&re, pattern, cf) != 0)
+			return (-1);
+		have_re = 1;
+	} else if (icase || mode == PGH_SEARCH_MODE_FUZZY) {
+		needle_fold = xmalloc(nn + 1);
+		for (k = 0; k < nn; k++)
+			needle_fold[k] = (char)tolower((u_char)pattern[k]);
+		needle_fold[nn] = '\0';
+	}
 
 	for (i = 0; i < n_ids; i++) {
-		if (plugin_search_one(ids[i], pattern, icase, max_lines, sink,
-		    ctx))
+		struct window_pane	*wp;
+
+		wp = window_pane_find_by_id(ids[i]);
+		if (wp == NULL || (wp->flags & PANE_DESTROYED))
+			continue;
+		if (search_pane(wp, pattern, needle_fold, nn,
+		    have_re ? &re : NULL, mode, icase, max_lines, sink, ctx))
 			count++;
 	}
+
+	if (have_re)
+		regfree(&re);
+	free(needle_fold);
 	return (count);
 }
 

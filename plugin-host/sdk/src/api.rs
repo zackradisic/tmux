@@ -380,25 +380,41 @@ pub fn pane_fds(pane: PaneId) -> Result<Option<Vec<String>>, HostError> {
     }
 }
 
+/// The matcher `panes_search` runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchMode {
+    /// Plain substring (SIMD `memmem`).
+    Plain,
+    /// POSIX extended regex.
+    Regex,
+    /// Fuzzy: score every line, return the best per pane.
+    Fuzzy,
+}
+
 /// One `panes_search` match: the pane that matched, the grid line and
-/// byte column of the hit, and the matching line as a snippet.
+/// byte column of the hit, a `score` (fuzzy ranking; 0 for plain/regex),
+/// and the matching line as a snippet.
 #[derive(Debug, Clone)]
 pub struct SearchHit {
     pub pane: PaneId,
     pub line: u32,
     pub col: u32,
+    pub score: u32,
     pub snippet: String,
 }
 
 /// Grep the grids of several panes for `pattern` in one host call. The
 /// search runs in tmux over the live grid, so the pane contents never
 /// cross the ABI - only the needle in and the matches out. Soft-wrapped
-/// rows are joined, so a wrapped match is found. Only the last
-/// `max_lines` lines of each pane are searched (0 = the host default).
-/// The result holds one hit per matching pane. Needs `capture-pane`.
+/// rows are joined, so a wrapped match is found. `mode` picks the matcher
+/// (plain / regex / fuzzy). Only the last `max_lines` lines of each pane
+/// are searched (0 = the host default). The result holds one hit per
+/// matching pane. Errors with `E_BAD_REQUEST` on a bad regex. Needs
+/// `capture-pane`.
 pub fn panes_search(
     panes: &[PaneId],
     pattern: &str,
+    mode: SearchMode,
     case_sensitive: bool,
     max_lines: u32,
 ) -> Result<Vec<SearchHit>, HostError> {
@@ -408,9 +424,14 @@ pub fn panes_search(
     let ids: Vec<u32> = panes.iter().map(|p| p.0).collect();
     let pat = pattern.to_tmux();
     let (pp, pl) = pat.parts();
-    let mut flags = 0u32;
+    use tmux_plugin_abi::search_flags as sf;
+    let mut flags = match mode {
+        SearchMode::Plain => sf::MODE_PLAIN,
+        SearchMode::Regex => sf::MODE_REGEX,
+        SearchMode::Fuzzy => sf::MODE_FUZZY,
+    };
     if case_sensitive {
-        flags |= tmux_plugin_abi::search_flags::CASE_SENSITIVE;
+        flags |= sf::CASE_SENSITIVE;
     }
     let buf = call_owned(|out| unsafe {
         raw::panes_search(
@@ -428,6 +449,7 @@ pub fn panes_search(
             pane: PaneId(c.u32()?),
             line: c.u32()?,
             col: c.u32()?,
+            score: c.u32()?,
             snippet: String::from_utf8_lossy(c.bytes()?).into_owned(),
         })
     })

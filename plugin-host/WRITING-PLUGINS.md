@@ -316,12 +316,14 @@ pane_env(pane: PaneId, name: &str) -> Result<Option<String>, _> // env of the
     // pane's foreground process; Ok(None) = unset or pane gone (needs env-read)
 pane_fds(pane: PaneId) -> Result<Option<Vec<String>>, _> // open-file paths of
     // the pane's foreground process; Ok(None) = pane gone (needs pane-fds)
-panes_search(panes: &[PaneId], pattern: &str, case_sensitive: bool,
-    max_lines: u32) -> Result<Vec<SearchHit>, _> // grep the grids of many
-    // panes in ONE call; the search runs in tmux, so the pane contents never
-    // cross the ABI - only the needle in and the matches out. One SearchHit
-    // {pane, line, col, snippet} per matching pane. Soft-wrapped rows join,
-    // so a wrapped match is found. max_lines bounds the depth (0 = default).
+panes_search(panes: &[PaneId], pattern: &str, mode: SearchMode,
+    case_sensitive: bool, max_lines: u32) -> Result<Vec<SearchHit>, _>
+    // grep the grids of many panes in ONE call; the search runs in tmux, so
+    // the pane contents never cross the ABI - only the needle in and the
+    // matches out. mode = Plain (SIMD memmem) | Regex (POSIX) | Fuzzy
+    // (per-line score). One SearchHit {pane, line, col, score, snippet} per
+    // matching pane (score ranks Fuzzy). Soft-wrapped rows join, so a
+    // wrapped match is found. max_lines bounds the depth (0 = default).
     // Reuses the capture-pane cap.
 resolve_pane(PaneId) -> Result<PaneInfo, _>      // id, window, size, active,
                                                  // floating, dead, title/shell/

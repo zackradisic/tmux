@@ -36,9 +36,13 @@
  */
 #define PLUGIN_SEARCH_MAX_LINES 5000
 #define PLUGIN_SEARCH_SNIPPET_MAX 240
-#define PGH_SEARCH_REGEX 0x1
-#define PGH_SEARCH_CASE_SENSITIVE 0x2
-#define PGH_SEARCH_MULTILINE 0x4
+/* flags word: low two bits are the matcher mode. */
+#define PGH_SEARCH_MODE_MASK 0x3
+#define PGH_SEARCH_MODE_PLAIN 0
+#define PGH_SEARCH_MODE_REGEX 1
+#define PGH_SEARCH_MODE_FUZZY 2
+#define PGH_SEARCH_CASE_SENSITIVE 0x4
+#define PGH_SEARCH_MULTILINE 0x8
 
 /*
  * Cap on job output bytes carried in one async completion (mirrors
