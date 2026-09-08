@@ -10,7 +10,9 @@
 //! selection at once (and un-archives when every marked row is archived).
 //! Esc clears the selection before it closes the picker. `+`/`-` grow and
 //! shrink the popup; the size is remembered across opens. The popup opens
-//! at a fraction of the window by default.
+//! at a fraction of the window by default. `r` renames the selected agent
+//! (Enter accepts, Esc cancels, empty reverts to the harness name); your
+//! name and the harness name compete by recency (see `display_name`).
 //! `C-f` toggles content search: the filter then also greps each live
 //! agent's pane CONTENTS, not just its name and status. The grep runs in
 //! tmux over the live grid (the `panes_search` host call), so the pane
@@ -113,6 +115,7 @@ struct AgentsConfig {
     pick_history: Option<String>,
     pick_close: Option<String>,
     pick_content: Option<String>,
+    pick_rename: Option<String>,
 }
 
 #[derive(Clone)]
@@ -123,6 +126,7 @@ struct PickKeys {
     history: String,
     close: String,
     content: String,
+    rename: String,
 }
 
 impl Default for PickKeys {
@@ -134,6 +138,7 @@ impl Default for PickKeys {
             history: "h".into(),
             close: "Escape".into(),
             content: "C-f".into(),
+            rename: "r".into(),
         }
     }
 }
@@ -178,6 +183,7 @@ impl Config {
                 history: pick(&c.pick_history, d.history),
                 close: pick(&c.pick_close, d.close),
                 content: pick(&c.pick_content, d.content),
+                rename: pick(&c.pick_rename, d.rename),
             },
         })
     }
@@ -330,6 +336,7 @@ async fn apply(a: &mut Agent, r: Resolved) {
     if let Some(real) = r.real_id.as_deref().filter(|id| *id != a.id) {
         migrate_id(a, real).await;
     }
+    let now = now_ms() as i64;
     let _ = store::enrich(
         &a.id,
         r.name.as_deref(),
@@ -337,9 +344,17 @@ async fn apply(a: &mut Agent, r: Resolved) {
         r.started_ms,
         r.last_active_ms,
         r.source_path.as_deref(),
+        now,
     )
     .await;
     if let Some(v) = r.name {
+        // Mirror the store's name_ms rule for this render: a real change
+        // stamps now, unless it is the FIRST name and a user name already
+        // stands, which must keep winning (stamp it older).
+        if a.name.as_deref() != Some(v.as_str()) {
+            let first = a.name.as_deref().unwrap_or("").is_empty();
+            a.name_ms = Some(if first && a.user_name.is_some() { 0 } else { now });
+        }
         a.name = Some(v);
     }
     if let Some(v) = r.status {
@@ -389,8 +404,16 @@ async fn on_identify(pane: u32, id: String, source: Option<String>) {
     if id != a.id {
         migrate_id(&mut a, &id).await;
     }
-    let _ = store::enrich(&a.id, None, None, None, None, source.as_deref())
-        .await;
+    let _ = store::enrich(
+        &a.id,
+        None,
+        None,
+        None,
+        None,
+        source.as_deref(),
+        now_ms() as i64,
+    )
+    .await;
 }
 
 /// A shim's status report for a pane.
@@ -627,7 +650,34 @@ impl Agents {
             // modes; they are never text.
             let is_down = matches!(key.as_str(), "Down" | "C-n" | "C-j");
             let is_up = matches!(key.as_str(), "Up" | "C-p" | "C-k");
-            if p.filtering {
+            if p.renaming {
+                // Rename mode: keys are text, except accept / cancel.
+                if key == k.close {
+                    p.renaming = false;
+                    p.rename_buf.clear();
+                    pick_render(p);
+                } else if key == "Enter" {
+                    if let Some(&i) = p.view.get(p.sel) {
+                        let id = p.rows[i].id.clone();
+                        after = PickAfter::Rename(id, p.rename_buf.trim().to_string());
+                    }
+                    p.renaming = false;
+                } else if key == "BSpace" {
+                    p.rename_buf.pop();
+                    pick_render(p);
+                } else if key == "C-u" {
+                    p.rename_buf.clear();
+                    pick_render(p);
+                } else if key == "Space" {
+                    p.rename_buf.push(' ');
+                    pick_render(p);
+                } else if key.chars().count() == 1
+                    && !key.chars().next().unwrap().is_control()
+                {
+                    p.rename_buf.push_str(&key);
+                    pick_render(p);
+                }
+            } else if p.filtering {
                 // Filter mode: keys are text, except accept / cancel / move.
                 if key == k.close {
                     // Esc leaves filter mode and clears it (a second Esc,
@@ -680,6 +730,12 @@ impl Agents {
                 pick_render(p);
             } else if key == k.content {
                 toggle_content(p);
+            } else if key == k.rename {
+                if let Some(&i) = p.view.get(p.sel) {
+                    p.rename_buf = p.rows[i].user_name.clone().unwrap_or_default();
+                    p.renaming = true;
+                    pick_render(p);
+                }
             } else if key == k.jump {
                 if let Some(i) = sel {
                     let a = &p.rows[i];
@@ -742,6 +798,15 @@ impl Agents {
                 ctx.spawn(async move {
                     let _ = store::set_setting("pick_w", &w.to_string()).await;
                     let _ = store::set_setting("pick_h", &h.to_string()).await;
+                });
+            }
+            PickAfter::Rename(id, name) => {
+                let picker = Rc::clone(&self.picker);
+                ctx.spawn(async move {
+                    let n = (!name.is_empty()).then_some(name.as_str());
+                    let _ =
+                        store::rename_by_user(&id, n, now_ms() as i64).await;
+                    reload_picker(picker, false).await;
                 });
             }
         }
@@ -833,6 +898,7 @@ enum PickAfter {
     Life(Vec<String>, String),
     Reload,
     Resize(ModeId, u32, u32),
+    Rename(String, String),
 }
 
 /// One rendered line: a band header, or a selectable row (by its position
@@ -858,6 +924,9 @@ struct Picker {
     marked: HashSet<String>,
     filter: String,
     filtering: bool,
+    /// A rename in progress: the typed name for the selected agent.
+    renaming: bool,
+    rename_buf: String,
     /// When on, the filter also matches live pane CONTENTS: the grid of
     /// each live agent's pane is grep'd for the query, in tmux, through
     /// `panes_search`. Toggled with `C-f`.
@@ -996,6 +1065,8 @@ async fn pick_open(
         marked: HashSet::new(),
         filter: String::new(),
         filtering: false,
+        renaming: false,
+        rename_buf: String::new(),
         content_search: false,
         content_hits: HashMap::new(),
         content_mode: SearchMode::Plain,
@@ -1138,16 +1209,29 @@ fn sort_rows(rows: &mut [Agent]) {
     });
 }
 
-/// The name to show: the harness's own name, else the pane title, else a
-/// `kind · session` fallback. `activate`/resolvers store the first two in
-/// `name`; this only adds the last-resort composition.
+/// The name to show. A user rename and the harness name compete by
+/// recency: the more recently changed wins. The store's write path makes
+/// the exception - the harness's FIRST name is stamped older than a rename
+/// that preceded it, so a name you set while the agent was nameless keeps
+/// winning. Falls back to the pane title (also in `name`), else
+/// `kind · session`.
 fn display_name(a: &Agent) -> String {
-    if let Some(n) = a.name.as_deref().filter(|s| !s.is_empty()) {
-        return n.to_string();
-    }
-    match a.session.as_deref() {
-        Some(s) if !s.is_empty() => format!("{} · {}", a.kind, s),
-        _ => a.kind.clone(),
+    let user = a.user_name.as_deref().filter(|s| !s.is_empty());
+    let harness = a.name.as_deref().filter(|s| !s.is_empty());
+    match (user, harness) {
+        (Some(u), Some(h)) => {
+            if a.user_name_ms.unwrap_or(0) >= a.name_ms.unwrap_or(0) {
+                u.to_string()
+            } else {
+                h.to_string()
+            }
+        }
+        (Some(u), None) => u.to_string(),
+        (None, Some(h)) => h.to_string(),
+        (None, None) => match a.session.as_deref() {
+            Some(s) if !s.is_empty() => format!("{} · {}", a.kind, s),
+            _ => a.kind.clone(),
+        },
     }
 }
 
@@ -1373,7 +1457,13 @@ fn pick_render(p: &mut Picker) {
         "\x1b[1;1H\x1b[1m agents\x1b[0m \x1b[2m({live} live{}{content_tag}{selected})\x1b[0m",
         if p.show_history { ", +history" } else { "" },
     ));
-    if p.filtering {
+    if p.renaming {
+        // Rename mode takes over the prompt line, with a block cursor.
+        out.push_str(&format!(
+            "\x1b[2;1H  \x1b[2mrename\x1b[0m {}\x1b[7m \x1b[0m",
+            p.rename_buf
+        ));
+    } else if p.filtering {
         // Active: show the query with a block cursor.
         out.push_str(&format!(
             "\x1b[2;1H  \x1b[2mfilter\x1b[0m {}\x1b[7m \x1b[0m",
@@ -1508,13 +1598,16 @@ fn pick_render(p: &mut Picker) {
         .and_then(|&i| p.rows.get(i))
         .is_some_and(|a| a.life == "archived");
     let arch = if cursor_archived { "unarch" } else { "arch" };
-    let footer = if p.filtering {
+    let footer = if p.renaming {
+        "type a name · Enter accept · Esc cancel".to_string()
+    } else if p.filtering {
         format!("type to filter · {ctok} · Enter accept · Esc cancel")
     } else {
         format!(
-            "j/k move · {} jump · {} filter · {ctok} · {} {arch} · +/- size · {} close",
+            "j/k move · {} jump · {} filter · {ctok} · {} rename · {} {arch} · +/- size · {} close",
             keyname(&k.jump),
             keyname(&k.filter),
+            keyname(&k.rename),
             keyname(&k.archive),
             keyname(&k.close),
         )

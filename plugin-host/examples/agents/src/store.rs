@@ -19,7 +19,7 @@
 
 use tmux_plugin_sdk::prelude::*;
 
-pub const USER_VERSION: i64 = 3;
+pub const USER_VERSION: i64 = 4;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS agents (
@@ -33,6 +33,9 @@ CREATE TABLE IF NOT EXISTS agents (
   window TEXT,
   task TEXT,
   name TEXT,
+  name_ms INTEGER,
+  user_name TEXT,
+  user_name_ms INTEGER,
   first_seen_ms INTEGER NOT NULL,
   last_status_ms INTEGER NOT NULL,
   started_ms INTEGER,
@@ -51,7 +54,7 @@ CREATE TABLE IF NOT EXISTS captures (
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT);
-PRAGMA user_version = 3;";
+PRAGMA user_version = 4;";
 
 /// The v1 -> v2 upgrade: the resolved columns did not exist in v1.
 const MIGRATE_V2: &str = "
@@ -68,9 +71,18 @@ CREATE TABLE IF NOT EXISTS settings (
   value TEXT);
 PRAGMA user_version = 3;";
 
+/// The v3 -> v4 upgrade: a user-set name that competes with the harness
+/// name by recency (see `display` name resolution and `rename_by_user`).
+const MIGRATE_V4: &str = "
+ALTER TABLE agents ADD COLUMN name_ms INTEGER;
+ALTER TABLE agents ADD COLUMN user_name TEXT;
+ALTER TABLE agents ADD COLUMN user_name_ms INTEGER;
+PRAGMA user_version = 4;";
+
 const COLS: &str = "id, kind, status, life, pane, session, window, task, name, \
-                    first_seen_ms, last_status_ms, started_ms, last_active_ms, \
-                    source_path, ended_ms, reason";
+                    name_ms, user_name, user_name_ms, first_seen_ms, \
+                    last_status_ms, started_ms, last_active_ms, source_path, \
+                    ended_ms, reason";
 
 #[derive(Debug, Clone)]
 pub struct Agent {
@@ -83,6 +95,9 @@ pub struct Agent {
     pub window: Option<String>,
     pub task: Option<String>,
     pub name: Option<String>,
+    pub name_ms: Option<i64>,
+    pub user_name: Option<String>,
+    pub user_name_ms: Option<i64>,
     pub first_seen_ms: i64,
     pub last_status_ms: i64,
     pub started_ms: Option<i64>,
@@ -129,6 +144,9 @@ fn agents_from(rows: &Rows) -> Vec<Agent> {
             window: s(row.get_named("window")),
             task: s(row.get_named("task")),
             name: s(row.get_named("name")),
+            name_ms: i(row.get_named("name_ms")),
+            user_name: s(row.get_named("user_name")),
+            user_name_ms: i(row.get_named("user_name_ms")),
             first_seen_ms: i(row.get_named("first_seen_ms")).unwrap_or(0),
             last_status_ms: i(row.get_named("last_status_ms")).unwrap_or(0),
             started_ms: i(row.get_named("started_ms")),
@@ -165,6 +183,10 @@ pub fn migrate_sync() -> Result<(), String> {
         }
         if version <= 2 {
             db_exec_sync(MIGRATE_V3, params![])
+                .map_err(|e| format!("db: {e}"))?;
+        }
+        if version <= 3 {
+            db_exec_sync(MIGRATE_V4, params![])
                 .map_err(|e| format!("db: {e}"))?;
         }
     }
@@ -240,13 +262,18 @@ pub async fn activate(
     db_exec(
         "INSERT INTO agents \
            (id, kind, status, life, pane, session, window, task, name, \
-            first_seen_ms, last_status_ms, last_active_ms) \
-         VALUES (?1, ?2, 'working', 'active', ?3, ?4, ?5, NULL, ?6, ?7, ?7, ?7) \
+            name_ms, first_seen_ms, last_status_ms, last_active_ms) \
+         VALUES (?1, ?2, 'working', 'active', ?3, ?4, ?5, NULL, ?6, \
+            CASE WHEN ?6 IS NOT NULL THEN ?7 ELSE NULL END, ?7, ?7, ?7) \
          ON CONFLICT(id) DO UPDATE SET \
             kind = excluded.kind, \
             pane = excluded.pane, \
             session = excluded.session, \
             window = excluded.window, \
+            name_ms = CASE \
+                WHEN agents.name IS NULL AND excluded.name IS NOT NULL \
+                THEN CASE WHEN agents.user_name IS NOT NULL THEN 0 ELSE ?7 END \
+                ELSE agents.name_ms END, \
             name = COALESCE(agents.name, excluded.name), \
             ended_ms = NULL, \
             reason = NULL, \
@@ -316,16 +343,44 @@ pub async fn enrich(
     started_ms: Option<i64>,
     last_active_ms: Option<i64>,
     source_path: Option<&str>,
+    now_ms: i64,
 ) -> Result<(), HostError> {
     db_exec(
         "UPDATE agents SET \
+            name_ms = CASE \
+                WHEN ?2 IS NOT NULL AND ?2 <> COALESCE(name, '') THEN \
+                    CASE WHEN COALESCE(name, '') = '' \
+                              AND user_name IS NOT NULL \
+                         THEN 0 ELSE ?7 END \
+                ELSE name_ms END, \
             name = COALESCE(?2, name), \
             status = COALESCE(?3, status), \
             started_ms = COALESCE(?4, started_ms), \
             last_active_ms = COALESCE(?5, last_active_ms), \
             source_path = COALESCE(?6, source_path) \
          WHERE id = ?1 AND ended_ms IS NULL",
-        params![id, name, status, started_ms, last_active_ms, source_path],
+        params![id, name, status, started_ms, last_active_ms, source_path,
+                now_ms],
+    )
+    .await?;
+    Ok(())
+}
+
+/// The user's chosen name for an agent. Empty clears it (revert to the
+/// harness name). The name competes with the harness name by recency; see
+/// the display-name resolution.
+pub async fn rename_by_user(
+    id: &str,
+    name: Option<&str>,
+    now_ms: i64,
+) -> Result<(), HostError> {
+    let name = name.map(str::trim).filter(|s| !s.is_empty());
+    db_exec(
+        "UPDATE agents SET \
+            user_name = ?2, \
+            user_name_ms = CASE WHEN ?2 IS NULL THEN NULL ELSE ?3 END \
+         WHERE id = ?1",
+        params![id, name, now_ms],
     )
     .await?;
     Ok(())
