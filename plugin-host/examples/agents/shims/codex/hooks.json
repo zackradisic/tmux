@@ -1,17 +1,17 @@
 {
+  "SessionStart": [
+    { "hooks": [ { "type": "command", "command": "~/.config/agents/agents-codex.sh working" } ] }
+  ],
   "UserPromptSubmit": [
-    { "hooks": [ { "type": "command", "command": "~/.config/agents/agent-status.sh working" } ] }
+    { "hooks": [ { "type": "command", "command": "~/.config/agents/agents-codex.sh working" } ] }
   ],
   "PreToolUse": [
-    { "hooks": [ { "type": "command", "command": "~/.config/agents/agent-status.sh working" } ] }
+    { "hooks": [ { "type": "command", "command": "~/.config/agents/agents-codex.sh working" } ] }
   ],
   "PermissionRequest": [
-    { "hooks": [ { "type": "command", "command": "~/.config/agents/agent-status.sh needs_input" } ] }
-  ],
-  "Stop": [
-    { "hooks": [ { "type": "command", "command": "~/.config/agents/agent-status.sh waiting" } ] }
+    { "hooks": [ { "type": "command", "command": "~/.config/agents/agents-codex.sh needs_input" } ] }
   ],
   "SessionEnd": [
-    { "hooks": [ { "type": "command", "command": "~/.config/agents/agent-status.sh done" } ] }
+    { "hooks": [ { "type": "command", "command": "~/.config/agents/agents-codex.sh done" } ] }
   ]
 }

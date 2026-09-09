@@ -347,8 +347,14 @@ async fn enrich_live(rows: &mut [Agent]) {
         .unwrap_or_default();
         // The live pane title tracks the conversation topic (Claude and
         // its kin write it there), which beats the session file's slug.
-        // Prefer it; keep the harness name only as a fallback.
-        let title = a.pane.and_then(|p| pane_title(p as u32, &a.kind));
+        // Prefer it; keep the harness name only as a fallback. Codex is the
+        // exception: its pane title is just the cwd, so prefer the
+        // resolver's nickname there.
+        let title = if a.kind == "codex" {
+            None
+        } else {
+            a.pane.and_then(|p| pane_title(p as u32, &a.kind))
+        };
         r.name = title.or_else(|| r.name.take());
         apply(a, r).await;
     }
@@ -422,7 +428,17 @@ async fn migrate_id(a: &mut Agent, real: &str) {
 /// The `identify` verb: a pi/opencode hook reports its durable id and
 /// session file for a pane. Migrate the pane's live row to that id and
 /// record the source, so the next render can date it.
-async fn on_identify(pane: u32, id: String, source: Option<String>) {
+async fn on_identify(
+    pane: u32,
+    id: String,
+    source: Option<String>,
+    cfg: Rc<Config>,
+) {
+    // The hook can beat detection (a fresh codex pane whose command has not
+    // changed to `node` yet). Discover the pane first, so the id lands.
+    if store::live_by_pane(pane as i64).await.ok().flatten().is_none() {
+        classify(pane, cfg).await;
+    }
     let Ok(Some(mut a)) = store::live_by_pane(pane as i64).await else {
         return;
     };
@@ -630,9 +646,10 @@ impl Agents {
                 return;
             };
             let source = rest.next().map(str::to_string);
+            let cfg = Rc::clone(&self.cfg);
             let picker = Rc::clone(&self.picker);
             ctx.spawn(async move {
-                on_identify(pane, id, source).await;
+                on_identify(pane, id, source, cfg).await;
                 refresh_if_open(&picker).await;
             });
             return;

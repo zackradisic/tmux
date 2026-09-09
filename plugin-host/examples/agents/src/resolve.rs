@@ -139,26 +139,44 @@ fn parse_claude(path: &str, bytes: &[u8]) -> Option<(u32, Resolved)> {
 /// Find the open rollout file through `pane_fds`, read its session id from
 /// the first line, and date it by the file's mtime.
 pub async fn codex(a: &Agent) -> Option<Resolved> {
-    let pane = a.pane? as u32;
-    let fds = pane_fds(PaneId(pane)).ok().flatten()?;
-    let path = fds.into_iter().find(|p| {
-        p.ends_with(".jsonl") && p.rsplit('/').next().is_some_and(|n| {
-            n.starts_with("rollout-")
-        })
-    })?;
+    // Prefer the rollout the hook already named (source_path, from the
+    // `identify` verb - the hook's transcript_path). Fall back to scanning
+    // the pane's open fds for a rollout (the pre-hook layout, when codex
+    // ran as a bare `codex` and held the file open).
+    let path = match a.source_path.as_deref() {
+        Some(p) if p.ends_with(".jsonl") => p.to_string(),
+        _ => {
+            let pane = a.pane? as u32;
+            let fds = pane_fds(PaneId(pane)).ok().flatten()?;
+            fds.into_iter().find(|p| {
+                p.ends_with(".jsonl")
+                    && p.rsplit('/')
+                        .next()
+                        .is_some_and(|n| n.starts_with("rollout-"))
+            })?
+        }
+    };
 
-    // The first line is a small session_meta record naming the session.
+    // The first line is a session_meta record: the durable id, and - when
+    // the user named the session - a nickname to show.
     let mut real_id = None;
+    let mut name = None;
     if let Ok((bytes, _)) = fs_read(&path, 0, 8 * 1024).await {
         let text = String::from_utf8_lossy(&bytes);
         if let Some(line) = text.lines().next() {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                if let Some(sid) = v
-                    .get("payload")
-                    .and_then(|p| p.get("session_id"))
-                    .and_then(|x| x.as_str())
+                let p = v.get("payload");
+                if let Some(sid) =
+                    p.and_then(|p| p.get("session_id")).and_then(|x| x.as_str())
                 {
                     real_id = Some(format!("codex:{sid}"));
+                }
+                if let Some(nick) = p
+                    .and_then(|p| p.get("agent_nickname"))
+                    .and_then(|x| x.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    name = Some(nick.to_string());
                 }
             }
         }
@@ -166,6 +184,7 @@ pub async fn codex(a: &Agent) -> Option<Resolved> {
 
     Some(Resolved {
         real_id,
+        name,
         last_active_ms: file_mtime_ms(&path).await,
         source_path: Some(path),
         ..Default::default()
