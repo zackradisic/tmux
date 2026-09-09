@@ -5,9 +5,9 @@
 //! waiting, working, done) and, inside each group, most recently active
 //! first. A live preview of the highlighted pane sits to the right.
 //! `j`/`k` move, `gg`/`G` jump to the ends, Enter jumps to the pane, `a`
-//! archives, `h` folds in the finished ones. Navigate the cursor up past
-//! the top row to focus the search box; Esc unfocuses it and keeps the
-//! query. `J`/`K` (shift) mark rows into a selection; `a` then archives the whole
+//! archives, `h` folds in the finished ones. Press `/`, or navigate the
+//! cursor up past the top row, to focus the search box; Esc unfocuses it
+//! and keeps the query. `J`/`K` (shift) mark rows into a selection; `a` then archives the whole
 //! selection at once (and un-archives when every marked row is archived).
 //! Esc clears the selection before it closes the picker. `+`/`-` grow and
 //! shrink the popup; the size is remembered across opens. The popup opens
@@ -117,6 +117,7 @@ struct AgentsConfig {
     keep_days: Option<serde_json::Value>,
     commands: Option<Vec<String>>,
     pick_jump: Option<String>,
+    pick_filter: Option<String>,
     pick_archive: Option<String>,
     pick_history: Option<String>,
     pick_close: Option<String>,
@@ -127,6 +128,7 @@ struct AgentsConfig {
 #[derive(Clone)]
 struct PickKeys {
     jump: String,
+    filter: String,
     archive: String,
     history: String,
     close: String,
@@ -138,6 +140,7 @@ impl Default for PickKeys {
     fn default() -> Self {
         Self {
             jump: "Enter".into(),
+            filter: "/".into(),
             archive: "a".into(),
             history: "h".into(),
             close: "Escape".into(),
@@ -182,6 +185,7 @@ impl Config {
             commands,
             keys: PickKeys {
                 jump: pick(&c.pick_jump, d.jump),
+                filter: pick(&c.pick_filter, d.filter),
                 archive: pick(&c.pick_archive, d.archive),
                 history: pick(&c.pick_history, d.history),
                 close: pick(&c.pick_close, d.close),
@@ -734,6 +738,10 @@ impl Agents {
                     p.status = Some("selection cleared".into());
                     pick_render(p);
                 }
+            } else if key == k.filter {
+                // `/` focuses the search box (so does navigating up).
+                p.filtering = true;
+                pick_render(p);
             } else if key == "g" {
                 // Vim `gg`: the first `g` waits, the second goes to the top.
                 if g_pending {
@@ -1536,7 +1544,7 @@ fn pick_render(p: &mut Picker) {
     } else if p.filter.is_empty() {
         // Idle, no query: a hint. The box is reached by navigating up.
         out.push_str(
-            "\x1b[2;1H  \x1b[2msearch\x1b[0m \x1b[2m(↑ to search)\x1b[0m",
+            "\x1b[2;1H  \x1b[2msearch\x1b[0m \x1b[2m(/ or ↑ to search)\x1b[0m",
         );
     } else {
         // Idle, query applied: show it, no cursor.
@@ -1667,7 +1675,8 @@ fn pick_render(p: &mut Picker) {
         format!("type to search · {ctok} · Esc unfocus")
     } else {
         format!(
-            "j/k move · gg/G ends · {} jump · {ctok} · {} rename · {} {arch} · +/- size · {} close",
+            "j/k move · gg/G ends · {} search · {} jump · {ctok} · {} rename · {} {arch} · +/- size · {} close",
+            keyname(&k.filter),
             keyname(&k.jump),
             keyname(&k.rename),
             keyname(&k.archive),

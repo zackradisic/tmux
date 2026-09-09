@@ -1,7 +1,7 @@
 #!/bin/sh
 # Picker navigation: vim `gg`/`G` jump to the ends of the list, and the
-# search box is focused by navigating the cursor up past the top row (Esc
-# unfocuses it and keeps the query). No `/` hotkey anymore.
+# search box is focused by pressing `/` or by navigating the cursor up
+# past the top row (Esc unfocuses it and keeps the query).
 #
 # Needs the wasm example built:
 #   cargo build -p agents --target wasm32-unknown-unknown --release
@@ -95,6 +95,10 @@ screen | grep -q 'zzqz' || fail "typing did not reach the search box"
 keys Escape
 screen | grep -q 'Esc unfocus' && fail "Esc did not unfocus the search box"
 screen | grep -q 'zzqz' || fail "Esc cleared the query (it should keep it)"
+
+# `/` also focuses the search box.
+keys /
+screen | grep -q 'Esc unfocus' || fail "/ did not focus the search box"
 
 cleanup
 exit 0
