@@ -1,8 +1,7 @@
 #!/bin/sh
-# Closing the picker. `q` closes it from the list. Esc closes it from the
-# list too, and from an EMPTY search box (so a stray move up into the box
-# never swallows a close); Esc in a NON-empty box only unfocuses and keeps
-# the query (a second Esc then closes).
+# Closing the picker. `q` closes it from the list, and so does Esc. When
+# the search box is focused, Esc only UNFOCUSES it (keeps the query) and
+# never closes; a second Esc, now in the list, closes.
 #
 # Needs the wasm example built:
 #   cargo build -p agents --target wasm32-unknown-unknown --release
@@ -61,15 +60,19 @@ open_picker
 $TMUX send-keys -t "$FORM" Escape; sleep 0.5
 [ -z "$(mode_of)" ] || fail "Esc did not close the picker (mode '$(mode_of)')"
 
-# Esc closes from an EMPTY search box (navigate up into it, then Esc).
+# Esc in the search box only UNFOCUSES (never closes), empty or not; a
+# second Esc, back in the list, then closes.
 open_picker
-$TMUX send-keys -t "$FORM" Up; sleep 0.4
+$TMUX send-keys -t "$FORM" Up; sleep 0.4    # focus the (empty) box
 $TMUX capture-pane -M -p -t "$FORM" | grep -q 'Esc unfocus' ||
     fail "up did not focus the search box"
 $TMUX send-keys -t "$FORM" Escape; sleep 0.5
-[ -z "$(mode_of)" ] || fail "Esc on an empty box did not close (mode '$(mode_of)')"
+[ "$(mode_of)" = "plugin-mode" ] ||
+    fail "Esc on the empty box should unfocus, not close (mode '$(mode_of)')"
+$TMUX send-keys -t "$FORM" Escape; sleep 0.5
+[ -z "$(mode_of)" ] || fail "Esc back in the list did not close (mode '$(mode_of)')"
 
-# Esc in a NON-empty box only unfocuses; a second Esc then closes.
+# Same for a non-empty box: Esc unfocuses (keeps query), second Esc closes.
 open_picker
 $TMUX send-keys -t "$FORM" /; sleep 0.3
 $TMUX send-keys -t "$FORM" x; sleep 0.3

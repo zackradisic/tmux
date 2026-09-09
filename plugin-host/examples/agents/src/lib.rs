@@ -731,18 +731,10 @@ impl Agents {
                 }
             } else if p.filtering {
                 // The search box is focused: keys are text, except the ones
-                // that unfocus it or move the selection. Enter unfocuses and
-                // KEEPS the query, fzf-style. Esc keeps the query too when
-                // there is one; on an EMPTY box Esc closes the picker, so a
-                // stray "up into the box" never swallows a close.
-                if key == k.close {
-                    if p.filter.trim().is_empty() {
-                        after = PickAfter::Close(p.mode);
-                    } else {
-                        p.filtering = false;
-                        pick_render(p);
-                    }
-                } else if key == "Enter" {
+                // that unfocus it or move the selection. Esc (or Enter)
+                // unfocuses and KEEPS the query, fzf-style; it never closes
+                // the picker from here (close is q, or Esc from the list).
+                if key == k.close || key == "Enter" {
                     p.filtering = false;
                     pick_render(p);
                 } else if is_down {
