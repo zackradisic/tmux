@@ -641,7 +641,8 @@ impl Agents {
             let cfg = Rc::clone(&self.cfg);
             let picker = Rc::clone(&self.picker);
             let client = event.scope.client.map(u64::from);
-            ctx.spawn(pick_open(picker, cfg, client));
+            let here = event.scope.pane;
+            ctx.spawn(pick_open(picker, cfg, client, here));
             return;
         }
         if verb == "identify" {
@@ -1051,6 +1052,9 @@ struct Picker {
     order_next: u64,
     /// The 2s refresh task, cancelled when the picker closes or reopens.
     timer: Option<TaskId>,
+    /// The pane the picker was opened from. Its row gets a "you are here"
+    /// border, so you can spot the agent you are currently sitting on.
+    current_pane: Option<u32>,
 }
 
 impl Picker {
@@ -1117,6 +1121,7 @@ async fn pick_open(
     picker: Rc<RefCell<Option<Picker>>>,
     cfg: Rc<Config>,
     client: Option<u64>,
+    here: Option<u32>,
 ) {
     let window = client
         .and_then(|cid| {
@@ -1190,6 +1195,7 @@ async fn pick_open(
         order,
         order_next,
         timer: None,
+        current_pane: here,
     };
     pick_refilter(&mut p);
     pick_render(&mut p);
@@ -1746,6 +1752,15 @@ fn pick_render(p: &mut Picker) {
                         ));
                     } else {
                         out.push_str(&format!("\x1b[{row};1H{shown}"));
+                    }
+                    // "You are here": the pane the picker was opened from
+                    // gets a bright left border, drawn last so it shows over
+                    // any row state (cursor, marked, or plain).
+                    let here =
+                        a.live() && a.pane.map(|pn| pn as u32) == p.current_pane;
+                    if here {
+                        let g = if cur { "▸" } else { "▎" };
+                        out.push_str(&format!("\x1b[{row};1H\x1b[1;94m{g}\x1b[0m"));
                     }
                 }
             }
