@@ -611,6 +611,9 @@ impl Plugin for Agents {
                 if b.as_ref().is_some_and(|p| {
                     event.get_i64("mode") == Some(p.mode.0 as i64)
                 }) {
+                    if let Some(t) = b.as_ref().and_then(|p| p.timer) {
+                        cancel(t);
+                    }
                     *b = None;
                 }
             }
@@ -630,6 +633,9 @@ impl Agents {
             // wedge the hotkey. Drop the old one (best-effort close) and
             // open fresh, so pressing the key always shows a picker.
             if let Some(old) = self.picker.borrow_mut().take() {
+                if let Some(t) = old.timer {
+                    cancel(t);
+                }
                 let _ = mode_close(old.mode);
             }
             let cfg = Rc::clone(&self.cfg);
@@ -1037,6 +1043,14 @@ struct Picker {
     status: Option<String>,
     /// A `g` was pressed and waits for a second `g` (vim `gg` = go top).
     pending_g: bool,
+    /// A stable display rank per agent id, assigned in the recency order
+    /// the FIRST time each agent is seen this session. Live refreshes sort
+    /// by band then this rank, so an activity-time bump never reshuffles
+    /// rows under the cursor; the recency order is set once, at open.
+    order: HashMap<String, u64>,
+    order_next: u64,
+    /// The 2s refresh task, cancelled when the picker closes or reopens.
+    timer: Option<TaskId>,
 }
 
 impl Picker {
@@ -1134,7 +1148,9 @@ async fn pick_open(
     }
     let mut rows = store::live_agents().await.unwrap_or_default();
     enrich_live(&mut rows).await;
-    sort_rows(&mut rows);
+    let mut order: HashMap<String, u64> = HashMap::new();
+    let mut order_next: u64 = 0;
+    stable_sort(&mut order, &mut order_next, &mut rows);
     let mode = match mode_open(&ModeOpts {
         window: Some(WindowId(window)),
         width,
@@ -1171,13 +1187,21 @@ async fn pick_open(
         keys: cfg.keys.clone(),
         status: None,
         pending_g: false,
+        order,
+        order_next,
+        timer: None,
     };
     pick_refilter(&mut p);
     pick_render(&mut p);
     *picker.borrow_mut() = Some(p);
     // Keep times and file-sourced status fresh while the picker is open,
-    // without a costly file scan on every event.
-    spawn(refresh_timer(Rc::clone(&picker), mode));
+    // without a costly file scan on every event. Track the task so close
+    // (or a reopen) can cancel it deterministically, instead of leaving it
+    // to notice the picker is gone on its next tick.
+    let tid = spawn(refresh_timer(Rc::clone(&picker), mode));
+    if let Some(p) = picker.borrow_mut().as_mut() {
+        p.timer = Some(tid);
+    }
 }
 
 /// Reload rows from the database, preserving the highlight.
@@ -1195,21 +1219,25 @@ async fn reload_picker(picker: Rc<RefCell<Option<Picker>>>, enrich: bool) {
     if show_history {
         rows.extend(store::history(HISTORY_MAX).await.unwrap_or_default());
     }
-    sort_rows(&mut rows);
     let mut b = picker.borrow_mut();
     if let Some(p) = b.as_mut() {
-        // Capture the selected agent id against the OLD rows before we
-        // swap them in, so the highlight follows the agent (and the
-        // refilter never indexes the new, possibly-shorter list with a
-        // stale index).
+        // Capture the selected agent (id AND pane) against the OLD rows
+        // before we swap them in, so the highlight follows the agent. The
+        // pane is the fallback: an id migration (prov -> durable) changes
+        // the id but never the pane, so the cursor stays put across it.
         let keep = p
             .view
             .get(p.sel)
             .and_then(|&i| p.rows.get(i))
-            .map(|a| a.id.clone());
+            .map(|a| (a.id.clone(), a.pane));
+        // Stable order (band + frozen rank), so a refresh never reshuffles
+        // rows under the cursor.
+        stable_sort(&mut p.order, &mut p.order_next, &mut rows);
         p.rows = rows;
         p.now_ms = now_ms();
-        pick_refilter_keep(p, keep);
+        // A refresh keeps the scroll where it is (only filter typing snaps
+        // back to the top).
+        pick_refilter_keep(p, keep, false);
         pick_render(p);
     }
 }
@@ -1296,6 +1324,29 @@ fn band_label(b: u8) -> &'static str {
 /// Order the roster: by band, then most-recently-active first, then most
 /// recently started, then name - so the order never jitters between
 /// renders.
+/// Order rows for a live refresh WITHOUT reshuffling under the cursor.
+/// New agents get a rank in ideal (band + unread + recency) order the
+/// first time they appear; thereafter rows sort by band then that frozen
+/// rank. Band is primary, so a status change that moves an agent to
+/// another band still moves it - only the churn from activity-time bumps
+/// is removed.
+fn stable_sort(
+    order: &mut HashMap<String, u64>,
+    order_next: &mut u64,
+    rows: &mut Vec<Agent>,
+) {
+    // Ideal order first, so a batch of new agents is ranked sensibly.
+    sort_rows(rows);
+    for a in rows.iter() {
+        if !order.contains_key(&a.id) {
+            order.insert(a.id.clone(), *order_next);
+            *order_next += 1;
+        }
+    }
+    let rank = |a: &Agent| order.get(&a.id).copied().unwrap_or(u64::MAX);
+    rows.sort_by(|a, b| band(a).cmp(&band(b)).then(rank(a).cmp(&rank(b))));
+}
+
 fn sort_rows(rows: &mut [Agent]) {
     // 0 sorts before 1: unread first.
     let unread_rank = |a: &Agent| u8::from(!a.unread());
@@ -1423,15 +1474,19 @@ fn pick_refilter(p: &mut Picker) {
         .view
         .get(p.sel)
         .and_then(|&i| p.rows.get(i))
-        .map(|a| a.id.clone());
-    pick_refilter_keep(p, keep);
+        .map(|a| (a.id.clone(), a.pane));
+    pick_refilter_keep(p, keep, true);
 }
 
 /// Rebuild `view`/`sel`/`lines`, restoring the highlight to `keep`'s agent
 /// if it survived the filter. Callers that replace `rows` pass the id they
 /// captured from the OLD rows, since the internal `view`/`sel` no longer
 /// index the new set.
-fn pick_refilter_keep(p: &mut Picker, keep: Option<String>) {
+fn pick_refilter_keep(
+    p: &mut Picker,
+    keep: Option<(String, Option<i64>)>,
+    reset_scroll: bool,
+) {
     let needle = p.filter.trim().to_string();
     // Refresh the content-match set when content search is on. The grep
     // runs in tmux over the live grids (`panes_search`); only the needle
@@ -1462,13 +1517,30 @@ fn pick_refilter_keep(p: &mut Picker, keep: Option<String>) {
         .map(|(i, _)| i)
         .collect();
     p.sel = keep
-        .and_then(|id| p.view.iter().position(|&i| p.rows[i].id == id))
+        .and_then(|(id, pane)| {
+            // Prefer the id; fall back to the pane, which survives an
+            // id migration (prov -> durable) that the id would miss.
+            p.view
+                .iter()
+                .position(|&i| p.rows[i].id == id)
+                .or_else(|| {
+                    pane.and_then(|pn| {
+                        p.view.iter().position(|&i| p.rows[i].pane == Some(pn))
+                    })
+                })
+        })
         .unwrap_or(0);
     if p.sel >= p.view.len() {
         p.sel = p.view.len().saturating_sub(1);
     }
     p.rebuild_lines();
-    p.top = 0;
+    // Filter typing snaps to the top; a refresh keeps the scroll where it
+    // is (then just nudges to keep the selection visible).
+    if reset_scroll {
+        p.top = 0;
+    } else if p.top >= p.lines.len() {
+        p.top = p.lines.len().saturating_sub(1);
+    }
     p.scroll_to_selection();
 }
 

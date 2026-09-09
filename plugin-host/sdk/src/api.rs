@@ -670,11 +670,25 @@ pub async fn sleep_ms(ms: u64) -> Result<(), HostError> {
     HostFuture::timer(token as u64).await.map(|_| ())
 }
 
+/// A handle to a spawned task, for [`cancel`].
+pub use crate::executor::TaskId;
+
 /// Spawn a detached background task on the plugin's executor. Runs at the
 /// next drain, like [`crate::Ctx::spawn`], but callable without a `Ctx` -
-/// e.g. from inside another task.
-pub fn spawn(fut: impl core::future::Future<Output = ()> + 'static) {
-    crate::executor::spawn(fut);
+/// e.g. from inside another task. Returns a [`TaskId`] you may hand to
+/// [`cancel`] to stop it early; ignore the id for a fire-and-forget task.
+pub fn spawn(
+    fut: impl core::future::Future<Output = ()> + 'static,
+) -> TaskId {
+    crate::executor::spawn(fut)
+}
+
+/// Stop a task started by [`spawn`]. A pending sleep is cancelled
+/// host-side; any other host operation in flight has its completion
+/// discarded when it arrives. Cancelling a finished or unknown task is a
+/// no-op.
+pub fn cancel(id: TaskId) {
+    crate::executor::cancel(id);
 }
 
 // ---- filesystem (capabilities: fs-read / fs-write) ----
