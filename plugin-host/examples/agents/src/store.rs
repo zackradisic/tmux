@@ -19,7 +19,7 @@
 
 use tmux_plugin_sdk::prelude::*;
 
-pub const USER_VERSION: i64 = 4;
+pub const USER_VERSION: i64 = 5;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS agents (
@@ -36,6 +36,8 @@ CREATE TABLE IF NOT EXISTS agents (
   name_ms INTEGER,
   user_name TEXT,
   user_name_ms INTEGER,
+  waiting_ms INTEGER,
+  acked_ms INTEGER,
   first_seen_ms INTEGER NOT NULL,
   last_status_ms INTEGER NOT NULL,
   started_ms INTEGER,
@@ -54,7 +56,7 @@ CREATE TABLE IF NOT EXISTS captures (
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT);
-PRAGMA user_version = 4;";
+PRAGMA user_version = 5;";
 
 /// The v1 -> v2 upgrade: the resolved columns did not exist in v1.
 const MIGRATE_V2: &str = "
@@ -79,8 +81,18 @@ ALTER TABLE agents ADD COLUMN user_name TEXT;
 ALTER TABLE agents ADD COLUMN user_name_ms INTEGER;
 PRAGMA user_version = 4;";
 
+/// The v4 -> v5 upgrade: unread tracking. `waiting_ms` stamps the moment
+/// an agent enters `waiting`; `acked_ms` stamps when the user last got to
+/// it (a jump, or the picker cursor landing on the row). An agent is
+/// unread while it waits and `acked_ms` is older than `waiting_ms`.
+const MIGRATE_V5: &str = "
+ALTER TABLE agents ADD COLUMN waiting_ms INTEGER;
+ALTER TABLE agents ADD COLUMN acked_ms INTEGER;
+PRAGMA user_version = 5;";
+
 const COLS: &str = "id, kind, status, life, pane, session, window, task, name, \
-                    name_ms, user_name, user_name_ms, first_seen_ms, \
+                    name_ms, user_name, user_name_ms, waiting_ms, acked_ms, \
+                    first_seen_ms, \
                     last_status_ms, started_ms, last_active_ms, source_path, \
                     ended_ms, reason";
 
@@ -98,6 +110,8 @@ pub struct Agent {
     pub name_ms: Option<i64>,
     pub user_name: Option<String>,
     pub user_name_ms: Option<i64>,
+    pub waiting_ms: Option<i64>,
+    pub acked_ms: Option<i64>,
     pub first_seen_ms: i64,
     pub last_status_ms: i64,
     pub started_ms: Option<i64>,
@@ -121,6 +135,19 @@ impl Agent {
     /// When the agent started: the resolved harness time, else first seen.
     pub fn started(&self) -> i64 {
         self.started_ms.unwrap_or(self.first_seen_ms)
+    }
+
+    /// A waiting agent the user has not gotten to yet: it entered `waiting`
+    /// more recently than the last acknowledgement (a jump, or the picker
+    /// cursor landing on it). A live waiting row with no ack is unread.
+    pub fn unread(&self) -> bool {
+        if !self.live() || self.status != "waiting" {
+            return false;
+        }
+        match self.waiting_ms {
+            None => false,
+            Some(w) => self.acked_ms.map_or(true, |a| a < w),
+        }
     }
 }
 
@@ -147,6 +174,8 @@ fn agents_from(rows: &Rows) -> Vec<Agent> {
             name_ms: i(row.get_named("name_ms")),
             user_name: s(row.get_named("user_name")),
             user_name_ms: i(row.get_named("user_name_ms")),
+            waiting_ms: i(row.get_named("waiting_ms")),
+            acked_ms: i(row.get_named("acked_ms")),
             first_seen_ms: i(row.get_named("first_seen_ms")).unwrap_or(0),
             last_status_ms: i(row.get_named("last_status_ms")).unwrap_or(0),
             started_ms: i(row.get_named("started_ms")),
@@ -187,6 +216,10 @@ pub fn migrate_sync() -> Result<(), String> {
         }
         if version <= 3 {
             db_exec_sync(MIGRATE_V4, params![])
+                .map_err(|e| format!("db: {e}"))?;
+        }
+        if version <= 4 {
+            db_exec_sync(MIGRATE_V5, params![])
                 .map_err(|e| format!("db: {e}"))?;
         }
     }
@@ -395,19 +428,35 @@ pub async fn set_status(
 ) -> Result<u64, HostError> {
     let r = if task.is_some() {
         db_exec(
-            "UPDATE agents SET status = ?2, task = ?3, last_status_ms = ?4 \
+            "UPDATE agents SET status = ?2, task = ?3, last_status_ms = ?4, \
+             waiting_ms = CASE WHEN status <> 'waiting' AND ?2 = 'waiting' \
+                               THEN ?4 ELSE waiting_ms END \
              WHERE pane = ?1 AND ended_ms IS NULL",
             params![pane, status, task, now_ms],
         )
         .await?
     } else {
         db_exec(
-            "UPDATE agents SET status = ?2, last_status_ms = ?3 \
+            "UPDATE agents SET status = ?2, last_status_ms = ?3, \
+             waiting_ms = CASE WHEN status <> 'waiting' AND ?2 = 'waiting' \
+                               THEN ?3 ELSE waiting_ms END \
              WHERE pane = ?1 AND ended_ms IS NULL",
             params![pane, status, now_ms],
         )
         .await?
     };
+    Ok(r.changes as u64)
+}
+
+/// Mark an agent acknowledged as of `now_ms`: the user got to it (a jump
+/// to its pane, or the picker cursor landing on its row). This clears the
+/// unread flag for the current waiting episode.
+pub async fn acknowledge(id: &str, now_ms: i64) -> Result<u64, HostError> {
+    let r = db_exec(
+        "UPDATE agents SET acked_ms = ?2 WHERE id = ?1",
+        params![id, now_ms],
+    )
+    .await?;
     Ok(r.changes as u64)
 }
 

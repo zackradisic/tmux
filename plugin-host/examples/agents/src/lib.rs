@@ -4,9 +4,10 @@
 //! floating chooser: one row per agent, grouped by state (needs input,
 //! waiting, working, done) and, inside each group, most recently active
 //! first. A live preview of the highlighted pane sits to the right.
-//! `j`/`k` move, Enter jumps, `a` archives, `h` folds in the finished
-//! ones, and `/` starts a filter (Enter accepts it, Esc cancels).
-//! `J`/`K` (shift) mark rows into a selection; `a` then archives the whole
+//! `j`/`k` move, `gg`/`G` jump to the ends, Enter jumps to the pane, `a`
+//! archives, `h` folds in the finished ones. Navigate the cursor up past
+//! the top row to focus the search box; Esc unfocuses it and keeps the
+//! query. `J`/`K` (shift) mark rows into a selection; `a` then archives the whole
 //! selection at once (and un-archives when every marked row is archived).
 //! Esc clears the selection before it closes the picker. `+`/`-` grow and
 //! shrink the popup; the size is remembered across opens. The popup opens
@@ -21,6 +22,12 @@
 //! (a query with regex metacharacters runs as a regex, else a plain
 //! substring), and falls back to fuzzy when it finds nothing; the active
 //! mode shows in the header and footer.
+//!
+//! A waiting agent you have not gotten to yet is UNREAD: it entered
+//! `waiting` more recently than your last acknowledgement. Jumping to its
+//! pane or landing the cursor on its row acknowledges it. Unread rows sort
+//! to the top of the waiting band, show a bright filled badge, and count
+//! in the header.
 //!
 //! Three signals drive it, each from its own trusted source:
 //!
@@ -110,7 +117,6 @@ struct AgentsConfig {
     keep_days: Option<serde_json::Value>,
     commands: Option<Vec<String>>,
     pick_jump: Option<String>,
-    pick_filter: Option<String>,
     pick_archive: Option<String>,
     pick_history: Option<String>,
     pick_close: Option<String>,
@@ -121,7 +127,6 @@ struct AgentsConfig {
 #[derive(Clone)]
 struct PickKeys {
     jump: String,
-    filter: String,
     archive: String,
     history: String,
     close: String,
@@ -133,7 +138,6 @@ impl Default for PickKeys {
     fn default() -> Self {
         Self {
             jump: "Enter".into(),
-            filter: "/".into(),
             archive: "a".into(),
             history: "h".into(),
             close: "Escape".into(),
@@ -178,7 +182,6 @@ impl Config {
             commands,
             keys: PickKeys {
                 jump: pick(&c.pick_jump, d.jump),
-                filter: pick(&c.pick_filter, d.filter),
                 archive: pick(&c.pick_archive, d.archive),
                 history: pick(&c.pick_history, d.history),
                 close: pick(&c.pick_close, d.close),
@@ -634,6 +637,9 @@ impl Agents {
         let mode_id = event.get_i64("mode");
         let key = event.get_str("key").unwrap_or("").to_string();
         let mut after = PickAfter::None;
+        // An agent to acknowledge (mark read) after the borrow drops: the
+        // cursor landed on an unread waiting row, or the user jumped to it.
+        let mut ack_id: Option<String> = None;
         {
             let mut b = self.picker.borrow_mut();
             let Some(p) = b.as_mut() else { return };
@@ -646,6 +652,12 @@ impl Agents {
             p.status = None;
             let k = &p.keys.clone();
             let sel = p.view.get(p.sel).copied();
+            // True when this key moved the selection: drives read-ack.
+            let mut moved = false;
+            // A pending `g` is consumed by this key; only a second `g`
+            // keeps it (see the `g` branch).
+            let g_pending = p.pending_g;
+            p.pending_g = false;
             // Arrows and their control aliases move the selection in both
             // modes; they are never text.
             let is_down = matches!(key.as_str(), "Down" | "C-n" | "C-j");
@@ -678,22 +690,19 @@ impl Agents {
                     pick_render(p);
                 }
             } else if p.filtering {
-                // Filter mode: keys are text, except accept / cancel / move.
-                if key == k.close {
-                    // Esc leaves filter mode and clears it (a second Esc,
-                    // now in normal mode, closes the picker).
-                    p.filtering = false;
-                    p.filter.clear();
-                    pick_refilter(p);
-                    pick_render(p);
-                } else if key == "Enter" {
-                    // Accept the filter; stay on the picker in normal mode.
+                // The search box is focused: keys are text, except the ones
+                // that unfocus it or move the selection. Esc (or Enter)
+                // unfocuses and KEEPS the query, fzf-style; the query stays
+                // applied while you work the list.
+                if key == k.close || key == "Enter" {
                     p.filtering = false;
                     pick_render(p);
                 } else if is_down {
                     move_sel(p, 1);
+                    moved = true;
                 } else if is_up {
                     move_sel(p, -1);
+                    moved = true;
                 } else if key == "BSpace" {
                     p.filter.pop();
                     pick_refilter(p);
@@ -725,9 +734,20 @@ impl Agents {
                     p.status = Some("selection cleared".into());
                     pick_render(p);
                 }
-            } else if key == k.filter {
-                p.filtering = true;
-                pick_render(p);
+            } else if key == "g" {
+                // Vim `gg`: the first `g` waits, the second goes to the top.
+                if g_pending {
+                    let n = p.view.len() as i32;
+                    move_sel(p, -n);
+                    moved = true;
+                } else {
+                    p.pending_g = true;
+                }
+            } else if key == "G" {
+                // Vim `G`: go to the bottom.
+                let n = p.view.len() as i32;
+                move_sel(p, n);
+                moved = true;
             } else if key == k.content {
                 toggle_content(p);
             } else if key == k.rename {
@@ -738,8 +758,11 @@ impl Agents {
                 }
             } else if key == k.jump {
                 if let Some(i) = sel {
-                    let a = &p.rows[i];
-                    if let Some(pane) = a.pane.filter(|_| a.live()) {
+                    let pane = p.rows[i].pane.filter(|_| p.rows[i].live());
+                    if let Some(pane) = pane {
+                        // Jumping to the pane acknowledges the agent.
+                        p.rows[i].acked_ms = Some(p.now_ms as i64);
+                        ack_id = Some(p.rows[i].id.clone());
                         after = PickAfter::Jump(pane as u32, p.mode);
                     } else {
                         p.status = Some("no live pane to jump to".into());
@@ -753,8 +776,10 @@ impl Agents {
                 after = PickAfter::Reload;
             } else if key == "J" {
                 mark_and_move(p, 1);
+                moved = true;
             } else if key == "K" {
                 mark_and_move(p, -1);
+                moved = true;
             } else if key == "+" || key == "=" {
                 let w = (p.width + RESIZE_STEP_W).min(MAX_WIDTH);
                 let h = (p.height + RESIZE_STEP_H).min(MAX_HEIGHT);
@@ -771,9 +796,34 @@ impl Agents {
                 after = PickAfter::Resize(p.mode, w, h);
             } else if is_down || key == "j" {
                 move_sel(p, 1);
+                moved = true;
             } else if is_up || key == "k" {
-                move_sel(p, -1);
+                if p.sel == 0 {
+                    // Already at the top: bring the cursor up into the
+                    // search box.
+                    p.filtering = true;
+                    pick_render(p);
+                } else {
+                    move_sel(p, -1);
+                    moved = true;
+                }
             }
+            // Landing the cursor on an unread waiting row acknowledges it
+            // (only real navigation acks; opening the picker does not).
+            if moved && ack_id.is_none() {
+                if let Some(&i) = p.view.get(p.sel) {
+                    if p.rows[i].unread() {
+                        p.rows[i].acked_ms = Some(p.now_ms as i64);
+                        ack_id = Some(p.rows[i].id.clone());
+                        pick_render(p);
+                    }
+                }
+            }
+        }
+        if let Some(id) = ack_id {
+            ctx.spawn(async move {
+                let _ = store::acknowledge(&id, now_ms() as i64).await;
+            });
         }
         match after {
             PickAfter::None => {}
@@ -941,6 +991,8 @@ struct Picker {
     show_history: bool,
     keys: PickKeys,
     status: Option<String>,
+    /// A `g` was pressed and waits for a second `g` (vim `gg` = go top).
+    pending_g: bool,
 }
 
 impl Picker {
@@ -1074,6 +1126,7 @@ async fn pick_open(
         show_history: false,
         keys: cfg.keys.clone(),
         status: None,
+        pending_g: false,
     };
     pick_refilter(&mut p);
     pick_render(&mut p);
@@ -1200,9 +1253,12 @@ fn band_label(b: u8) -> &'static str {
 /// recently started, then name - so the order never jitters between
 /// renders.
 fn sort_rows(rows: &mut [Agent]) {
+    // 0 sorts before 1: unread first.
+    let unread_rank = |a: &Agent| u8::from(!a.unread());
     rows.sort_by(|a, b| {
         band(a)
             .cmp(&band(b))
+            .then(unread_rank(a).cmp(&unread_rank(b)))
             .then(b.active_ms().cmp(&a.active_ms()))
             .then(b.started().cmp(&a.started()))
             .then(display_name(a).cmp(&display_name(b)))
@@ -1422,6 +1478,8 @@ fn badge(a: &Agent) -> String {
     match a.status.as_str() {
         "needs_input" => "\x1b[1;33m!\x1b[0m".into(),
         "working" => "\x1b[32m●\x1b[0m".into(),
+        // Unread waiting: bright, bold, filled. Read waiting: hollow.
+        "waiting" if a.unread() => "\x1b[1;96m◉\x1b[0m".into(),
         "waiting" => "\x1b[36m◍\x1b[0m".into(),
         "done" => "\x1b[2m·\x1b[0m".into(),
         _ => "?".into(),
@@ -1453,8 +1511,14 @@ fn pick_render(p: &mut Picker) {
     } else {
         String::new()
     };
+    let unread = p.rows.iter().filter(|a| a.unread()).count();
+    let unread_tag = if unread > 0 {
+        format!(", {unread} unread")
+    } else {
+        String::new()
+    };
     out.push_str(&format!(
-        "\x1b[1;1H\x1b[1m agents\x1b[0m \x1b[2m({live} live{}{content_tag}{selected})\x1b[0m",
+        "\x1b[1;1H\x1b[1m agents\x1b[0m \x1b[2m({live} live{}{unread_tag}{content_tag}{selected})\x1b[0m",
         if p.show_history { ", +history" } else { "" },
     ));
     if p.renaming {
@@ -1464,21 +1528,20 @@ fn pick_render(p: &mut Picker) {
             p.rename_buf
         ));
     } else if p.filtering {
-        // Active: show the query with a block cursor.
+        // Focused: show the query with a block cursor.
         out.push_str(&format!(
-            "\x1b[2;1H  \x1b[2mfilter\x1b[0m {}\x1b[7m \x1b[0m",
+            "\x1b[2;1H  \x1b[2msearch\x1b[0m {}\x1b[7m \x1b[0m",
             p.filter
         ));
     } else if p.filter.is_empty() {
-        // Idle, no query: a hint.
-        out.push_str(&format!(
-            "\x1b[2;1H  \x1b[2mfilter\x1b[0m \x1b[2m(press {} to filter)\x1b[0m",
-            keyname(&p.keys.filter),
-        ));
+        // Idle, no query: a hint. The box is reached by navigating up.
+        out.push_str(
+            "\x1b[2;1H  \x1b[2msearch\x1b[0m \x1b[2m(↑ to search)\x1b[0m",
+        );
     } else {
         // Idle, query applied: show it, no cursor.
         out.push_str(&format!(
-            "\x1b[2;1H  \x1b[2mfilter\x1b[0m {}",
+            "\x1b[2;1H  \x1b[2msearch\x1b[0m {}",
             p.filter
         ));
     }
@@ -1601,12 +1664,11 @@ fn pick_render(p: &mut Picker) {
     let footer = if p.renaming {
         "type a name · Enter accept · Esc cancel".to_string()
     } else if p.filtering {
-        format!("type to filter · {ctok} · Enter accept · Esc cancel")
+        format!("type to search · {ctok} · Esc unfocus")
     } else {
         format!(
-            "j/k move · {} jump · {} filter · {ctok} · {} rename · {} {arch} · +/- size · {} close",
+            "j/k move · gg/G ends · {} jump · {ctok} · {} rename · {} {arch} · +/- size · {} close",
             keyname(&k.jump),
-            keyname(&k.filter),
             keyname(&k.rename),
             keyname(&k.archive),
             keyname(&k.close),

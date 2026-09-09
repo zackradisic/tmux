@@ -601,10 +601,22 @@ window_copy_init(struct window_mode_entry *wme,
     struct args *args)
 {
 	struct window_pane		*wp = wme->swp;
+	struct window_mode_entry	*below;
 	struct window_copy_mode_data	*data;
 	struct screen			*base = &wp->base;
 	struct screen_write_ctx		 ctx;
 	u_int				 i, cx, cy;
+
+	/*
+	 * Entered over a plugin mode (the agents picker, say): that mode drew
+	 * to its own screen, which sits directly below this copy mode on the
+	 * stack. Copy that screen instead of the pane's empty real grid, so
+	 * copy mode shows what the plugin rendered, not a blank pane.
+	 */
+	below = TAILQ_NEXT(wme, entry);
+	if (below != NULL && below->mode == &window_plugin_mode &&
+	    below->mode->get_screen != NULL)
+		base = below->mode->get_screen(below);
 
 	data = window_copy_common_init(wme);
 	data->backing = window_copy_clone_screen(base, &data->screen, &cx, &cy,

@@ -1,7 +1,8 @@
 #!/bin/sh
-# Content search in the agents roster. Pressing `/` filters on metadata
-# (name, kind, status, ...). Pressing the content-search hotkey (C-f)
-# ALSO greps the live pane contents - the grid is searched inside tmux
+# Content search in the agents roster. Navigating the cursor up focuses
+# the search box, which filters on metadata (name, kind, status). The
+# content-search hotkey (C-f) ALSO greps the live pane contents - the grid
+# is searched inside tmux
 # through `panes_search`, so the pane text never crosses the plugin ABI.
 # Check:
 #
@@ -78,7 +79,7 @@ screen | grep -q 'claude' || fail "the agent row is missing"
 
 # Filter on the token with content search OFF: metadata does not hold it,
 # so the row drops out.
-keys /
+keys Up   # focus the search box (navigate up)
 $TMUX send-keys -t "$FORM" xyzzy; sleep 0.4
 screen | grep -q '(no agents)' ||
     fail "a content-only token matched with content search off"
