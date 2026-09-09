@@ -106,6 +106,12 @@ const SEARCH_LINES: u32 = 5000;
 const DEFAULT_COMMANDS: &[&str] = &["claude", "codex", "pi", "opencode"];
 /// The statuses a shim may report.
 const STATUSES: &[&str] = &["working", "needs_input", "waiting", "done"];
+/// Foreground commands that are really interpreters launching a script.
+/// Codex ships as `node /usr/bin/codex`, so the pane's foreground command
+/// is `node`; the agent name is the basename of the launched script, which
+/// the process keeps in its `_` environment variable.
+const INTERPRETERS: &[&str] =
+    &["node", "bun", "deno", "python", "python3", "ruby"];
 
 // ---------------------------------------------------------------------------
 // configuration
@@ -209,6 +215,18 @@ fn detect(pane: u32, commands: &[String]) -> Option<String> {
         let base = cmd.rsplit('/').next().unwrap_or(&cmd);
         if let Some(k) = commands.iter().find(|c| c.as_str() == base) {
             return Some(k.clone());
+        }
+        // An interpreter-wrapped CLI: match the basename of the launched
+        // script (the `_` var), not the interpreter. Gated to interpreters
+        // so an idle shell's stale `_` cannot trip a false positive.
+        if INTERPRETERS.contains(&base) {
+            if let Ok(Some(under)) = pane_env(PaneId(pane), "_") {
+                let ubase = under.rsplit('/').next().unwrap_or(&under);
+                if let Some(k) = commands.iter().find(|c| c.as_str() == ubase)
+                {
+                    return Some(k.clone());
+                }
+            }
         }
     }
     if let Ok(Some(v)) = pane_env(PaneId(pane), "AI_AGENT") {

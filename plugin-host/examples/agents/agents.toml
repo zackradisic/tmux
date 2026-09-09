@@ -21,10 +21,13 @@ requests = [
 # The only environment variables the roster ever reads. Everything else
 # in a pane's environment (tokens, secrets) stays unreadable. Used only
 # for detection fallback; identity comes from the harness session files.
+# `_` is the launched program path: an interpreter-wrapped CLI (codex runs
+# as `node /usr/bin/codex`) is detected by the basename of `_`.
 [caps.env-read]
 names = [
   "AI_AGENT",
   "OPENCODE",
+  "_",
 ]
 
 # The only directories the roster ever reads. fs-read stays sandboxed
