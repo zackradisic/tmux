@@ -5,9 +5,10 @@
 //! waiting, working, done) and, inside each group, most recently active
 //! first. A live preview of the highlighted pane sits to the right.
 //! `j`/`k` move, `gg`/`G` jump to the ends, Enter jumps to the pane, `a`
-//! archives, `h` folds in the finished ones. Press `/`, or navigate the
-//! cursor up past the top row, to focus the search box; Esc unfocuses it
-//! and keeps the query. `J`/`K` (shift) mark rows into a selection; `a` then archives the whole
+//! archives, `h` folds in the finished ones. `q` or Esc closes the picker.
+//! Press `/`, or navigate the cursor up past the top row, to focus the
+//! search box; Esc there unfocuses it and keeps the query (but an empty box
+//! closes the picker, so a stray move up never swallows a close). `J`/`K` (shift) mark rows into a selection; `a` then archives the whole
 //! selection at once (and un-archives when every marked row is archived).
 //! Esc clears the selection before it closes the picker. `+`/`-` grow and
 //! shrink the popup; the size is remembered across opens. The popup opens
@@ -730,10 +731,18 @@ impl Agents {
                 }
             } else if p.filtering {
                 // The search box is focused: keys are text, except the ones
-                // that unfocus it or move the selection. Esc (or Enter)
-                // unfocuses and KEEPS the query, fzf-style; the query stays
-                // applied while you work the list.
-                if key == k.close || key == "Enter" {
+                // that unfocus it or move the selection. Enter unfocuses and
+                // KEEPS the query, fzf-style. Esc keeps the query too when
+                // there is one; on an EMPTY box Esc closes the picker, so a
+                // stray "up into the box" never swallows a close.
+                if key == k.close {
+                    if p.filter.trim().is_empty() {
+                        after = PickAfter::Close(p.mode);
+                    } else {
+                        p.filtering = false;
+                        pick_render(p);
+                    }
+                } else if key == "Enter" {
                     p.filtering = false;
                     pick_render(p);
                 } else if is_down {
@@ -763,9 +772,9 @@ impl Agents {
                     pick_refilter(p);
                     pick_render(p);
                 }
-            } else if key == k.close {
-                // Esc cancels a pending selection first; a second Esc, with
-                // nothing marked, closes the picker.
+            } else if key == k.close || key == "q" {
+                // Esc or q cancels a pending selection first; a second press,
+                // with nothing marked, closes the picker.
                 if p.marked.is_empty() {
                     after = PickAfter::Close(p.mode);
                 } else {
@@ -1710,7 +1719,7 @@ fn pick_render(p: &mut Picker) {
         format!("type to search · {ctok} · Esc unfocus")
     } else {
         format!(
-            "j/k move · gg/G ends · {} search · {} jump · {ctok} · {} rename · {} {arch} · +/- size · {} close",
+            "j/k move · gg/G ends · {} search · {} jump · {ctok} · {} rename · {} {arch} · +/- size · q/{} close",
             keyname(&k.filter),
             keyname(&k.jump),
             keyname(&k.rename),
