@@ -134,6 +134,9 @@ Wire formats (little-endian, packed; `str` = `u32 len` + UTF-8, no NUL):
 value   := u8 ty, payload         one SQL value; ty is SQLite's own code
    1 INTEGER: i64 | 2 FLOAT: f64 | 3 TEXT: str | 4 BLOB: u32 len, bytes
    5 NULL: nothing              (TEXT that is not UTF-8 arrives as BLOB)
+   6 ZSTD_REF: u32 ptr, u32 len  guest→host, params only: the host reads
+                                 the bytes in place, compresses them with
+                                 zstd and binds the frame as a BLOB
 params  := u16 count, count * value               guest→host, ?1..?count
                                    a zero-length buffer = no parameters
 batch   := u16 count, count * { str sql, params }  guest→host, ONE txn
@@ -144,8 +147,16 @@ exec    := i64 changes, i64 last_insert_rowid     16-byte out struct
 ```
 
 SQL and parameter blocks are raw bytes (host-consumed, no NUL rule) and
-are copied out of guest memory at call time, so the async calls pin
-nothing and hold off no teardown. Parameters are positional only. A
+are copied out of guest memory at call time. A `ZSTD_REF` parameter is
+the one exception: it names a guest buffer that the SQLite worker reads
+in place, so the call holds a pinned in-flight guard, like `fs_write`,
+until the bytes are compressed. The guard drops before the task waits
+for the connection, so teardown waits for the compression only, never
+for the statement queue. The buffer must stay valid until the completion
+arrives. `ZSTD_REF` is accepted by `db_exec` and `db_batch`; `db_query`
+and the sync imports reject it with `E_BAD_REQUEST`. The stored value is
+a plain BLOB holding one zstd frame with its content size; `db_decompress`
+inflates it. Parameters are positional only. A
 multi-statement script is accepted only with zero parameters
 (`db_exec`); with parameters, more than one statement is
 `E_BAD_REQUEST`. `db_batch` runs its statements in one transaction and
@@ -169,7 +180,11 @@ shutdown before it re-executes, so a transaction in flight at that
 moment is rolled back by WAL recovery on the next open.
 
 Limits: a request (SQL + params, or a batch block) is capped at 8 MiB and
-a result set at 8 MiB (`E_LIMIT`; page with `LIMIT`/`OFFSET`). Errors:
+a result set at 8 MiB (`E_LIMIT`; page with `LIMIT`/`OFFSET`). A
+`ZSTD_REF` counts its 8-byte reference toward the request cap; the bytes
+it points at are capped at 64 MiB, as is the output of `db_decompress`.
+A frame that inflates past 8 MiB still travels as one row, so keep one
+compressed value well under the result-set cap. Errors:
 syntax, constraint, missing table or column, type or parameter-count
 mismatch → `E_BAD_REQUEST`; size and time caps → `E_LIMIT`; busy, I/O,
 corruption → `E_HOST`. SQLite's message text is the error message.
@@ -257,6 +272,7 @@ Errors: sync imports return `0` or `-code`; value-returning imports
 | `fs_read_sync` | `(path, offset: i64, out, cap, len_out, eof_out) -> i32` | fs-read |
 | `db_exec_sync` | `(sql Bytes, params Bytes, out_ptr) -> i32` — out = 16-byte exec struct; main thread, 500 ms cap | db |
 | `db_query_sync` | `(sql Bytes, params Bytes, owned_out) -> i32` — OwnedBuf = rows block | db |
+| `db_decompress` | `(src Bytes, owned_out) -> i32` — OwnedBuf = the bytes behind a stored zstd frame | db |
 | `time_now` | `() -> i64` — Unix time, milliseconds | none |
 | `log` | `(level, ptr, len)` — raw UTF-8; 0=debug 1=info 2=warn 3=error | none |
 

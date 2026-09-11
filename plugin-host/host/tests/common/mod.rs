@@ -178,6 +178,18 @@ pub unsafe extern "C" fn vt_mode_resize(_m: u64, _w: u32, _h: u32) -> c_int {
     -1
 }
 
+pub unsafe extern "C" fn vt_panes_search(
+    _ids: *const u32,
+    _n: u32,
+    _p: *const c_char,
+    _f: u32,
+    _m: u32,
+    _s: pgh_sink,
+    _c: *mut c_void,
+) -> c_int {
+    -1
+}
+
 pub unsafe extern "C" fn vt_format_expand(
     _k: c_int,
     _i: u32,
@@ -215,6 +227,7 @@ pub fn base_vtable() -> pgh_host_vtable {
         mode_move: vt_mode_move,
         mode_resize: vt_mode_resize,
         format_expand: vt_format_expand,
+        panes_search: vt_panes_search,
     }
 }
 

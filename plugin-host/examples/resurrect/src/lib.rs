@@ -3,24 +3,27 @@
 //!
 //! Verbs (wire them to keys or run them from the prompt):
 //!
-//!   plugin-command resurrect save      # snapshot everything to disk
-//!   plugin-command resurrect kill      # snapshot, then kill-server
-//!   plugin-command resurrect restore   # rebuild on a fresh server
-//!   plugin-command resurrect status    # what the save file holds
-//!   plugin-command resurrect pick      # open the picker (needs -c mode)
+//!   plugin-command resurrect save          # snapshot everything
+//!   plugin-command resurrect kill          # snapshot, then kill-server
+//!   plugin-command resurrect restore [id]  # rebuild the newest (or #id)
+//!   plugin-command resurrect status        # newest snapshot, count, size
+//!   plugin-command resurrect pick          # open the picker (needs -c mode)
 //!
 //! Picker: a filter list of saved snapshots. Type to filter; Up/Down or
 //! C-p/C-n move; Enter restores the highlighted snapshot; C-d deletes it
-//! (with a y/n confirm); C-k saves then kills the server; C-r saves then
+//! (with a y/n confirm); p pins or unpins it (pinned rows are exempt
+//! from retention); C-k saves then kills the server; C-r saves then
 //! restarts the server in place (processes stay live); Esc closes. The
-//! action keys are configurable (pick_restore, pick_delete, pick_kill,
-//! pick_restart, pick_close in the manifest config).
+//! action keys are configurable (pick_restore, pick_delete, pick_pin,
+//! pick_kill, pick_restart, pick_close in the manifest config).
 //!
 //! Autosave (manifest config): `autosave = "5m"` saves on a timer. The
-//! first autosave waits one full period, so a restore after a server
-//! restart is never overwritten by an autosave of the empty new world.
-//! `keep = "3"` rotates old snapshots into state.1.bin, state.2.bin
-//! (higher = older) before each publish. Defaults: autosave off, keep 1.
+//! first autosave waits one full period, and an autosave whose content
+//! equals the newest snapshot inserts nothing. Retention:
+//! `keep_snapshots = "20"` keeps that many newest rows, `keep_days =
+//! "30"` drops older ones past that age ("0" = no age rule). Pinned
+//! rows and the newest row are never dropped. Defaults: autosave off,
+//! keep_snapshots 20, keep_days 30. The old `keep` key is ignored.
 //!
 //! Saved: sessions, windows (name, size, layout incl. floating panes,
 //! automatic-rename state), panes (cwd, running command as a note, full
@@ -31,21 +34,24 @@
 //!
 //! Load (tmux.conf):
 //!   load-plugin -c capture-pane -c run-command -c fs-read -c fs-write \
-//!       -c mode ~/.tmux/plugins/resurrect.wasm
+//!       -c db -c mode ~/.tmux/plugins/resurrect.wasm
 //!   bind-key C-r plugin-command resurrect pick
 //!
 //! The dev loop: prefix C-r, then C-r again to save and restart in place
 //! (processes stay live), or C-k to save and kill for a full restart.
 //!
-//! Save data lives in the plugin's sandbox
-//! (~/.local/share/tmux/plugins/resurrect/) as one container file,
-//! state.bin: an 8-byte magic, a u32 metadata length, JSON metadata
-//! carrying a Unix timestamp, then the raw pane contents as byte ranges
-//! the metadata points into. A save writes state.bin.tmp and publishes
-//! it with one atomic rename, so a reader sees the old snapshot or the
-//! new one, never a mix, and a crash mid-save loses nothing. Restore
-//! materializes the ranges back into per-pane files for the cat-wrapper
-//! (the v1 state.json layout still restores).
+//! Storage: the plugin's SQLite file (~/.local/share/tmux/plugins/
+//! resurrect/store.db). One `snapshot` row per save carries the time,
+//! the reason (manual, autosave, kill, restart, import), a pin flag,
+//! counts, a content hash and the JSON tree; one `pane_blob` row per
+//! 4 MiB chunk of pane text holds a zstd frame the host compressed on
+//! the way in (`zstd_ref`) and inflates on the way out
+//! (`db_decompress`). A save is one transaction. On first run an old
+//! state.bin / state.N.bin / state.json is imported as a snapshot and
+//! renamed to <file>.imported. Restore materializes each pane's text
+//! into a per-pane file for the cat-wrapper.
+
+mod store;
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -55,6 +61,8 @@ use serde::{Deserialize, Serialize};
 use tmux_plugin_sdk::abi::ErrorCode;
 use tmux_plugin_sdk::prelude::*;
 
+use store::{Chunk, NewSnapshot, Reason, Retention, SnapshotRow};
+
 /// Rows per capture_pane page: safely under the host's 2000-line cap
 /// while keeping pages comfortably sized.
 const PAGE_ROWS: i32 = 800;
@@ -62,11 +70,18 @@ const PAGE_ROWS: i32 = 800;
 /// each write short so pane teardown never waits on a big one.
 const WRITE_CHUNK: usize = 256 * 1024;
 
-/// The live snapshot, and the temp name a save publishes from.
+/// The pre-SQLite container file, imported on first run.
 const STATE_BIN: &str = "state.bin";
-const STATE_TMP: &str = "state.bin.tmp";
 /// Container magic; the trailing digit is the format version.
 const MAGIC: &[u8; 8] = b"TMUXRES2";
+/// The metadata format stored in `snapshot.version`.
+const META_VERSION: i64 = 3;
+/// Raw bytes per pane_blob row. Compressed, a chunk stays far under the
+/// 8 MiB result-set cap when it is read back one row at a time.
+const CHUNK_RAW: usize = 4 * 1024 * 1024;
+/// Retention defaults.
+const DEFAULT_KEEP_SNAPSHOTS: u32 = 20;
+const DEFAULT_KEEP_DAYS: u32 = 30;
 
 /// The picker float: a fixed width and the rows it grows to hold.
 const PICK_WIDTH: u32 = 76;
@@ -93,6 +108,9 @@ struct SavedPane {
     /// region (relative to the end of the metadata).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     blob: Option<(u64, u64)>,
+    /// v3: the pane has pane_blob chunks in the database.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    has_blob: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -130,14 +148,19 @@ struct SaveFile {
 struct ResurrectConfig {
     /// Autosave period: "5m", "90s", "300" (seconds); "0" turns it off.
     autosave: Option<serde_json::Value>,
-    /// Snapshots to keep. "1" = state.bin only; "3" also rotates the
-    /// two previous snapshots into state.1.bin and state.2.bin.
+    /// Newest snapshots that always stay (default 20).
+    keep_snapshots: Option<serde_json::Value>,
+    /// Snapshots older than this go, newest and pinned excepted; "0"
+    /// disables the age rule (default 30).
+    keep_days: Option<serde_json::Value>,
+    /// The pre-SQLite rotation count. Ignored, with a log line.
     keep: Option<serde_json::Value>,
     /// Picker keys, as tmux key strings (e.g. "Enter", "C-d", "x").
     /// Printable keys go into the filter, so an action wants a control
     /// or a named key. Unset uses the default below.
     pick_restore: Option<String>,
     pick_delete: Option<String>,
+    pick_pin: Option<String>,
     pick_kill: Option<String>,
     pick_restart: Option<String>,
     pick_close: Option<String>,
@@ -149,6 +172,7 @@ struct ResurrectConfig {
 struct PickKeys {
     restore: String,
     delete: String,
+    pin: String,
     kill: String,
     restart: String,
     close: String,
@@ -159,6 +183,7 @@ impl Default for PickKeys {
         Self {
             restore: "Enter".into(),
             delete: "C-d".into(),
+            pin: "p".into(),
             kill: "C-k".into(),
             restart: "C-r".into(),
             close: "Escape".into(),
@@ -175,6 +200,7 @@ impl PickKeys {
         Self {
             restore: pick(&c.pick_restore, d.restore),
             delete: pick(&c.pick_delete, d.delete),
+            pin: pick(&c.pick_pin, d.pin),
             kill: pick(&c.pick_kill, d.kill),
             restart: pick(&c.pick_restart, d.restart),
             close: pick(&c.pick_close, d.close),
@@ -210,10 +236,18 @@ fn parse_period(s: &str) -> Result<u64, String> {
         .map_err(|_| format!("bad autosave period {s:?}"))
 }
 
+/// A manifest integer: "20" or 20.
+fn cfg_u32(v: &Option<serde_json::Value>, name: &str, default: u32) -> Result<u32, String> {
+    match v {
+        None => Ok(default),
+        Some(v) => cfg_str(v).trim().parse::<u32>().map_err(|_| format!("bad {name} {v}")),
+    }
+}
+
 struct Resurrect {
     busy: Rc<Cell<bool>>,
-    /// Snapshots to keep, 1..=8 (config `keep`).
-    keep: u32,
+    /// Retention rules (config `keep_snapshots`, `keep_days`).
+    retention: Retention,
     /// Picker action keys, from config or defaults.
     keys: PickKeys,
     /// The open picker, or None. Shared with the async actions it spawns.
@@ -232,15 +266,26 @@ impl Plugin for Resurrect {
             None => 0,
             Some(v) => parse_period(&cfg_str(v))?,
         };
-        let keep = match &config.keep {
-            None => 1,
-            Some(v) => cfg_str(v)
-                .trim()
-                .parse::<u32>()
-                .map_err(|_| format!("bad keep {v}"))?
-                .clamp(1, 8),
+        let retention = Retention {
+            keep_snapshots: cfg_u32(&config.keep_snapshots, "keep_snapshots", DEFAULT_KEEP_SNAPSHOTS)?
+                .max(1),
+            keep_days: cfg_u32(&config.keep_days, "keep_days", DEFAULT_KEEP_DAYS)?,
         };
+        if config.keep.is_some() {
+            log("resurrect: config `keep` is ignored; use keep_snapshots and keep_days");
+        }
+        store::migrate_sync()?;
         let busy = Rc::new(Cell::new(false));
+        // Bring an old state.bin into the database before anything else
+        // can save. The busy flag holds saves and restores off meanwhile.
+        {
+            busy.set(true);
+            let busy = Rc::clone(&busy);
+            ctx.spawn(async move {
+                import_legacy().await;
+                busy.set(false);
+            });
+        }
         if every > 0 {
             // Floor, so a config typo cannot hammer the server.
             let every = every.max(10_000);
@@ -257,14 +302,14 @@ impl Plugin for Resurrect {
                         continue;
                     }
                     busy.set(true);
-                    autosave(keep).await;
+                    autosave(retention).await;
                     busy.set(false);
                 }
             });
         }
         Ok(Self {
             busy,
-            keep,
+            retention,
             keys,
             picker: Rc::new(RefCell::new(None)),
         })
@@ -325,16 +370,25 @@ impl Resurrect {
         }
         self.busy.set(true);
         let busy = Rc::clone(&self.busy);
-        let keep = self.keep;
+        let retention = self.retention;
         ctx.spawn(async move {
-            match verb.as_str() {
-                "save" => save(false, keep).await,
-                "kill" => save(true, keep).await,
-                "restore" => restore().await,
+            let mut words = verb.split_whitespace();
+            let head = words.next().unwrap_or("");
+            let arg = words.next();
+            match head {
+                "save" => save(false, Reason::Manual, retention).await,
+                "kill" => save(true, Reason::Kill, retention).await,
+                "restore" => match arg.map(str::parse::<i64>) {
+                    None => restore(None).await,
+                    Some(Ok(id)) => restore(Some(id)).await,
+                    Some(Err(_)) => {
+                        let _ = display_message("resurrect: restore takes a snapshot id");
+                    }
+                },
                 "status" => status().await,
                 other => {
                     let _ = display_message(&format!(
-                        "resurrect: unknown verb {other:?} (save|kill|restore|status|pick)"
+                        "resurrect: unknown verb {other:?} (save|kill|restore [id]|status|pick)"
                     ));
                 }
             }
@@ -365,7 +419,7 @@ impl Resurrect {
                         p.confirm = None;
                         after = match c {
                             Confirm::Delete(i) => match p.snaps.get(i) {
-                                Some(s) => PickAfter::Delete(s.file.clone()),
+                                Some(s) => PickAfter::Delete(s.id),
                                 None => PickAfter::None,
                             },
                             Confirm::Kill => PickAfter::Kill,
@@ -382,7 +436,11 @@ impl Resurrect {
                 after = PickAfter::Close(p.mode);
             } else if key == self.keys.restore {
                 if let Some(&i) = p.view.get(p.sel) {
-                    after = PickAfter::Restore(p.snaps[i].file.clone());
+                    after = PickAfter::Restore(p.snaps[i].id);
+                }
+            } else if key == self.keys.pin {
+                if let Some(&i) = p.view.get(p.sel) {
+                    after = PickAfter::Pin(p.snaps[i].id, !p.snaps[i].pinned);
                 }
             } else if key == self.keys.delete {
                 if let Some(&i) = p.view.get(p.sel) {
@@ -442,32 +500,40 @@ impl Resurrect {
             PickAfter::Close(mode) => {
                 let _ = mode_close(mode);
             }
-            PickAfter::Restore(file) => {
+            PickAfter::Restore(id) => {
                 ctx.spawn(pick_restore(
                     Rc::clone(&self.picker),
                     Rc::clone(&self.busy),
-                    file,
+                    id,
                 ));
             }
-            PickAfter::Delete(file) => {
+            PickAfter::Delete(id) => {
                 ctx.spawn(pick_delete(
                     Rc::clone(&self.picker),
                     Rc::clone(&self.busy),
-                    file,
+                    id,
+                ));
+            }
+            PickAfter::Pin(id, pinned) => {
+                ctx.spawn(pick_pin(
+                    Rc::clone(&self.picker),
+                    Rc::clone(&self.busy),
+                    id,
+                    pinned,
                 ));
             }
             PickAfter::Kill => {
                 ctx.spawn(pick_kill(
                     Rc::clone(&self.picker),
                     Rc::clone(&self.busy),
-                    self.keep,
+                    self.retention,
                 ));
             }
             PickAfter::Restart => {
                 ctx.spawn(pick_restart(
                     Rc::clone(&self.picker),
                     Rc::clone(&self.busy),
-                    self.keep,
+                    self.retention,
                 ));
             }
         }
@@ -480,17 +546,33 @@ tmux_plugin!(Resurrect);
 // Picker: a filterable list of snapshots, with restore/delete/kill/restart.
 // ---------------------------------------------------------------------------
 
-/// One saved snapshot on disk: the live state.bin or an archive.
+/// One saved snapshot: a `snapshot` row.
 #[derive(Clone)]
 struct Snapshot {
-    /// The file name in the data dir (e.g. "state.bin", "state.1.bin").
-    file: String,
-    /// state.bin, the newest snapshot.
+    id: i64,
+    /// The newest row.
     live: bool,
+    pinned: bool,
+    reason: String,
     saved_at_ms: u64,
     sessions: usize,
     panes: usize,
     names: Vec<String>,
+}
+
+impl Snapshot {
+    fn from_row(r: SnapshotRow, live: bool) -> Self {
+        Self {
+            id: r.id,
+            live,
+            pinned: r.pinned,
+            reason: r.reason,
+            saved_at_ms: r.saved_at_ms.max(0) as u64,
+            sessions: r.sessions.max(0) as usize,
+            panes: r.panes.max(0) as usize,
+            names: r.names,
+        }
+    }
 }
 
 /// A destructive action waiting for a y/n answer.
@@ -508,8 +590,9 @@ enum Confirm {
 enum PickAfter {
     None,
     Close(ModeId),
-    Restore(String),
-    Delete(String),
+    Restore(i64),
+    Delete(i64),
+    Pin(i64, bool),
     Kill,
     Restart,
 }
@@ -536,8 +619,10 @@ struct Picker {
     /// A pending y/n action, or None.
     confirm: Option<Confirm>,
     keys: PickKeys,
-    /// A transient line (e.g. "deleted state.1.bin").
+    /// A transient line (e.g. "deleted #12").
     status: Option<String>,
+    /// Compressed bytes on disk, for the header.
+    db_bytes: i64,
 }
 
 impl Picker {
@@ -590,45 +675,26 @@ fn rank(hay: &str, needle: &str) -> Option<u8> {
     None
 }
 
-/// Probe the live file and the archive chain, reading each header for
-/// its metadata. Missing or unreadable files are skipped. Newest first.
-async fn enumerate() -> Vec<Snapshot> {
-    let mut candidates = vec![STATE_BIN.to_string()];
-    // keep <= 8, so archives never pass state.7.bin; probe a little past.
-    for i in 1..=8u32 {
-        candidates.push(format!("state.{i}.bin"));
-    }
-    let mut out = Vec::new();
-    for file in candidates {
-        let Ok((state, _)) = read_state(&file).await else { continue };
-        let panes: usize = state
-            .sessions
-            .iter()
-            .flat_map(|s| &s.windows)
-            .map(|w| w.panes.len())
-            .sum();
-        out.push(Snapshot {
-            live: file == STATE_BIN,
-            file,
-            saved_at_ms: state.saved_at_ms,
-            sessions: state.sessions.len(),
-            panes,
-            names: state.sessions.iter().map(|s| s.name.clone()).collect(),
-        });
-    }
-    // Newest first; a stable sort keeps the probe order for equal times.
-    out.sort_by(|a, b| b.saved_at_ms.cmp(&a.saved_at_ms));
-    out
+/// Every snapshot row, newest first; the first one is "live".
+async fn enumerate() -> Result<Vec<Snapshot>, String> {
+    let rows = store::list().await?;
+    Ok(rows
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| Snapshot::from_row(r, i == 0))
+        .collect())
 }
 
 /// Re-rank the rows against the filter, keeping the highlighted snapshot
 /// highlighted when it survives.
 fn pick_refilter(p: &mut Picker) {
-    let keep = p.view.get(p.sel).map(|&i| p.snaps[i].file.clone());
+    // `view` may index a list that just shrank (a delete): look up
+    // through `get`, never by direct indexing.
+    let keep = p.view.get(p.sel).and_then(|&i| p.snaps.get(i)).map(|s| s.id);
     let mut scored: Vec<(u8, usize)> = Vec::new();
     for (i, s) in p.snaps.iter().enumerate() {
-        let tag = if s.live { "live" } else { "archive" };
-        let hay = format!("{} {} {}", s.names.join(" "), s.file, tag);
+        let pin = if s.pinned { "pinned" } else { "" };
+        let hay = format!("{} #{} {} {pin}", s.names.join(" "), s.id, s.reason);
         if let Some(r) = rank(&hay, p.filter.trim()) {
             scored.push((r, i));
         }
@@ -637,7 +703,7 @@ fn pick_refilter(p: &mut Picker) {
     scored.sort_by(|a, b| a.0.cmp(&b.0));
     p.view = scored.into_iter().map(|(_, i)| i).collect();
     p.sel = keep
-        .and_then(|f| p.view.iter().position(|&i| p.snaps[i].file == f))
+        .and_then(|id| p.view.iter().position(|&i| p.snaps[i].id == id))
         .unwrap_or(0);
     if p.sel >= p.view.len() {
         p.sel = p.view.len().saturating_sub(1);
@@ -674,8 +740,9 @@ fn pick_render(p: &mut Picker) {
     let w = p.width as usize;
     let mut out = String::from("\x1b[2J\x1b[H");
     out.push_str(&format!(
-        "\x1b[1m saved states\x1b[0m \x1b[2m({} on disk)\x1b[0m\r\n",
-        p.snaps.len()
+        "\x1b[1m saved states\x1b[0m \x1b[2m({} snapshots, {} on disk)\x1b[0m\r\n",
+        p.snaps.len(),
+        fmt_bytes(p.db_bytes)
     ));
     // Filter line, with a block cursor at the end of the typed text.
     out.push_str(&format!(
@@ -693,7 +760,13 @@ fn pick_render(p: &mut Picker) {
             let s = &p.snaps[p.view[vi]];
             let cur = vi == p.sel;
             let marker = if cur { "▸" } else { " " };
-            let dot = if s.live { "●" } else { "·" };
+            let dot = if s.pinned {
+                "★"
+            } else if s.live {
+                "●"
+            } else {
+                "·"
+            };
             let age = if s.saved_at_ms > 0 {
                 fmt_age(p.now_ms.saturating_sub(s.saved_at_ms) / 1000)
             } else {
@@ -706,7 +779,8 @@ fn pick_render(p: &mut Picker) {
             };
             let meta = format!("{} sess / {} panes", s.sessions, s.panes);
             let line = format!(
-                "{marker} {dot} {age:>9}  {meta:<18}  {names}"
+                "{marker} {dot} #{:<3} {age:>9}  {:<8} {meta:<18}  {names}",
+                s.id, s.reason
             );
             let line = clip(&line, w.saturating_sub(1));
             if cur {
@@ -727,8 +801,8 @@ fn pick_render(p: &mut Picker) {
     if let Some(c) = &p.confirm {
         let msg = match c {
             Confirm::Delete(i) => {
-                let f = p.snaps.get(*i).map(|s| s.file.as_str()).unwrap_or("?");
-                format!("delete {f}? y/n")
+                let id = p.snaps.get(*i).map(|s| s.id).unwrap_or(0);
+                format!("delete snapshot #{id}? y/n")
             }
             Confirm::Kill => {
                 "save & KILL server — processes die, restore later. y/n"
@@ -748,9 +822,10 @@ fn pick_render(p: &mut Picker) {
 
     let k = &p.keys;
     let footer = format!(
-        "{} restore · {} del · {} save+kill · {} save+restart · {} close",
+        "{} restore · {} del · {} pin · {} save+kill · {} save+restart · {} close",
         keyname(&k.restore),
         keyname(&k.delete),
+        keyname(&k.pin),
         keyname(&k.kill),
         keyname(&k.restart),
         keyname(&k.close),
@@ -776,7 +851,14 @@ async fn pick_open(
         let _ = display_message("resurrect: no client to open the picker");
         return;
     };
-    let snaps = enumerate().await;
+    let snaps = match enumerate().await {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = display_message(&format!("resurrect: {e}"));
+            return;
+        }
+    };
+    let db_bytes = store::size().await.map(|(_, b)| b).unwrap_or(0);
     let mode = match mode_open(&ModeOpts {
         window: Some(WindowId(window)),
         width: PICK_WIDTH,
@@ -807,6 +889,7 @@ async fn pick_open(
         confirm: None,
         keys,
         status: None,
+        db_bytes,
     };
     pick_refilter(&mut p);
     pick_render(&mut p);
@@ -818,7 +901,7 @@ async fn pick_open(
 async fn pick_restore(
     picker: Rc<RefCell<Option<Picker>>>,
     busy: Rc<Cell<bool>>,
-    file: String,
+    id: i64,
 ) {
     busy.set(true);
     {
@@ -827,7 +910,7 @@ async fn pick_restore(
             let _ = mode_close(p.mode);
         }
     }
-    match do_restore(&file).await {
+    match do_restore(id).await {
         Ok((restored, skipped)) => {
             let _ = display_message(&format!(
                 "resurrect: restored {restored} sessions{}",
@@ -846,26 +929,64 @@ async fn pick_restore(
     busy.set(false);
 }
 
-/// Delete the snapshot file, then refresh the list in place.
+/// Delete the snapshot row, then refresh the list in place.
 async fn pick_delete(
     picker: Rc<RefCell<Option<Picker>>>,
     busy: Rc<Cell<bool>>,
-    file: String,
+    id: i64,
 ) {
     busy.set(true);
-    let result = fs_remove(&file).await;
+    let result = store::delete(id).await;
+    let db_bytes = store::size().await.map(|(_, b)| b).ok();
     {
         let mut b = picker.borrow_mut();
         if let Some(p) = b.as_mut() {
             match result {
                 Ok(()) => {
-                    p.snaps.retain(|s| s.file != file);
-                    p.status = Some(format!("deleted {file}"));
+                    p.snaps.retain(|s| s.id != id);
+                    if let Some(first) = p.snaps.first_mut() {
+                        first.live = true;
+                    }
+                    if let Some(bytes) = db_bytes {
+                        p.db_bytes = bytes;
+                    }
+                    p.status = Some(format!("deleted #{id}"));
                     pick_refilter(p);
                 }
                 Err(e) => {
-                    p.status =
-                        Some(format!("delete failed: {}", e.message));
+                    p.status = Some(format!("delete failed: {e}"));
+                }
+            }
+            pick_render(p);
+        }
+    }
+    busy.set(false);
+}
+
+/// Pin or unpin a snapshot: pinned rows are exempt from retention.
+async fn pick_pin(
+    picker: Rc<RefCell<Option<Picker>>>,
+    busy: Rc<Cell<bool>>,
+    id: i64,
+    pinned: bool,
+) {
+    busy.set(true);
+    let result = store::set_pinned(id, pinned).await;
+    {
+        let mut b = picker.borrow_mut();
+        if let Some(p) = b.as_mut() {
+            match result {
+                Ok(()) => {
+                    if let Some(s) = p.snaps.iter_mut().find(|s| s.id == id) {
+                        s.pinned = pinned;
+                    }
+                    p.status = Some(format!(
+                        "{} #{id}",
+                        if pinned { "pinned" } else { "unpinned" }
+                    ));
+                }
+                Err(e) => {
+                    p.status = Some(format!("pin failed: {e}"));
                 }
             }
             pick_render(p);
@@ -879,7 +1000,7 @@ async fn pick_delete(
 async fn pick_kill(
     picker: Rc<RefCell<Option<Picker>>>,
     busy: Rc<Cell<bool>>,
-    keep: u32,
+    retention: Retention,
 ) {
     busy.set(true);
     {
@@ -890,7 +1011,7 @@ async fn pick_kill(
     }
     // Let the float's pane tear down before list_panes runs.
     let _ = sleep_ms(80).await;
-    save(true, keep).await;
+    save(true, Reason::Kill, retention).await;
     busy.set(false);
 }
 
@@ -900,7 +1021,7 @@ async fn pick_kill(
 async fn pick_restart(
     picker: Rc<RefCell<Option<Picker>>>,
     busy: Rc<Cell<bool>>,
-    keep: u32,
+    retention: Retention,
 ) {
     busy.set(true);
     {
@@ -910,8 +1031,8 @@ async fn pick_restart(
         }
     }
     let _ = sleep_ms(80).await;
-    match do_save(keep).await {
-        Ok((s, pn)) => {
+    match do_save(Reason::Restart, retention).await {
+        Ok(Saved { sessions: s, panes: pn, .. }) => {
             let _ = display_message(&format!(
                 "resurrect: saved {s} sessions / {pn} panes; restarting (processes stay live)"
             ));
@@ -1179,20 +1300,29 @@ fn parse_floats(section: &str) -> Vec<FloatCell> {
 // Save
 // ---------------------------------------------------------------------------
 
+/// What a save produced.
+struct Saved {
+    sessions: usize,
+    panes: usize,
+    /// The new row, or None when an autosave found nothing changed.
+    id: Option<i64>,
+}
+
 /// Timer-driven save: quiet on success (a toast every period is
 /// noise), loud on failure.
-async fn autosave(keep: u32) {
-    if let Err(e) = do_save(keep).await {
+async fn autosave(retention: Retention) {
+    if let Err(e) = do_save(Reason::Autosave, retention).await {
         let _ =
             display_message(&format!("resurrect: autosave failed: {e}"));
     }
 }
 
-async fn save(kill: bool, keep: u32) {
-    match do_save(keep).await {
-        Ok((sessions, panes)) => {
+async fn save(kill: bool, reason: Reason, retention: Retention) {
+    match do_save(reason, retention).await {
+        Ok(Saved { sessions, panes, id }) => {
             let _ = display_message(&format!(
-                "resurrect: saved {sessions} sessions / {panes} panes{}",
+                "resurrect: saved {sessions} sessions / {panes} panes as #{}{}",
+                id.unwrap_or(0),
                 if kill { "; killing server" } else { "" }
             ));
             if kill {
@@ -1207,7 +1337,16 @@ async fn save(kill: bool, keep: u32) {
     }
 }
 
-async fn do_save(keep: u32) -> Result<(usize, usize), String> {
+/// The tree as saved, plus each live pane's text.
+struct Capture {
+    file: SaveFile,
+    /// (pane id, raw text), in tree order.
+    blobs: Vec<(u32, Vec<u8>)>,
+    windows: usize,
+}
+
+/// Walk the live server into a SaveFile and capture every pane.
+fn capture_world() -> Result<Capture, String> {
     let sessions = list_sessions().map_err(|e| e.to_string())?;
     let windows = list_windows().map_err(|e| e.to_string())?;
     let panes = list_panes().map_err(|e| e.to_string())?;
@@ -1217,12 +1356,12 @@ async fn do_save(keep: u32) -> Result<(usize, usize), String> {
         panes.iter().map(|p| (p.id, p)).collect();
 
     let mut out = SaveFile {
-        version: 2,
+        version: META_VERSION as u32,
         saved_at_ms: now_ms(),
         sessions: Vec::new(),
     };
-    let mut blobs: Vec<u8> = Vec::new();
-    let mut npanes = 0;
+    let mut blobs = Vec::new();
+    let mut nwindows = 0;
 
     for s in &sessions {
         let mut saved = SavedSession {
@@ -1260,68 +1399,82 @@ async fn do_save(keep: u32) -> Result<(usize, usize), String> {
             };
             for &pane_id in &w.panes {
                 let Some(p) = pane_by_id.get(&pane_id) else { continue };
-                sw.panes.push(save_pane(p, &mut blobs)?);
-                npanes += 1;
+                let (saved_pane, text) = save_pane(p)?;
+                if let Some(text) = text {
+                    blobs.push((p.id, text));
+                }
+                sw.panes.push(saved_pane);
             }
+            nwindows += 1;
             saved.windows.push(sw);
         }
         out.sessions.push(saved);
     }
-
-    let meta =
-        serde_json::to_vec(&out).map_err(|e| format!("serialize: {e}"))?;
-    let mut file = Vec::with_capacity(12 + meta.len() + blobs.len());
-    file.extend_from_slice(MAGIC);
-    file.extend_from_slice(&(meta.len() as u32).to_le_bytes());
-    file.extend_from_slice(&meta);
-    file.extend_from_slice(&blobs);
-    let mut first = true;
-    for chunk in file.chunks(WRITE_CHUNK) {
-        fs_write(STATE_TMP, chunk.to_vec(), !first)
-            .await
-            .map_err(|e| format!("{STATE_TMP}: {e}"))?;
-        first = false;
-    }
-    publish(keep).await?;
-    Ok((out.sessions.len(), npanes))
+    Ok(Capture { file: out, blobs, windows: nwindows })
 }
 
-/// Make the temp file the live snapshot. Plain rename is the atomic
-/// replace; the exchange path keeps `state.bin` present at every
-/// instant while the previous snapshot rotates into the archive chain.
-async fn publish(keep: u32) -> Result<(), String> {
-    let name = |i: u32| format!("state.{i}.bin");
-    // `keep` counts snapshots in total: the live state.bin plus
-    // keep - 1 archives. Shift the archives oldest-last, dropping the
-    // one that falls off the end (its name is simply renamed over).
-    for i in (1..keep.saturating_sub(1)).rev() {
-        // A hole in the chain is fine: the source may not exist yet.
-        let _ = fs_rename(&name(i), &name(i + 1), RenameFlag::Replace).await;
+/// Snapshot the world into one new row. An autosave whose content
+/// hash equals the newest row's inserts nothing; every other reason
+/// always inserts. Retention runs after the insert.
+async fn do_save(reason: Reason, retention: Retention) -> Result<Saved, String> {
+    let Capture { mut file, blobs, windows } = capture_world()?;
+    let npanes: usize = file.sessions.iter().flat_map(|s| &s.windows).map(|w| w.panes.len()).sum();
+
+    // The hash covers the tree without its timestamp, plus every blob.
+    let saved_at = file.saved_at_ms;
+    file.saved_at_ms = 0;
+    let meta_for_hash = serde_json::to_vec(&file).map_err(|e| format!("serialize: {e}"))?;
+    let mut h = Fnv::new();
+    h.update(&meta_for_hash);
+    for (_, text) in &blobs {
+        h.update(text);
     }
-    if keep > 1 {
-        match fs_rename(STATE_TMP, STATE_BIN, RenameFlag::Exchange).await {
-            Ok(()) => {
-                // The temp name now holds the previous snapshot.
-                fs_rename(STATE_TMP, &name(1), RenameFlag::Replace)
-                    .await
-                    .map_err(|e| format!("archive: {}", e.message))
+    let content_hash = h.finish();
+    file.saved_at_ms = saved_at;
+
+    if reason == Reason::Autosave {
+        if let Some((id, hash)) = store::newest_hash().await? {
+            if hash == content_hash {
+                return Ok(Saved { sessions: file.sessions.len(), panes: npanes, id: None });
             }
-            // No snapshot yet: nothing to exchange with.
-            Err(e) if e.code == ErrorCode::NoSuchObject => {
-                fs_rename(STATE_TMP, STATE_BIN, RenameFlag::Replace)
-                    .await
-                    .map_err(|e| format!("publish: {}", e.message))
-            }
-            Err(e) => Err(format!("publish: {}", e.message)),
+            let _ = id;
         }
-    } else {
-        fs_rename(STATE_TMP, STATE_BIN, RenameFlag::Replace)
-            .await
-            .map_err(|e| format!("publish: {}", e.message))
     }
+
+    let meta = serde_json::to_string(&file).map_err(|e| format!("serialize: {e}"))?;
+    let names: Vec<String> = file.sessions.iter().map(|s| s.name.clone()).collect();
+    let raw_bytes: usize = blobs.iter().map(|(_, t)| t.len()).sum();
+    let id = store::next_id().await?;
+    let chunks: Vec<Chunk<'_>> = blobs
+        .iter()
+        .flat_map(|(pane_id, text)| {
+            text.chunks(CHUNK_RAW).enumerate().map(move |(seq, data)| Chunk {
+                pane_id: i64::from(*pane_id),
+                seq: seq as i64,
+                data,
+            })
+        })
+        .collect();
+    let snap = NewSnapshot {
+        id,
+        saved_at_ms: saved_at as i64,
+        version: META_VERSION,
+        reason,
+        sessions: file.sessions.len() as i64,
+        windows: windows as i64,
+        panes: npanes as i64,
+        raw_bytes: raw_bytes as i64,
+        content_hash,
+        names: &names,
+        meta: &meta,
+    };
+    store::insert(&snap, &chunks).await?;
+    store::retain(retention, now_ms() as i64).await?;
+    Ok(Saved { sessions: file.sessions.len(), panes: npanes, id: Some(id) })
 }
 
-fn save_pane(p: &PaneInfo, blobs: &mut Vec<u8>) -> Result<SavedPane, String> {
+/// Describe one pane and capture its text. Dead panes have no text.
+fn save_pane(p: &PaneInfo) -> Result<(SavedPane, Option<Vec<u8>>), String> {
     let pane = PaneId(p.id);
     let command =
         format_expand(OptionTarget::Pane(pane), c"#{pane_current_command}")
@@ -1333,9 +1486,10 @@ fn save_pane(p: &PaneInfo, blobs: &mut Vec<u8>) -> Result<SavedPane, String> {
         command,
         content: None,
         blob: None,
+        has_blob: false,
     };
     if p.dead {
-        return Ok(saved);
+        return Ok((saved, None));
     }
 
     let history: i64 =
@@ -1349,7 +1503,7 @@ fn save_pane(p: &PaneInfo, blobs: &mut Vec<u8>) -> Result<SavedPane, String> {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
 
-    let start_off = blobs.len() as u64;
+    let mut text: Vec<u8> = Vec::new();
     let mut start = -history;
     let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     while start <= cursor_y {
@@ -1362,22 +1516,56 @@ fn save_pane(p: &PaneInfo, blobs: &mut Vec<u8>) -> Result<SavedPane, String> {
             &mut buf,
         )
         .map_err(|e| format!("capture %{}: {e}", p.id))?;
-        blobs.append(&mut unescape(&buf));
+        text.append(&mut unescape(&buf));
         start = end + 1;
     }
-    saved.blob = Some((start_off, blobs.len() as u64 - start_off));
-    Ok(saved)
+    saved.has_blob = true;
+    Ok((saved, Some(text)))
+}
+
+/// FNV-1a 64: a cheap, dependency-free content hash for dedup.
+struct Fnv(u64);
+
+impl Fnv {
+    fn new() -> Self {
+        Fnv(0xcbf2_9ce4_8422_2325)
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 ^= u64::from(b);
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    fn finish(&self) -> i64 {
+        self.0 as i64
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Restore
 // ---------------------------------------------------------------------------
 
-async fn restore() {
-    match do_restore(STATE_BIN).await {
+async fn restore(id: Option<i64>) {
+    let id = match store::find(id).await {
+        Ok(Some(row)) => row.id,
+        Ok(None) => {
+            let _ = display_message(match id {
+                Some(_) => "resurrect: no such snapshot",
+                None => "resurrect: nothing saved yet",
+            });
+            return;
+        }
+        Err(e) => {
+            let _ = display_message(&format!("resurrect: {e}"));
+            return;
+        }
+    };
+    match do_restore(id).await {
         Ok((restored, skipped)) => {
             let _ = display_message(&format!(
-                "resurrect: restored {restored} sessions{}",
+                "resurrect: restored {restored} sessions from #{id}{}",
                 if skipped > 0 {
                     format!(" ({skipped} already existed)")
                 } else {
@@ -1448,55 +1636,62 @@ async fn read_state_v1() -> Result<SaveFile, String> {
         .map_err(|e| format!("state.json is unreadable ({e}); save again"))
 }
 
-/// Copy one blob out of the snapshot `src` into `dest`, so the restore
-/// wrapper can cat it. `dest` is a transient restore artifact, not part
-/// of the snapshot.
-async fn extract_blob(
-    src: &str,
-    mut off: u64,
-    len: u64,
-    dest: &str,
-) -> Result<(), String> {
+/// Read one blob out of a legacy container file, for the import.
+async fn read_blob(src: &str, mut off: u64, len: u64) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(len as usize);
     let mut left = len as usize;
-    let mut first = true;
-    loop {
+    while left > 0 {
         let want = left.min(WRITE_CHUNK);
-        if want == 0 && !first {
-            break;
+        let (page, _) = fs_read(src, off, want)
+            .await
+            .map_err(|e| format!("{src}: {e}"))?;
+        if page.is_empty() {
+            return Err(format!("{src} is truncated"));
         }
-        // A zero-length blob still writes the file (empty pane).
-        let page = if want == 0 {
-            Vec::new()
-        } else {
-            let (page, _) = fs_read(src, off, want)
-                .await
-                .map_err(|e| format!("{dest}: {e}"))?;
-            if page.is_empty() {
-                return Err(format!("{dest}: {src} is truncated"));
-            }
-            page
-        };
         off += page.len() as u64;
         left -= page.len();
-        fs_write(dest, page, !first)
+        out.extend_from_slice(&page);
+    }
+    Ok(out)
+}
+
+/// Materialize one pane's chunks into `dest` for the cat-wrapper. A
+/// pane with chunks but no bytes still gets an (empty) file.
+async fn extract_pane(id: i64, pane_id: u32, dest: &str) -> Result<(), String> {
+    let mut seq = 0i64;
+    let mut first = true;
+    loop {
+        let Some(raw) = store::chunk(id, i64::from(pane_id), seq).await? else {
+            break;
+        };
+        for page in raw.chunks(WRITE_CHUNK) {
+            fs_write(dest, page.to_vec(), !first)
+                .await
+                .map_err(|e| format!("{dest}: {e}"))?;
+            first = false;
+        }
+        seq += 1;
+    }
+    if first {
+        fs_write(dest, Vec::new(), false)
             .await
             .map_err(|e| format!("{dest}: {e}"))?;
-        first = false;
-        if left == 0 {
-            break;
-        }
     }
     Ok(())
 }
 
-async fn do_restore(file: &str) -> Result<(usize, usize), String> {
-    let (mut state, blob_base) = read_state(file).await?;
+async fn do_restore(id: i64) -> Result<(usize, usize), String> {
+    let meta = store::meta(id).await?.ok_or_else(|| format!("snapshot #{id} is gone"))?;
+    let mut state: SaveFile = serde_json::from_str(&meta)
+        .map_err(|e| format!("snapshot #{id} is unreadable ({e})"))?;
     for session in &mut state.sessions {
         for window in &mut session.windows {
             for pane in &mut window.panes {
-                let Some((off, len)) = pane.blob else { continue };
+                if !pane.has_blob {
+                    continue;
+                }
                 let dest = format!("pane-{}.txt", pane.id);
-                extract_blob(file, blob_base + off, len, &dest).await?;
+                extract_pane(id, pane.id, &dest).await?;
                 pane.content = Some(dest);
             }
         }
@@ -1530,6 +1725,115 @@ async fn do_restore(file: &str) -> Result<(usize, usize), String> {
         restored += 1;
     }
     Ok((restored, skipped))
+}
+
+// ---------------------------------------------------------------------------
+// Import of the pre-SQLite files
+// ---------------------------------------------------------------------------
+
+/// Bring state.bin, state.N.bin and state.json into the database, once:
+/// only while the snapshot table is empty. Each file becomes an
+/// `import` row with its original timestamp and is renamed to
+/// `<file>.imported`. Nothing is deleted.
+async fn import_legacy() {
+    let empty = match store::size().await {
+        Ok((n, _)) => n == 0,
+        Err(e) => {
+            log(&format!("import skipped: {e}"));
+            return;
+        }
+    };
+    if !empty {
+        return;
+    }
+    let mut files = vec![STATE_BIN.to_string()];
+    for i in 1..=8u32 {
+        files.push(format!("state.{i}.bin"));
+    }
+    let mut imported = 0;
+    for file in files {
+        let (state, blob_base) = match read_state(&file).await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        match import_one(&file, state, blob_base).await {
+            Ok(id) => {
+                imported += 1;
+                // v1 lives in state.json; read_state fell back to it.
+                let src = if blob_base == 0 && file == STATE_BIN {
+                    "state.json".to_string()
+                } else {
+                    file.clone()
+                };
+                let dest = format!("{src}.imported");
+                if let Err(e) = fs_rename(&src, &dest, RenameFlag::Replace).await {
+                    log(&format!("imported {src} as #{id}, rename failed: {e}"));
+                } else {
+                    log(&format!("imported {src} as snapshot #{id}"));
+                }
+            }
+            Err(e) => log(&format!("import of {file} failed: {e}")),
+        }
+    }
+    if imported > 0 {
+        let _ = display_message(&format!(
+            "resurrect: imported {imported} old snapshot file(s) into store.db"
+        ));
+    }
+}
+
+async fn import_one(file: &str, mut state: SaveFile, blob_base: u64) -> Result<i64, String> {
+    let mut blobs: Vec<(u32, Vec<u8>)> = Vec::new();
+    let mut windows = 0usize;
+    for session in &mut state.sessions {
+        for window in &mut session.windows {
+            windows += 1;
+            for pane in &mut window.panes {
+                if let Some((off, len)) = pane.blob.take() {
+                    blobs.push((pane.id, read_blob(file, blob_base + off, len).await?));
+                    pane.has_blob = true;
+                }
+                pane.content = None;
+            }
+        }
+    }
+    let saved_at = if state.saved_at_ms > 0 { state.saved_at_ms } else { now_ms() };
+    state.saved_at_ms = saved_at;
+    state.version = META_VERSION as u32;
+    let npanes: usize =
+        state.sessions.iter().flat_map(|s| &s.windows).map(|w| w.panes.len()).sum();
+    let mut h = Fnv::new();
+    for (_, text) in &blobs {
+        h.update(text);
+    }
+    let meta = serde_json::to_string(&state).map_err(|e| format!("serialize: {e}"))?;
+    let names: Vec<String> = state.sessions.iter().map(|s| s.name.clone()).collect();
+    let id = store::next_id().await?;
+    let chunks: Vec<Chunk<'_>> = blobs
+        .iter()
+        .flat_map(|(pane_id, text)| {
+            text.chunks(CHUNK_RAW).enumerate().map(move |(seq, data)| Chunk {
+                pane_id: i64::from(*pane_id),
+                seq: seq as i64,
+                data,
+            })
+        })
+        .collect();
+    let snap = NewSnapshot {
+        id,
+        saved_at_ms: saved_at as i64,
+        version: META_VERSION,
+        reason: Reason::Import,
+        sessions: state.sessions.len() as i64,
+        windows: windows as i64,
+        panes: npanes as i64,
+        raw_bytes: blobs.iter().map(|(_, t)| t.len() as i64).sum(),
+        content_hash: h.finish(),
+        names: &names,
+        meta: &meta,
+    };
+    store::insert(&snap, &chunks).await?;
+    Ok(id)
 }
 
 /// The pane's start command: replay saved contents, then hand over to
@@ -1795,33 +2099,41 @@ fn fmt_age(secs: u64) -> String {
     }
 }
 
+/// Human-readable byte count for the picker header and status.
+fn fmt_bytes(n: i64) -> String {
+    let n = n.max(0) as f64;
+    if n < 1024.0 {
+        format!("{n:.0} B")
+    } else if n < 1024.0 * 1024.0 {
+        format!("{:.0} KB", n / 1024.0)
+    } else {
+        format!("{:.1} MB", n / (1024.0 * 1024.0))
+    }
+}
+
 async fn status() {
-    match read_state(STATE_BIN).await {
-        Ok((state, _)) => {
-            let panes: usize =
-                state.sessions.iter().flat_map(|s| &s.windows)
-                    .map(|w| w.panes.len())
-                    .sum();
-            let names: Vec<&str> = state
-                .sessions
-                .iter()
-                .map(|s| s.name.as_str())
-                .collect();
-            let age = if state.saved_at_ms > 0 {
-                let secs =
-                    now_ms().saturating_sub(state.saved_at_ms) / 1000;
-                format!(", saved {}", fmt_age(secs))
-            } else {
-                String::new()
-            };
-            let _ = display_message(&format!(
-                "resurrect: save holds {} sessions ({}) / {panes} panes{age}",
-                state.sessions.len(),
-                names.join(", ")
-            ));
-        }
+    let newest = match store::find(None).await {
+        Ok(v) => v,
         Err(e) => {
             let _ = display_message(&format!("resurrect: {e}"));
+            return;
         }
-    }
+    };
+    let (count, bytes) = store::size().await.unwrap_or((0, 0));
+    let Some(row) = newest else {
+        let _ = display_message("resurrect: nothing saved yet");
+        return;
+    };
+    let secs = now_ms().saturating_sub(row.saved_at_ms.max(0) as u64) / 1000;
+    let _ = display_message(&format!(
+        "resurrect: #{} holds {} sessions ({}) / {} windows / {} panes, saved {} ({}); {count} snapshots, {} on disk",
+        row.id,
+        row.sessions,
+        row.names.join(", "),
+        row.windows,
+        row.panes,
+        fmt_age(secs),
+        row.reason,
+        fmt_bytes(bytes)
+    ));
 }

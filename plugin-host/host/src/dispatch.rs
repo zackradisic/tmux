@@ -1270,29 +1270,124 @@ fn db_check_size(len: i32, extra: i32) -> Result<(), HostError> {
     Ok(())
 }
 
-/// Start one async statement task: allocate the token, take the detached
-/// in-flight guard, hand the job to sqlite::submit.
+/// Reject ZSTD_REF parameters where they are not supported: the sync
+/// imports (compression belongs on a worker thread) and `db_query`.
+fn db_reject_refs(params: &[tmux_plugin_abi::db::DbValue]) -> Result<(), HostError> {
+    if params.iter().any(|p| matches!(p, tmux_plugin_abi::db::DbValue::ZstdRef { .. })) {
+        return Err(err(
+            ErrorCode::BadRequest,
+            "ZSTD_REF parameters are accepted by db_exec and db_batch only",
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve one ZSTD_REF into a pinned guest slice. Bounds-checked against
+/// linear memory here; the worker reads it in place under a pinned guard.
+fn db_zstd_slice(
+    mem: &GuestMem<'_, '_>,
+    ptr: u32,
+    len: u32,
+) -> Result<crate::fsworker::GuestSlice, HostError> {
+    if len as usize > tmux_plugin_abi::MAX_DB_ZSTD_RAW_BYTES {
+        return Err(err(
+            ErrorCode::Limit,
+            format!(
+                "ZSTD_REF is {len} bytes, the limit is {}",
+                tmux_plugin_abi::MAX_DB_ZSTD_RAW_BYTES
+            ),
+        ));
+    }
+    let (Ok(p), Ok(l)) = (i32::try_from(ptr), i32::try_from(len)) else {
+        return Err(err(ErrorCode::BadRequest, "ZSTD_REF outside linear memory"));
+    };
+    let ptr = mem.pinned_bytes(p, l)?;
+    Ok(crate::fsworker::GuestSlice { ptr, len: len as usize })
+}
+
+/// Collect the ZSTD_REF parameters of a job as pinned inputs. Empty for
+/// a job without any, which then runs detached as before.
+fn db_zstd_inputs(
+    mem: &GuestMem<'_, '_>,
+    job: &crate::sqlite::DbJob,
+) -> Result<Vec<crate::sqlite::ZstdInput>, HostError> {
+    use tmux_plugin_abi::db::DbValue;
+    let mut out = Vec::new();
+    let mut visit = |stmt: Option<usize>, params: &[DbValue]| -> Result<(), HostError> {
+        for (i, p) in params.iter().enumerate() {
+            if let DbValue::ZstdRef { ptr, len } = p {
+                let src = db_zstd_slice(mem, *ptr, *len)?;
+                out.push(crate::sqlite::ZstdInput { stmt, param: i, src });
+            }
+        }
+        Ok(())
+    };
+    match job {
+        crate::sqlite::DbJob::Exec { params, .. } => visit(None, params)?,
+        crate::sqlite::DbJob::Batch { stmts } => {
+            for (i, s) in stmts.iter().enumerate() {
+                visit(Some(i), &s.params)?;
+            }
+        }
+        crate::sqlite::DbJob::Query { params, .. } => db_reject_refs(params)?,
+    }
+    Ok(out)
+}
+
+/// Start one async statement task: allocate the token, take the in-flight
+/// guards (detached always, pinned when ZSTD_REF inputs exist), hand the
+/// job to sqlite::submit.
 fn db_start(
     mem: &mut GuestMem<'_, '_>,
     job: crate::sqlite::DbJob,
 ) -> Result<i64, HostError> {
+    let zstd = db_zstd_inputs(mem, &job)?;
     let root = fs_root_of(mem)?;
     let handle = crate::sqlite::handle_for(&mem.data().plugin, &root);
     let data = mem.data();
     let key = (data.plugin.clone(), data.scope, data.generation);
     let token = alloc_token(mem);
-    let guard = match crate::worker::track(key, false) {
+    let guard = match crate::worker::track(key.clone(), false) {
         Ok(g) => g,
         Err(e) => {
             crate::tokens::discard(token);
             return Err(err(ErrorCode::Host, e));
         }
     };
+    let pinned = if zstd.is_empty() {
+        None
+    } else {
+        match crate::worker::track(key, true) {
+            Ok(g) => Some(g),
+            Err(e) => {
+                crate::tokens::discard(token);
+                return Err(err(ErrorCode::Host, e));
+            }
+        }
+    };
     crate::sqlite::submit(
         &handle,
-        crate::sqlite::DbRequest { token, guard, job },
+        crate::sqlite::DbRequest { token, guard, pinned, zstd, job },
     );
     Ok(token as i64)
+}
+
+/// Inflate a BLOB that was stored from a ZSTD_REF parameter. Sync; the
+/// result is an OwnedBuf in guest memory.
+pub fn db_decompress(
+    mem: &mut GuestMem<'_, '_>,
+    src_ptr: i32,
+    src_len: i32,
+    owned_out: i32,
+) -> Result<(), HostError> {
+    check_cap(mem, crate::caps::DB)?;
+    let raw = {
+        let src = mem.byte_slice(src_ptr, src_len)?;
+        crate::sqlite::decompress(src)?
+    };
+    // The borrow of guest memory ended above; give_owned may re-enter
+    // the guest allocator now.
+    mem.give_owned(&raw, owned_out)
 }
 
 pub fn db_exec_async(
@@ -1351,6 +1446,7 @@ pub fn db_exec_sync(
     db_check_size(sql_len, params_len)?;
     let sql = db_sql(mem, sql_ptr, sql_len)?;
     let params = db_params(mem, params_ptr, params_len)?;
+    db_reject_refs(&params)?;
     let root = fs_root_of(mem)?;
     let result = crate::sqlite::with_sync(&mem.data().plugin, &root, |conn| {
         crate::sqlite::exec(conn, &sql, &params)
@@ -1370,6 +1466,7 @@ pub fn db_query_sync(
     db_check_size(sql_len, params_len)?;
     let sql = db_sql(mem, sql_ptr, sql_len)?;
     let params = db_params(mem, params_ptr, params_len)?;
+    db_reject_refs(&params)?;
     let root = fs_root_of(mem)?;
     let (rows, _, _) = crate::sqlite::with_sync(&mem.data().plugin, &root, |conn| {
         crate::sqlite::query(conn, &sql, &params)

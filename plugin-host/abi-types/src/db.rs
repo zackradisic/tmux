@@ -17,8 +17,16 @@
 //!    3 TEXT:    str
 //!    4 BLOB:    u32 len, bytes
 //!    5 NULL:    (nothing)
+//!    6 ZSTD_REF: u32 ptr, u32 len    guest -> host, params only
 //!    other ty -> WireError::BadTag
 //!    The host emits TEXT that is not valid UTF-8 as BLOB.
+//!
+//!    ZSTD_REF points at `len` bytes of guest linear memory instead of
+//!    carrying them inline. The host reads them in place, compresses
+//!    them with zstd on the SQLite worker, and binds the compressed
+//!    bytes as a plain BLOB. The buffer must stay valid until the
+//!    completion arrives. Rows never carry code 6; `db_decompress`
+//!    turns the stored frame back into the original bytes.
 //!
 //! params  := u16 count, count * value          guest -> host
 //!            bound to ?1..?count; a zero-length buffer means count 0
@@ -42,6 +50,9 @@ pub mod ty {
     pub const TEXT: u8 = 3;
     pub const BLOB: u8 = 4;
     pub const NULL: u8 = 5;
+    /// Not a SQLite type: a reference to guest memory the host compresses
+    /// before binding. Legal in params blocks only.
+    pub const ZSTD_REF: u8 = 6;
 }
 
 /// Size of the `exec` out struct.
@@ -56,6 +67,10 @@ pub enum DbValue {
     Real(f64),
     Text(String),
     Blob(Vec<u8>),
+    /// `len` bytes at guest address `ptr`, compressed by the host on the
+    /// way in and stored as a BLOB. Build one with the SDK's `zstd_ref`.
+    /// Never returned in a result set.
+    ZstdRef { ptr: u32, len: u32 },
 }
 
 impl DbValue {
@@ -111,6 +126,7 @@ impl DbValue {
             DbValue::Real(_) => ty::FLOAT,
             DbValue::Text(_) => ty::TEXT,
             DbValue::Blob(_) => ty::BLOB,
+            DbValue::ZstdRef { .. } => ty::ZSTD_REF,
         }
     }
 }
@@ -123,6 +139,7 @@ impl fmt::Display for DbValue {
             DbValue::Real(v) => write!(f, "{v}"),
             DbValue::Text(s) => f.write_str(s),
             DbValue::Blob(b) => write!(f, "<blob {} bytes>", b.len()),
+            DbValue::ZstdRef { len, .. } => write!(f, "<zstd ref {len} bytes>"),
         }
     }
 }
@@ -231,6 +248,10 @@ pub fn write_value(out: &mut Vec<u8>, v: &DbValue) {
             out.extend_from_slice(&(b.len() as u32).to_le_bytes());
             out.extend_from_slice(b);
         }
+        DbValue::ZstdRef { ptr, len } => {
+            out.extend_from_slice(&ptr.to_le_bytes());
+            out.extend_from_slice(&len.to_le_bytes());
+        }
     }
 }
 
@@ -242,6 +263,11 @@ pub fn read_value(c: &mut Cursor<'_>) -> Result<DbValue, WireError> {
         ty::TEXT => DbValue::Text(c.str()?.to_string()),
         ty::BLOB => DbValue::Blob(c.bytes()?.to_vec()),
         ty::NULL => DbValue::Null,
+        ty::ZSTD_REF => {
+            let ptr = c.u32()?;
+            let len = c.u32()?;
+            DbValue::ZstdRef { ptr, len }
+        }
         other => return Err(WireError::BadTag(other)),
     })
 }
@@ -576,6 +602,7 @@ mod tests {
             DbValue::Text("héllo".into()),
             DbValue::Blob(vec![0, 1, 2, 255]),
             DbValue::Null,
+            DbValue::ZstdRef { ptr: 4096, len: 70_000 },
         ]
     }
 
@@ -583,7 +610,7 @@ mod tests {
     fn params_round_trip() {
         let p = all_types();
         let buf = encode_params(&p);
-        assert_eq!(buf[0..2], 5u16.to_le_bytes());
+        assert_eq!(buf[0..2], 6u16.to_le_bytes());
         assert_eq!(decode_params(&buf).unwrap(), p);
         assert!(encode_params(&[]).is_empty());
         assert_eq!(decode_params(&[]).unwrap(), Vec::<DbValue>::new());
@@ -600,11 +627,20 @@ mod tests {
 
     #[test]
     fn bad_type_code_is_rejected() {
-        for bad in [0u8, 6, 7, 255] {
+        for bad in [0u8, 7, 8, 255] {
             let mut buf = 1u16.to_le_bytes().to_vec();
             buf.push(bad);
             assert_eq!(decode_params(&buf), Err(WireError::BadTag(bad)));
         }
+    }
+
+    #[test]
+    fn zstd_ref_is_nine_bytes() {
+        let buf = encode_params(&[DbValue::ZstdRef { ptr: 0x1000, len: 3 }]);
+        assert_eq!(buf.len(), 2 + 1 + 8);
+        assert_eq!(buf[2], ty::ZSTD_REF);
+        assert_eq!(&buf[3..7], &0x1000u32.to_le_bytes());
+        assert_eq!(&buf[7..11], &3u32.to_le_bytes());
     }
 
     #[test]

@@ -2,7 +2,9 @@
 # Roundtrip test for the resurrect plugin: build a scene (two sessions,
 # splits, a custom layout, a floating pane, distinct markers and cwds),
 # save-and-kill, restore on a fresh server, and assert the world came
-# back. Needs the wasm example built:
+# back. The save lands in the plugin's SQLite store (store.db): one
+# snapshot row, one compressed pane_blob row per pane. Needs the wasm
+# example built:
 #   cargo build -p resurrect --target wasm32-unknown-unknown --release
 #
 # Panes must run explicit commands (bare shells can die immediately in
@@ -14,10 +16,12 @@ TERM=screen
 [ -z "$TEST_TMUX" ] && TEST_TMUX=$(readlink -f ../tmux)
 TMUX="$TEST_TMUX -Lresurrect-test"
 WASM=$(dirname "$TEST_TMUX")/plugin-host/target/wasm32-unknown-unknown/release/resurrect.wasm
+CAPS="-c capture-pane -c run-command -c fs-read -c fs-write -c db"
 # Own data dir: never touch the user's real saves.
 XDG_DATA_HOME=$(mktemp -d)
 export XDG_DATA_HOME
 DATA=$XDG_DATA_HOME/tmux/plugins/resurrect
+DB=$DATA/store.db
 trap 'rm -rf "$XDG_DATA_HOME"' EXIT
 
 fail() {
@@ -26,7 +30,16 @@ fail() {
 	exit 1
 }
 
+# One scalar from the store (empty for NULL / no row).
+q() {
+	python3 -c "import sqlite3, sys
+c = sqlite3.connect('file:$DB?mode=ro', uri=True)
+r = c.execute(sys.argv[1]).fetchone()
+print('' if r is None or r[0] is None else r[0])" "$1"
+}
+
 [ -f "$WASM" ] || fail "resurrect.wasm not built"
+command -v python3 >/dev/null || fail "python3 is needed to read store.db"
 
 $TMUX kill-server 2>/dev/null
 rm -rf "$DATA"
@@ -51,9 +64,8 @@ sleep 0.3
 layout_before=$($TMUX display -p -t alpha:0 '#{window_layout}')
 
 # --- save + kill -----------------------------------------------------------
-$TMUX load-plugin -c capture-pane -c run-command -c fs-read -c fs-write \
-    "$WASM" || fail "load-plugin (save side)"
-sleep 0.3
+$TMUX load-plugin $CAPS "$WASM" || fail "load-plugin (save side)"
+sleep 0.5
 $TMUX plugin-command resurrect kill
 
 for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -61,21 +73,36 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
 	sleep 0.5
 done
 $TMUX ls >/dev/null 2>&1 && fail "server still alive after kill"
-[ -f "$DATA/state.bin" ] || fail "state.bin was not written"
-[ -f "$DATA/state.bin.tmp" ] && fail "temp file left behind after publish"
-for mark in MARK-A0 MARK-A1 MARK-A2 MARK-A3 MARK-FLOAT MARK-B0; do
-	grep -aq "$mark" "$DATA/state.bin" ||
-	    fail "marker $mark missing from state.bin"
-done
-grep -aq '"saved_at_ms":[1-9]' "$DATA/state.bin" ||
-    fail "state.bin has no timestamp"
+[ -f "$DB" ] || fail "store.db was not written"
+[ -e "$DATA/state.bin" ] && fail "a legacy state.bin was written"
+[ "$(q 'SELECT count(*) FROM snapshot')" = 1 ] ||
+    fail "expected one snapshot row, got $(q 'SELECT count(*) FROM snapshot')"
+[ "$(q 'SELECT reason FROM snapshot')" = kill ] ||
+    fail "snapshot reason is $(q 'SELECT reason FROM snapshot'), not kill"
+[ "$(q 'SELECT saved_at_ms > 0 FROM snapshot')" = 1 ] ||
+    fail "snapshot has no timestamp"
+[ "$(q 'SELECT sessions FROM snapshot')" = 2 ] ||
+    fail "snapshot counts $(q 'SELECT sessions FROM snapshot') sessions, not 2"
+[ "$(q 'SELECT panes FROM snapshot')" = 6 ] ||
+    fail "snapshot counts $(q 'SELECT panes FROM snapshot') panes, not 6"
+[ "$(q 'SELECT count(*) FROM pane_blob')" = 6 ] ||
+    fail "expected six pane_blob rows, got $(q 'SELECT count(*) FROM pane_blob')"
+# Every stored blob is a zstd frame (magic 28 b5 2f fd).
+[ "$(q "SELECT count(*) FROM pane_blob WHERE hex(substr(data, 1, 4)) != '28B52FFD'")" = 0 ] ||
+    fail "a pane_blob row is not a zstd frame"
+# With the zstd CLI at hand, inflate one frame and find its marker.
+if command -v zstd >/dev/null; then
+	python3 -c "import sqlite3, sys
+c = sqlite3.connect('file:$DB?mode=ro', uri=True)
+sys.stdout.buffer.write(c.execute('SELECT data FROM pane_blob ORDER BY pane_id LIMIT 1').fetchone()[0])" |
+	    zstd -d -c | grep -aq 'MARK-' || fail "inflated frame has no marker"
+fi
 
 # --- restore ---------------------------------------------------------------
 $TMUX -f/dev/null new-session -d -s bootstrap "sleep 600" ||
     fail "bootstrap session"
-$TMUX load-plugin -c capture-pane -c run-command -c fs-read -c fs-write \
-    "$WASM" || fail "load-plugin (restore side)"
-sleep 0.3
+$TMUX load-plugin $CAPS "$WASM" || fail "load-plugin (restore side)"
+sleep 0.5
 $TMUX plugin-command resurrect restore
 
 ok=
@@ -123,6 +150,12 @@ name=$($TMUX display -p -t alpha:1 '#{window_name}')
 [ "$name" = "buildwin" ] || fail "window name not restored (got $name)"
 cur=$($TMUX display -p -t alpha: '#{window_index}')
 [ "$cur" = "1" ] || fail "current window not restored (got $cur)"
+
+# Status names the snapshot and the store.
+$TMUX plugin-command resurrect status
+sleep 0.5
+$TMUX show-messages | grep -q 'resurrect: #1 holds 2 sessions' ||
+    fail "status did not report snapshot #1"
 
 $TMUX kill-server 2>/dev/null
 echo OK

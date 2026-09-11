@@ -56,11 +56,16 @@ use std::time::Duration;
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags};
 use tmux_plugin_abi::db::{BatchStmt, DbValue, ExecResult, RowsWriter};
-use tmux_plugin_abi::{ErrorCode, MAX_DB_ROWS_BYTES};
+use tmux_plugin_abi::{ErrorCode, MAX_DB_ROWS_BYTES, MAX_DB_ZSTD_RAW_BYTES};
 
 use crate::abi::{err, HostError};
 use crate::fsbox::Root;
+use crate::fsworker::GuestSlice;
 use crate::worker::{self, Completion, InFlight};
+
+/// zstd level for ZSTD_REF parameters. Level 3 is the library default:
+/// several hundred MB/s and about a fifth of the size on terminal text.
+pub const ZSTD_LEVEL: i32 = 3;
 
 /// The database file, inside the plugin's data directory.
 pub const DB_FILE: &str = "store.db";
@@ -197,9 +202,61 @@ pub enum DbJob {
 pub struct DbRequest {
     pub token: u64,
     /// Detached in-flight accounting: counted by `worker::shutdown`, not
-    /// by `wait_for_instance` (the job touches no guest memory).
+    /// by `wait_for_instance`. The statement itself touches no guest
+    /// memory.
     pub guard: InFlight,
+    /// Pinned accounting, present only when `zstd` is non-empty: the
+    /// compression reads guest memory in place. Dropped right after the
+    /// bytes are compressed, before the task waits for the connection.
+    pub pinned: Option<InFlight>,
+    /// ZSTD_REF parameters to compress and splice into `job` first.
+    pub zstd: Vec<ZstdInput>,
     pub job: DbJob,
+}
+
+/// One ZSTD_REF parameter: where it sits in the job and what it points
+/// at. `stmt` is `None` for Exec, the statement index for Batch.
+pub struct ZstdInput {
+    pub stmt: Option<usize>,
+    pub param: usize,
+    pub src: GuestSlice,
+}
+
+/// Compress every ZSTD_REF input and replace it in the job with the
+/// compressed BLOB. Runs on a worker thread while the pinned guard is
+/// held; the guest buffers are valid for exactly that long.
+fn materialize(job: &mut DbJob, inputs: Vec<ZstdInput>) -> Result<(), HostError> {
+    for input in inputs {
+        // SAFETY: dispatch bounds-checked (ptr, len) against linear
+        // memory, memory never moves (engine config), and the pinned
+        // InFlight guard keeps the instance alive until we return.
+        let src = unsafe { std::slice::from_raw_parts(input.src.ptr, input.src.len) };
+        let blob = zstd::bulk::compress(src, ZSTD_LEVEL)
+            .map_err(|e| err(ErrorCode::Host, format!("zstd compress: {e}")))?;
+        let params = match (&mut *job, input.stmt) {
+            (DbJob::Exec { params, .. }, None) => params,
+            (DbJob::Batch { stmts }, Some(i)) => &mut stmts[i].params,
+            _ => return Err(err(ErrorCode::Host, "zstd input does not match its job")),
+        };
+        params[input.param] = DbValue::Blob(blob);
+    }
+    Ok(())
+}
+
+/// Inflate one stored frame. The frame must carry its content size (the
+/// bulk compressor always writes it), and that size must fit the cap.
+pub fn decompress(src: &[u8]) -> Result<Vec<u8>, HostError> {
+    let size = zstd::zstd_safe::get_frame_content_size(src)
+        .map_err(|_| err(ErrorCode::BadRequest, "not a zstd frame"))?
+        .ok_or_else(|| err(ErrorCode::BadRequest, "zstd frame without a content size"))?;
+    if size > MAX_DB_ZSTD_RAW_BYTES as u64 {
+        return Err(err(
+            ErrorCode::Limit,
+            format!("frame inflates to {size} bytes, the limit is {MAX_DB_ZSTD_RAW_BYTES}"),
+        ));
+    }
+    zstd::bulk::decompress(src, size as usize)
+        .map_err(|e| err(ErrorCode::BadRequest, format!("zstd decompress: {e}")))
 }
 
 /// A plugin's async connection. Shared between the main thread (which
@@ -278,7 +335,19 @@ fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
 pub fn submit(h: &Arc<DbHandle>, req: DbRequest) {
     let h = Arc::clone(h);
     worker::spawn(async move {
-        let DbRequest { token, guard, job } = req;
+        let DbRequest { token, guard, pinned, zstd, mut job } = req;
+        // Compress ZSTD_REF inputs first, straight out of guest memory,
+        // then release the pinned guard: teardown waits on it, so the
+        // wait is the compression time and never the connection queue.
+        if !zstd.is_empty() {
+            if let Err(e) = materialize(&mut job, zstd) {
+                drop(pinned);
+                worker::post(worker::err_completion(token, e.code, e.message));
+                drop(guard);
+                return;
+            }
+        }
+        drop(pinned);
         // Parked, not blocking, while the pool is full of SQL.
         let _permit = running().acquire().await;
         // Parked in the executor while another statement of this plugin
@@ -354,6 +423,9 @@ fn bind(params: &[DbValue]) -> Vec<rusqlite::types::Value> {
             DbValue::Real(f) => Value::Real(*f),
             DbValue::Text(s) => Value::Text(s.clone()),
             DbValue::Blob(b) => Value::Blob(b.clone()),
+            // Dispatch rejects refs on the sync paths and materialize()
+            // replaces them on the async ones, so this is unreachable.
+            DbValue::ZstdRef { .. } => Value::Null,
         })
         .collect()
 }
@@ -599,6 +671,43 @@ pub fn map_err(e: rusqlite::Error) -> HostError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn materialize_compresses_in_place_and_decompress_inverts() {
+        let text: Vec<u8> = b"pane text with colour \x1b[31m!\x1b[0m\n".repeat(200);
+        let mut job = DbJob::Batch {
+            stmts: vec![
+                BatchStmt { sql: "x".into(), params: vec![DbValue::Integer(1)] },
+                BatchStmt {
+                    sql: "y".into(),
+                    params: vec![DbValue::Null, DbValue::ZstdRef { ptr: 0, len: 0 }],
+                },
+            ],
+        };
+        let inputs = vec![ZstdInput {
+            stmt: Some(1),
+            param: 1,
+            src: GuestSlice { ptr: text.as_ptr(), len: text.len() },
+        }];
+        materialize(&mut job, inputs).unwrap();
+        let DbJob::Batch { stmts } = job else { panic!("job kind changed") };
+        let DbValue::Blob(frame) = &stmts[1].params[1] else { panic!("not a blob") };
+        assert!(frame.len() < text.len() / 4, "frame is {} bytes", frame.len());
+        assert_eq!(decompress(frame).unwrap(), text);
+        assert_eq!(stmts[0].params[0], DbValue::Integer(1));
+
+        // A mismatched location is an error, not a panic.
+        let mut exec = DbJob::Exec { sql: "z".into(), params: vec![DbValue::Null] };
+        let bad = vec![ZstdInput {
+            stmt: Some(0),
+            param: 0,
+            src: GuestSlice { ptr: text.as_ptr(), len: 1 },
+        }];
+        assert!(materialize(&mut exec, bad).is_err());
+
+        // Garbage is a bad request, not a crash.
+        assert_eq!(decompress(b"not a frame").unwrap_err().code, ErrorCode::BadRequest);
+    }
 
     fn temp_conn(tag: &str, busy: Duration) -> (Conn, PathBuf) {
         let dir = std::env::temp_dir()

@@ -174,8 +174,10 @@ fn process_dying() {
 pub fn release_instance_resources(inst: &Instance) {
     // In-flight fs jobs touch the instance's pinned guest memory; block
     // until they finish before anything can drop the store. Local file
-    // I/O, so bounded. Db jobs are detached (they copy their inputs and
-    // return rows as completion data), so they are not waited for here.
+    // I/O, so bounded. Db jobs copy their inputs and are detached, except
+    // for the compression of ZSTD_REF parameters: that reads guest memory
+    // in place under a pinned guard, which the job drops as soon as the
+    // bytes are compressed and before it waits for the connection.
     crate::worker::wait_for_instance(
         &inst.plugin,
         inst.scope_id,

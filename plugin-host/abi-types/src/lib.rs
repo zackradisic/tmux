@@ -175,6 +175,9 @@ pub mod db;
 ///                       // out_ptr -> 16-byte exec struct
 /// db_query_sync(sql_ptr, sql_len, params_ptr, params_len, owned_out) -> i32
 ///                       // OwnedBuf = rows block
+/// db_decompress(src_ptr, src_len, owned_out) -> i32
+///                       // OwnedBuf = the bytes behind a stored zstd frame
+///                       // (a BLOB written from a ZSTD_REF parameter)
 /// ```
 pub mod imports {
     pub const MODULE: &str = "tmux";
@@ -243,6 +246,7 @@ pub mod imports {
     pub const DB_BATCH: &str = "db_batch";
     pub const DB_EXEC_SYNC: &str = "db_exec_sync";
     pub const DB_QUERY_SYNC: &str = "db_query_sync";
+    pub const DB_DECOMPRESS: &str = "db_decompress";
 }
 
 /// Structured error codes. Sync imports return `-code`; `host_request`-style
@@ -999,8 +1003,13 @@ pub const MAX_MODE_WRITE_BYTES: usize = 256 * 1024;
 pub const MAX_JOB_OUTPUT_BYTES: usize = 256 * 1024;
 /// Cap on one database request: SQL plus params, or a whole batch block.
 /// The host copies the request out of guest memory before the statement
-/// runs on a worker thread, so this bounds that copy.
+/// runs on a worker thread, so this bounds that copy. A ZSTD_REF param
+/// counts its 8-byte reference here, not the bytes it points at.
 pub const MAX_DB_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+/// Cap on the raw bytes behind one ZSTD_REF parameter, and on the output
+/// of `db_decompress`. The bytes are read in place from pinned guest
+/// memory, so this bounds the worker's compression input, not a copy.
+pub const MAX_DB_ZSTD_RAW_BYTES: usize = 64 * 1024 * 1024;
 /// Cap on one result set (the rows block). It is delivered into the
 /// guest through `pgh_alloc`; a query that needs more should page with
 /// `LIMIT`/`OFFSET`.

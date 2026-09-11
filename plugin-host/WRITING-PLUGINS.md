@@ -347,6 +347,8 @@ fs_write_sync(path, data, append) / fs_read_sync(path, offset, &mut buf)
 db_exec_sync(sql, params![...]) -> Result<ExecResult, _>   // cap db;
 db_query_sync(sql, params![...]) -> Result<Rows, _>        // init-time
     // migrations and one-row reads only: main thread, 500 ms cap
+db_decompress(&frame) -> Result<Owned, _>               // inflate a BLOB
+    // stored from zstd_ref(); sync, about 1 ms per MB; cap db
 
 // UI modes (capability: mode) — see the "UI modes" section
 mode_open(&ModeOpts { window?, width, height, x?, y?, title? })
@@ -380,6 +382,9 @@ fs_remove(path).await                                   // unlink one file;
 db_exec(sql, params![...]).await -> ExecResult { changes, last_insert_rowid }
 db_query(sql, params![...]).await -> Rows               // see "Database"
 db_batch(&[(sql, params![...]), ...]).await -> ExecResult // ONE transaction
+zstd_ref(&bytes) -> DbValue      // a parameter the host compresses on the
+    // way in, read straight from your buffer; keep the buffer alive
+    // until the db_exec / db_batch future completes
 ```
 
 Async tasks are spawned with `ctx.spawn(async move { ... })` in `init` (or
@@ -527,6 +532,31 @@ Rules of thumb:
 - The file is WAL mode with `synchronous=NORMAL`: a completed write
   survives a tmux crash or `kill-server`. `ATTACH` and `VACUUM` are
   refused.
+
+### Compressed blobs
+
+Large byte buffers, pane scrollback for example, go in as `zstd_ref`
+parameters instead of `DbValue::Blob`. The host reads the bytes straight
+out of your memory on its worker thread, compresses them with zstd, and
+stores one frame as a plain BLOB. Nothing is copied into the params
+block, and the compressed bytes never enter the guest. Read the frame
+back with a normal query and inflate it with `db_decompress`:
+
+```rust
+let text: Vec<u8> = capture();                  // stays alive across the await
+db_exec("INSERT INTO blobs (id, data) VALUES (?1, ?2)",
+        &[1i64.into(), zstd_ref(&text)]).await?;
+
+let rows = db_query("SELECT data FROM blobs WHERE id = ?1",
+                    params![1i64]).await?;
+let frame = rows.scalar().and_then(DbValue::as_blob).ok_or(...)?;
+let text = db_decompress(frame)?;               // Owned, derefs to [u8]
+```
+
+Rules: `zstd_ref` works with `db_exec` and `db_batch` only, the buffer
+must outlive the future, one buffer is capped at 64 MiB, and a stored
+frame still has to fit the 8 MiB result-set cap when you read it back, so
+chunk anything that might compress to more than that.
 
 ## UI modes: interactive panels
 

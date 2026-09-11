@@ -37,6 +37,9 @@ async-lock = "3"
 # the SQL sandbox and the statement time cap; `limits` the ATTACH limit.
 # All rusqlite usage is confined to sqlite.rs.
 rusqlite = { version = "0.32", features = ["bundled", "hooks", "limits"] }
+# Compress-on-write for ZSTD_REF blob parameters and `db_decompress`.
+# Already built for wasmtime's cache feature; confined to sqlite.rs.
+zstd = "0.13"
 
 [dev-dependencies]
 wat = "1"

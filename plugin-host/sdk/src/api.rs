@@ -1112,8 +1112,33 @@ pub fn fs_read_sync(
 // SQLite errors come back as `E_BAD_REQUEST` (your SQL: syntax,
 // constraint, missing table, parameter count), `E_LIMIT` (size or time
 // cap) or `E_HOST` (busy, I/O), with SQLite's message in the error.
+//
+// Large blobs: bind them with [`zstd_ref`] instead of `DbValue::Blob`.
+// The host reads the bytes straight out of this module's memory on its
+// worker thread, compresses them with zstd, and stores the frame as a
+// plain BLOB. Nothing is copied into the params block and the compressed
+// bytes never enter the guest. Read them back with [`db_decompress`].
 
 pub use tmux_plugin_abi::db::{DbValue, ExecResult, Row, Rows};
+
+/// Bind `bytes` as a parameter the host compresses on the way in. The
+/// value is a reference, not a copy: `bytes` must stay alive and
+/// unchanged until the `db_exec` or `db_batch` future completes, the
+/// same contract as the buffer of [`fs_write`]. Accepted by [`db_exec`]
+/// and [`db_batch`] only; the sync calls and [`db_query`] reject it. Raw
+/// size cap: 64 MiB.
+pub fn zstd_ref(bytes: &[u8]) -> DbValue {
+    DbValue::ZstdRef { ptr: bytes.as_ptr() as u32, len: bytes.len() as u32 }
+}
+
+/// Inflate a BLOB that was stored from a [`zstd_ref`] parameter. Sync
+/// and cheap (about a millisecond per MB); the result is owned guest
+/// memory. Fails with `E_BAD_REQUEST` on bytes that are not a frame.
+pub fn db_decompress(src: &[u8]) -> Result<Owned, HostError> {
+    call_owned(|out| unsafe {
+        raw::db_decompress(src.as_ptr() as i32, src.len() as i32, out)
+    })
+}
 
 /// Run a statement that returns no rows (INSERT, UPDATE, DELETE, DDL) on
 /// the host's worker pool. With no parameters, `sql` may be a whole
@@ -1129,7 +1154,9 @@ pub async fn db_exec(sql: &str, params: &[DbValue]) -> Result<ExecResult, HostEr
                 p.len() as i32,
             )
         };
-        // The host copies sql and params before returning: nothing to pin.
+        // The host copies sql and the params block before returning. A
+        // zstd_ref points at the caller's buffer, which the caller holds
+        // across this await.
         start_async(token)?
     };
     let Completion { v0, v1, .. } = fut.await?;

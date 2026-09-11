@@ -1122,5 +1122,11 @@ fn register_imports(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
         }))
     })?;
 
+    linker.func_wrap(m, im::DB_DECOMPRESS, |mut c: Caller<'_, StoreData>, src_ptr: i32, src_len: i32, owned_out: i32| -> i32 {
+        ret_i32(with_mem(&mut c, |mem| {
+            dispatch::db_decompress(mem, src_ptr, src_len, owned_out)
+        }))
+    })?;
+
     Ok(())
 }
