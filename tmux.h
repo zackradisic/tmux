@@ -3298,6 +3298,8 @@ int	 server_get_socket_fd(void);
 
 /* server-handoff.c */
 int	 server_handoff_begin(const char *, char **);
+char	*server_handoff_self_binary(char **);
+char	*server_handoff_shell_quote(const char *);
 int	 server_handoff_pending(void);
 void	 server_handoff_check(void);
 int	 server_handoff_restore(const char *, int *, char **);

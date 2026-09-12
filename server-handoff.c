@@ -1850,3 +1850,17 @@ server_handoff_check(void)
 	free(handoff_binary);
 	handoff_binary = NULL;
 }
+
+/* The path of the running binary, for commands that manage the install. */
+char *
+server_handoff_self_binary(char **cause)
+{
+	return (handoff_find_binary(NULL, cause));
+}
+
+/* Quote a string for the shell (a caller-owned copy). */
+char *
+server_handoff_shell_quote(const char *s)
+{
+	return (handoff_shell_quote(s));
+}

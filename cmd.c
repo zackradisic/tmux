@@ -130,6 +130,7 @@ extern const struct cmd_entry cmd_switch_client_entry;
 extern const struct cmd_entry cmd_switch_mode_entry;
 extern const struct cmd_entry cmd_unbind_key_entry;
 extern const struct cmd_entry cmd_unlink_window_entry;
+extern const struct cmd_entry cmd_update_entry;
 extern const struct cmd_entry cmd_wait_for_entry;
 
 const struct cmd_entry *cmd_table[] = {
@@ -244,6 +245,7 @@ const struct cmd_entry *cmd_table[] = {
 	&cmd_switch_mode_entry,
 	&cmd_unbind_key_entry,
 	&cmd_unlink_window_entry,
+	&cmd_update_entry,
 #ifdef ENABLE_PLUGINS
 	&cmd_sync_plugins_entry,
 	&cmd_unload_plugin_entry,

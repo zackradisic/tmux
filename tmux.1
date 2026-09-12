@@ -1203,6 +1203,39 @@ If it does exist, exit with 0.
 Kill the
 .Nm
 server and clients and destroy all sessions.
+.It Xo Ic update
+.Op Fl ny
+.Op Ar version
+.Xc
+Update a
+.Nm
+install made by
+.Pa install-tmux2.sh
+from a GitHub release, then restart the server in place so that pane
+processes stay alive.
+The running binary must be
+.Pa <home>/bin/tmux
+with the installed tag in
+.Pa <home>/VERSION .
+Without
+.Ar version ,
+the latest release is used.
+The command reports the installed and the available tag, then asks on
+the client's standard input before it downloads anything; it cannot ask
+on an attached client.
+.Fl y
+skips the question and
+.Fl n
+only reports.
+Inside
+.Nm ,
+bind it as
+.Ql confirm-before -p \(aqupdate tmux2? (y/n)\(aq \(aqupdate -y\(aq .
+The repository defaults to
+.Pa zackradisic/tmux
+and the
+.Ev TMUX2_REPO
+environment variable overrides it.
 .It Xo Ic kill\-session
 .Op Fl aCg
 .Op Fl f Ar filter
