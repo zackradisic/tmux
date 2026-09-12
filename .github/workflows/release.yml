@@ -96,12 +96,24 @@ jobs:
       # host may not have (macOS configure insists on an explicit choice).
       # libevent and ncurses/tinfo stay dynamic; both are present on any
       # host with a stock tmux.
+      # A release build: no ASan (configure turns it on by default on
+      # macOS for the "next" version) and no debug flags. The check
+      # after the link makes sure no sanitizer runtime sneaks back in;
+      # the runner has that library, the target host does not.
       - name: build
         run: |
           sh autogen.sh
-          ./configure --enable-plugins --disable-utf8proc
+          ./configure --enable-plugins --disable-utf8proc \
+              --disable-asan --disable-debug
           ${{ matrix.make }} -j"$(getconf _NPROCESSORS_ONLN)"
           strip tmux
+          if [ "$(uname -s)" = Darwin ]; then
+            otool -L tmux
+            ! otool -L tmux | grep -q 'clang_rt\|asan'
+          else
+            ldd tmux
+            ! ldd tmux | grep -q 'asan\|not found'
+          fi
           ./tmux -V
 
       - name: bundle
