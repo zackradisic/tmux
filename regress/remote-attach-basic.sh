@@ -46,6 +46,17 @@ wait_for 6 "[ \"\$($TMUX display-message -p -t fakehost/work:0.0 \
 [ "$($TMUX display-message -p -t fakehost/work '#{session_remote_host}')" = fakehost ] ||
     fail "session_remote_host"
 
+# A host with dots gets a name that still works as a target; remote_host
+# keeps the host as given.
+$TMUX2 new-session -d -s dotted -x 80 -y 24 || exit 1
+$TMUX remote-attach -t dotted user@10.0.0.5 || fail "remote-attach dotted"
+wait_for 6 "$TMUX has-session -t user@10_0_0_5/dotted" || fail "no dotted session"
+wait_for 6 "[ \"\$($TMUX display-message -p -t user@10_0_0_5/dotted:0.0 \
+    '#{remote_connected}')\" = 1 ]" || fail "dotted not connected"
+[ "$($TMUX display-message -p -t user@10_0_0_5/dotted '#{session_remote_host}')" = \
+    user@10.0.0.5 ] || fail "dotted remote_host"
+$TMUX kill-session -t user@10_0_0_5/dotted || fail "kill dotted"
+
 # A second link to the same session is refused.
 $TMUX remote-attach -t work fakehost 2>/dev/null && fail "duplicate link allowed"
 

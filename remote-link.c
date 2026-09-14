@@ -880,8 +880,29 @@ remote_link_panes_cb(struct remote_link *rl, struct remote_request *req,
 }
 
 /*
- * Set the local session name, keeping the "host/" prefix. A colon would
- * make the name unusable as a target (":" separates the window part).
+ * Build the local session name from the host and the remote session name.
+ * A target splits on ":" and ".", so a host such as user@10.0.0.5 would make
+ * the name unusable; replace both with "_". The host string itself stays as
+ * given for remote_host and the ssh command.
+ */
+static char *
+remote_link_label(const char *host, const char *session)
+{
+	char	*name, *cp;
+
+	if (session != NULL)
+		xasprintf(&name, "%s/%s", host, session);
+	else
+		name = xstrdup(host);
+	for (cp = name; *cp != '\0'; cp++) {
+		if (*cp == ':' || *cp == '.')
+			*cp = '_';
+	}
+	return (name);
+}
+
+/*
+ * Set the local session name, keeping the "host/" prefix.
  */
 static void
 remote_link_set_session_name(struct remote_link *rl, const char *name)
@@ -891,7 +912,7 @@ remote_link_set_session_name(struct remote_link *rl, const char *name)
 
 	if (s == NULL)
 		return;
-	xasprintf(&full, "%s/%s", rl->host, name);
+	full = remote_link_label(rl->host, name);
 	if (strcmp(s->name, full) == 0 || session_find(full) != NULL) {
 		free(full);
 		return;
@@ -1624,10 +1645,7 @@ remote_link_create(const char *host, const char *session, int pinned_id,
 	char			*name, *wname;
 	const char		*home;
 
-	if (session != NULL)
-		xasprintf(&name, "%s/%s", host, session);
-	else
-		name = xstrdup(host);
+	name = remote_link_label(host, session);
 	if (session_find(name) != NULL) {
 		xasprintf(cause, "duplicate session: %s", name);
 		free(name);

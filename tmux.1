@@ -1620,6 +1620,15 @@ server on
 .Ar host
 as a local session named
 .Ar host Ns / Ns Ar session .
+Any
+.Ql \&:
+or
+.Ql \&.
+in that name becomes
+.Ql _ ,
+so the name stays usable as a target;
+.Ar host
+itself is passed to the ssh command unchanged.
 With
 .Fl t ,
 .Ar remote\-session
@@ -9340,7 +9349,13 @@ title set sequences and to automatically set some of the capabilities above.
 links the local server to one session of a
 .Nm
 server on another host and mirrors it as a local session named
-.Ar host Ns / Ns Ar session .
+.Ar host Ns / Ns Ar session ,
+with any
+.Ql \&:
+or
+.Ql \&.
+replaced by
+.Ql _ .
 The link runs the
 .Ic remote\-ssh\-command
 option as a job and speaks the

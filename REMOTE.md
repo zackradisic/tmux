@@ -28,7 +28,11 @@ Not built yet: `new-session -H host`, `new-window -H host`, remote panes
 inside local windows, mouse forwarding, remote floating panes.
 
 The local name is `host/session`, not `host:session`: tmux forbids `:` and
-`.` in session names, and `:` separates the window part of a target.
+`.` in session names, and `:` separates the window part of a target. The
+link replaces `:` and `.` in the name with `_`, so `remote-attach -t work
+user@10.0.0.5` makes the session `user@10_0_0_5/work`. The host string
+itself does not change: `#{remote_host}` and `remote-ssh-command` see
+`user@10.0.0.5`.
 
 ## Why the client protocol does not help
 

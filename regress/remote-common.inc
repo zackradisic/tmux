@@ -4,6 +4,9 @@
 
 PATH=/bin:/usr/bin
 TERM=screen
+# The tests attach nested clients; a TMUX variable from the shell that runs
+# them would make those clients refuse.
+unset TMUX
 
 [ -z "$TEST_TMUX" ] && TEST_TMUX=$(readlink -f ../tmux)
 TMUX="$TEST_TMUX -LtestA$$ -f/dev/null"
