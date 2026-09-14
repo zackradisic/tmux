@@ -143,6 +143,12 @@ impl Event {
         self.get(key)?.as_bool()
     }
 
+    /// The raw bytes of a BYTES field (service payloads). A STR field
+    /// answers with its UTF-8 bytes.
+    pub fn get_bytes(&self, key: &str) -> Option<&[u8]> {
+        self.get(key)?.as_bytes()
+    }
+
     /// Iterate every payload field as (key name, value). Key names resolve
     /// through the intern cache.
     pub fn iter(&self) -> impl Iterator<Item = (String, ValueRef<'_>)> {
@@ -188,6 +194,8 @@ pub fn config_value(bytes: &[u8]) -> serde_json::Value {
             ValueRef::Str(s) => s.into(),
             ValueRef::Json(s) => serde_json::from_str(s)
                 .unwrap_or(serde_json::Value::Null),
+            // Config never carries raw bytes; keep the key, drop the value.
+            ValueRef::Bytes(_) => serde_json::Value::Null,
         };
         map.insert(key, value);
     }

@@ -210,6 +210,83 @@ instantiation:
 
 Each instance is fully isolated: own wasm memory, own state, own budget.
 
+## Roles and services
+
+A plugin that wants to see every linked server splits into two halves:
+
+- the **provider** runs on each server and sees only that machine (its
+  panes, processes, files, store);
+- the **view** runs on the local server, merges what the providers report
+  and owns the UI.
+
+One crate holds both. `Ctx::role()` says which half this instance runs:
+`Both` on the local server (the default), `Provider` on a remote server
+that received the plugin by push over a `remote-attach` link, `View` when
+loaded with `load-plugin -r view`. A provider cannot open UI modes.
+
+The halves talk through *services*. The provider registers methods and
+publishes topics; the view calls and follows them, naming a target as
+`plugin` (this server) or `plugin@server`:
+
+```rust
+fn init(ctx: &Ctx, _c: Self::Config) -> Result<Self, String> {
+    let role = ctx.role();
+    if role.provides() {
+        service::register("list")?;          // needs service-serve
+    }
+    if role.views() {
+        ctx.subscribe(&["link-up", "link-down"])?;
+        service::subscribe("agents", "changed")?;   // needs service-call
+    }
+    Ok(Self { role, rows: Replica::new() })
+}
+
+fn on_service_request(&mut self, _ctx: &Ctx, req: ServiceRequest) {
+    match req.method.as_str() {
+        "list" => { let _ = req.reply_json(&self.rows_for_list()); }
+        _ => { let _ = req.fail("unknown method"); }
+    }
+}
+
+fn on_service_event(&mut self, _ctx: &Ctx, ev: ServiceEvent) {
+    if ev.topic == "changed" {
+        if let Ok(delta) = ev.json::<service::Delta<Agent>>() {
+            if !self.rows.apply(&ev.server, ev.seq, delta) {
+                self.resync(&ev.server);  // a sequence gap: fetch `list` again
+            }
+        }
+    }
+}
+```
+
+`service::call(target, method, payload)` collects every reply page;
+`call_stream` yields them one at a time; `call_all(plugin, method,
+payload)` asks every connected server and returns one result per server.
+Replies are bytes; the `_json` variants use serde_json. A call to a
+server whose link is down fails at once with `E_UNREACHABLE`; a call for
+a plugin that is loaded but has not registered the method yet (its init
+is still queued, as right after a push) waits up to ten seconds; a call
+nobody answers fails after thirty seconds with `E_TIMEOUT`.
+
+`Replica<T>` keeps a view's per-server copy of what providers report:
+`apply_full(server, seq, rows)` after a `list`, `apply(server, seq,
+delta)` on every topic event (false means a gap: fetch the list again),
+`mark_stale(server)` on `link-down`, `age_ms(server)` for a "disconnected
+2m" label, `iter()` grouped by server.
+
+In role `Both` the view half reads its own provider half by calling its
+methods directly; the host path is for other plugins and other servers.
+`service::servers()` lists the local server and every linked server with
+its link state. `plugin-host/examples/services-probe` is the smallest
+complete provider/view pair.
+
+Over a link the local server pushes every plugin with role `both` or
+`provider` to the remote, which loads it as a provider with the grants
+its `plugin-remote-caps` server option allows (everything but
+`run-process`, `fs-write`, `fs-read-any` and `fs-write-any` by default).
+Two servers on one machine share a plugin's `store.db` when they share
+`XDG_DATA_HOME`; the regress tests give the second server its own.
+
 ## Events
 
 Events cross the ABI as binary buffers (interned name id + scope ids +
@@ -445,6 +522,8 @@ load-plugin -c send-keys -c run-process ... myplugin.wasm
 
 | capability | unlocks |
 |---|---|
+| `service-serve` | `service::register`, `ServiceRequest::reply`, `service::emit` |
+| `service-call` | `service::call`, `call_all`, `service::subscribe` (a `[caps.services] call = ["agents@*"]` sidecar list narrows the targets) |
 | `write-options` | `set_option` (@-options) |
 | `send-keys` | `send_text` / `send_key` |
 | `capture-pane` | `capture_pane`, `panes_search` |

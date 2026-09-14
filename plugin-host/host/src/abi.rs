@@ -15,7 +15,7 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
-use tmux_plugin_abi::{exports, imports, ErrorCode, ABI_VERSION};
+use tmux_plugin_abi::{exports, imports, ErrorCode, Role, ABI_VERSION};
 use wasmtime::{
     Caller, Engine, Instance as WtInstance, Linker, Memory, Module, Store,
     StoreLimits, StoreLimitsBuilder, TypedFunc, UpdateDeadline,
@@ -34,6 +34,7 @@ pub struct StoreData {
     pub plugin: String,
     pub generation: u64,
     pub scope: crate::registry::ScopeId,
+    pub role: Role,
     pub caps: crate::caps::EffectiveCaps,
     /// Subscribed event ids (interned).
     pub subscriptions: HashSet<u32>,
@@ -52,6 +53,7 @@ impl StoreData {
             plugin: "test".into(),
             generation: 1,
             scope,
+            role: Role::Both,
             caps,
             subscriptions: HashSet::new(),
             soft_warned: false,
@@ -151,12 +153,14 @@ pub fn instantiate(
     plugin: &str,
     generation: u64,
     scope: crate::registry::ScopeId,
+    role: Role,
     caps: crate::caps::EffectiveCaps,
 ) -> Result<Guest, String> {
     let data = StoreData {
         plugin: plugin.to_string(),
         generation,
         scope,
+        role,
         caps,
         subscriptions: HashSet::new(),
         soft_warned: false,
@@ -1126,6 +1130,47 @@ fn register_imports(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
         ret_i32(with_mem(&mut c, |mem| {
             dispatch::db_decompress(mem, src_ptr, src_len, owned_out)
         }))
+    })?;
+
+    linker.func_wrap(m, im::SERVICE_REGISTER, |mut c: Caller<'_, StoreData>, method_ptr: i32, method_len: i32| -> i32 {
+        ret_i32(with_mem(&mut c, |mem| {
+            dispatch::service_register(mem, method_ptr, method_len)
+        }))
+    })?;
+
+    linker.func_wrap(m, im::SERVICE_CALL, |mut c: Caller<'_, StoreData>, target_ptr: i32, target_len: i32, method_ptr: i32, method_len: i32, payload_ptr: i32, payload_len: i32| -> i64 {
+        ret_i64(with_mem(&mut c, |mem| {
+            dispatch::service_call(
+                mem, target_ptr, target_len, method_ptr, method_len,
+                payload_ptr, payload_len,
+            )
+        }))
+    })?;
+
+    linker.func_wrap(m, im::SERVICE_REPLY, |mut c: Caller<'_, StoreData>, call: i64, payload_ptr: i32, payload_len: i32, flags: i32| -> i32 {
+        ret_i32(with_mem(&mut c, |mem| {
+            dispatch::service_reply(mem, call, payload_ptr, payload_len, flags)
+        }))
+    })?;
+
+    linker.func_wrap(m, im::SERVICE_CANCEL, |mut c: Caller<'_, StoreData>, token: i64| -> i32 {
+        ret_i32(with_mem(&mut c, |mem| dispatch::service_cancel(mem, token)))
+    })?;
+
+    linker.func_wrap(m, im::SERVICE_EMIT, |mut c: Caller<'_, StoreData>, topic_ptr: i32, topic_len: i32, payload_ptr: i32, payload_len: i32| -> i32 {
+        ret_i32(with_mem(&mut c, |mem| {
+            dispatch::service_emit(mem, topic_ptr, topic_len, payload_ptr, payload_len)
+        }))
+    })?;
+
+    linker.func_wrap(m, im::SERVICE_SUBSCRIBE, |mut c: Caller<'_, StoreData>, target_ptr: i32, target_len: i32, topic_ptr: i32, topic_len: i32| -> i32 {
+        ret_i32(with_mem(&mut c, |mem| {
+            dispatch::service_subscribe(mem, target_ptr, target_len, topic_ptr, topic_len)
+        }))
+    })?;
+
+    linker.func_wrap(m, im::SERVERS, |mut c: Caller<'_, StoreData>, owned_out: i32| -> i32 {
+        ret_i32(with_mem(&mut c, |mem| dispatch::servers(mem, owned_out)))
     })?;
 
     Ok(())

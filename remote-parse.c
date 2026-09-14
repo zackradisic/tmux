@@ -584,6 +584,14 @@ remote_parse_exit(struct remote_parser *rp, const char *rest)
 		rp->cb->exit(rp->data, rest);
 }
 
+/* %bridge <base64>: an opaque plugin bridge frame from the remote host. */
+static void
+remote_parse_bridge(struct remote_parser *rp, const char *rest)
+{
+	if (rp->cb->bridge != NULL)
+		rp->cb->bridge(rp->data, rest);
+}
+
 static void
 remote_parse_ignore(__unused struct remote_parser *rp,
     __unused const char *rest)
@@ -611,6 +619,7 @@ static const struct {
 	{ "pane-mode-changed", remote_parse_pane_mode_changed },
 	{ "subscription-changed", remote_parse_subscription_changed },
 	{ "exit", remote_parse_exit },
+	{ "bridge", remote_parse_bridge },
 	{ "unlinked-window-add", remote_parse_ignore },
 	{ "unlinked-window-close", remote_parse_ignore },
 	{ "unlinked-window-renamed", remote_parse_ignore },

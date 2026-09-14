@@ -52,8 +52,9 @@ const struct cmd_entry cmd_load_plugin_entry = {
 	.name = "load-plugin",
 	.alias = NULL,
 
-	.args = { "n:s:c:o:", 1, 1, NULL },
-	.usage = "[-n name] [-s scope] [-c capability] [-o key=value] path",
+	.args = { "n:r:s:c:o:", 1, 1, NULL },
+	.usage = "[-n name] [-r role] [-s scope] [-c capability] "
+		 "[-o key=value] path",
 
 	.flags = CMD_AFTERHOOK,
 	.exec = cmd_load_plugin_exec
@@ -209,6 +210,7 @@ cmd_load_plugin_exec(struct cmd *self, struct cmdq_item *item)
 	const char		*path = args_string(args, 0);
 	const char		*name = args_get(args, 'n');
 	const char		*scope = args_get(args, 's');
+	const char		*role = args_get(args, 'r');
 	const char		**caps = NULL, **opts = NULL;
 	u_int			 ncaps = 0, nopts = 0;
 	char			*copy = NULL, *base, *dot, *cmd;
@@ -223,6 +225,11 @@ cmd_load_plugin_exec(struct cmd *self, struct cmdq_item *item)
 	    strcmp(scope, "session") != 0 && strcmp(scope, "window") != 0 &&
 	    strcmp(scope, "pane") != 0) {
 		cmdq_error(item, "bad scope: %s", scope);
+		return (CMD_RETURN_ERROR);
+	}
+	if (role != NULL && strcmp(role, "both") != 0 &&
+	    strcmp(role, "view") != 0 && strcmp(role, "provider") != 0) {
+		cmdq_error(item, "bad role: %s", role);
 		return (CMD_RETURN_ERROR);
 	}
 
@@ -259,7 +266,7 @@ cmd_load_plugin_exec(struct cmd *self, struct cmdq_item *item)
 	evb = evbuffer_new();
 	if (evb == NULL)
 		fatalx("out of memory");
-	rc = pgh_plugin_load(name, path, scope,
+	rc = pgh_plugin_load(name, path, scope, role,
 	    (const char *const *)caps, ncaps, (const char *const *)opts,
 	    nopts, cmd_plugin_sink, evb);
 	free(caps);

@@ -40,6 +40,7 @@ pub mod event;
 pub mod executor;
 pub mod ids;
 pub mod runtime;
+pub mod service;
 pub mod strings;
 
 pub use api::*;
@@ -47,22 +48,24 @@ pub use event::Event;
 pub use ids::*;
 pub use strings::{AsTmuxStr, TmuxString};
 pub use tmux_plugin_abi as abi;
+pub use service::{Replica, ServiceEvent, ServiceRequest};
 pub use tmux_plugin_abi::{
-    ClientInfo, EventScope, HostError, PaneInfo, SelfInfo, SessionInfo,
-    WindowInfo,
+    ClientInfo, EventScope, HostError, PaneInfo, Role, SelfInfo, ServerInfo,
+    SessionInfo, WindowInfo,
 };
 
 pub mod prelude {
     pub use crate::api::*;
     pub use crate::event::Event;
     pub use crate::ids::*;
+    pub use crate::service::{self, Replica, ServiceEvent, ServiceRequest};
     pub use crate::strings::{AsTmuxStr, TmuxString};
     pub use crate::tmux_plugin;
     pub use crate::{params, Ctx, Plugin};
     pub use tmux_plugin_abi::db::{DbValue, ExecResult, Row, Rows};
     pub use tmux_plugin_abi::{
-        ClientInfo, EventScope, HostError, PaneInfo, SelfInfo, SessionInfo,
-        WindowInfo,
+        ClientInfo, EventScope, HostError, PaneInfo, Role, SelfInfo,
+        ServerInfo, SessionInfo, WindowInfo,
     };
 }
 
@@ -114,6 +117,19 @@ pub trait Plugin: Sized + 'static {
 
     /// Called for subscribed events and implicit lifecycle events.
     fn on_event(&mut self, _ctx: &Ctx, _event: Event) {}
+
+    /// Another plugin (on this server or a linked one) called a method
+    /// this instance registered with [`service::register`]. Answer with
+    /// [`ServiceRequest::reply`], [`ServiceRequest::reply_page`] or
+    /// [`ServiceRequest::fail`]; a request dropped without an answer
+    /// fails the caller when it times out.
+    fn on_service_request(&mut self, _ctx: &Ctx, req: ServiceRequest) {
+        let _ = req.fail("method not handled");
+    }
+
+    /// A topic this instance subscribed to with [`service::subscribe`]
+    /// published a payload.
+    fn on_service_event(&mut self, _ctx: &Ctx, _event: ServiceEvent) {}
 
     /// State to carry across a code reload. `None` (the default) means the
     /// plugin is stateless: reloads simply re-init. The bytes are opaque
@@ -186,6 +202,14 @@ impl Ctx {
 
     pub fn display_message(&self, msg: &str) -> Result<(), HostError> {
         api::display_message(msg)
+    }
+
+    /// The role this instance runs: `Provider` on a remote server that
+    /// received the plugin by push, `Both` on the local server (the
+    /// default), `View` when loaded with `-r view`. `Both` if the host
+    /// is too old to say.
+    pub fn role(&self) -> Role {
+        api::self_info().map(|i| i.role).unwrap_or_default()
     }
 }
 
@@ -325,7 +349,13 @@ macro_rules! tmux_plugin {
                 let ctx = $crate::Ctx::new();
                 PLUGIN.with(|p| {
                     if let Some(plugin) = p.borrow_mut().as_mut() {
-                        $crate::Plugin::on_event(plugin, &ctx, event);
+                        if let Some(req) = $crate::ServiceRequest::from_event(&event) {
+                            $crate::Plugin::on_service_request(plugin, &ctx, req);
+                        } else if let Some(ev) = $crate::ServiceEvent::from_event(&event) {
+                            $crate::Plugin::on_service_event(plugin, &ctx, ev);
+                        } else {
+                            $crate::Plugin::on_event(plugin, &ctx, event);
+                        }
                     }
                 });
                 executor::run_until_stalled();

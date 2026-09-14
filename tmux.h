@@ -4095,6 +4095,7 @@ struct remote_parse_callbacks {
 	void	(*subscription_changed)(void *, const char *, u_int, int, int,
 		    int, const char *);
 	void	(*exit)(void *, const char *);
+	void	(*bridge)(void *, const char *);
 	void	(*unknown)(void *, const char *);
 };
 struct remote_parser *remote_parser_create(
@@ -4130,6 +4131,7 @@ const char *remote_link_remote_session(struct remote_link *);
 struct session *remote_link_session(struct remote_link *);
 int	 remote_link_connected(struct remote_link *);
 const char *remote_link_pane_cache(struct window_pane *, int);
+int	 remote_link_bridge_send(struct remote_link *, const void *, size_t);
 #define REMOTE_CACHE_CMD 0
 #define REMOTE_CACHE_PATH 1
 #define REMOTE_CACHE_PID 2
@@ -4366,6 +4368,11 @@ void	 plugin_notify(const char *, struct client *, struct session *,
 	     struct window *, struct window_pane *, const char *);
 void	 plugin_object_created(enum plugin_obj_kind, u_int);
 void	 plugin_object_destroyed(enum plugin_obj_kind, u_int);
+
+/* plugin-bridge.c */
+void	 plugin_bridge_recv(u_int, const char *);
+void	 plugin_bridge_client_lost(struct client *);
+void	 plugin_bridge_link_state(struct remote_link *, int);
 
 /* window-plugin-mode.c */
 extern const struct window_mode window_plugin_mode;

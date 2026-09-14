@@ -49,3 +49,24 @@ impl From<u64> for ModeId {
         Self(id)
     }
 }
+
+/// A server the host knows: 0 is the local server, other ids are linked
+/// remote servers (`remote-attach`). Service targets name servers by
+/// name, not id; see [`crate::service::servers`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ServerId(pub u32);
+
+impl ServerId {
+    pub const LOCAL: ServerId = ServerId(0);
+
+    pub fn is_local(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl fmt::Display for ServerId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "server:{}", self.0)
+    }
+}

@@ -111,7 +111,7 @@ thread_local! {
         RefCell::new(HashMap::new());
 }
 
-fn data_home() -> Result<PathBuf, String> {
+pub(crate) fn data_home() -> Result<PathBuf, String> {
     if let Some(x) = std::env::var_os("XDG_DATA_HOME") {
         if !x.is_empty() {
             return Ok(PathBuf::from(x));

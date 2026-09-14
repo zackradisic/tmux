@@ -4,7 +4,7 @@
 //!   same code + same config + same caps  -> keep running untouched
 //!   changed code                         -> transactional snapshot/migrate
 //!   changed config                       -> on_config_changed or restart
-//!   changed caps or scope                -> restart instances
+//!   changed caps, scope or role          -> restart instances
 //!
 //! The code-reload transaction is per instance: build v2 first, migrate the
 //! v1 snapshot into it, and only then unload v1. Any v2 failure leaves v1
@@ -25,11 +25,12 @@ pub fn upsert(desc: LoadDescriptor) -> Result<&'static str, String> {
     let existing = REGISTRY.with(|r| {
         let reg = r.borrow();
         reg.plugins.get(&desc.name).map(|d| {
-            (d.hash, d.config.clone(), d.caps.clone(), d.scope_type)
+            (d.hash, d.config.clone(), d.caps.clone(), d.scope_type, d.role)
         })
     });
 
-    let Some((old_hash, old_config, old_caps, old_scope)) = existing else {
+    let Some((old_hash, old_config, old_caps, old_scope, old_role)) = existing
+    else {
         // Fresh load.
         let name = desc.name.clone();
         REGISTRY.with(|r| r.borrow_mut().load(desc))?;
@@ -47,14 +48,19 @@ pub fn upsert(desc: LoadDescriptor) -> Result<&'static str, String> {
         &desc.caps,
     )?;
 
-    if desc.scope != old_scope {
-        // Scope change: full restart via unload + load.
+    if desc.scope != old_scope || desc.role != old_role {
+        // Scope or role change: full restart via unload + load.
         let name = desc.name.clone();
+        let what = if desc.scope != old_scope { "scope" } else { "role" };
         REGISTRY.with(|r| r.borrow_mut().unload(&name));
         REGISTRY.with(|r| r.borrow_mut().load(desc))?;
         let scopes = REGISTRY.with(|r| r.borrow().initial_scopes(&name));
         events::queue_instantiations(&name, scopes);
-        return Ok("scope changed, restarted");
+        return Ok(if what == "scope" {
+            "scope changed, restarted"
+        } else {
+            "role changed, restarted"
+        });
     }
 
     if new_hash != old_hash {

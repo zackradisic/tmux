@@ -95,6 +95,8 @@ pub fn drain(max_us: u32) -> u32 {
     let deadline = Instant::now() + Duration::from_micros(u64::from(budget));
 
     process_dying();
+    crate::services::sweep_deadlines();
+    crate::bridge::sweep();
 
     loop {
         let delivery = EVENTS.with(|e| e.borrow_mut().deliveries.pop_front());
@@ -125,6 +127,21 @@ pub fn drain(max_us: u32) -> u32 {
             }
             Delivery::ModeEvent { mode_id, bytes } => {
                 deliver_mode_event(mode_id, bytes);
+            }
+            Delivery::ServiceRequest { owner, bytes } => {
+                deliver_to_owner(&owner, bytes, "service-request");
+            }
+            Delivery::ServiceEvent { target, bytes } => {
+                deliver_to_owner(&target, bytes, "service-event");
+            }
+            Delivery::ServicePage { token, page, flags, data } => {
+                deliver_page(token, page, flags, &data);
+            }
+            Delivery::BridgeFrame { peer, bytes } => {
+                crate::bridge::recv(peer, &bytes);
+            }
+            Delivery::BridgeState { peer, name, up } => {
+                crate::bridge::state(peer, name, up);
             }
         }
 
@@ -183,6 +200,7 @@ pub fn release_instance_resources(inst: &Instance) {
         inst.scope_id,
         inst.generation,
     );
+    crate::services::purge_instance(&inst.plugin, inst.scope_id, inst.generation);
     let timers =
         crate::tokens::purge_instance(&inst.plugin, inst.scope_id, inst.generation);
     let modes =
@@ -237,6 +255,76 @@ fn deliver_async(token: u64, err: i32, v0: i64, v1: i64, data: &[u8]) {
             &inst.plugin,
             &format!("on_async_complete trapped: {e}"),
         );
+    }
+    check_in(key, inst, trapped);
+}
+
+/// Deliver one reply page of a service call. With MORE set the token
+/// stays alive for the next page; the last page (or an error, which
+/// arrives as a plain AsyncComplete) takes it.
+fn deliver_page(token: u64, page: u32, flags: u32, data: &[u8]) {
+    let more = flags & tmux_plugin_abi::service_flags::MORE != 0;
+    let pending = if more {
+        crate::tokens::peek(token)
+    } else {
+        crate::tokens::take(token)
+    };
+    let Some(pending) = pending else { return };
+    let Some((key, mut inst)) = checkout(&pending.plugin, pending.scope) else {
+        return;
+    };
+    if inst.generation != pending.generation {
+        check_in(key, inst, false);
+        return;
+    }
+    let outcome = inst.guest.call_on_async_complete(
+        token,
+        0,
+        i64::from(page),
+        i64::from(flags),
+        data,
+    );
+    inst.stats.record(&outcome);
+    let trapped = outcome.trapped();
+    if let Err(e) = &outcome.result {
+        hostlog::error(&inst.plugin, &format!("on_async_complete trapped: {e}"));
+    }
+    check_in(key, inst, trapped);
+}
+
+/// Check an instance out of the registry by (plugin, scope).
+fn checkout(plugin: &str, scope: ScopeId) -> Option<(usize, Instance)> {
+    let key = REGISTRY.with(|r| {
+        r.borrow().by_scope.get(&(plugin.to_string(), scope)).copied()
+    })?;
+    let inst = REGISTRY.with(|r| {
+        r.borrow_mut().instances.get_mut(key).and_then(Option::take)
+    })?;
+    Some((key, inst))
+}
+
+/// Deliver a complete event buffer to one instance only (a service
+/// request or topic event), generation-checked. No subscription is
+/// needed: the delivery is addressed.
+fn deliver_to_owner(owner: &crate::services::Owner, mut bytes: Vec<u8>, what: &str) {
+    let Some((key, mut inst)) = checkout(&owner.plugin, owner.scope) else {
+        return;
+    };
+    if inst.generation != owner.generation {
+        check_in(key, inst, false);
+        return;
+    }
+    let seq = EVENTS.with(|e| {
+        let mut q = e.borrow_mut();
+        q.seq += 1;
+        q.seq
+    });
+    let _ = patch_event_seq(&mut bytes, seq);
+    let outcome = inst.guest.call_on_event(&bytes);
+    inst.stats.record(&outcome);
+    let trapped = outcome.trapped();
+    if let Err(e) = &outcome.result {
+        hostlog::error(&inst.plugin, &format!("on_event({what}) trapped: {e}"));
     }
     check_in(key, inst, trapped);
 }
@@ -414,21 +502,23 @@ pub fn build_guest(
         };
         let config = abi::encode_config(&def.config);
         let caps = def.caps.clone();
+        let role = def.role;
         let Some(engine) = reg.engine.as_ref().map(|e| e.engine.clone())
         else {
             return Err("no engine".to_string());
         };
         reg.next_generation += 1;
-        Ok(Some((engine, module, config, caps, reg.next_generation)))
+        Ok(Some((engine, module, config, caps, role, reg.next_generation)))
     })?;
-    let Some((engine, module, config, caps, generation)) = setup else {
+    let Some((engine, module, config, caps, role, generation)) = setup else {
         return Ok(None);
     };
 
     // Phase 2 (no borrow): instantiate + handshake + init under budget.
-    let mut guest =
-        abi::instantiate(&engine, &module, plugin, generation, scope, caps)
-            .map_err(|e| format!("instantiate for {scope}: {e}"))?;
+    let mut guest = abi::instantiate(
+        &engine, &module, plugin, generation, scope, role, caps,
+    )
+    .map_err(|e| format!("instantiate for {scope}: {e}"))?;
     let outcome = guest.call_init(&config);
     let mut stats = InstanceStats::default();
     stats.record(&outcome);

@@ -265,13 +265,72 @@ These host calls inspect a local process or the local filesystem:
 `PaneInfo` carries `remote: bool` and `host: String` (flag bit 8 in the
 record). `cwd` for a remote pane is the remote's cached current path.
 
-### Two plugin runtimes
+### Roles: provider and view
 
-If the remote runs tmux2 with plugins, its plugins run there. A remote mode
-pane is a floating remote pane. `layout_parse()` does not read floats, so the
-link needs a separate `list-panes -F '#{pane_floating}'` pass to mirror them.
-Both sides that load the same UI plugin show duplicates. Rule: UI plugins run
-locally only. The remote runs plain tmux, or tmux2 with no UI plugins.
+Machine facts enter plugins through a few doors only: `pane_env`,
+`pane_fds`, `pane_pid`, the fs calls, `run_job`, the process-derived
+formats and the clock. Everything else is tmux state, and the shadow
+tree carries that. So a plugin splits into two halves:
+
+- the *provider* runs on every server and sees only its own machine; it
+  detects, reads processes and files, keeps the store and answers
+  service calls;
+- the *view* runs on the local server, merges what the providers report
+  and owns the UI.
+
+One crate, two roles: `load-plugin -r` picks `both` (the local default),
+`view` or `provider`. `Ctx::role()` tells the plugin which half to run.
+The host refuses `mode_open` for a provider; nothing else is gated.
+
+### The bridge
+
+The link carries a plugin bridge between the two hosts. Version 1 rides
+the control mode connection: the local side sends a frame as a
+`plugin-bridge <base64>` command, the remote answers with `%bridge
+<base64>` lines through `control_write()`, so a frame never splits an
+output block. The Rust host (`plugin-host/host/src/bridge.rs`) frames,
+compresses (zstd above 4 KiB) and interprets; C moves opaque bytes
+(`plugin-bridge.c`, `cmd-plugin-bridge.c`). A remote running plain tmux
+answers `plugin-bridge` with an error and the link stops sending.
+
+Frames: `hello` (ABI version, host name, providers, capability ceiling),
+`push` (a plugin's descriptor, sidecar and wasm bytes), `call`, `reply`
+(paged, with MORE and ERROR flags), `cancel`, `subscribe`,
+`unsubscribe`, `event` (a topic payload with a host-stamped sequence),
+`ping`, `pong`.
+
+### Push
+
+When the link comes up the hosts exchange `hello`. The local server then
+pushes every plugin with role `both` or `provider` to the remote, which
+writes it under `<data>/tmux/plugin-cache/<host>/` and loads it in role
+`provider` through the ordinary path-based load. The wasm is
+byte-portable (no `cfg(target_os)`, no WASI), so the local build runs on
+the remote as it is. The remote decides the grants with its
+`plugin-remote-caps` server option; the default leaves out
+`run-process`, `fs-write`, `fs-read-any` and `fs-write-any`. A remote
+tmux2 older than the pushed ABI refuses the load and the link logs
+"remote tmux2 is older; run tmux update there". Pushed plugins are
+unloaded ten minutes after their peer stays down.
+
+### Services
+
+Providers register methods (`service_register`) and publish topics
+(`service_emit`); views call them (`service_call` with a target `plugin`
+or `plugin@server`, `service_subscribe`) and list the servers
+(`servers`). Delivery is queued in the host and never re-entrant. A call
+for a plugin that is loaded but not yet registered waits up to ten
+seconds (a pushed plugin's init may still be queued); a call to a down
+server fails at once with `E_UNREACHABLE`; a call nobody answers fails
+after thirty seconds with `E_TIMEOUT`. The SDK adds `service::call`,
+`call_all`, `call_stream`, `emit`, `subscribe`, `ServiceRequest` with
+`reply`/`reply_page`/`fail`, and `Replica<T>` for a view's per-server
+copy with gap detection. `plugin-host/examples/services-probe` is the
+smallest provider/view pair; `regress/plugin-services-remote.sh` drives
+it across two servers.
+
+Two links to one host are two peers with one name; service targets reach
+the first one that is up.
 
 ## Server restart
 

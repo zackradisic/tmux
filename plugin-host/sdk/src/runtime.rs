@@ -115,6 +115,22 @@ pub(crate) mod raw {
             owned_out: i32,
         ) -> i32;
         pub fn db_decompress(src_ptr: i32, src_len: i32, owned_out: i32) -> i32;
+        pub fn service_register(method_ptr: i32, method_len: i32) -> i32;
+        pub fn service_call(
+            target_ptr: i32, target_len: i32, method_ptr: i32, method_len: i32,
+            payload_ptr: i32, payload_len: i32,
+        ) -> i64;
+        pub fn service_reply(
+            call: i64, payload_ptr: i32, payload_len: i32, flags: i32,
+        ) -> i32;
+        pub fn service_cancel(token: i64) -> i32;
+        pub fn service_emit(
+            topic_ptr: i32, topic_len: i32, payload_ptr: i32, payload_len: i32,
+        ) -> i32;
+        pub fn service_subscribe(
+            target_ptr: i32, target_len: i32, topic_ptr: i32, topic_len: i32,
+        ) -> i32;
+        pub fn servers(owned_out: i32) -> i32;
     }
 }
 
@@ -169,6 +185,13 @@ pub(crate) mod raw {
     pub unsafe fn db_exec_sync(sql_ptr: i32, sql_len: i32, params_ptr: i32, params_len: i32, out_ptr: i32) -> i32 { -7 }
     pub unsafe fn db_query_sync(sql_ptr: i32, sql_len: i32, params_ptr: i32, params_len: i32, owned_out: i32) -> i32 { -7 }
     pub unsafe fn db_decompress(src_ptr: i32, src_len: i32, owned_out: i32) -> i32 { -7 }
+    pub unsafe fn service_register(method_ptr: i32, method_len: i32) -> i32 { -7 }
+    pub unsafe fn service_call(target_ptr: i32, target_len: i32, method_ptr: i32, method_len: i32, payload_ptr: i32, payload_len: i32) -> i64 { -7 }
+    pub unsafe fn service_reply(call: i64, payload_ptr: i32, payload_len: i32, flags: i32) -> i32 { -7 }
+    pub unsafe fn service_cancel(token: i64) -> i32 { -7 }
+    pub unsafe fn service_emit(topic_ptr: i32, topic_len: i32, payload_ptr: i32, payload_len: i32) -> i32 { -7 }
+    pub unsafe fn service_subscribe(target_ptr: i32, target_len: i32, topic_ptr: i32, topic_len: i32) -> i32 { -7 }
+    pub unsafe fn servers(owned_out: i32) -> i32 { -7 }
 }
 
 /// ABI allocator: 8-aligned, size echoed back on free.

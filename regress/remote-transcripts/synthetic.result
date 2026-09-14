@@ -44,6 +44,7 @@ begin 1700000004 5 1
 error 1700000004 5 1 [no such command]
 begin 1700000005 6 1
 end 1700000005 6 1 [crlf line]
+bridge [UEdCMQMAAAAAAA==]
 unknown [%nonsense-notification with args]
 begin 1700000006 7 1
 exit [reason given]

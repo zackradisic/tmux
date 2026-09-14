@@ -19,7 +19,7 @@ use crate::runtime::{self, raw, Owned};
 use crate::strings::AsTmuxStr;
 
 /// Fetch the host's message for the error a call just returned.
-fn host_err(rc_neg: i32) -> HostError {
+pub(crate) fn host_err(rc_neg: i32) -> HostError {
     let code = ErrorCode::from_num(-rc_neg);
     let mut buf = vec![0u8; 256];
     let mut message = String::new();
@@ -46,7 +46,7 @@ fn host_err(rc_neg: i32) -> HostError {
     HostError { code, message }
 }
 
-fn check(rc: i32) -> Result<(), HostError> {
+pub(crate) fn check(rc: i32) -> Result<(), HostError> {
     if rc == 0 {
         Ok(())
     } else {
@@ -54,7 +54,7 @@ fn check(rc: i32) -> Result<(), HostError> {
     }
 }
 
-fn check_i64(rc: i64) -> Result<i64, HostError> {
+pub(crate) fn check_i64(rc: i64) -> Result<i64, HostError> {
     if rc > 0 {
         Ok(rc)
     } else {
@@ -90,7 +90,7 @@ fn call_out(
 
 /// Run an OwnedBuf-shaped call: the host allocates the result in guest
 /// memory and RAII owns it from the moment the call returns.
-fn call_owned(f: impl FnOnce(i32) -> i32) -> Result<Owned, HostError> {
+pub(crate) fn call_owned(f: impl FnOnce(i32) -> i32) -> Result<Owned, HostError> {
     let mut out: [u32; 2] = [0, 0];
     let rc = f(out.as_mut_ptr() as i32);
     if rc != 0 {
@@ -99,7 +99,7 @@ fn call_owned(f: impl FnOnce(i32) -> i32) -> Result<Owned, HostError> {
     Ok(Owned::from_out_struct(out))
 }
 
-fn wire_err() -> HostError {
+pub(crate) fn wire_err() -> HostError {
     HostError {
         code: ErrorCode::Host,
         message: "malformed buffer from host".into(),
@@ -620,7 +620,7 @@ pub struct JobOutput {
 }
 
 /// Start an async request: the raw call returns a token (> 0) or -err.
-fn start_async(token: i64) -> Result<HostFuture, HostError> {
+pub(crate) fn start_async(token: i64) -> Result<HostFuture, HostError> {
     if token <= 0 {
         return Err(host_err(token as i32));
     }

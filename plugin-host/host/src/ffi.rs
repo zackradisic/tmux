@@ -40,6 +40,13 @@ pub const PGH_ERR_NO_SUCH_OBJECT: c_int = 4;
 pub const PGH_ERR_LIMIT: c_int = 6;
 pub const PGH_ERR_HOST: c_int = 7;
 pub const PGH_ERR_CANCELLED: c_int = 8;
+pub const PGH_ERR_UNREACHABLE: c_int = 10;
+pub const PGH_ERR_TIMEOUT: c_int = 11;
+
+/// Bridge peer ids with this bit set are remote links this server made
+/// (`remote-attach`); the rest are control clients of this server that
+/// speak the bridge. The C side picks the transport by this bit.
+pub const PGH_PEER_LINK: u32 = 1 << 31;
 
 /// Relation queries for `pgh_host_vtable.obj_relation` (scope checks).
 pub const PGH_REL_PANE_WINDOW: c_int = 0;
@@ -212,6 +219,12 @@ pub struct pgh_host_vtable {
         sink: pgh_sink,
         ctx: *mut c_void,
     ) -> c_int,
+    /// Send an opaque bridge frame to a peer (PGH_PEER_LINK bit: a remote
+    /// link, sent as a `plugin-bridge` control mode command; else a
+    /// control client, sent as a `%bridge` line). The bytes are copied
+    /// before this returns. 0 ok, -1 no such peer or peer down.
+    pub bridge_send:
+        unsafe extern "C" fn(peer: u32, data: *const u8, len: usize) -> c_int,
 }
 
 // Function pointers are Send + Sync; the vtable is stored in a OnceLock.

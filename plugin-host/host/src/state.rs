@@ -32,6 +32,20 @@ pub enum Delivery {
     /// C, including the mode field); delivered only to the instance owning
     /// the mode, after a generation check (stale events are dropped).
     ModeEvent { mode_id: u64, bytes: Vec<u8> },
+    /// A service call for the instance that registered the method: a
+    /// complete `service-request` event buffer, delivered to `owner`
+    /// only, generation-checked.
+    ServiceRequest { owner: crate::services::Owner, bytes: Vec<u8> },
+    /// One reply page of a service call, for the caller. Like
+    /// AsyncComplete, but with `MORE` set the token stays alive.
+    ServicePage { token: u64, page: u32, flags: u32, data: Vec<u8> },
+    /// A topic event for one subscribed instance: a complete
+    /// `service-event` buffer, delivered to `target` only.
+    ServiceEvent { target: crate::services::Owner, bytes: Vec<u8> },
+    /// A frame from a bridge peer (pgh_bridge_recv is enqueue-only).
+    BridgeFrame { peer: u32, bytes: Vec<u8> },
+    /// A bridge peer came up (with a name) or went down.
+    BridgeState { peer: u32, name: Option<String>, up: bool },
 }
 
 pub struct EventQueue {

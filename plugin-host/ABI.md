@@ -237,7 +237,9 @@ Errors: sync imports return `0` or `-code`; value-returning imports
 `-code`. The message for the most recent error is fetched with
 `last_error` (an OutBuf). Codes: `E_BAD_REQUEST`(1), `E_UNKNOWN_METHOD`(2),
 `E_CAP_DENIED`(3), `E_NO_SUCH_OBJECT`(4), `E_OUT_OF_SCOPE`(5),
-`E_LIMIT`(6), `E_HOST`(7), `E_CANCELLED`(8), `E_UNSUPPORTED`(9).
+`E_LIMIT`(6), `E_HOST`(7), `E_CANCELLED`(8), `E_UNSUPPORTED`(9),
+`E_UNREACHABLE`(10, the server a service call names is not linked or
+its link is down), `E_TIMEOUT`(11, a service call got no reply in time).
 
 `kind` values: -1 server/global, 0 session, 1 window, 2 pane, 3 client.
 
@@ -248,7 +250,13 @@ Errors: sync imports return `0` or `-code`; value-returning imports
 | `subscribe` / `unsubscribe` | `(event_id) -> i32` | read-state |
 | `list` | `(kind, owned_out) -> i32` — object list buffer | read-state |
 | `resolve` | `(kind, id, owned_out) -> i32` — one object record | read-state |
-| `self_info` | `(out) -> i32` — 16-byte `{scope_kind: i32, scope_id: u32, generation: u64}` | read-state |
+| `self_info` | `(out) -> i32` — 24-byte `{scope_kind: i32, scope_id: u32, generation: u64, role: u32, pad: u32}`; a guest that reads 16 bytes gets the first three, an old host writes 16 and the guest reads role 0 = both | read-state |
+| `servers` | `(owned_out) -> i32` — `u32 count` list of `{u32 id, str name, u32 flags(1 up | 2 local)}`: the local server (id 0, "local") and every linked server | read-state |
+| `service_register` | `(method Str) -> i32` — answer `method` for this plugin; calls arrive as `service-request` events | service-serve |
+| `service_reply` | `(call: i64, payload Bytes, flags) -> i32` — one page of the answer; flags bit 0 MORE (another page follows), bit 1 ERROR (the payload is the message) | service-serve |
+| `service_emit` | `(topic Str, payload Bytes) -> i32` — publish on a topic of this plugin; the host stamps a sequence per (plugin, topic) | service-serve |
+| `service_cancel` | `(token: i64) -> i32` — give up on a call; a late reply is dropped | service-call |
+| `service_subscribe` | `(target Str, topic Str) -> i32` — follow a topic; events arrive as `service-event`. A subscription to a linked server is sent again when its link returns | service-call |
 | `get_option` | `(kind, id, name Str, out, cap, len_out) -> i32` | read-state |
 | `set_option` | `(kind, id, name Str, value Str) -> i32` (@-options only) | write-options |
 | `format_expand` | `(kind, id, fmt Str, out, cap, len_out) -> i32` — `#{...}` against the scope; `#()` disabled | read-state |
@@ -310,6 +318,14 @@ guest frees (the error message bytes when `err != 0`; empty = none).
 | `db_exec` | `(sql Bytes, params Bytes) -> i64` | v0 = changes, v1 = last_insert_rowid | db |
 | `db_query` | `(sql Bytes, params Bytes) -> i64` | v0 = nrows, v1 = ncols, data = rows block | db |
 | `db_batch` | `(block Bytes) -> i64` — one transaction | v0 = total changes, v1 = last_insert_rowid | db |
+| `service_call` | `(target Str, method Str, payload Bytes) -> i64` — `target` is `plugin` or `plugin@server` | one completion per reply page: v0 = page index, v1 = flags (bit 0 MORE: the token stays alive for the next page), data = the payload; an ERROR reply completes with `err` = `E_HOST` and the message | service-call |
+
+A service call for a plugin that is loaded but has not registered the
+method yet (its init is still queued, as right after a push) waits up to
+10 s for the registration; a call for a plugin that is not loaded fails
+at once with `E_NO_SUCH_OBJECT`. A call the provider never answers fails
+with `E_TIMEOUT` after 30 s. The host copies payloads and never parses
+them; payload encoding is the plugin's choice.
 
 The async fs calls run on the host's worker pool (the tmux loop never
 blocks) with ZERO copies: a runner reads `fs_write`'s data and fills
@@ -375,6 +391,7 @@ field  := u32 key_id              (0 = inline key: u32 len + bytes follow)
           value
 tags   := 0 null | 1 bool (u8) | 2 i64 (8B) | 3 f64 (8B)
           | 4 str (u32 len + bytes) | 5 json (u32 len + bytes; config only)
+          | 6 bytes (u32 len + raw bytes; service payloads)
 ```
 
 Object names travel as flat fields (`session_name`, `window_name`,
@@ -398,6 +415,16 @@ the first) and `new_command`; it is pane-scoped and needs `subscribe`.
 only the plugin named in its `plugin` field receives it (subscription
 still required); the command string is the `text` field and the target
 pane/window/session form the scope.
+
+Service events are addressed, never broadcast, and need no subscription:
+`service-request` (fields, in this order: `call` i64, `method`,
+`from_server`, `from_plugin`, `payload` bytes) goes to the instance that
+registered the method, and `service-event` (`plugin`, `topic`, `seq` i64,
+`server`, `payload` bytes) to each instance that subscribed to the topic.
+`call` is always the first field, so a guest that reads the raw buffer
+finds it at a fixed offset. `link-up` and `link-down` (`server`, `id`,
+`plugins` json list of the peer's providers) fire when a linked server's
+plugin bridge comes up or goes down; they need `subscribe`.
 
 Config (`pgh_init` / `pgh_on_config_changed`) is a bare field block with
 inline string keys; scalar values map directly, nested values (arrays /
@@ -463,6 +490,32 @@ is not offered; the design for it is in [MODE-ATTACH.md](MODE-ATTACH.md).)
   teardown (unload, reload, scope-object death) force-closes all modes the
   instance owns; stale events from a previous generation are dropped.
 
+## Roles
+
+A plugin has two halves. The *provider* half sees one server: it detects,
+reads processes and files, keeps the store, and answers service calls. The
+*view* half merges what providers report and owns the UI. `load-plugin -r`
+(or `role` in a manifest entry) picks what an instance runs: `both` (the
+default, the local server), `view`, or `provider`. The role travels in
+`self_info`; the host refuses `mode_open` for a provider
+(`E_CAP_DENIED`, "provider role has no UI") and gates nothing else. A
+role change is a restart, like a scope change.
+
+A `remote-attach` link carries a *plugin bridge* between the two hosts
+(frames over the control mode connection: a `plugin-bridge <base64>`
+command outbound, a `%bridge <base64>` line inbound). When the link comes
+up the hosts exchange `hello` (ABI version, host name, providers,
+capability ceiling); the local server then *pushes* every plugin with role
+`both` or `provider` to the remote as bytes, and the remote loads it in
+role `provider` from `<data>/tmux/plugin-cache/<host>/<name>.wasm` with
+the grants its `plugin-remote-caps` server option allows (by default
+everything but `run-process`, `fs-write`, `fs-read-any`, `fs-write-any`).
+The wasm is byte-portable, so the same build runs on both machines; a
+remote host older than the pushed ABI refuses the load and the link logs
+"run tmux update there". Pushed plugins are unloaded ten minutes after
+their peer stays down, so a flapping link does not thrash. Frames above
+4 KiB are zstd-compressed.
+
 ## Scopes, lifecycle, reload
 
 One instance per (plugin, scope object): `server`, `session`, `window`, or
@@ -476,7 +529,7 @@ cancelled.
 running; changed code triggers a per-instance transaction (snapshot v1 →
 instantiate+init v2 → migrate → swap; failure keeps v1); changed config
 calls `pgh_on_config_changed`, restarting instances that refuse; changed
-caps or scope restarts. `reload-plugin` forces the transaction.
+caps, scope or role restarts. `reload-plugin` forces the transaction.
 
 ## Failure policy
 
@@ -505,7 +558,11 @@ reach), `db` (the plugin's own SQLite database, see Database), `env-read`
 to a `[caps.env-read] names = [...]` allowlist — an empty list, as under
 trust-the-user, is unrestricted, like `argv0`), `env-read-any` (lift that
 allowlist), `pane-fds` (read the open-file paths of a pane's
-foreground process with `pane_fds`), and reserved: `popup`, `menu`,
+foreground process with `pane_fds`), `service-serve` (register methods,
+reply, emit topics), `service-call` (call methods and follow topics, on
+this server or a linked one; a `[caps.services] call = ["agents@*"]`
+sidecar list narrows the targets to `plugin`, `plugin@server` or
+`plugin@*` patterns), and reserved: `popup`, `menu`,
 `db-read` (read-only access to
 other plugins' databases, to be named in a `[caps.db] read = [...]`
 sidecar list).
@@ -516,7 +573,8 @@ session's panes; `cross-scope` lifts this.
 ## tmux commands
 
 ```
-load-plugin [-n name] [-s server|session|window|pane] [-c cap]...
+load-plugin [-n name] [-r both|view|provider]
+            [-s server|session|window|pane] [-c cap]...
             [-o key=value]... path.wasm
 sync-plugins manifest.toml
 unload-plugin name

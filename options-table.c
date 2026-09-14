@@ -518,6 +518,18 @@ const struct options_table_entry options_table[] = {
 		  "'remote_session'."
 	},
 
+	{ .name = "plugin-remote-caps",
+	  .type = OPTIONS_TABLE_STRING,
+	  .scope = OPTIONS_TABLE_SERVER,
+	  .default_str = "read-state,write-options,send-keys,capture-pane,"
+			 "display-message,timers,run-command,cross-scope,"
+			 "popup,menu,fs-read,mode,fs-list,db,env-read,"
+			 "env-read-any,pane-fds,service-call,service-serve",
+	  .text = "Capabilities a plugin pushed by a linked server may get "
+		  "on this server. The default leaves out run-process, "
+		  "fs-write, fs-read-any and fs-write-any."
+	},
+
 	{ .name = "prompt-history-limit",
 	  .type = OPTIONS_TABLE_NUMBER,
 	  .scope = OPTIONS_TABLE_SERVER,

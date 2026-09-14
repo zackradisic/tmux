@@ -85,6 +85,59 @@ impl fmt::Display for ScopeType {
     }
 }
 
+/// What half of a plugin an instance runs. A `Provider` sees one server
+/// (its own) and answers service calls; a `View` merges what providers
+/// report and owns the UI; `Both` runs the two halves in one instance, the
+/// usual case on the local server. A remote server runs pushed plugins as
+/// providers. Wire values: Both = 0 (an old host writes no role and a
+/// zeroed field reads as Both), View = 1, Provider = 2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    #[default]
+    Both,
+    View,
+    Provider,
+}
+
+impl Role {
+    pub fn as_num(self) -> u32 {
+        match self {
+            Role::Both => 0,
+            Role::View => 1,
+            Role::Provider => 2,
+        }
+    }
+
+    pub fn from_num(n: u32) -> Role {
+        match n {
+            1 => Role::View,
+            2 => Role::Provider,
+            _ => Role::Both,
+        }
+    }
+
+    /// Does this role run the provider half (services, detection)?
+    pub fn provides(self) -> bool {
+        matches!(self, Role::Provider | Role::Both)
+    }
+
+    /// Does this role run the view half (UI, merging)?
+    pub fn views(self) -> bool {
+        matches!(self, Role::View | Role::Both)
+    }
+}
+
+impl fmt::Display for Role {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Role::Both => write!(f, "both"),
+            Role::View => write!(f, "view"),
+            Role::Provider => write!(f, "provider"),
+        }
+    }
+}
+
 /// Names of the wasm exports a guest must (or may) provide.
 pub mod exports {
     pub const ABI_VERSION: &str = "pgh_abi_version";
@@ -178,6 +231,24 @@ pub mod db;
 /// db_decompress(src_ptr, src_len, owned_out) -> i32
 ///                       // OwnedBuf = the bytes behind a stored zstd frame
 ///                       // (a BLOB written from a ZSTD_REF parameter)
+///
+/// // services (capabilities service-serve / service-call; payloads are
+/// // raw bytes the plugin defines; a target is "plugin" or
+/// // "plugin@server", where server is "local" or a linked server's name):
+/// service_register(method_ptr, method_len) -> i32
+/// service_call(target_ptr, target_len, method_ptr, method_len,
+///              payload_ptr, payload_len) -> i64
+///                       // async; each page completes with v0 = page
+///                       // index, v1 = flags (bit 0 MORE: another page
+///                       // follows and the token stays alive), data =
+///                       // payload; an error reply completes with err
+/// service_reply(call: i64, payload_ptr, payload_len, flags) -> i32
+///                       // flags bit 0 = MORE, bit 1 = ERROR (payload is
+///                       // the message)
+/// service_cancel(token: i64) -> i32
+/// service_emit(topic_ptr, topic_len, payload_ptr, payload_len) -> i32
+/// service_subscribe(target_ptr, target_len, topic_ptr, topic_len) -> i32
+/// servers(owned_out) -> i32                     // list of server records
 /// ```
 pub mod imports {
     pub const MODULE: &str = "tmux";
@@ -247,6 +318,85 @@ pub mod imports {
     pub const DB_EXEC_SYNC: &str = "db_exec_sync";
     pub const DB_QUERY_SYNC: &str = "db_query_sync";
     pub const DB_DECOMPRESS: &str = "db_decompress";
+
+    pub const SERVICE_REGISTER: &str = "service_register";
+    pub const SERVICE_CALL: &str = "service_call";
+    pub const SERVICE_REPLY: &str = "service_reply";
+    pub const SERVICE_CANCEL: &str = "service_cancel";
+    pub const SERVICE_EMIT: &str = "service_emit";
+    pub const SERVICE_SUBSCRIBE: &str = "service_subscribe";
+    pub const SERVERS: &str = "servers";
+}
+
+/// Flag bits of a service reply page (`service_reply` flags, and `v1` of
+/// the completion the caller receives).
+pub mod service_flags {
+    /// Another page follows; the caller's token stays alive.
+    pub const MORE: u32 = 1 << 0;
+    /// The payload is an error message; the call fails with E_HOST.
+    pub const ERROR: u32 = 1 << 1;
+}
+
+/// The name of the local server in service targets and server records.
+pub const LOCAL_SERVER: &str = "local";
+
+/// Field names of the `service-request` and `service-event` events. The
+/// host writes `call` FIRST in a service-request so a guest that reads the
+/// raw buffer finds it at a fixed offset.
+pub mod service_fields {
+    pub const CALL: &str = "call";
+    pub const METHOD: &str = "method";
+    pub const FROM_SERVER: &str = "from_server";
+    pub const FROM_PLUGIN: &str = "from_plugin";
+    pub const PAYLOAD: &str = "payload";
+    pub const PLUGIN: &str = "plugin";
+    pub const TOPIC: &str = "topic";
+    pub const SEQ: &str = "seq";
+    pub const SERVER: &str = "server";
+}
+
+/// A server as listed by the `servers` import: the local server (id 0,
+/// name "local") and every linked remote server.
+///
+///   record := u32 id, str name, u32 flags
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerInfo {
+    pub id: u32,
+    pub name: String,
+    pub up: bool,
+    pub local: bool,
+}
+
+pub mod server_flags {
+    pub const UP: u32 = 1 << 0;
+    pub const LOCAL: u32 = 1 << 1;
+}
+
+impl ServerInfo {
+    pub fn parse(c: &mut Cursor<'_>) -> Result<Self, WireError> {
+        let id = c.u32()?;
+        let name = c.str()?.to_string();
+        let flags = c.u32()?;
+        Ok(Self {
+            id,
+            name,
+            up: flags & server_flags::UP != 0,
+            local: flags & server_flags::LOCAL != 0,
+        })
+    }
+
+    pub fn emit(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.id.to_le_bytes());
+        emit_str(out, &self.name);
+        let mut flags = 0u32;
+        if self.up {
+            flags |= server_flags::UP;
+        }
+        if self.local {
+            flags |= server_flags::LOCAL;
+        }
+        out.extend_from_slice(&flags.to_le_bytes());
+    }
 }
 
 /// Structured error codes. Sync imports return `-code`; `host_request`-style
@@ -272,6 +422,13 @@ pub enum ErrorCode {
     Cancelled,
     #[serde(rename = "E_UNSUPPORTED")]
     Unsupported,
+    /// The server a call or subscription names is not linked or its link
+    /// is down.
+    #[serde(rename = "E_UNREACHABLE")]
+    Unreachable,
+    /// A service call got no reply within its deadline.
+    #[serde(rename = "E_TIMEOUT")]
+    Timeout,
 }
 
 impl ErrorCode {
@@ -287,6 +444,8 @@ impl ErrorCode {
             ErrorCode::Host => 7,
             ErrorCode::Cancelled => 8,
             ErrorCode::Unsupported => 9,
+            ErrorCode::Unreachable => 10,
+            ErrorCode::Timeout => 11,
         }
     }
 
@@ -300,6 +459,8 @@ impl ErrorCode {
             6 => ErrorCode::Limit,
             8 => ErrorCode::Cancelled,
             9 => ErrorCode::Unsupported,
+            10 => ErrorCode::Unreachable,
+            11 => ErrorCode::Timeout,
             _ => ErrorCode::Host,
         }
     }
@@ -315,6 +476,8 @@ impl ErrorCode {
             ErrorCode::Host => "E_HOST",
             ErrorCode::Cancelled => "E_CANCELLED",
             ErrorCode::Unsupported => "E_UNSUPPORTED",
+            ErrorCode::Unreachable => "E_UNREACHABLE",
+            ErrorCode::Timeout => "E_TIMEOUT",
         }
     }
 }
@@ -351,6 +514,8 @@ pub struct LoadDescriptor {
     pub config: serde_json::Value,
     #[serde(default)]
     pub caps: Vec<String>,
+    #[serde(default)]
+    pub role: Role,
 }
 
 fn default_scope() -> ScopeType {
@@ -379,6 +544,9 @@ pub mod tag {
     /// the bytes are JSON text, interpreted by the guest SDK only. Never
     /// used by events.
     pub const JSON: u8 = 5;
+    /// Raw bytes: u32 len + bytes, no UTF-8 rule. Service payloads ride
+    /// in events with this tag.
+    pub const BYTES: u8 = 6;
 }
 
 /// A field key: interned id (events) or inline name (config).
@@ -397,12 +565,23 @@ pub enum ValueRef<'a> {
     F64(f64),
     Str(&'a str),
     Json(&'a str),
+    Bytes(&'a [u8]),
 }
 
 impl<'a> ValueRef<'a> {
     pub fn as_str(&self) -> Option<&'a str> {
         match self {
             ValueRef::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// The raw bytes of a BYTES field (a STR field also answers, as its
+    /// UTF-8 bytes).
+    pub fn as_bytes(&self) -> Option<&'a [u8]> {
+        match self {
+            ValueRef::Bytes(b) => Some(b),
+            ValueRef::Str(s) => Some(s.as_bytes()),
             _ => None,
         }
     }
@@ -487,6 +666,13 @@ impl FieldWriter {
 
     pub fn json(&mut self, key: KeyRef<'_>, v: &str) {
         self.str_with_tag(key, tag::JSON, v);
+    }
+
+    pub fn bytes(&mut self, key: KeyRef<'_>, v: &[u8]) {
+        self.key(key);
+        self.buf.push(tag::BYTES);
+        self.buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+        self.buf.extend_from_slice(v);
     }
 
     /// Finish: u16 count header + fields.
@@ -630,6 +816,7 @@ fn read_field<'a>(
         tag::F64 => ValueRef::F64(c.f64()?),
         tag::STR => ValueRef::Str(c.str()?),
         tag::JSON => ValueRef::Json(c.str()?),
+        tag::BYTES => ValueRef::Bytes(c.bytes()?),
         other => return Err(WireError::BadTag(other)),
     };
     Ok((key, value))
@@ -973,16 +1160,19 @@ pub fn parse_list<T>(
 // Fixed out-structs.
 // ---------------------------------------------------------------------------
 
-/// `self_info` out-struct: 16 packed LE bytes
-/// { scope_kind: i32, scope_id: u32, generation: u64 }.
+/// `self_info` out-struct: 24 packed LE bytes
+/// { scope_kind: i32, scope_id: u32, generation: u64, role: u32, pad: u32 }.
+/// A guest built for the 16-byte form reads the first three fields and
+/// keeps working; a new guest on an old host reads role 0 = Both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SelfInfo {
     pub scope_kind: i32,
     pub scope_id: u32,
     pub generation: u64,
+    pub role: Role,
 }
 
-pub const SELF_INFO_LEN: usize = 16;
+pub const SELF_INFO_LEN: usize = 24;
 
 impl SelfInfo {
     pub fn to_bytes(self) -> [u8; SELF_INFO_LEN] {
@@ -990,16 +1180,21 @@ impl SelfInfo {
         out[0..4].copy_from_slice(&self.scope_kind.to_le_bytes());
         out[4..8].copy_from_slice(&self.scope_id.to_le_bytes());
         out[8..16].copy_from_slice(&self.generation.to_le_bytes());
+        out[16..20].copy_from_slice(&self.role.as_num().to_le_bytes());
         out
     }
 
     pub fn from_bytes(buf: &[u8]) -> Result<Self, WireError> {
         let mut c = Cursor::new(buf);
-        Ok(Self {
-            scope_kind: c.u32()? as i32,
-            scope_id: c.u32()?,
-            generation: c.u64()?,
-        })
+        let scope_kind = c.u32()? as i32;
+        let scope_id = c.u32()?;
+        let generation = c.u64()?;
+        let role = if c.remaining() >= 4 {
+            Role::from_num(c.u32()?)
+        } else {
+            Role::Both
+        };
+        Ok(Self { scope_kind, scope_id, generation, role })
     }
 }
 
@@ -1203,7 +1398,7 @@ mod tests {
 
     #[test]
     fn self_info_round_trip() {
-        let si = SelfInfo { scope_kind: KIND_PANE, scope_id: 12, generation: 9 };
+        let si = SelfInfo { scope_kind: KIND_PANE, scope_id: 12, generation: 9, role: Role::Provider };
         assert_eq!(SelfInfo::from_bytes(&si.to_bytes()), Ok(si));
     }
 

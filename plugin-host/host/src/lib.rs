@@ -7,6 +7,7 @@
 //! host/ directory whenever the FFI surface changes).
 
 mod abi;
+mod bridge;
 mod caps;
 mod dispatch;
 mod engine;
@@ -20,6 +21,7 @@ mod manifest;
 mod modes;
 mod registry;
 mod reload;
+mod services;
 mod sqlite;
 mod state;
 mod tokens;
@@ -153,6 +155,7 @@ pub extern "C" fn pgh_shutdown() {
 }
 
 /// Load (or replace) a plugin. `scope` may be NULL (defaults to server);
+/// `role` may be NULL (defaults to both) or "both", "view" or "provider";
 /// `caps` is an array of `ncaps` capability names; `opts` is an array of
 /// `nopts` config entries ("key=value", or a bare "key" meaning true).
 /// Compiles and validates the module synchronously (obvious errors are
@@ -168,6 +171,7 @@ pub unsafe extern "C" fn pgh_plugin_load(
     name: *const c_char,
     path: *const c_char,
     scope: *const c_char,
+    role: *const c_char,
     caps: *const *const c_char,
     ncaps: usize,
     opts: *const *const c_char,
@@ -188,6 +192,15 @@ pub unsafe extern "C" fn pgh_plugin_load(
             Some("pane") => tmux_plugin_abi::ScopeType::Pane,
             Some(other) => {
                 sink_str(err_sink, err_ctx, &format!("bad scope {other:?}"));
+                return -1;
+            }
+        };
+        let role = match cstr_lossy(role).as_deref() {
+            None | Some("both") => tmux_plugin_abi::Role::Both,
+            Some("view") => tmux_plugin_abi::Role::View,
+            Some("provider") => tmux_plugin_abi::Role::Provider,
+            Some(other) => {
+                sink_str(err_sink, err_ctx, &format!("bad role {other:?}"));
                 return -1;
             }
         };
@@ -217,6 +230,7 @@ pub unsafe extern "C" fn pgh_plugin_load(
             scope,
             config: serde_json::Value::Object(config),
             caps,
+            role,
         };
         match reload::upsert(desc) {
             Ok(outcome) => {
@@ -476,6 +490,50 @@ pub unsafe extern "C" fn pgh_mode_event(
             e.borrow_mut().deliveries.push_back(
                 state::Delivery::ModeEvent { mode_id, bytes },
             );
+        });
+    })
+}
+
+/// A bridge frame arrived from a peer: a `plugin-bridge` command from a
+/// control client (peer = client id) or a `%bridge` line on a remote link
+/// (peer = link id | PGH_PEER_LINK). The bytes are the decoded frame.
+///
+/// ENQUEUE ONLY, like pgh_notify. The C side should call
+/// plugin_schedule_drain() afterwards.
+///
+/// # Safety
+/// `bytes` must point at `len` readable bytes (copied before returning).
+#[no_mangle]
+pub unsafe extern "C" fn pgh_bridge_recv(peer: u32, bytes: *const u8, len: usize) {
+    ffi_guard!((), {
+        if bytes.is_null() {
+            return;
+        }
+        let bytes = std::slice::from_raw_parts(bytes, len).to_vec();
+        EVENTS.with(|e| {
+            e.borrow_mut()
+                .deliveries
+                .push_back(state::Delivery::BridgeFrame { peer, bytes });
+        });
+    })
+}
+
+/// A bridge peer came up (`up` != 0, `name` = the remote host for a link
+/// this server made; may be NULL) or went down. ENQUEUE ONLY. The C side
+/// should call plugin_schedule_drain() afterwards.
+///
+/// # Safety
+/// `name` NUL-terminated or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn pgh_bridge_state(peer: u32, name: *const c_char, up: c_int) {
+    ffi_guard!((), {
+        let name = cstr_lossy(name);
+        EVENTS.with(|e| {
+            e.borrow_mut().deliveries.push_back(state::Delivery::BridgeState {
+                peer,
+                name,
+                up: up != 0,
+            });
         });
     })
 }

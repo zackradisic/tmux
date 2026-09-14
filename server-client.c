@@ -517,8 +517,12 @@ server_client_lost(struct client *c)
 	if (c->name != NULL && (c->flags & (CLIENT_CONTROL|CLIENT_TERMINAL)))
 		events_fire_client("client-closed", c);
 
-	if (c->flags & CLIENT_CONTROL)
+	if (c->flags & CLIENT_CONTROL) {
+#ifdef ENABLE_PLUGINS
+		plugin_bridge_client_lost(c);
+#endif
 		control_stop(c);
+	}
 	if (c->flags & CLIENT_TERMINAL)
 		tty_free(&c->tty);
 	free(c->ttyname);

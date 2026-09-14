@@ -39,9 +39,9 @@ pub const FS_READ_ANY: u32 = 1 << 15;
 /// is a separate grant.
 pub const FS_WRITE_ANY: u32 = 1 << 16;
 /// The plugin's own SQLite database (`db_*` imports): one file,
-/// `store.db`, inside its data directory. Bit 17 is reserved for a
-/// future `db-read` (read-only access to other plugins' databases, named
-/// in a `[caps.db] read = [...]` sidecar list that mirrors `argv0`).
+/// `store.db`, inside its data directory. A future `db-read` (read-only
+/// access to other plugins' databases, named in a `[caps.db] read = [...]`
+/// sidecar list that mirrors `argv0`) would be its own bit.
 pub const DB: u32 = 1 << 17;
 /// Read environment variables from a pane's foreground process
 /// (`pane_env`). Restricted to the names on the `[caps.env-read] names`
@@ -54,9 +54,16 @@ pub const ENV_READ_ANY: u32 = 1 << 19;
 /// (`pane_fds`). Reveals which files a process holds open, so it is its
 /// own grant, separate from `env-read`.
 pub const PANE_FDS: u32 = 1 << 20;
+/// Call services other plugins register (`service_call`,
+/// `service_subscribe`), on this server or a linked one. The
+/// `[caps.services] call = ["agents@*"]` sidecar list narrows the targets.
+pub const SERVICE_CALL: u32 = 1 << 21;
+/// Register service methods and emit topics (`service_register`,
+/// `service_reply`, `service_emit`).
+pub const SERVICE_SERVE: u32 = 1 << 22;
 
 /// Highest bit used above, for `describe`.
-const CAP_BITS: u32 = 21;
+const CAP_BITS: u32 = 23;
 
 /// Granted to every plugin without being asked for.
 pub const DEFAULT_CAPS: u32 = READ_STATE | DISPLAY_MESSAGE | TIMERS;
@@ -84,6 +91,8 @@ pub fn cap_from_name(name: &str) -> Option<u32> {
         "env-read" => ENV_READ,
         "env-read-any" => ENV_READ_ANY,
         "pane-fds" => PANE_FDS,
+        "service-call" => SERVICE_CALL,
+        "service-serve" => SERVICE_SERVE,
         _ => return None,
     })
 }
@@ -111,6 +120,8 @@ pub fn cap_name(flag: u32) -> &'static str {
         ENV_READ => "env-read",
         ENV_READ_ANY => "env-read-any",
         PANE_FDS => "pane-fds",
+        SERVICE_CALL => "service-call",
+        SERVICE_SERVE => "service-serve",
         _ => "?",
     }
 }
@@ -129,11 +140,34 @@ pub struct EffectiveCaps {
     /// (empty = sandbox only, unless fs-read-any is granted). A middle
     /// ground: least privilege for a plugin that must read known dirs.
     pub fs_allow: Vec<String>,
+    /// Service targets `service_call`/`service_subscribe` may name, as
+    /// `plugin` or `plugin@server` patterns (`*` matches any server).
+    /// Empty = any target, if service-call is granted.
+    pub services_allow: Vec<String>,
 }
 
 impl EffectiveCaps {
     pub fn has(&self, flag: u32) -> bool {
         self.flags & flag != 0
+    }
+
+    /// May this plugin call `plugin@server`? An empty list allows every
+    /// target; a pattern is `plugin`, `plugin@server` or `plugin@*`.
+    pub fn service_target_allowed(&self, plugin: &str, server: &str) -> bool {
+        if self.services_allow.is_empty() {
+            return true;
+        }
+        self.services_allow.iter().any(|pat| {
+            let (p, s) = match pat.split_once('@') {
+                Some((p, s)) => (p, Some(s)),
+                None => (pat.as_str(), None),
+            };
+            (p == "*" || p == plugin)
+                && match s {
+                    None | Some("*") => true,
+                    Some(s) => s == server,
+                }
+        })
     }
 
     /// Human-readable list for show-plugins -v.
@@ -168,6 +202,12 @@ struct ManifestCapsFsRead {
 }
 
 #[derive(Debug, Deserialize, Default)]
+struct ManifestCapsServices {
+    #[serde(default)]
+    call: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
 struct ManifestCaps {
     #[serde(default)]
     requests: Vec<String>,
@@ -177,6 +217,8 @@ struct ManifestCaps {
     env_read: ManifestCapsEnvRead,
     #[serde(rename = "fs-read", default)]
     fs_read: ManifestCapsFsRead,
+    #[serde(default)]
+    services: ManifestCapsServices,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -217,6 +259,7 @@ pub fn compute(wasm_path: &Path, grants: &[String]) -> Result<EffectiveCaps, Str
             argv0_allow: Vec::new(),
             env_allow: Vec::new(),
             fs_allow: Vec::new(),
+            services_allow: Vec::new(),
         }),
         Some(m) => {
             let requested =
@@ -226,6 +269,7 @@ pub fn compute(wasm_path: &Path, grants: &[String]) -> Result<EffectiveCaps, Str
                 argv0_allow: m.caps.run_process.argv0,
                 env_allow: m.caps.env_read.names,
                 fs_allow: m.caps.fs_read.paths,
+                services_allow: m.caps.services.call,
             })
         }
     }

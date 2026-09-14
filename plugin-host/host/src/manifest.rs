@@ -22,7 +22,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
-use tmux_plugin_abi::{LoadDescriptor, ScopeType};
+use tmux_plugin_abi::{LoadDescriptor, Role, ScopeType};
 
 use crate::hostlog;
 use crate::reload;
@@ -38,6 +38,8 @@ struct ManifestEntry {
     path: String,
     #[serde(default)]
     scope: Option<ScopeType>,
+    #[serde(default)]
+    role: Option<Role>,
     #[serde(default)]
     caps: Vec<String>,
     #[serde(default)]
@@ -129,6 +131,7 @@ pub fn sync_manifest(path: &str) -> Result<String, String> {
                 .as_ref()
                 .map_or(serde_json::Value::Null, toml_to_json),
             caps: entry.caps.clone(),
+            role: entry.role.unwrap_or_default(),
         };
         match reload::upsert(desc) {
             Ok(outcome) => {

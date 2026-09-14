@@ -96,9 +96,11 @@ pub fn cancel(id: TaskId) {
 }
 
 /// Register interest in a host token before its completion can arrive.
+/// A slot that already holds a result (a streamed page that landed
+/// between two awaits on the same token) is kept.
 pub(crate) fn register_token(token: u64) {
     EXEC.with(|e| {
-        e.borrow_mut().waiting.insert(token, TokenSlot::default());
+        e.borrow_mut().waiting.entry(token).or_default();
     });
 }
 

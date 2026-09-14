@@ -212,6 +212,12 @@ cb_exit(__unused void *data, const char *reason)
 }
 
 static void
+cb_bridge(__unused void *data, const char *b64)
+{
+	printf("bridge [%s]\n", b64);
+}
+
+static void
 cb_unknown(__unused void *data, const char *line)
 {
 	printf("unknown [%s]\n", line);
@@ -236,6 +242,7 @@ static const struct remote_parse_callbacks callbacks = {
 	.pane_mode_changed = cb_pane_mode_changed,
 	.subscription_changed = cb_subscription_changed,
 	.exit = cb_exit,
+	.bridge = cb_bridge,
 	.unknown = cb_unknown,
 };
 

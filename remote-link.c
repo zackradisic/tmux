@@ -18,6 +18,8 @@
 
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <resolv.h>
 
 #include <ctype.h>
 #include <errno.h>
@@ -67,6 +69,12 @@
 /* Window index of the placeholder, out of the way of remote indices. */
 #define REMOTE_PLACEHOLDER_INDEX 999999
 
+/*
+ * Bit set in the plugin bridge peer id of a link, so the host can tell a
+ * link this server made from a control client that reached it. Must match
+ * PGH_PEER_LINK in plugin-host.h.
+ */
+#define REMOTE_LINK_PEER_BIT 0x80000000U
 
 struct remote_link;
 struct remote_request;
@@ -153,6 +161,7 @@ struct remote_link {
 	int			 want_disconnect;
 	int			 applying;	/* inside a remote notification */
 	int			 synced_once;
+	int			 bridge_unsupported; /* remote has no plugin-bridge */
 
 	TAILQ_ENTRY(remote_link) entry;
 };
@@ -1079,11 +1088,15 @@ remote_link_windows_cb(struct remote_link *rl, __unused struct remote_request *r
 	rl->state = REMOTE_UP;
 	rl->backoff = 0;
 	rl->synced_once = 1;
+	rl->bridge_unsupported = 0;
 	RB_FOREACH(rw, remote_windows, &rl->windows)
 		rw->sent_sx = rw->sent_sy = 0;
 	recalculate_sizes();
 	server_redraw_session(rl->s);
 	log_debug("%s: %s: up", __func__, rl->host);
+#ifdef ENABLE_PLUGINS
+	plugin_bridge_link_state(rl, 1);
+#endif
 }
 
 /* Reply to pause-after: an old remote cannot pause, carry on without it. */
@@ -1384,6 +1397,19 @@ remote_link_cb_subscription_changed(void *data, const char *name,
 		server_status_window(rp->wp->window);
 }
 
+/* %bridge: a plugin bridge frame from the remote host, base64. */
+static void
+remote_link_cb_bridge(void *data, const char *b64)
+{
+	struct remote_link	*rl = data;
+
+	if (rl->dying)
+		return;
+#ifdef ENABLE_PLUGINS
+	plugin_bridge_recv(rl->id | REMOTE_LINK_PEER_BIT, b64);
+#endif
+}
+
 static void
 remote_link_cb_exit(void *data, const char *reason)
 {
@@ -1420,6 +1446,7 @@ static const struct remote_parse_callbacks remote_link_callbacks = {
 	.pane_mode_changed = NULL,
 	.subscription_changed = remote_link_cb_subscription_changed,
 	.exit = remote_link_cb_exit,
+	.bridge = remote_link_cb_bridge,
 	.unknown = remote_link_cb_unknown,
 };
 
@@ -1469,8 +1496,13 @@ static void
 remote_link_down(struct remote_link *rl)
 {
 	struct remote_pane	*rp;
+	int			 was_up = (rl->state == REMOTE_UP);
 
 	rl->state = REMOTE_DOWN;
+#ifdef ENABLE_PLUGINS
+	if (was_up)
+		plugin_bridge_link_state(rl, 0);
+#endif
 	remote_parser_reset(rl->parser);
 	remote_link_fail_requests(rl, "remote link disconnected");
 	if (rl->dying)
@@ -1665,6 +1697,10 @@ remote_link_destroy(struct remote_link *rl)
 	struct job		*job;
 
 	log_debug("%s: %s", __func__, rl->host);
+#ifdef ENABLE_PLUGINS
+	if (rl->state == REMOTE_UP)
+		plugin_bridge_link_state(rl, 0);
+#endif
 	rl->dying = 1;
 	evtimer_del(&rl->retry_timer);
 	evtimer_del(&rl->defer_timer);
@@ -2053,3 +2089,46 @@ remote_link_forward(struct cmdq_item *item, struct cmd *cmd)
 	return (CMD_RETURN_WAIT);
 }
 
+/* Plugin bridge. */
+
+/* Reply to plugin-bridge: an old remote has no such command. */
+static void
+remote_link_bridge_cb(struct remote_link *rl, __unused struct remote_request *req,
+    int error, const char *body)
+{
+	if (error && !rl->bridge_unsupported) {
+		log_debug("%s: %s: no plugin bridge: %s", __func__, rl->host,
+		    body);
+		rl->bridge_unsupported = 1;
+	}
+}
+
+/*
+ * Send an opaque plugin bridge frame to the remote host as a control mode
+ * command. The remote decodes it and hands it to its plugin host. Returns
+ * -1 when the link is down or the remote has no bridge.
+ */
+int
+remote_link_bridge_send(struct remote_link *rl, const void *data, size_t len)
+{
+	char	*b64;
+	size_t	 b64len;
+	int	 n;
+
+	if (rl->state != REMOTE_UP || rl->bridge_unsupported)
+		return (-1);
+	b64len = 4 * ((len + 2) / 3) + 1;
+	b64 = xmalloc(b64len);
+	n = b64_ntop(data, len, b64, b64len);
+	if (n < 0) {
+		free(b64);
+		return (-1);
+	}
+	if (remote_link_send(rl, remote_link_bridge_cb, 0, NULL,
+	    "plugin-bridge %s", b64) == NULL) {
+		free(b64);
+		return (-1);
+	}
+	free(b64);
+	return (0);
+}

@@ -69,6 +69,12 @@ pub fn take(token: u64) -> Option<PendingToken> {
     TOKENS.with(|t| t.borrow_mut().map.remove(&token))
 }
 
+/// Look at a pending token without taking it (a streamed reply page
+/// keeps the token alive for the next page).
+pub fn peek(token: u64) -> Option<PendingToken> {
+    TOKENS.with(|t| t.borrow().map.get(&token).cloned())
+}
+
 /// Drop a token allocated for a request that failed to start.
 pub fn discard(token: u64) {
     TOKENS.with(|t| {

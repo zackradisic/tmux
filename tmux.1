@@ -5127,6 +5127,19 @@ Once reached, the sequence will be discarded.
 .It Ic message\-limit Ar number
 Set the number of error or information messages to save in the message log for
 each client.
+.It Ic plugin\-remote\-caps Ar capabilities
+A comma-separated list of the capabilities a plugin pushed by a linked
+server (see
+.Ic remote\-attach
+and the
+.Sx PLUGINS
+section) may get on this server.
+The default is every capability except
+.Ql run-process ,
+.Ql fs-write ,
+.Ql fs-read-any
+and
+.Ql fs-write-any .
 .It Ic prompt\-history\-limit Ar number
 Set the number of history items to save in the history file for each type of
 command prompt.
@@ -6842,10 +6855,41 @@ A plugin may ship a TOML manifest next to the
 file declaring the capabilities it needs; the effective set is the
 intersection of what the manifest requests and what the user grants.
 .Pp
+A plugin has two halves.
+The provider half sees one server: it reads processes and files there,
+keeps its store and answers calls from other plugins.
+The view half runs on the local server, merges what the providers report
+and owns the user interface.
+.Fl r
+picks what an instance runs:
+.Ql both
+(the default),
+.Ql view
+or
+.Ql provider .
+When
+.Ic remote-attach
+links a remote server, the local server pushes every plugin with role
+.Ql both
+or
+.Ql provider
+to it; the remote loads the plugin as a provider with the capabilities its
+.Ic plugin-remote-caps
+option allows.
+The two halves talk through services: methods and topics a plugin
+registers and other plugins, on this server or a linked one, call and
+follow.
+The
+.Ql service-serve
+and
+.Ql service-call
+capabilities gate them.
+.Pp
 The following commands are available:
 .Bl -tag -width Ds
 .It Xo Ic load-plugin
 .Op Fl n Ar name
+.Op Fl r Ar role
 .Op Fl s Ar scope
 .Op Fl c Ar capability
 .Op Fl o Ar key Ns = Ns Ar value
@@ -6856,6 +6900,13 @@ Load the plugin at
 .Fl n
 sets the plugin name (default: the file name without
 .Ql .wasm ) ,
+.Fl r
+the role (one of
+.Ql both ,
+.Ql view
+or
+.Ql provider ;
+see below),
 .Fl s
 the scope (one of
 .Ql server ,
@@ -6901,6 +6952,7 @@ table gives the plugin name and may set
 .Ql path
 (required; relative paths resolve against the manifest),
 .Ql scope ,
+.Ql role ,
 .Ql caps ,
 .Ql config
 and
@@ -6909,6 +6961,11 @@ Plugins loaded interactively with
 .Ic load-plugin
 are never unloaded by a sync.
 A manifest that fails to parse or validate changes nothing.
+.It Ic plugin-bridge Ar frame
+Carry one plugin bridge frame (base64) from a control mode client to the
+plugin host.
+.Ic remote-attach
+sends this on the link; it is not meant to be typed.
 .It Ic unload-plugin Ar name
 Unload a plugin and destroy its instances.
 Plugins loaded with

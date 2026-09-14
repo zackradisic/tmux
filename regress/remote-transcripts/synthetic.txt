@@ -48,6 +48,7 @@ no such command
 %begin 1700000005 6 1
 crlf line
 %end 1700000005 6 1
+%bridge UEdCMQMAAAAAAA==
 %nonsense-notification with args
 %begin 1700000006 7 1
 %exit reason given

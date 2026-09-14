@@ -190,6 +190,14 @@ pub unsafe extern "C" fn vt_panes_search(
     -1
 }
 
+pub unsafe extern "C" fn vt_bridge_send(
+    _peer: u32,
+    _d: *const u8,
+    _l: usize,
+) -> c_int {
+    -1
+}
+
 pub unsafe extern "C" fn vt_format_expand(
     _k: c_int,
     _i: u32,
@@ -228,6 +236,7 @@ pub fn base_vtable() -> pgh_host_vtable {
         mode_resize: vt_mode_resize,
         format_expand: vt_format_expand,
         panes_search: vt_panes_search,
+        bridge_send: vt_bridge_send,
     }
 }
 
@@ -240,16 +249,28 @@ pub unsafe extern "C" fn collect_sink(
     buf.extend_from_slice(std::slice::from_raw_parts(ptr as *const u8, len));
 }
 
-/// pgh_plugin_load with the argument-array signature.
+/// pgh_plugin_load with the argument-array signature (role: both).
 pub fn load_plugin(
     name: &str,
     path: &std::path::Path,
     scope: &str,
     caps: &[&str],
 ) -> (i32, String) {
+    load_plugin_role(name, path, scope, "both", caps)
+}
+
+/// pgh_plugin_load with an explicit role.
+pub fn load_plugin_role(
+    name: &str,
+    path: &std::path::Path,
+    scope: &str,
+    role: &str,
+    caps: &[&str],
+) -> (i32, String) {
     let name = CString::new(name).unwrap();
     let path = CString::new(path.to_str().unwrap()).unwrap();
     let scope = CString::new(scope).unwrap();
+    let role = CString::new(role).unwrap();
     let caps_c: Vec<CString> =
         caps.iter().map(|c| CString::new(*c).unwrap()).collect();
     let caps_ptrs: Vec<*const c_char> =
@@ -260,6 +281,7 @@ pub fn load_plugin(
             name.as_ptr(),
             path.as_ptr(),
             scope.as_ptr(),
+            role.as_ptr(),
             caps_ptrs.as_ptr(),
             caps_ptrs.len(),
             std::ptr::null(),

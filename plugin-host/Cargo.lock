@@ -1049,6 +1049,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "services_probe"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tmux-plugin-sdk",
+]
+
+[[package]]
 name = "session_creator"
 version = "0.1.0"
 dependencies = [

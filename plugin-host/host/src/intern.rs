@@ -38,6 +38,7 @@ fn is_implicit(name: &str) -> bool {
     name.ends_with("-created")
         || name.ends_with("-destroyed")
         || name == "session-closed"
+        || name.starts_with("service-")
 }
 
 /// Intern a name, returning its stable id (>= 1).

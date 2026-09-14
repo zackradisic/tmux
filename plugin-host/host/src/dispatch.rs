@@ -18,8 +18,8 @@
 use std::ffi::c_void;
 
 use tmux_plugin_abi::{
-    ErrorCode, SelfInfo, KIND_CLIENT, KIND_PANE, KIND_SERVER, KIND_SESSION,
-    KIND_WINDOW, MAX_MODE_WRITE_BYTES,
+    ErrorCode, Role, SelfInfo, KIND_CLIENT, KIND_PANE, KIND_SERVER,
+    KIND_SESSION, KIND_WINDOW, MAX_MODE_WRITE_BYTES,
 };
 
 use crate::abi::{collect_sink, err, out_sink, GuestMem, HostError};
@@ -294,7 +294,12 @@ pub fn self_info(mem: &mut GuestMem<'_, '_>, out: i32) -> Result<(), HostError> 
         ScopeId::Window(id) => (KIND_WINDOW, id),
         ScopeId::Pane(id) => (KIND_PANE, id),
     };
-    let info = SelfInfo { scope_kind, scope_id, generation: data.generation };
+    let info = SelfInfo {
+        scope_kind,
+        scope_id,
+        generation: data.generation,
+        role: data.role,
+    };
     mem.write_at(out, &info.to_bytes())
 }
 
@@ -625,6 +630,9 @@ pub fn mode_open(
     title_len: i32,
 ) -> Result<i64, HostError> {
     check_cap(mem, crate::caps::MODE)?;
+    if mem.data().role == Role::Provider {
+        return Err(err(ErrorCode::CapDenied, "provider role has no UI"));
+    }
     if width <= 0 || height <= 0 {
         return Err(err(ErrorCode::BadRequest, "zero mode size"));
     }
@@ -1486,4 +1494,127 @@ pub fn timer_start(mem: &mut GuestMem<'_, '_>, ms: i64) -> Result<i64, HostError
     let id = unsafe { (vt.timer_start)(ms as u64, token) };
     crate::tokens::set_timer_id(token, id);
     Ok(token as i64)
+}
+
+// ---------------------------------------------------------------------------
+// Services: plugin-to-plugin calls and topics, local or over a bridge
+// peer. The host copies payloads and never parses them; delivery is
+// queued (services.rs), never re-entrant.
+// ---------------------------------------------------------------------------
+
+fn owner_of_caller(mem: &GuestMem<'_, '_>) -> crate::services::Owner {
+    let data = mem.data();
+    crate::services::Owner {
+        plugin: data.plugin.clone(),
+        scope: data.scope,
+        generation: data.generation,
+    }
+}
+
+pub fn service_register(
+    mem: &mut GuestMem<'_, '_>,
+    method_ptr: i32,
+    method_len: i32,
+) -> Result<(), HostError> {
+    check_cap(mem, crate::caps::SERVICE_SERVE)?;
+    let method = mem.read_str(method_ptr, method_len)?;
+    let owner = owner_of_caller(mem);
+    crate::services::register(&owner, &method)
+}
+
+pub fn service_call(
+    mem: &mut GuestMem<'_, '_>,
+    target_ptr: i32,
+    target_len: i32,
+    method_ptr: i32,
+    method_len: i32,
+    payload_ptr: i32,
+    payload_len: i32,
+) -> Result<i64, HostError> {
+    check_cap(mem, crate::caps::SERVICE_CALL)?;
+    let target = mem.read_str(target_ptr, target_len)?;
+    let method = mem.read_str(method_ptr, method_len)?;
+    let (plugin, server) = crate::services::parse_target(&target)?;
+    if !mem.data().caps.service_target_allowed(&plugin, &server) {
+        return Err(err(
+            ErrorCode::CapDenied,
+            format!("service target {target:?} not in the services allowlist"),
+        ));
+    }
+    let payload = mem.read(payload_ptr, payload_len)?;
+    let owner = owner_of_caller(mem);
+    let token = alloc_token(mem);
+    if let Err(e) = crate::services::call(&owner, token, &plugin, &server, &method, payload) {
+        crate::tokens::discard(token);
+        return Err(e);
+    }
+    Ok(token as i64)
+}
+
+pub fn service_reply(
+    mem: &mut GuestMem<'_, '_>,
+    call: i64,
+    payload_ptr: i32,
+    payload_len: i32,
+    flags: i32,
+) -> Result<(), HostError> {
+    check_cap(mem, crate::caps::SERVICE_SERVE)?;
+    if call <= 0 {
+        return Err(err(ErrorCode::BadRequest, "bad call id"));
+    }
+    let payload = mem.read(payload_ptr, payload_len)?;
+    let owner = owner_of_caller(mem);
+    crate::services::reply(&owner, call as u64, payload, flags.max(0) as u32)
+}
+
+pub fn service_cancel(mem: &mut GuestMem<'_, '_>, token: i64) -> Result<(), HostError> {
+    check_cap(mem, crate::caps::SERVICE_CALL)?;
+    if token <= 0 {
+        return Err(err(ErrorCode::BadRequest, "bad token"));
+    }
+    let owner = owner_of_caller(mem);
+    crate::services::cancel(&owner, token as u64)
+}
+
+pub fn service_emit(
+    mem: &mut GuestMem<'_, '_>,
+    topic_ptr: i32,
+    topic_len: i32,
+    payload_ptr: i32,
+    payload_len: i32,
+) -> Result<(), HostError> {
+    check_cap(mem, crate::caps::SERVICE_SERVE)?;
+    let topic = mem.read_str(topic_ptr, topic_len)?;
+    let payload = mem.read(payload_ptr, payload_len)?;
+    let owner = owner_of_caller(mem);
+    crate::services::emit(&owner, &topic, payload)
+}
+
+pub fn service_subscribe(
+    mem: &mut GuestMem<'_, '_>,
+    target_ptr: i32,
+    target_len: i32,
+    topic_ptr: i32,
+    topic_len: i32,
+) -> Result<(), HostError> {
+    check_cap(mem, crate::caps::SERVICE_CALL)?;
+    let target = mem.read_str(target_ptr, target_len)?;
+    let topic = mem.read_str(topic_ptr, topic_len)?;
+    let (plugin, server) = crate::services::parse_target(&target)?;
+    if !mem.data().caps.service_target_allowed(&plugin, &server) {
+        return Err(err(
+            ErrorCode::CapDenied,
+            format!("service target {target:?} not in the services allowlist"),
+        ));
+    }
+    let owner = owner_of_caller(mem);
+    crate::services::subscribe(&owner, &plugin, &server, &topic)
+}
+
+/// The local server and every bridge peer, as a `u32 count` list of
+/// server records.
+pub fn servers(mem: &mut GuestMem<'_, '_>, owned_out: i32) -> Result<(), HostError> {
+    check_cap(mem, crate::caps::READ_STATE)?;
+    let buf = crate::bridge::servers_record();
+    mem.give_owned(&buf, owned_out)
 }

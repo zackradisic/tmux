@@ -20,6 +20,12 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+/**
+ * Bodies above this many bytes are compressed (level 3). Base64 on the
+ * wire costs a third; compression pays it back on anything that matters.
+ */
+#define COMPRESS_ABOVE 4096
+
 #define READ_STATE (1 << 0)
 
 #define WRITE_OPTIONS (1 << 1)
@@ -48,6 +54,65 @@
 
 #define MODE (1 << 13)
 
+#define FS_LIST (1 << 14)
+
+/**
+ * Lets fs_read and fs_list leave the sandbox: an absolute path means
+ * what it says, and `..` may walk out. Relative paths still resolve
+ * against the plugin's data directory, exactly as a process resolves
+ * against its cwd. This grants no power a plugin with `run-process`
+ * does not already have; it exists so a plugin can read a directory
+ * WITHOUT reaching for a shell.
+ */
+#define FS_READ_ANY (1 << 15)
+
+/**
+ * The same escape for fs_write. Strictly the more dangerous half, so it
+ * is a separate grant.
+ */
+#define FS_WRITE_ANY (1 << 16)
+
+/**
+ * The plugin's own SQLite database (`db_*` imports): one file,
+ * `store.db`, inside its data directory. A future `db-read` (read-only
+ * access to other plugins' databases, named in a `[caps.db] read = [...]`
+ * sidecar list that mirrors `argv0`) would be its own bit.
+ */
+#define DB (1 << 17)
+
+/**
+ * Read environment variables from a pane's foreground process
+ * (`pane_env`). Restricted to the names on the `[caps.env-read] names`
+ * allowlist, because a process environment routinely holds secrets.
+ */
+#define ENV_READ (1 << 18)
+
+/**
+ * The escape hatch: read ANY variable, ignoring the allowlist. A
+ * separate grant, like `fs-read-any`.
+ */
+#define ENV_READ_ANY (1 << 19)
+
+/**
+ * Read the open-file paths of a pane's foreground process
+ * (`pane_fds`). Reveals which files a process holds open, so it is its
+ * own grant, separate from `env-read`.
+ */
+#define PANE_FDS (1 << 20)
+
+/**
+ * Call services other plugins register (`service_call`,
+ * `service_subscribe`), on this server or a linked one. The
+ * `[caps.services] call = ["agents@*"]` sidecar list narrows the targets.
+ */
+#define SERVICE_CALL (1 << 21)
+
+/**
+ * Register service methods and emit topics (`service_register`,
+ * `service_reply`, `service_emit`).
+ */
+#define SERVICE_SERVE (1 << 22)
+
 /**
  * Granted to every plugin without being asked for.
  */
@@ -65,8 +130,17 @@
 
 /**
  * Hard budget per guest callback (trap), in ticks.
+ *
+ * Two seconds, not a few milliseconds. The cap does not police ordinary
+ * work: a correct callback finishes well inside the soft budget, and a
+ * legitimate burst - ranking ten thousand directory entries, say - must
+ * never die for taking 20 ms. The cap catches a runaway, and it exists
+ * only because a running callback blocks input, so the user cannot
+ * interrupt it the way C-g interrupts Elisp. Emacs, Vim and Neovim run
+ * plugin code on the UI thread with no budget at all. This is the same
+ * choice, with a backstop.
  */
-#define HARD_TICKS 8
+#define HARD_TICKS 2000
 
 /**
  * Log levels for `pgh_host_vtable.log`.
@@ -104,6 +178,17 @@
 
 #define PGH_ERR_CANCELLED 8
 
+#define PGH_ERR_UNREACHABLE 10
+
+#define PGH_ERR_TIMEOUT 11
+
+/**
+ * Bridge peer ids with this bit set are remote links this server made
+ * (`remote-attach`); the rest are control clients of this server that
+ * speak the bridge. The C side picks the transport by this bit.
+ */
+#define PGH_PEER_LINK (1 << 31)
+
 /**
  * Relation queries for `pgh_host_vtable.obj_relation` (scope checks).
  */
@@ -118,9 +203,45 @@
 #define PGH_REL_PANE_IN_SESSION 4
 
 /**
- * Consecutive failures before a plugin is disabled until explicit reload.
+ * `flags` wire values for [`do_rename`], renumbered so the wire form
+ * does not depend on libc. `RENAME_EXCHANGE` swaps two existing names
+ * atomically; plain replace is already atomic and is the right tool for
+ * the publish-a-temp-file pattern.
+ */
+#define RENAME_REPLACE 0
+
+#define RENAME_NOREPLACE 1
+
+#define RENAME_EXCHANGE 2
+
+/**
+ * `flags` bits for [`do_list`].
+ */
+#define LIST_MTIME (1 << 0)
+
+#define LIST_DIRS_ONLY (1 << 1)
+
+/**
+ * Failures within [`FAILURE_WINDOW`] before a plugin is disabled until an
+ * explicit reload. A window rather than a consecutive count: a trapped
+ * instance is restarted, and its init is a clean callback, so a plugin
+ * that traps on its first event would otherwise restart forever without
+ * ever reaching the limit.
  */
 #define MAX_FAILURES 3
+
+/**
+ * zstd level for ZSTD_REF parameters. Level 3 is the library default:
+ * several hundred MB/s and about a fifth of the size on terminal text.
+ */
+#define ZSTD_LEVEL 3
+
+/**
+ * Statement wall-clock caps, enforced by the progress handler.
+ */
+#define ASYNC_STATEMENT_MS 30000
+
+#define SYNC_STATEMENT_MS 500
 
 /**
  * Sink used wherever bytes cross the FFI from callee to caller: the
@@ -171,21 +292,30 @@ typedef struct {
    */
   int (*capture_pane)(uint32_t pane_id, int start, int end, int escapes, pgh_sink sink, void *ctx);
   /**
-   * Read one environment variable from a pane's foreground process as a
-   * string. 0 ok, -1 dead pane, -2 no such variable.
+   * Read one environment variable from a pane's foreground process as
+   * a string. 0 ok, -1 dead pane, -2 no such variable.
    */
   int (*pane_env)(uint32_t pane_id, const char *name, pgh_sink sink, void *ctx);
+  /**
+   * Emit the open-file paths of a pane's foreground process, one per
+   * line. 0 ok, -1 dead pane, -2 none.
+   */
   int (*pane_fds)(uint32_t pane_id, pgh_sink sink, void *ctx);
   /**
-   * Grep the grids of n_ids panes for a pattern. Soft-wrapped rows are
-   * joined so a wrapped match is found. Emits one match record per
-   * matching pane through the sink - {pane:u32, line:u32, col:u32,
-   * snip_len:u32, snip bytes}, all little-endian - and returns the match
-   * count (>=0), or -1 on error (e.g. an unsupported flag).
+   * Grep the grids of `n_ids` panes for `pattern`. Emits one match
+   * record per matching pane through the sink; returns the match count
+   * (>=0) or -1 on error.
    */
-  int (*panes_search)(const uint32_t *ids, uint32_t n_ids,
-      const char *pattern, uint32_t flags, uint32_t max_lines,
-      pgh_sink sink, void *ctx);
+  int (*panes_search)(const uint32_t *ids,
+                      uint32_t n_ids,
+                      const char *pattern,
+                      uint32_t flags,
+                      uint32_t max_lines,
+                      pgh_sink sink,
+                      void *ctx);
+  /**
+   * The pid of a pane's foreground process group, or -1 if dead.
+   */
   int (*pane_pid)(uint32_t pane_id);
   /**
    * Get an option value as a string (kind -1 = server/global scope).
@@ -282,6 +412,13 @@ typedef struct {
    * disabled. 0 ok, -1 dead/bad target.
    */
   int (*format_expand)(int kind, uint32_t id, const char *fmt, pgh_sink sink, void *ctx);
+  /**
+   * Send an opaque bridge frame to a peer (PGH_PEER_LINK bit: a remote
+   * link, sent as a `plugin-bridge` control mode command; else a
+   * control client, sent as a `%bridge` line). The bytes are copied
+   * before this returns. 0 ok, -1 no such peer or peer down.
+   */
+  int (*bridge_send)(uint32_t peer, const uint8_t *data, uintptr_t len);
 } pgh_host_vtable;
 
 #ifdef __cplusplus
@@ -307,6 +444,7 @@ void pgh_shutdown(void);
 
 /**
  * Load (or replace) a plugin. `scope` may be NULL (defaults to server);
+ * `role` may be NULL (defaults to both) or "both", "view" or "provider";
  * `caps` is an array of `ncaps` capability names; `opts` is an array of
  * `nopts` config entries ("key=value", or a bare "key" meaning true).
  * Compiles and validates the module synchronously (obvious errors are
@@ -321,6 +459,7 @@ void pgh_shutdown(void);
 int pgh_plugin_load(const char *name,
                     const char *path,
                     const char *scope,
+                    const char *role,
                     const char *const *caps,
                     uintptr_t ncaps,
                     const char *const *opts,
@@ -452,6 +591,29 @@ void pgh_async_complete(uint64_t token,
 void pgh_mode_event(uint64_t mode_id, const uint8_t *event, uintptr_t len);
 
 /**
+ * A bridge frame arrived from a peer: a `plugin-bridge` command from a
+ * control client (peer = client id) or a `%bridge` line on a remote link
+ * (peer = link id | PGH_PEER_LINK). The bytes are the decoded frame.
+ *
+ * ENQUEUE ONLY, like pgh_notify. The C side should call
+ * plugin_schedule_drain() afterwards.
+ *
+ * # Safety
+ * `bytes` must point at `len` readable bytes (copied before returning).
+ */
+void pgh_bridge_recv(uint32_t peer, const uint8_t *bytes, uintptr_t len);
+
+/**
+ * A bridge peer came up (`up` != 0, `name` = the remote host for a link
+ * this server made; may be NULL) or went down. ENQUEUE ONLY. The C side
+ * should call plugin_schedule_drain() afterwards.
+ *
+ * # Safety
+ * `name` NUL-terminated or NULL.
+ */
+void pgh_bridge_state(uint32_t peer, const char *name, int up);
+
+/**
  * Run queued plugin work for at most `max_us` microseconds of wall clock
  * (0 = default budget). Returns the number of deliveries still queued;
  * when nonzero the C side re-schedules via its zero-timeout evtimer so the
@@ -462,16 +624,17 @@ void pgh_mode_event(uint64_t mode_id, const uint8_t *event, uintptr_t len);
 uint32_t pgh_drain(uint32_t max_us);
 
 /**
- * The fs worker's pollable doorbell fd (created on first call). The C
- * side registers a persistent read event on it whose callback calls
+ * The worker pool's pollable doorbell fd (created on first call). The
+ * C side registers a persistent read event on it whose callback calls
  * pgh_fs_drain() then plugin_schedule_drain(). Returns -1 on failure.
+ * The name predates the pool: it carries db completions too.
  */
 int pgh_fs_notify_fd(void);
 
 /**
- * Move finished fs completions onto the plugin delivery queue (they are
- * delivered to guests at the next pgh_drain). Main thread only; called
- * from the doorbell event callback.
+ * Move finished worker completions (fs and db) onto the plugin delivery
+ * queue (they are delivered to guests at the next pgh_drain). Main
+ * thread only; called from the doorbell event callback.
  */
 void pgh_fs_drain(void);
 

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use slab::Slab;
-use tmux_plugin_abi::{LoadDescriptor, ScopeType};
+use tmux_plugin_abi::{LoadDescriptor, Role, ScopeType};
 use wasmtime::Module;
 
 use crate::abi::{self, Guest};
@@ -64,6 +64,8 @@ pub struct PluginDef {
     pub path: PathBuf,
     pub hash: blake3::Hash,
     pub scope_type: ScopeType,
+    /// Which half of the plugin its instances run (see abi-types Role).
+    pub role: Role,
     pub config: Value,
     pub caps: crate::caps::EffectiveCaps,
     pub state: PluginState,
@@ -74,6 +76,9 @@ pub struct PluginDef {
     /// no longer names it. Interactive load-plugin definitions are
     /// unmanaged.
     pub managed: bool,
+    /// The bridge peer that pushed this plugin, if any. Pushed plugins are
+    /// unloaded when their peer stays down past the grace period.
+    pub pushed_by: Option<u32>,
 }
 
 pub struct Instance {
@@ -180,16 +185,21 @@ impl Registry {
                 path: PathBuf::from(&desc.path),
                 hash,
                 scope_type: desc.scope,
+                role: desc.role,
                 config: desc.config,
                 caps,
                 state: PluginState::Running,
                 failures: Vec::new(),
                 managed: false,
+                pushed_by: None,
             },
         );
         hostlog::info(
             &desc.name,
-            &format!("loaded ({}, scope {})", desc.path, desc.scope),
+            &format!(
+                "loaded ({}, scope {}, role {})",
+                desc.path, desc.scope, desc.role
+            ),
         );
         Ok(())
     }
@@ -304,13 +314,15 @@ impl Registry {
                 .count();
             let _ = writeln!(
                 out,
-                "{}: scope {}, {}, {} instance{}, {}path {}",
+                "{}: scope {}, role {}, {}, {} instance{}, {}{}path {}",
                 def.name,
                 def.scope_type,
+                def.role,
                 state,
                 ninstances,
                 if ninstances == 1 { "" } else { "s" },
                 if def.managed { "managed, " } else { "" },
+                if def.pushed_by.is_some() { "pushed, " } else { "" },
                 def.path.display()
             );
             if verbose {

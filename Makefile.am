@@ -265,7 +265,9 @@ PLUGIN_HOST_LIB =
 if ENABLE_PLUGINS
 dist_tmux_SOURCES += \
 	cmd-plugin.c \
+	cmd-plugin-bridge.c \
 	plugin-async.c \
+	plugin-bridge.c \
 	plugin-buf.c \
 	plugin-events.c \
 	plugin-internal.h \
