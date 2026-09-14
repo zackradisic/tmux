@@ -39,7 +39,7 @@ const struct cmd_entry cmd_resize_window_entry = {
 
 	.target = { 't', CMD_FIND_WINDOW, 0 },
 
-	.flags = CMD_AFTERHOOK,
+	.flags = CMD_AFTERHOOK|CMD_REMOTE,
 	.exec = cmd_resize_window_exec
 };
 

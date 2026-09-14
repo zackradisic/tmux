@@ -1,0 +1,66 @@
+begin 1789355762 316 0
+session-changed $0 [work]
+end 1789355762 316 0 []
+begin 1789355762 319 1
+end 1789355762 319 1 [ready]
+begin 1789355762 320 1
+end 1789355762 320 1 [%0: 80x24]
+begin 1789355762 321 1
+error 1789355762 321 1 [parse error: unknown command: this-is-not-a-command]
+begin 1789355763 322 1
+window-renamed @0 [name with spaces]
+end 1789355763 322 1 []
+begin 1789355763 324 1
+session-renamed $0 [w s]
+end 1789355763 324 1 []
+begin 1789355764 326 1
+end 1789355764 326 1 []
+output %0 ext=0 age=0 len=25 [printf "a\\\\\\\\b\\\\tc\\\\r\\\\n"]
+begin 1789355764 328 1
+end 1789355764 328 1 []
+output %0 ext=0 age=0 len=11 [\x0d\x0a\x1b[?2004l\x0d]
+output %0 ext=0 age=0 len=16 [a\\b\x09c\x0d\x0d\x0a\x1b]133;A\x07]
+output %0 ext=0 age=0 len=8 [\x1b[?2004h]
+output %0 ext=0 age=0 len=50 [\x1b[01;32mzack@ns5033247\x1b[00m:\x1b[01;34m~/tmux2\x1b[00m$ ]
+begin 1789355765 334 1
+window-pane-changed @0 %1
+layout-change @0 [c195,80x24,0,0[80x12,0,0,0,80x11,0,13,1]] [c195,80x24,0,0[80x12,0,0,0,80x11,0,13,1]] [*]
+  stripped [c195,80x24,0,0[80x12,0,0,0,80x11,0,13,1]] leaves %0 %1
+end 1789355765 334 1 []
+output %0 ext=0 age=0 len=55 [\x0d\x1b[K\x0d\x1b[01;32mzack@ns5033247\x1b[00m:\x1b[01;34m~/tmux2\x1b[00m$ ]
+output %1 ext=0 age=0 len=8 [\x1b]133;A\x07]
+output %1 ext=0 age=0 len=58 [\x1b[?2004h\x1b[01;32mzack@ns5033247\x1b[00m:\x1b[01;34m~/tmux2\x1b[00m$ ]
+layout-change @0 [2c88,80x24,0,0[80x12,0,0,0,80x11,0,13,1,18x3,3,3,2]<18x3,3,3,2>] [2c88,80x24,0,0[80x12,0,0,0,80x11,0,13,1,18x3,3,3,2]<18x3,3,3,2>] [*]
+  stripped [c195,80x24,0,0[80x12,0,0,0,80x11,0,13,1]] leaves %0 %1
+begin 1789355766 343 1
+end 1789355766 343 1 [2c88,80x24,0,0[80x12,0,0,0,80x11,0,13,1,18x3,3,3,2]<18x3,3,3,2>]
+begin 1789355766 344 1
+session-window-changed $0 @1
+window-add @1
+end 1789355766 344 1 []
+output %3 ext=0 age=0 len=8 [\x1b]133;A\x07]
+output %3 ext=0 age=0 len=58 [\x1b[?2004h\x1b[01;32mzack@ns5033247\x1b[00m:\x1b[01;34m~/tmux2\x1b[00m$ ]
+begin 1789355767 348 1
+session-window-changed $0 @0
+end 1789355767 348 1 []
+begin 1789355767 350 1
+end 1789355767 350 1 []
+begin 1789355767 351 1
+end 1789355767 351 1 []
+begin 1789355768 352 1
+end 1789355768 352 1 []
+output %0 ext=1 age=0 len=8 [echo ext]
+begin 1789355768 354 1
+end 1789355768 354 1 []
+output %0 ext=1 age=0 len=2 [\x0d\x0a]
+output %0 ext=1 age=0 len=14 [\x1b[?2004l\x0dext\x0d\x0a]
+output %0 ext=1 age=0 len=16 [\x1b]133;A\x07\x1b[?2004h]
+output %0 ext=1 age=0 len=50 [\x1b[01;32mzack@ns5033247\x1b[00m:\x1b[01;34m~/tmux2\x1b[00m$ ]
+subscription-changed rl_cmd $0 0 0 0 [bash]
+subscription-changed rl_cmd $0 0 0 1 [bash]
+subscription-changed rl_cmd $0 0 0 2 [sleep]
+subscription-changed rl_cmd $0 1 1 3 [bash]
+begin 1789355769 360 1
+end 1789355769 360 1 []
+exit []
+in-block 0

@@ -1,0 +1,51 @@
+unknown [Welcome banner from ssh before tmux starts]
+begin 1700000000 1 0
+session-changed $3 [dev]
+end 1700000000 1 0 []
+begin 1700000001 2 1
+end 1700000001 2 1 []
+output %5 ext=0 age=0 len=10 [plain text]
+output %5 ext=0 age=0 len=41 [tab\x09nl\x0acr\x0desc\x1b[31mred\x1b[0m bs\\ hi\xc2\xa0 lone\\x]
+output %7 ext=0 age=0 len=0 []
+output %5 ext=1 age=1234 len=8 [with age]
+output %5 ext=1 age=0 len=0 []
+pause %5
+continue %5
+layout-change @2 [e4e6,80x24,0,0{40x24,0,0,5,39x24,41,0,7}<20x5,2,2,9>] [e4e6,80x24,0,0{40x24,0,0,5,39x24,41,0,7}<20x5,2,2,9>] [*Z]
+  stripped [821c,80x24,0,0{40x24,0,0,5,39x24,41,0,7}] leaves %5 %7
+layout-change @3 [b25d,80x24,0,0,0] [b25d,80x24,0,0,0] []
+  stripped [b25d,80x24,0,0,0] leaves %0
+layout-change @4 [d1e7,160x48,0,0[160x23,0,0,1,160x24,0,24{80x24,0,24,2,79x24,81,24,3}]] [d1e7,160x48,0,0[160x23,0,0,1,160x24,0,24{80x24,0,24,2,79x24,81,24,3}]] [-]
+  stripped [2cbd,160x48,0,0[160x23,0,0,1,160x24,0,24{80x24,0,24,2,79x24,81,24,3}]] leaves %1 %2 %3
+layout-change @9 [0000,80x24,0,0{18x3,3,3,9,40x24,0,0,5,39x24,41,0,7}<18x3,3,3,9>] [0000,80x24,0,0{40x24,0,0,5,39x24,41,0,7}] [-]
+  stripped [821c,80x24,0,0{40x24,0,0,5,39x24,41,0,7}] leaves %5 %7
+layout-change @9 [0000,80x24,0,0[80x12,0,0,0,80x11,0,13,1,18x3,3,3,2,10x2,1,1,3]<18x3,3,3,2,10x2,1,1,3>] [x] [x]
+  stripped [c195,80x24,0,0[80x12,0,0,0,80x11,0,13,1]] leaves %0 %1
+window-add @6
+window-close @6
+window-renamed @2 [two  words   here]
+window-pane-changed @2 %7
+session-renamed $3 [renamed session]
+sessions-changed
+session-window-changed $3 @2
+pane-mode-changed %5
+subscription-changed rl_cmd $3 2 1 5 [vim]
+subscription-changed sw $3 -1 -1 -1 [2]
+subscription-changed cw $3 2 1 -1 [@2:1]
+subscription-changed empty $3 2 1 5 []
+begin 1700000002 3 1
+end 1700000002 3 1 [%5: [80x24] body line that starts with a percent\n%end 1700000009 4 1]
+begin 1700000003 4 1
+window-add @8
+layout-change @8 [b25e,80x24,0,0,1] [b25e,80x24,0,0,1] []
+  stripped [b25e,80x24,0,0,1] leaves %1
+end 1700000003 4 1 [inside body]
+begin 1700000004 5 1
+error 1700000004 5 1 [no such command]
+begin 1700000005 6 1
+end 1700000005 6 1 [crlf line]
+unknown [%nonsense-notification with args]
+begin 1700000006 7 1
+exit [reason given]
+exit []
+in-block 1

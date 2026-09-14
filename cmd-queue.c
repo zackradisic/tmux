@@ -619,7 +619,17 @@ cmdq_fire_command(struct cmdq_item *item)
 	if (retval == CMD_RETURN_ERROR)
 		goto out;
 
-	retval = entry->exec(cmd, item);
+	/*
+	 * A structural command on a shadow object runs on the remote server
+	 * that owns it; the reply block becomes this command's output.
+	 */
+	if ((entry->flags & CMD_REMOTE) &&
+	    (remote_link_target(&item->target, &entry->target) != NULL ||
+	    (entry->source.flag != 0 &&
+	    remote_link_target(&item->source, &entry->source) != NULL)))
+		retval = remote_link_forward(item, cmd);
+	else
+		retval = entry->exec(cmd, item);
 	if (retval == CMD_RETURN_ERROR)
 		goto out;
 

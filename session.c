@@ -207,6 +207,8 @@ session_destroy(struct session *s, int notify, const char *from)
 	RB_REMOVE(sessions, &sessions, s);
 	if (notify)
 		events_fire_session("session-closed", s);
+	if (s->remote != NULL)
+		remote_link_session_destroyed(s);
 #ifdef ENABLE_PLUGINS
 	/* Authoritative death signal, regardless of the notify flag. */
 	plugin_object_destroyed(PLUGIN_OBJ_SESSION, s->id);
@@ -521,6 +523,8 @@ session_set_current(struct session *s, struct winlink *wl)
 	window_update_activity(wl->window);
 	tty_update_window_offset(wl->window);
 	session_fire_window_changed(s, wl, old);
+	if (s->remote != NULL)
+		remote_link_window_focus(wl);
 	return (0);
 }
 

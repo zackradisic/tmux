@@ -40,7 +40,7 @@ const struct cmd_entry cmd_respawn_window_entry = {
 
 	.target = { 't', CMD_FIND_WINDOW, 0 },
 
-	.flags = 0,
+	.flags = CMD_REMOTE,
 	.exec = cmd_respawn_window_exec
 };
 

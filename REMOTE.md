@@ -1,18 +1,29 @@
 # Remote sessions, windows and panes over ssh
 
-This is a design for remote objects in tmux2. The local server shows a
+This is the design for remote objects in tmux2. The local server shows a
 session, window or pane that lives on another machine. The user stays in the
 local tmux. Keys, resizes and structural commands go to the remote. Output
-comes back and renders in a local grid. Nothing here is built yet.
+comes back and renders in a local grid.
 
-Proposed use:
+Status: phase 1 (remote sessions) is built. `remote-attach` mirrors one
+remote session as `host/session`, with output, keys, resize, command
+forwarding, reconnect, the format cache and server restart. The files are
+`remote-parse.c` (the control mode line parser), `remote-link.c` (the link)
+and `cmd-remote-attach.c`. The tests are `regress/remote-*.sh`.
+
+Use:
 
 ```
-$ tmux remote-attach host              # mirror every session on host
-$ tmux remote-attach -t work host      # mirror one session as "host:work"
-$ tmux new-session -H host -s deploy   # create a session on host and mirror it
-$ tmux new-window -H host              # a remote window in a local session
+$ tmux remote-attach host              # mirror the current session on host
+$ tmux remote-attach -t work host      # mirror one session as "host/work"
+$ tmux remote-attach -k host           # drop the link(s) to host
 ```
+
+Not built yet: `new-session -H host`, `new-window -H host`, remote panes
+inside local windows, mouse forwarding, remote floating panes.
+
+The local name is `host/session`, not `host:session`: tmux forbids `:` and
+`.` in session names, and `:` separates the window part of a target.
 
 ## Why the client protocol does not help
 
@@ -53,8 +64,30 @@ The local side already has the matching parts:
 - `window_pane_key()` and `window_pane_paste()` write keys to `wp->event`,
   so key input already flows through the pane descriptor.
 
-Any tmux with control mode works on the remote. Version 3.2 or later gives
-`%pause`. Floating panes and plugin modes on the remote need tmux2.
+Any tmux with control mode works on the remote. Version 3.3 or later gives
+`pause-after` and `refresh-client -C`, both of which the link needs.
+Floating panes and plugin modes on the remote need tmux2.
+
+Facts about the protocol that shaped the parser (`remote-parse.c`):
+
+- Events fire synchronously on the remote, so a notification such as
+  `%window-add` or `%layout-change` can land inside the `%begin`/`%end`
+  block of the command that caused it. The parser dispatches known
+  notification lines wherever they appear and keeps every other line as
+  body (`list-panes -F '#{pane_id}: ...'` prints body lines that start with
+  `%`).
+- The `flags` field of `%begin` is 1 for a command the control client sent
+  and 0 for everything else (the initial `attach-session`, hooks). The link
+  matches reply blocks to its request queue by that flag, so it needs no
+  guesswork about unsolicited replies.
+- `spawn_pane()` makes a new pane active before it reports the layout, so
+  `%window-pane-changed` for a new pane arrives before the `%layout-change`
+  that creates it. The link keeps the wanted pane and applies it after the
+  layout.
+- `#{window_layout}` from tmux2 lists a floating pane's cell inline in the
+  tiled tree *and* in the `<...>` part. `layout_parse()` rejects both, so
+  the link cuts the `<...>` part and every inline leaf whose id it names,
+  then recomputes the checksum.
 
 ## Architecture
 
@@ -63,7 +96,7 @@ A new module `remote-link.c` owns one `struct remote_link` per ssh connection.
 ```
  local server                                   remote host
  ------------                                   -----------
- shadow session "host:work"
+ shadow session "host/work"
    shadow window  <-- %layout-change ---------- window
      shadow pane                                 pane
        wp->fd = socketpair[0]                      pty + shell
@@ -73,7 +106,7 @@ A new module `remote-link.c` owns one `struct remote_link` per ssh connection.
        remote_link
          socketpair[1] per pane
          parser for %-lines
-         job: ssh host tmux -CC attach -t work
+         job: ssh host tmux -C attach -t work
               stdout --> %output, %layout-change, ...
               stdin  <-- send-keys -H, resize-window, split-window, ...
 ```
@@ -81,7 +114,13 @@ A new module `remote-link.c` owns one `struct remote_link` per ssh connection.
 ### Shadow objects
 
 A shadow object is a real `struct session`, `struct window` or
-`struct window_pane`. It carries a pointer to its link and the remote id:
+`struct window_pane`. It carries a pointer to its link and the remote id.
+A shadow window keeps the remote window's index and name. The pane inventory
+comes from the layout string: each leaf cell carries the pane id, in the order
+`layout_parse()` assigns cells to the window's pane list, so the link orders
+the panes like the leaves before every parse. A local floating pane over a
+shadow window (a popup or a plugin mode) is taken out of the list for the
+parse and given back its cell afterwards.
 
 ```c
 struct remote_ref {
@@ -113,10 +152,12 @@ encoded mouse sequence as bytes when the remote pane has mouse mode on.
 
 ### Resize
 
-`window_pane_send_resize()` in `window.c` does `TIOCSWINSZ` on `wp->fd`. That
-fails on a socket. The function gets one check: if the pane is remote, it
-calls `remote_link_resize()` instead, which sends `resize-window -t @n -x -y`.
-This is the only hook in the pane code path.
+`window_pane_send_resize()` in `window.c` does `TIOCSWINSZ` on `wp->fd`, and
+calls `fatal()` when the ioctl fails. A shadow pane returns before the ioctl.
+Window sizing funnels through `resize_window()` in `resize.c`; for a shadow
+window it sends `refresh-client -C @n:WxH` to the remote instead, and the
+remote answers with `%layout-change`, which resizes the local window. The
+link sends one size per window and repeats it only when it changes.
 
 ## Command routing
 
@@ -146,13 +187,20 @@ reconnect restores it.
 
 The sessions live on the remote. The local objects are a view.
 
-1. The ssh job exits. The link marks every shadow pane `PANE_EXITED`, keeps
-   the grids, and shows `[remote: host disconnected]` in the pane border.
-2. The link retries with backoff. On success it runs `list-sessions`,
-   `list-windows -a` and `list-panes -a` with `-F` and reconciles the tree.
-3. For each pane it runs `capture-pane -p -e -J -S -` and feeds the result
-   through the local parser. This refills the grid and the scrollback.
+1. The ssh job exits. The link keeps every shadow pane, its grid and its
+   socketpair (closing the socketpair end would destroy the pane), and
+   writes `[remote: host disconnected]` into each pane.
+2. The link retries with backoff (1, 2, 4 .. 60 s). On success it runs
+   `list-windows -F` and reconciles the tree: new windows are built, gone
+   windows killed, the rest get the `%layout-change` treatment.
+3. For each pane it runs `capture-pane -p -e -J -S -` followed by a cursor
+   query, clears the grid and writes the result through the local parser.
+   Output for the pane is dropped until the cursor reply, which is exact
+   because the remote emits blocks in order.
 4. It subscribes to the formats it caches (see below) and resumes output.
+
+`%pause` gets the same treatment: `refresh-client -A %n:continue` followed by
+a capture, so a pane that fell behind snaps to the current remote grid.
 
 The local scrollback depth after reconnect is what `capture-pane` returned.
 
@@ -212,6 +260,11 @@ These host calls inspect a local process or the local filesystem:
 | session_creator | needs a host target for `new-session` |
 | cron, ticker, hello-raw | no effect |
 
+### Plugin records
+
+`PaneInfo` carries `remote: bool` and `host: String` (flag bit 8 in the
+record). `cwd` for a remote pane is the remote's cached current path.
+
 ### Two plugin runtimes
 
 If the remote runs tmux2 with plugins, its plugins run there. A remote mode
@@ -223,9 +276,11 @@ locally only. The remote runs plain tmux, or tmux2 with no UI plugins.
 ## Server restart
 
 `restart-server` (`SERVER-RESTART.md`) can adopt the socketpair through
-`adopt_fd`, but not the ssh job or the parser state. The simple path: the
-handoff records `host` and `session` per shadow session, drops the links,
-and the new server reconnects. The grids refill from `capture-pane`.
+`adopt_fd`, but not the ssh job or the parser state. The handoff writes a
+`remote host session id` record per shadow session and skips its windows
+and panes; the new server makes the link again with the same session id,
+so a client that reattaches to `$id` lands on the shadow session while it
+syncs. Window and pane ids are new after a restart.
 
 ## Scope and phases
 
@@ -234,8 +289,8 @@ remote window. A remote pane inside a local window is the hard case. It
 breaks the rule that the remote owns the layout, and it needs a per-pane byte
 forwarder on the remote with no persistence.
 
-1. Remote sessions. `remote-attach host` mirrors sessions as `host:name`.
-   Output, keys, resize, reconnect, the format cache.
+1. Remote sessions. `remote-attach host` mirrors a session as `host/name`.
+   Output, keys, resize, reconnect, the format cache. Built.
 2. Remote windows. `new-window -H host` links a remote window into a local
    session. The remote holds it in a hidden session.
 3. Command forwarding for the full table above. Mouse forwarding.
@@ -252,9 +307,9 @@ forwarder on the remote with no persistence.
   local. They vanish on reconnect unless the link stores them.
 - Clipboard. `set-clipboard` OSC 52 from the remote arrives as bytes and
   works. Remote `paste-buffer` needs the local buffer sent with `load-buffer`.
-- The ssh command. Take it from an option, `remote-ssh-command`, default
-  `ssh -T %h tmux -CC attach -t %s`. Multiplex with `ControlMaster` so a
-  second link to the same host is cheap.
+- The ssh command comes from the `remote-ssh-command` server option, a
+  format with `remote_host` and `remote_session`. Multiplex with
+  `ControlMaster` so a second link to the same host is cheap.
 
 ## Work items
 

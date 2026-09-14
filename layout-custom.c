@@ -24,7 +24,6 @@
 #include "tmux.h"
 
 static struct layout_cell	*layout_find_bottomright(struct layout_cell *);
-static u_short			 layout_checksum(const char *);
 static int			 layout_append(struct layout_cell *, char *,
 				     size_t, int);
 static int			 layout_construct(struct layout_cell *,
@@ -43,7 +42,7 @@ layout_find_bottomright(struct layout_cell *lc)
 }
 
 /* Calculate layout checksum. */
-static u_short
+u_short
 layout_checksum(const char *layout)
 {
 	u_short	csum;

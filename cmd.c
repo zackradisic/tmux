@@ -81,6 +81,7 @@ extern const struct cmd_entry cmd_pipe_pane_entry;
 extern const struct cmd_entry cmd_previous_layout_entry;
 extern const struct cmd_entry cmd_previous_window_entry;
 extern const struct cmd_entry cmd_refresh_client_entry;
+extern const struct cmd_entry cmd_remote_attach_entry;
 extern const struct cmd_entry cmd_rename_session_entry;
 extern const struct cmd_entry cmd_rename_window_entry;
 extern const struct cmd_entry cmd_resize_pane_entry;
@@ -201,6 +202,7 @@ const struct cmd_entry *cmd_table[] = {
 	&cmd_previous_layout_entry,
 	&cmd_previous_window_entry,
 	&cmd_refresh_client_entry,
+	&cmd_remote_attach_entry,
 #ifdef ENABLE_PLUGINS
 	&cmd_reload_plugin_entry,
 #endif

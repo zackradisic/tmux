@@ -1273,11 +1273,23 @@ struct visible_ranges {
 	u_int			 size;    /* allocated capacity of ranges */
 };
 
+/*
+ * Link to a remote object. A shadow session, window or pane mirrors an object
+ * on another server; remote_id is its id ($n, @n or %n) on that server.
+ */
+struct remote_link;
+struct remote_ref {
+	struct remote_link	*link;
+	u_int			 remote_id;
+};
+
 /* Child window structure. */
 struct window_pane {
 	u_int		 id;
 	int		 references;
 	u_int		 active_point;
+
+	struct remote_ref *remote;	/* NULL for a local pane */
 
 	struct window	*window;
 	struct options	*options;
@@ -1312,6 +1324,7 @@ struct window_pane {
 #define PANE_CMDRUNNING 0x20000
 #define PANE_ACTIVITY 0x40000
 #define PANE_NORESIZETRIM 0x80000
+#define PANE_REMOTE 0x100000
 
 	bitstr_t	*sync_dirty;
 	u_int		 sync_dirty_size;
@@ -1407,6 +1420,7 @@ RB_HEAD(window_pane_tree, window_pane);
 struct window {
 	u_int			 id;
 	void			*latest;
+	struct remote_ref	*remote;	/* NULL for a local window */
 
 	char			*name;
 	struct event		 name_event;
@@ -1586,6 +1600,7 @@ RB_HEAD(session_groups, session_group);
 
 struct session {
 	u_int		 id;
+	struct remote_ref *remote;	/* NULL for a local session */
 
 	char		*name;
 	const char	*cwd;
@@ -2033,6 +2048,7 @@ struct cmd_entry {
 #define CMD_CLIENT_CFLAG 0x8
 #define CMD_CLIENT_TFLAG 0x10
 #define CMD_CLIENT_CANFAIL 0x20
+#define CMD_REMOTE 0x40
 	int		 flags;
 
 	enum cmd_retval	 (*exec)(struct cmd *, struct cmdq_item *);
@@ -3893,6 +3909,7 @@ struct layout_cell *layout_split_pane(struct window_pane *, enum layout_type,
 struct layout_cell *layout_floating_pane(struct window *, struct window_pane *,
 		     struct layout_geometry *);
 void		 layout_close_pane(struct window_pane *);
+void		 layout_by_splitting(struct window *);
 int		 layout_spread_cell(struct window *, struct layout_cell *);
 void		 layout_spread_out(struct window_pane *);
 struct layout_cell *layout_get_tiled_cell(struct cmdq_item *, struct args *,
@@ -3910,6 +3927,7 @@ int		 layout_remove_tile(struct window *, struct layout_cell *);
 int		 layout_insert_tile(struct window *, struct layout_cell *);
 
 /* layout-custom.c */
+u_short		 layout_checksum(const char *);
 char		*layout_dump(struct window *, struct layout_cell *);
 char		*layout_dump_part(struct window *, struct layout_cell *, int);
 int		 layout_parse(struct window *, const char *, char **);
@@ -4053,6 +4071,69 @@ void	control_remove_sub(struct client *, const char *);
 
 /* control-notify.c */
 void	control_build_events(void);
+
+/* remote-parse.c */
+struct remote_parser;
+struct remote_parse_callbacks {
+	void	(*begin)(void *, uint64_t, u_int, int);
+	void	(*end)(void *, uint64_t, u_int, int, const char *);
+	void	(*error)(void *, uint64_t, u_int, int, const char *);
+	void	(*output)(void *, u_int, const u_char *, size_t, uint64_t, int);
+	void	(*pause)(void *, u_int);
+	void	(*cont)(void *, u_int);
+	void	(*layout_change)(void *, u_int, const char *, const char *,
+		    const char *);
+	void	(*window_add)(void *, u_int);
+	void	(*window_close)(void *, u_int);
+	void	(*window_renamed)(void *, u_int, const char *);
+	void	(*window_pane_changed)(void *, u_int, u_int);
+	void	(*session_changed)(void *, u_int, const char *);
+	void	(*sessions_changed)(void *);
+	void	(*session_renamed)(void *, u_int, const char *);
+	void	(*session_window_changed)(void *, u_int, u_int);
+	void	(*pane_mode_changed)(void *, u_int);
+	void	(*subscription_changed)(void *, const char *, u_int, int, int,
+		    int, const char *);
+	void	(*exit)(void *, const char *);
+	void	(*unknown)(void *, const char *);
+};
+struct remote_parser *remote_parser_create(
+	    const struct remote_parse_callbacks *, void *);
+void	 remote_parser_free(struct remote_parser *);
+void	 remote_parser_reset(struct remote_parser *);
+int	 remote_parser_in_block(struct remote_parser *);
+void	 remote_parse_feed(struct remote_parser *, struct evbuffer *);
+size_t	 remote_parse_unescape(char *);
+char	*remote_parse_layout_strip(const char *);
+u_int	*remote_parse_layout_leaf_ids(const char *, u_int *);
+
+/* remote-link.c */
+struct remote_link *remote_link_create(const char *, const char *, int,
+	    char **);
+void	 remote_link_destroy(struct remote_link *);
+struct remote_link *remote_link_find(const char *, const char *);
+struct remote_link *remote_link_find_by_id(u_int);
+struct remote_link *remote_link_first(void);
+struct remote_link *remote_link_next(struct remote_link *);
+struct remote_link *remote_link_target(struct cmd_find_state *,
+	    const struct cmd_entry_flag *);
+enum cmd_retval remote_link_forward(struct cmdq_item *, struct cmd *);
+void	 remote_link_window_resize(struct window *, u_int, u_int);
+void	 remote_link_pane_focus(struct window_pane *);
+void	 remote_link_window_focus(struct winlink *);
+void	 remote_link_session_destroyed(struct session *);
+void	 remote_link_pane_destroyed(struct window_pane *);
+void	 remote_link_window_destroyed(struct window *);
+u_int	 remote_link_id(struct remote_link *);
+const char *remote_link_host(struct remote_link *);
+const char *remote_link_remote_session(struct remote_link *);
+struct session *remote_link_session(struct remote_link *);
+int	 remote_link_connected(struct remote_link *);
+const char *remote_link_pane_cache(struct window_pane *, int);
+#define REMOTE_CACHE_CMD 0
+#define REMOTE_CACHE_PATH 1
+#define REMOTE_CACHE_PID 2
+#define REMOTE_CACHE_TTY 3
 
 /* session.c */
 extern struct sessions sessions;

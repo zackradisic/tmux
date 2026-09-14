@@ -53,6 +53,7 @@ static void	plugin_vtable_flush(struct plugin_buf *, pgh_sink,
 #define PLUGIN_PANE_ACTIVE	0x1
 #define PLUGIN_PANE_FLOATING	0x2
 #define PLUGIN_PANE_DEAD	0x4
+#define PLUGIN_PANE_REMOTE	0x8
 #define PLUGIN_CLIENT_ATTACHED	0x1
 #define PLUGIN_CLIENT_CONTROL	0x2
 
@@ -124,8 +125,8 @@ plugin_vtable_emit_window(struct plugin_buf *pb, struct window *w)
 static void
 plugin_vtable_emit_pane(struct plugin_buf *pb, struct window_pane *wp)
 {
-	char	*cwd = NULL;
-	uint8_t	 flags = 0;
+	const char	*cwd = NULL, *host = NULL;
+	uint8_t		 flags = 0;
 
 	if (wp == wp->window->active)
 		flags |= PLUGIN_PANE_ACTIVE;
@@ -133,6 +134,10 @@ plugin_vtable_emit_pane(struct plugin_buf *pb, struct window_pane *wp)
 		flags |= PLUGIN_PANE_FLOATING;
 	if (wp->flags & PANE_EXITED)
 		flags |= PLUGIN_PANE_DEAD;
+	if (wp->remote != NULL) {
+		flags |= PLUGIN_PANE_REMOTE;
+		host = remote_link_host(wp->remote->link);
+	}
 
 	plugin_buf_u32(pb, wp->id);
 	plugin_buf_u32(pb, wp->window->id);
@@ -141,10 +146,16 @@ plugin_vtable_emit_pane(struct plugin_buf *pb, struct window_pane *wp)
 	plugin_buf_u8(pb, flags);
 	plugin_buf_str(pb, wp->base.title);
 	plugin_buf_str(pb, wp->shell);
-	/* Same source as #{pane_current_path}; buffer is static, not freed. */
-	if (wp->fd != -1)
+	/*
+	 * Same source as #{pane_current_path}: the remote's cached value for
+	 * a shadow pane, else the process cwd (a static buffer, not freed).
+	 */
+	if (wp->remote != NULL)
+		cwd = remote_link_pane_cache(wp, REMOTE_CACHE_PATH);
+	else if (wp->fd != -1)
 		cwd = osdep_get_cwd(wp->fd);
 	plugin_buf_str(pb, cwd);
+	plugin_buf_str(pb, host);
 }
 
 static void

@@ -934,9 +934,17 @@ format_cb_current_command(struct format_tree *ft)
 {
 	struct window_pane	*wp = ft->wp;
 	char			*cmd, *value;
+	const char		*cached;
 
 	if (wp == NULL || wp->shell == NULL)
 		return (NULL);
+	if (wp->remote != NULL) {
+		/* The remote's value, kept by a control mode subscription. */
+		cached = remote_link_pane_cache(wp, REMOTE_CACHE_CMD);
+		if (cached == NULL)
+			return (NULL);
+		return (xstrdup(cached));
+	}
 
 	cmd = osdep_get_name(wp->fd, wp->tty);
 	if (cmd == NULL || *cmd == '\0') {
@@ -958,9 +966,16 @@ format_cb_current_path(struct format_tree *ft)
 {
 	struct window_pane	*wp = ft->wp;
 	char			*cwd;
+	const char		*cached;
 
 	if (wp == NULL)
 		return (NULL);
+	if (wp->remote != NULL) {
+		cached = remote_link_pane_cache(wp, REMOTE_CACHE_PATH);
+		if (cached == NULL)
+			return (NULL);
+		return (xstrdup(cached));
+	}
 
 	cwd = osdep_get_cwd(wp->fd);
 	if (cwd == NULL)
@@ -2456,6 +2471,14 @@ format_cb_pane_path(struct format_tree *ft)
 static void *
 format_cb_pane_pid(struct format_tree *ft)
 {
+	const char	*cached;
+
+	if (ft->wp != NULL && ft->wp->remote != NULL) {
+		cached = remote_link_pane_cache(ft->wp, REMOTE_CACHE_PID);
+		if (cached == NULL)
+			return (NULL);
+		return (xstrdup(cached));
+	}
 	if (ft->wp != NULL && ft->wp->fd != -1)
 		return (format_printf("%ld", (long)ft->wp->pid));
 	return (NULL);
@@ -2573,8 +2596,87 @@ format_cb_pane_top(struct format_tree *ft)
 static void *
 format_cb_pane_tty(struct format_tree *ft)
 {
+	const char	*cached;
+
+	if (ft->wp != NULL && ft->wp->remote != NULL) {
+		cached = remote_link_pane_cache(ft->wp, REMOTE_CACHE_TTY);
+		if (cached == NULL)
+			return (NULL);
+		return (xstrdup(cached));
+	}
 	if (ft->wp != NULL)
 		return (xstrdup(ft->wp->tty));
+	return (NULL);
+}
+
+/* The link behind the innermost remote object in the tree, or NULL. */
+static struct remote_link *
+format_remote_link(struct format_tree *ft)
+{
+	if (ft->wp != NULL && ft->wp->remote != NULL)
+		return (ft->wp->remote->link);
+	if (ft->w != NULL && ft->w->remote != NULL)
+		return (ft->w->remote->link);
+	if (ft->s != NULL && ft->s->remote != NULL)
+		return (ft->s->remote->link);
+	return (NULL);
+}
+
+/* Callback for pane_remote_id. */
+static void *
+format_cb_pane_remote_id(struct format_tree *ft)
+{
+	if (ft->wp != NULL && ft->wp->remote != NULL)
+		return (format_printf("%%%u", ft->wp->remote->remote_id));
+	return (NULL);
+}
+
+/* Callback for window_remote_id. */
+static void *
+format_cb_window_remote_id(struct format_tree *ft)
+{
+	if (ft->w != NULL && ft->w->remote != NULL)
+		return (format_printf("@%u", ft->w->remote->remote_id));
+	return (NULL);
+}
+
+/* Callback for session_remote_id. */
+static void *
+format_cb_session_remote_id(struct format_tree *ft)
+{
+	if (ft->s != NULL && ft->s->remote != NULL)
+		return (format_printf("$%u", ft->s->remote->remote_id));
+	return (NULL);
+}
+
+/* Callback for session_remote_host. */
+static void *
+format_cb_session_remote_host(struct format_tree *ft)
+{
+	if (ft->s != NULL && ft->s->remote != NULL)
+		return (xstrdup(remote_link_host(ft->s->remote->link)));
+	return (NULL);
+}
+
+/* Callback for remote_host. */
+static void *
+format_cb_remote_host(struct format_tree *ft)
+{
+	struct remote_link	*rl = format_remote_link(ft);
+
+	if (rl != NULL)
+		return (xstrdup(remote_link_host(rl)));
+	return (NULL);
+}
+
+/* Callback for remote_connected. */
+static void *
+format_cb_remote_connected(struct format_tree *ft)
+{
+	struct remote_link	*rl = format_remote_link(ft);
+
+	if (rl != NULL)
+		return (xstrdup(remote_link_connected(rl) ? "1" : "0"));
 	return (NULL);
 }
 
@@ -3731,6 +3833,9 @@ static const struct format_table_entry format_table[] = {
 	{ "pane_pipe_pid", FORMAT_TABLE_STRING,
 	  format_cb_pane_pipe_pid
 	},
+	{ "pane_remote_id", FORMAT_TABLE_STRING,
+	  format_cb_pane_remote_id
+	},
 	{ "pane_right", FORMAT_TABLE_STRING,
 	  format_cb_pane_right
 	},
@@ -3781,6 +3886,12 @@ static const struct format_table_entry format_table[] = {
 	},
 	{ "pid", FORMAT_TABLE_STRING,
 	  format_cb_pid
+	},
+	{ "remote_connected", FORMAT_TABLE_STRING,
+	  format_cb_remote_connected
+	},
+	{ "remote_host", FORMAT_TABLE_STRING,
+	  format_cb_remote_host
 	},
 	{ "scroll_region_lower", FORMAT_TABLE_STRING,
 	  format_cb_scroll_region_lower
@@ -3862,6 +3973,12 @@ static const struct format_table_entry format_table[] = {
 	},
 	{ "session_silence_flag", FORMAT_TABLE_STRING,
 	  format_cb_session_silence_flag
+	},
+	{ "session_remote_host", FORMAT_TABLE_STRING,
+	  format_cb_session_remote_host
+	},
+	{ "session_remote_id", FORMAT_TABLE_STRING,
+	  format_cb_session_remote_id
 	},
 	{ "session_stack", FORMAT_TABLE_STRING,
 	  format_cb_session_stack
@@ -3985,6 +4102,9 @@ static const struct format_table_entry format_table[] = {
 	},
 	{ "window_raw_flags", FORMAT_TABLE_STRING,
 	  format_cb_window_raw_flags
+	},
+	{ "window_remote_id", FORMAT_TABLE_STRING,
+	  format_cb_window_remote_id
 	},
 	{ "window_silence_flag", FORMAT_TABLE_STRING,
 	  format_cb_window_silence_flag

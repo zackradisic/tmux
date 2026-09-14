@@ -38,7 +38,7 @@ const struct cmd_entry cmd_select_layout_entry = {
 
 	.target = { 't', CMD_FIND_PANE, 0 },
 
-	.flags = CMD_AFTERHOOK,
+	.flags = CMD_AFTERHOOK|CMD_REMOTE,
 	.exec = cmd_select_layout_exec
 };
 
@@ -51,7 +51,7 @@ const struct cmd_entry cmd_next_layout_entry = {
 
 	.target = { 't', CMD_FIND_WINDOW, 0 },
 
-	.flags = CMD_AFTERHOOK,
+	.flags = CMD_AFTERHOOK|CMD_REMOTE,
 	.exec = cmd_select_layout_exec
 };
 
@@ -64,7 +64,7 @@ const struct cmd_entry cmd_previous_layout_entry = {
 
 	.target = { 't', CMD_FIND_WINDOW, 0 },
 
-	.flags = CMD_AFTERHOOK,
+	.flags = CMD_AFTERHOOK|CMD_REMOTE,
 	.exec = cmd_select_layout_exec
 };
 

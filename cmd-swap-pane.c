@@ -38,7 +38,7 @@ const struct cmd_entry cmd_swap_pane_entry = {
 	.source = { 's', CMD_FIND_PANE, CMD_FIND_DEFAULT_MARKED },
 	.target = { 't', CMD_FIND_PANE, 0 },
 
-	.flags = 0,
+	.flags = CMD_REMOTE,
 	.exec = cmd_swap_pane_exec
 };
 

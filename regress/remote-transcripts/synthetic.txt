@@ -1,0 +1,56 @@
+Welcome banner from ssh before tmux starts
+%begin 1700000000 1 0
+%session-changed $3 dev
+%end 1700000000 1 0
+%begin 1700000001 2 1
+%end 1700000001 2 1
+%output %5 plain text
+%output %5 tab\011nl\012cr\015esc\033[31mred\033[0m bs\134 hi\302\240 lone\x
+%output %7 
+%extended-output %5 1234 : with age
+%extended-output %5 0 :
+%pause %5
+%continue %5
+%layout-change @2 e4e6,80x24,0,0{40x24,0,0,5,39x24,41,0,7}<20x5,2,2,9> e4e6,80x24,0,0{40x24,0,0,5,39x24,41,0,7}<20x5,2,2,9> *Z
+%layout-change @3 b25d,80x24,0,0,0 b25d,80x24,0,0,0 
+%layout-change @4 d1e7,160x48,0,0[160x23,0,0,1,160x24,0,24{80x24,0,24,2,79x24,81,24,3}] d1e7,160x48,0,0[160x23,0,0,1,160x24,0,24{80x24,0,24,2,79x24,81,24,3}] -
+%layout-change @9 0000,80x24,0,0{18x3,3,3,9,40x24,0,0,5,39x24,41,0,7}<18x3,3,3,9> 0000,80x24,0,0{40x24,0,0,5,39x24,41,0,7} -
+%layout-change @9 0000,80x24,0,0[80x12,0,0,0,80x11,0,13,1,18x3,3,3,2,10x2,1,1,3]<18x3,3,3,2,10x2,1,1,3> x x
+%window-add @6
+%window-close @6
+%unlinked-window-add @7
+%window-renamed @2 two  words   here
+%window-pane-changed @2 %7
+%session-renamed $3 renamed session
+%sessions-changed
+%session-window-changed $3 @2
+%pane-mode-changed %5
+%subscription-changed rl_cmd $3 @2 1 %5 : vim
+%subscription-changed sw $3 - - - : 2
+%subscription-changed cw $3 @2 1 - : @2:1
+%subscription-changed empty $3 @2 1 %5 :
+%client-session-changed /dev/pts/9 $3 dev
+%client-detached /dev/pts/9
+%paste-buffer-changed buffer0
+%paste-buffer-deleted buffer0
+%begin 1700000002 3 1
+%5: [80x24] body line that starts with a percent
+%end 1700000009 4 1
+%end 1700000002 3 1
+%begin 1700000003 4 1
+%window-add @8
+inside body
+%layout-change @8 b25e,80x24,0,0,1 b25e,80x24,0,0,1 
+%end 1700000003 4 1
+%begin 1700000004 5 1
+no such command
+%error 1700000004 5 1
+%begin 1700000005 6 1
+crlf line
+%end 1700000005 6 1
+%nonsense-notification with args
+%begin 1700000006 7 1
+%exit reason given
+%exit
+%begin 1700000007 8 1
+unterminated block

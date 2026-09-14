@@ -126,6 +126,7 @@ dist_tmux_SOURCES = \
 	cmd-pipe-pane.c \
 	cmd-queue.c \
 	cmd-refresh-client.c \
+	cmd-remote-attach.c \
 	cmd-rename-session.c \
 	cmd-rename-window.c \
 	cmd-resize-pane.c \
@@ -194,6 +195,8 @@ dist_tmux_SOURCES = \
 	prompt-history.c \
 	prompt.c \
 	regsub.c \
+	remote-link.c \
+	remote-parse.c \
 	resize.c \
 	screen-redraw.c \
 	screen-write.c \
@@ -286,6 +289,15 @@ EXTRA_DIST += \
 endif
 tmux_LDADD = $(LDADD) $(PLUGIN_HOST_LIB)
 tmux_DEPENDENCIES = $(LIBOBJS) $(PLUGIN_HOST_LIB)
+
+# Test harness for the control mode line parser: feeds transcripts and
+# prints one line per callback. Built from the parser and xmalloc alone.
+noinst_PROGRAMS = regress/remote-parse-test
+regress_remote_parse_test_SOURCES = \
+	regress/remote-parse-test.c \
+	remote-parse.c \
+	xmalloc.c
+regress_remote_parse_test_LDADD = $(LDADD)
 
 # Add bits for fuzzing if enabled.
 if NEED_FUZZING

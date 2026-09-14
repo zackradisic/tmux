@@ -26,3 +26,4 @@ tags
 tmux
 tmux.1.*
 plugin-host/target/
+regress/remote-parse-test

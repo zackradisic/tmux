@@ -1607,6 +1607,47 @@ resets so that the position follows the cursor.
 See the
 .Ic window\-size
 option.
+.Tg remote
+.It Xo Ic remote\-attach
+.Op Fl k
+.Op Fl t Ar remote\-session
+.Ar host
+.Xc
+.D1 Pq alias: Ic remote
+Mirror a session of the
+.Nm
+server on
+.Ar host
+as a local session named
+.Ar host Ns / Ns Ar session .
+With
+.Fl t ,
+.Ar remote\-session
+is the session on the remote server; without it the remote server picks its
+current session.
+The link runs the
+.Ic remote\-ssh\-command
+option, which by default runs
+.Xr ssh 1
+to start
+.Nm
+in control mode on
+.Ar host .
+Each remote window and pane appears as a local window and pane; output shows
+in the local pane, keys go to the remote and structural commands such as
+.Ic split\-window
+on a remote object run on the remote server.
+See the
+.Sx REMOTE SESSIONS
+section.
+.Fl k
+drops the link (or all links to
+.Ar host
+without
+.Fl t )
+and destroys the local session.
+.Ic kill\-session
+on the local session does the same.
 .Tg rename
 .It Xo Ic rename\-session
 .Op Fl t Ar target\-session
@@ -5089,6 +5130,27 @@ each client.
 .It Ic prompt\-history\-limit Ar number
 Set the number of history items to save in the history file for each type of
 command prompt.
+.It Ic remote\-ssh\-command Ar shell-command
+The command
+.Ic remote\-attach
+runs to reach a remote
+.Nm
+server in control mode.
+It is expanded as a format with
+.Ql remote_host
+and
+.Ql remote_session
+(empty when no session was given) and must speak the control mode protocol on
+its standard input and output.
+The default is:
+.Bd -literal -offset indent
+ssh -T -o BatchMode=yes #{q:remote_host} tmux -C attach \e
+    #{?remote_session,-t #{q:remote_session},}
+.Ed
+.Pp
+Two servers on one machine can be linked for testing by pointing this at the
+other server's socket, for example
+.Ql tmux -L other -C attach -t #{remote_session} .
 .It Xo Ic set\-clipboard
 .Op Ic on | external | off
 .Xc
@@ -7610,6 +7672,7 @@ The following variables are available, where appropriate:
 .It Li "pane_pipe_pid" Ta "" Ta "PID of pipe process, if any"
 .It Li "pane_pb_state" Ta "" Ta "Pane progress bar state, one of hidden, normal, error, indeterminate, paused (can be set by application)"
 .It Li "pane_pb_progress" Ta "" Ta "Pane progress bar progress percentage (can be set by application)"
+.It Li "pane_remote_id" Ta "" Ta "Id of the pane on the remote server, if a remote pane"
 .It Li "pane_right" Ta "" Ta "Right of pane"
 .It Li "pane_search_string" Ta "" Ta "Last search string in copy mode"
 .It Li "pane_start_command" Ta "" Ta "Command pane started with"
@@ -7631,6 +7694,8 @@ The following variables are available, where appropriate:
 .It Li "prev_window_index" Ta "" Ta "Index of previous window in W: loop"
 .It Li "rectangle_toggle" Ta "" Ta "1 if rectangle selection is activated"
 .It Li "refresh_active" Ta "" Ta "1 if copy mode refresh is active"
+.It Li "remote_connected" Ta "" Ta "1 if the remote link is connected, 0 if not (empty for local objects)"
+.It Li "remote_host" Ta "" Ta "Host of the remote link, if a remote object"
 .It Li "scroll_position" Ta "" Ta "Scroll position in copy mode"
 .It Li "scroll_region_lower" Ta "" Ta "Bottom of scroll region in pane"
 .It Li "scroll_region_upper" Ta "" Ta "Top of scroll region in pane"
@@ -7668,6 +7733,8 @@ The following variables are available, where appropriate:
 .It Li "session_marked" Ta "" Ta "1 if this session contains the marked pane"
 .It Li "session_name" Ta "#S" Ta "Name of session"
 .It Li "session_path" Ta "" Ta "Working directory of session"
+.It Li "session_remote_host" Ta "" Ta "Host of the remote server, if a remote session"
+.It Li "session_remote_id" Ta "" Ta "Id of the session on the remote server, if a remote session"
 .It Li "session_silence_flag" Ta "" Ta "1 if any window in session has silence alert"
 .It Li "session_stack" Ta "" Ta "Window indexes in most recent order"
 .It Li "session_windows" Ta "" Ta "Number of windows in session"
@@ -7709,6 +7776,7 @@ The following variables are available, where appropriate:
 .It Li "window_offset_y" Ta "" Ta "Y offset into window if larger than client"
 .It Li "window_panes" Ta "" Ta "Number of panes in window"
 .It Li "window_raw_flags" Ta "" Ta "Window flags with nothing escaped"
+.It Li "window_remote_id" Ta "" Ta "Id of the window on the remote server, if a remote window"
 .It Li "window_silence_flag" Ta "" Ta "1 if window has silence alert"
 .It Li "window_stack_index" Ta "" Ta "Index in session most recent stack"
 .It Li "window_start_flag" Ta "" Ta "1 if window has the lowest index"
@@ -9210,6 +9278,78 @@ terminal supports the
 .Xr xterm 1
 title set sequences and to automatically set some of the capabilities above.
 .El
+.Sh REMOTE SESSIONS
+.Ic remote\-attach
+links the local server to one session of a
+.Nm
+server on another host and mirrors it as a local session named
+.Ar host Ns / Ns Ar session .
+The link runs the
+.Ic remote\-ssh\-command
+option as a job and speaks the
+.Sx CONTROL MODE
+protocol with the remote server.
+Any
+.Nm
+version 3.3 or later works on the remote.
+.Pp
+Every remote window becomes a local window with the same index and name, and
+every remote pane becomes a local pane whose contents are a copy of the
+remote pane.
+Output from the remote appears in the local pane, keys typed into the local
+pane go to the remote pane and the local scrollback fills from the remote
+when the link connects.
+The remote server owns the layout: a resize of the local window asks the
+remote to resize and the local window follows.
+.Pp
+Commands that change the structure of a remote object run on the remote
+server and their output comes back as the command's output:
+.Ic split\-window ,
+.Ic new\-window ,
+.Ic kill\-pane ,
+.Ic kill\-window ,
+.Ic rename\-window ,
+.Ic rename\-session ,
+.Ic resize\-pane ,
+.Ic resize\-window ,
+.Ic select\-layout ,
+.Ic rotate\-window ,
+.Ic swap\-pane ,
+.Ic respawn\-pane
+and
+.Ic respawn\-window .
+A command that mixes a local and a remote pane is an error.
+Everything else stays local: copy mode, floating panes,
+.Ic select\-pane ,
+.Ic select\-window ,
+.Ic send\-keys ,
+options and hooks.
+.Ic kill\-session
+on a remote session drops the link and leaves the remote session running.
+.Pp
+The
+.Ql pane_current_command ,
+.Ql pane_current_path ,
+.Ql pane_pid
+and
+.Ql pane_tty
+formats give the remote values.
+The
+.Ql pane_remote_id ,
+.Ql window_remote_id ,
+.Ql session_remote_id ,
+.Ql remote_host
+and
+.Ql remote_connected
+formats tell a remote object from a local one.
+.Pp
+When the connection drops, the local session, windows and panes stay with
+their ids, every pane shows a disconnected message and the link tries again
+with a growing delay.
+When it returns, the tree is brought in line with the remote and every pane
+is filled again.
+.Ic restart\-server
+keeps remote sessions and their ids and connects them again.
 .Sh CONTROL MODE
 .Nm
 offers a textual interface called

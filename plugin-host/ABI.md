@@ -347,8 +347,15 @@ window  := u32 id, u32 width, u32 height, u32 active_pane(NONE),
            str name, u32 nsessions, nsessions * u32,
            u32 npanes, npanes * u32          (pane ids in window order)
 pane    := u32 id, u32 window, u32 width, u32 height,
-           u8 flags(1 active | 2 floating | 4 dead),
-           str title, str shell, str cwd
+           u8 flags(1 active | 2 floating | 4 dead | 8 remote),
+           str title, str shell, str cwd, str host
+```
+
+A `remote` pane mirrors a pane on another tmux server through a remote link
+(`remote-attach`); `host` names that server and `cwd` is the remote's cached
+current path. Both are empty for a local pane.
+
+```
 client  := u32 id, u32 session(NONE), u8 flags(1 attached | 2 control),
            str name
 ```

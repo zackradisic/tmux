@@ -45,6 +45,16 @@ resize_window(struct window *w, u_int sx, u_int sy, int xpixel, int ypixel)
 	u_int	old_sx = w->sx, old_sy = w->sy;
 	int	zoomed;
 
+	/*
+	 * The remote owns the layout of a shadow window: ask it for the new
+	 * size and let its %layout-change resize the window.
+	 */
+	if (w->remote != NULL) {
+		w->flags &= ~WINDOW_RESIZE;
+		remote_link_window_resize(w, sx, sy);
+		return;
+	}
+
 	/* Check size limits. */
 	if (sx < WINDOW_MINIMUM)
 		sx = WINDOW_MINIMUM;

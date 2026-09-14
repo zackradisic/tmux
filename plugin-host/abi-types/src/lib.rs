@@ -736,6 +736,8 @@ pub mod pane_flags {
     pub const ACTIVE: u8 = 1 << 0;
     pub const FLOATING: u8 = 1 << 1;
     pub const DEAD: u8 = 1 << 2;
+    /// The pane mirrors a pane on another server (a remote link).
+    pub const REMOTE: u8 = 1 << 3;
 }
 
 /// Client record flag bits.
@@ -775,10 +777,15 @@ pub struct PaneInfo {
     pub active: bool,
     pub floating: bool,
     pub dead: bool,
+    /// The pane is a shadow of a pane on another server; `host` names it.
+    pub remote: bool,
     /// Empty string = absent.
     pub title: String,
     pub shell: String,
+    /// For a remote pane, the remote's current path (cached by the link).
     pub cwd: String,
+    /// The remote host for a remote pane, else empty.
+    pub host: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -868,6 +875,7 @@ impl PaneInfo {
         let title = c.str()?.to_string();
         let shell = c.str()?.to_string();
         let cwd = c.str()?.to_string();
+        let host = c.str()?.to_string();
         Ok(Self {
             id,
             window,
@@ -876,9 +884,11 @@ impl PaneInfo {
             active: flags & pane_flags::ACTIVE != 0,
             floating: flags & pane_flags::FLOATING != 0,
             dead: flags & pane_flags::DEAD != 0,
+            remote: flags & pane_flags::REMOTE != 0,
             title,
             shell,
             cwd,
+            host,
         })
     }
 
@@ -897,10 +907,14 @@ impl PaneInfo {
         if self.dead {
             flags |= pane_flags::DEAD;
         }
+        if self.remote {
+            flags |= pane_flags::REMOTE;
+        }
         out.push(flags);
         emit_str(out, &self.title);
         emit_str(out, &self.shell);
         emit_str(out, &self.cwd);
+        emit_str(out, &self.host);
     }
 }
 
@@ -1120,9 +1134,11 @@ mod tests {
             active: true,
             floating: false,
             dead: false,
+            remote: true,
             title: "t".into(),
             shell: "/bin/zsh".into(),
             cwd: "/home/x".into(),
+            host: "devbox".into(),
         };
         let c = ClientInfo {
             id: 0,

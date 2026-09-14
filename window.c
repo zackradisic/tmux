@@ -469,6 +469,8 @@ window_destroy(struct window *w)
 	/* After the panes so plugin teardown order is children first. */
 	plugin_object_destroyed(PLUGIN_OBJ_WINDOW, w->id);
 #endif
+	if (w->remote != NULL)
+		remote_link_window_destroyed(w);
 
 	if (event_initialized(&w->name_event))
 		evtimer_del(&w->name_event);
@@ -594,6 +596,8 @@ window_pane_send_resize(struct window_pane *wp, u_int sx, u_int sy)
 	struct winsize	 ws;
 
 	if (wp->fd == -1)
+		return;
+	if (wp->remote != NULL) /* a socket, the remote resizes its pty */
 		return;
 
 	log_debug("%s: %%%u resize to %u,%u", __func__, wp->id, sx, sy);
@@ -747,8 +751,11 @@ window_set_active_pane(struct window *w, struct window_pane *wp, int notify)
 	tty_update_window_offset(w);
 	server_redraw_window(w);
 
-	if (notify)
+	if (notify) {
 		window_fire_pane_changed(w, w->active, lastwp);
+		if (wp->remote != NULL)
+			remote_link_pane_focus(wp);
+	}
 	return (1);
 }
 
@@ -1471,6 +1478,8 @@ window_pane_destroy(struct window_pane *wp)
 	 */
 	plugin_object_destroyed(PLUGIN_OBJ_PANE, wp->id);
 #endif
+	if (wp->remote != NULL)
+		remote_link_pane_destroyed(wp);
 	window_pane_wait_finish(wp);
 	spawn_editor_finish(wp);
 

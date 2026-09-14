@@ -124,6 +124,10 @@ struct handoff_ctx {
 	char			**plugins;
 	u_int			 nplugins;
 
+	/* Remote links to make again: host, session, id triples. */
+	char			**remotes;
+	u_int			 nremotes;
+
 	struct handoff_bind	*binds;
 	u_int			 nbinds;
 
@@ -485,6 +489,21 @@ handoff_save(const char *path, char **cause)
 	 * the others.
 	 */
 	RB_FOREACH(s, sessions, &sessions) {
+		/*
+		 * A shadow session is a view of a remote server: save the
+		 * link and let the new server connect again. Its windows and
+		 * panes come back from the remote.
+		 */
+		if (s->remote != NULL) {
+			fputs("remote", f);
+			handoff_field(f, remote_link_host(s->remote->link));
+			handoff_field(f, remote_link_remote_session(
+			    s->remote->link) != NULL ?
+			    remote_link_remote_session(s->remote->link) : "");
+			handoff_number(f, s->id);
+			fputc('\n', f);
+			continue;
+		}
 		fputs("session", f);
 		handoff_number(f, s->id);
 		handoff_field(f, s->name);
@@ -946,50 +965,6 @@ handoff_free_panes(struct handoff_ctx *ctx)
 	ctx->curpane = NULL;
 }
 
-/*
- * Rebuild the layout by splitting, one pane at a time. This is the fallback
- * for a layout string the window cannot take, and it exists so that a pane
- * never ends up without a cell: layout_set_tiled() and the redraw code both
- * read wp->layout_cell without checking it.
- */
-static void
-handoff_layout_by_splitting(struct window *w)
-{
-	struct window_pane	*wp, *prev;
-	struct layout_cell	*lc;
-	u_int			 n, sy;
-
-	n = window_count_panes(w, 1);
-	prev = TAILQ_FIRST(&w->panes);
-	if (prev == NULL)
-		return;
-
-	/*
-	 * Make the window tall enough for every pane first, or a split runs
-	 * out of room half way through. recalculate_sizes() puts the size
-	 * back when a client attaches.
-	 */
-	sy = n * (PANE_MINIMUM + 1);
-	if (sy > w->sy)
-		window_resize(w, w->sx, sy, -1, -1);
-
-	layout_init(w, prev);
-	for (wp = TAILQ_NEXT(prev, entry); wp != NULL;
-	    wp = TAILQ_NEXT(wp, entry)) {
-		lc = layout_split_pane(prev, LAYOUT_TOPBOTTOM, -1, 0);
-		if (lc == NULL) {
-			log_debug("%s: @%u no room for %%%u", __func__, w->id,
-			    wp->id);
-			continue;
-		}
-		layout_assign_pane(lc, wp, 0);
-		prev = wp;
-	}
-	layout_fix_offsets(w);
-	layout_fix_panes(w, NULL);
-	recalculate_sizes();
-}
-
 /* Apply the saved layout, once every tiled pane exists. */
 static void
 handoff_apply_layout(struct handoff_ctx *ctx)
@@ -1003,7 +978,7 @@ handoff_apply_layout(struct handoff_ctx *ctx)
 	if (layout_parse(w, ctx->layout, &cause) != 0) {
 		log_debug("%s: @%u layout: %s", __func__, w->id, cause);
 		free(cause);
-		handoff_layout_by_splitting(w);
+		layout_by_splitting(w);
 	}
 	free(ctx->layout);
 	ctx->layout = NULL;
@@ -1416,6 +1391,15 @@ handoff_record(struct handoff_ctx *ctx, char **fields, u_int nfields)
 		ctx->plugins = xreallocarray(ctx->plugins, ctx->nplugins + 1,
 		    sizeof *ctx->plugins);
 		ctx->plugins[ctx->nplugins++] = xstrdup(F(1));
+	} else if (strcmp(key, "remote") == 0) {
+		handoff_close_session(ctx);
+		ctx->nsessions++;
+		ctx->remotes = xreallocarray(ctx->remotes,
+		    (ctx->nremotes + 1) * 3, sizeof *ctx->remotes);
+		ctx->remotes[ctx->nremotes * 3] = xstrdup(F(1));
+		ctx->remotes[ctx->nremotes * 3 + 1] = xstrdup(F(2));
+		ctx->remotes[ctx->nremotes * 3 + 2] = xstrdup(F(3));
+		ctx->nremotes++;
 	} else if (strcmp(key, "session") == 0)
 		handoff_open_session(ctx, fields, nfields);
 	else if (strcmp(key, "window") == 0)
@@ -1565,6 +1549,29 @@ server_handoff_restore(const char *path, int *socketfd, char **cause)
 
 	handoff_close_session(&ctx);
 
+	/*
+	 * Make the remote links again with their old session ids, so that a
+	 * client attaching to "$id" lands on the shadow session while the
+	 * link syncs. The counters go back below.
+	 */
+	if (rc == 0) {
+		for (i = 0; i < ctx.nremotes; i++) {
+			const char	*host = ctx.remotes[i * 3];
+			const char	*rs = ctx.remotes[i * 3 + 1];
+			char		*rcause = NULL;
+			int		 id;
+
+			id = handoff_num(ctx.remotes[i * 3 + 2], 0, INT_MAX,
+			    -1);
+			if (remote_link_create(host, *rs != '\0' ? rs : NULL,
+			    id, &rcause) == NULL) {
+				log_debug("%s: remote %s: %s", __func__, host,
+				    rcause);
+				free(rcause);
+			}
+		}
+	}
+
 	if (rc == 0 && !ctx.haveversion) {
 		xasprintf(cause, "%s: no version record", path);
 		rc = -1;
@@ -1616,6 +1623,9 @@ server_handoff_restore(const char *path, int *socketfd, char **cause)
 	for (i = 0; i < ctx.nplugins; i++)
 		free(ctx.plugins[i]);
 	free(ctx.plugins);
+	for (i = 0; i < ctx.nremotes * 3; i++)
+		free(ctx.remotes[i]);
+	free(ctx.remotes);
 	for (i = 0; i < ctx.nbinds; i++) {
 		free(ctx.binds[i].table);
 		free(ctx.binds[i].key);

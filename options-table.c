@@ -508,6 +508,16 @@ const struct options_table_entry options_table[] = {
 		  "pressed. Zero means disabled."
 	},
 
+	{ .name = "remote-ssh-command",
+	  .type = OPTIONS_TABLE_STRING,
+	  .scope = OPTIONS_TABLE_SERVER,
+	  .default_str = "ssh -T -o BatchMode=yes #{q:remote_host} tmux -C "
+			 "attach #{?remote_session,-t #{q:remote_session},}",
+	  .text = "Command run by remote-attach to reach a remote tmux in "
+		  "control mode. Expanded with 'remote_host' and "
+		  "'remote_session'."
+	},
+
 	{ .name = "prompt-history-limit",
 	  .type = OPTIONS_TABLE_NUMBER,
 	  .scope = OPTIONS_TABLE_SERVER,

@@ -1,0 +1,67 @@
+%begin 1789355762 316 0
+%session-changed $0 work
+%end 1789355762 316 0
+%begin 1789355762 319 1
+ready
+%end 1789355762 319 1
+%begin 1789355762 320 1
+%0: 80x24
+%end 1789355762 320 1
+%begin 1789355762 321 1
+parse error: unknown command: this-is-not-a-command
+%error 1789355762 321 1
+%begin 1789355763 322 1
+%window-renamed @0 name with spaces
+%end 1789355763 322 1
+%begin 1789355763 324 1
+%session-renamed $0 w s
+%end 1789355763 324 1
+%begin 1789355764 326 1
+%end 1789355764 326 1
+%output %0 printf "a\134\134\134\134b\134\134tc\134\134r\134\134n"
+%begin 1789355764 328 1
+%end 1789355764 328 1
+%output %0 \015\012\033[?2004l\015
+%output %0 a\134b\011c\015\015\012\033]133;A\007
+%output %0 \033[?2004h
+%output %0 \033[01;32mzack@ns5033247\033[00m:\033[01;34m~/tmux2\033[00m$ 
+%begin 1789355765 334 1
+%window-pane-changed @0 %1
+%layout-change @0 c195,80x24,0,0[80x12,0,0,0,80x11,0,13,1] c195,80x24,0,0[80x12,0,0,0,80x11,0,13,1] *
+%end 1789355765 334 1
+%output %0 \015\033[K\015\033[01;32mzack@ns5033247\033[00m:\033[01;34m~/tmux2\033[00m$ 
+%output %1 \033]133;A\007
+%output %1 \033[?2004h\033[01;32mzack@ns5033247\033[00m:\033[01;34m~/tmux2\033[00m$ 
+%layout-change @0 2c88,80x24,0,0[80x12,0,0,0,80x11,0,13,1,18x3,3,3,2]<18x3,3,3,2> 2c88,80x24,0,0[80x12,0,0,0,80x11,0,13,1,18x3,3,3,2]<18x3,3,3,2> *
+%begin 1789355766 343 1
+2c88,80x24,0,0[80x12,0,0,0,80x11,0,13,1,18x3,3,3,2]<18x3,3,3,2>
+%end 1789355766 343 1
+%begin 1789355766 344 1
+%session-window-changed $0 @1
+%window-add @1
+%end 1789355766 344 1
+%output %3 \033]133;A\007
+%output %3 \033[?2004h\033[01;32mzack@ns5033247\033[00m:\033[01;34m~/tmux2\033[00m$ 
+%begin 1789355767 348 1
+%session-window-changed $0 @0
+%end 1789355767 348 1
+%begin 1789355767 350 1
+%end 1789355767 350 1
+%begin 1789355767 351 1
+%end 1789355767 351 1
+%begin 1789355768 352 1
+%end 1789355768 352 1
+%extended-output %0 0 : echo ext
+%begin 1789355768 354 1
+%end 1789355768 354 1
+%extended-output %0 0 : \015\012
+%extended-output %0 0 : \033[?2004l\015ext\015\012
+%extended-output %0 0 : \033]133;A\007\033[?2004h
+%extended-output %0 0 : \033[01;32mzack@ns5033247\033[00m:\033[01;34m~/tmux2\033[00m$ 
+%subscription-changed rl_cmd $0 @0 0 %0 : bash
+%subscription-changed rl_cmd $0 @0 0 %1 : bash
+%subscription-changed rl_cmd $0 @0 0 %2 : sleep
+%subscription-changed rl_cmd $0 @1 1 %3 : bash
+%begin 1789355769 360 1
+%end 1789355769 360 1
+%exit

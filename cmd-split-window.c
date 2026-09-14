@@ -68,7 +68,7 @@ const struct cmd_entry cmd_split_window_entry = {
 
 	.target = { 't', CMD_FIND_PANE, 0 },
 
-	.flags = 0,
+	.flags = CMD_REMOTE,
 	.exec = cmd_split_window_exec
 };
 

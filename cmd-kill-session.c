@@ -76,7 +76,9 @@ cmd_kill_session_exec(struct cmd *self, struct cmdq_item *item)
 			server_destroy_session(sloop);
 			session_destroy(sloop, 1, __func__);
 		}
-	} else {
+	} else if (s->remote != NULL)
+		remote_link_destroy(s->remote->link);
+	else {
 		server_destroy_session(s);
 		session_destroy(s, 1, __func__);
 	}
@@ -94,6 +96,10 @@ cmd_kill_session_all(struct cmdq_item *item, const char *filter)
 			continue;
 		if (!cmd_kill_session_filter(item, sloop, filter))
 			continue;
+		if (sloop->remote != NULL) {
+			remote_link_destroy(sloop->remote->link);
+			continue;
+		}
 		server_destroy_session(sloop);
 		session_destroy(sloop, 1, __func__);
 	}

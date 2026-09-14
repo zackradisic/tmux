@@ -39,7 +39,7 @@ const struct cmd_entry cmd_rename_session_entry = {
 
 	.target = { 't', CMD_FIND_SESSION, 0 },
 
-	.flags = CMD_AFTERHOOK,
+	.flags = CMD_AFTERHOOK|CMD_REMOTE,
 	.exec = cmd_rename_session_exec
 };
 

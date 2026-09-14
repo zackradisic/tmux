@@ -40,7 +40,7 @@ const struct cmd_entry cmd_kill_window_entry = {
 
 	.target = { 't', CMD_FIND_WINDOW, 0 },
 
-	.flags = 0,
+	.flags = CMD_REMOTE,
 	.exec = cmd_kill_window_exec
 };
 
@@ -53,7 +53,7 @@ const struct cmd_entry cmd_unlink_window_entry = {
 
 	.target = { 't', CMD_FIND_WINDOW, 0 },
 
-	.flags = 0,
+	.flags = CMD_REMOTE,
 	.exec = cmd_kill_window_exec
 };
 

@@ -2008,3 +2008,48 @@ layout_insert_tile(struct window *w, struct layout_cell *lc)
 
 	return (0);
 }
+
+/*
+ * Rebuild the layout by splitting, one pane at a time. This is the fallback
+ * for a layout string the window cannot take (a server handoff or a remote
+ * link), and it exists so that a pane never ends up without a cell:
+ * layout_set_tiled() and the redraw code both read wp->layout_cell without
+ * checking it.
+ */
+void
+layout_by_splitting(struct window *w)
+{
+	struct window_pane	*wp, *prev;
+	struct layout_cell	*lc;
+	u_int			 n, sy;
+
+	n = window_count_panes(w, 1);
+	prev = TAILQ_FIRST(&w->panes);
+	if (prev == NULL)
+		return;
+
+	/*
+	 * Make the window tall enough for every pane first, or a split runs
+	 * out of room half way through. recalculate_sizes() puts the size
+	 * back when a client attaches.
+	 */
+	sy = n * (PANE_MINIMUM + 1);
+	if (sy > w->sy)
+		window_resize(w, w->sx, sy, -1, -1);
+
+	layout_init(w, prev);
+	for (wp = TAILQ_NEXT(prev, entry); wp != NULL;
+	    wp = TAILQ_NEXT(wp, entry)) {
+		lc = layout_split_pane(prev, LAYOUT_TOPBOTTOM, -1, 0);
+		if (lc == NULL) {
+			log_debug("%s: @%u no room for %%%u", __func__, w->id,
+			    wp->id);
+			continue;
+		}
+		layout_assign_pane(lc, wp, 0);
+		prev = wp;
+	}
+	layout_fix_offsets(w);
+	layout_fix_panes(w, NULL);
+	recalculate_sizes();
+}
