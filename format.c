@@ -2680,6 +2680,17 @@ format_cb_remote_connected(struct format_tree *ft)
 	return (NULL);
 }
 
+/* Callback for remote_error. */
+static void *
+format_cb_remote_error(struct format_tree *ft)
+{
+	struct remote_link	*rl = format_remote_link(ft);
+
+	if (rl != NULL)
+		return (xstrdup(remote_link_error(rl)));
+	return (NULL);
+}
+
 /* Callback for pane_width. */
 static void *
 format_cb_pane_width(struct format_tree *ft)
@@ -3889,6 +3900,9 @@ static const struct format_table_entry format_table[] = {
 	},
 	{ "remote_connected", FORMAT_TABLE_STRING,
 	  format_cb_remote_connected
+	},
+	{ "remote_error", FORMAT_TABLE_STRING,
+	  format_cb_remote_error
 	},
 	{ "remote_host", FORMAT_TABLE_STRING,
 	  format_cb_remote_host

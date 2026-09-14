@@ -18,6 +18,7 @@
 
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <netinet/in.h>
 #include <resolv.h>
 
@@ -163,6 +164,15 @@ struct remote_link {
 	int			 synced_once;
 	int			 bridge_unsupported; /* remote has no plugin-bridge */
 
+	/*
+	 * The last failure while not connected: an ssh error line, the
+	 * remote's reply to attach, or the exit status. Shown in the
+	 * placeholder window, the message log and the remote_error format.
+	 */
+	char			*last_error;
+	int			 error_this_try;
+	char			*reported_error;
+
 	TAILQ_ENTRY(remote_link) entry;
 };
 TAILQ_HEAD(remote_links, remote_link);
@@ -284,6 +294,69 @@ int
 remote_link_connected(struct remote_link *rl)
 {
 	return (rl->state == REMOTE_UP);
+}
+
+/* The last failure text, or "" while the link is up or untried. */
+const char *
+remote_link_error(struct remote_link *rl)
+{
+	return (rl->last_error != NULL ? rl->last_error : "");
+}
+
+/* Remember a failure text, without its trailing line break. */
+static void
+remote_link_set_error(struct remote_link *rl, const char *text)
+{
+	size_t	len;
+
+	if (text == NULL)
+		return;
+	len = strlen(text);
+	while (len > 0 && (text[len - 1] == '\n' || text[len - 1] == '\r'))
+		len--;
+	if (len == 0)
+		return;
+	free(rl->last_error);
+	rl->last_error = xstrndup(text, len);
+	rl->error_this_try = 1;
+	log_debug("%s: %s: %s", __func__, rl->host, rl->last_error);
+}
+
+/*
+ * Show why the link is not up. Before the first sync the session has only
+ * the placeholder window: put the text into its name and its pane, since
+ * there are no shadow panes to write to. Each new text goes to the message
+ * log once.
+ */
+static void
+remote_link_report_error(struct remote_link *rl)
+{
+	struct window	*w;
+	char		*name, *text;
+
+	if (rl->last_error == NULL)
+		return;
+	if (rl->reported_error == NULL ||
+	    strcmp(rl->reported_error, rl->last_error) != 0) {
+		free(rl->reported_error);
+		rl->reported_error = xstrdup(rl->last_error);
+		server_add_message("remote %s: %s", rl->host, rl->last_error);
+	}
+	if (rl->placeholder_id == -1)
+		return;
+	w = window_find_by_id(rl->placeholder_id);
+	if (w == NULL)
+		return;
+	xasprintf(&name, "connecting to %s: %s", rl->host, rl->last_error);
+	window_set_name(w, name, 0);
+	free(name);
+	if (w->active != NULL) {
+		xasprintf(&text, "\r\n[remote: %s: %s]\r\n", rl->host,
+		    rl->last_error);
+		input_parse_buffer(w->active, text, strlen(text));
+		free(text);
+	}
+	server_redraw_window(w);
 }
 
 struct remote_link *
@@ -1109,6 +1182,10 @@ remote_link_windows_cb(struct remote_link *rl, __unused struct remote_request *r
 	rl->state = REMOTE_UP;
 	rl->backoff = 0;
 	rl->synced_once = 1;
+	free(rl->last_error);
+	rl->last_error = NULL;
+	free(rl->reported_error);
+	rl->reported_error = NULL;
 	rl->bridge_unsupported = 0;
 	RB_FOREACH(rw, remote_windows, &rl->windows)
 		rw->sent_sx = rw->sent_sy = 0;
@@ -1186,6 +1263,12 @@ remote_link_cb_finish(struct remote_link *rl, int error, const char *body)
 
 	rl->cur = NULL;
 	if (rl->skip_block || rl->unsolicited) {
+		/*
+		 * The reply to the attach itself is not ours to match, but
+		 * its error ("can't find session") is why the link fails.
+		 */
+		if (error && rl->state != REMOTE_UP)
+			remote_link_set_error(rl, body);
 		rl->skip_block = 0;
 		rl->unsolicited = 0;
 		return;
@@ -1437,15 +1520,24 @@ remote_link_cb_exit(void *data, const char *reason)
 	struct remote_link	*rl = data;
 
 	log_debug("%s: %s: %%exit %s", __func__, rl->host, reason);
+	if (rl->state != REMOTE_UP && !rl->error_this_try)
+		remote_link_set_error(rl, reason);
 	rl->want_disconnect = 1;
 }
 
+/*
+ * A line that is not control mode protocol. Before the link is up that is
+ * ssh talking ("Host key verification failed.", "Permission denied"), the
+ * reason the link fails.
+ */
 static void
 remote_link_cb_unknown(void *data, const char *line)
 {
 	struct remote_link	*rl = data;
 
 	log_debug("%s: %s: %s", __func__, rl->host, line);
+	if (rl->state != REMOTE_UP)
+		remote_link_set_error(rl, line);
 }
 
 static const struct remote_parse_callbacks remote_link_callbacks = {
@@ -1531,9 +1623,16 @@ remote_link_down(struct remote_link *rl)
 	RB_FOREACH(rp, remote_panes, &rl->panes) {
 		rp->awaiting_capture = 0;
 		rp->paused = 0;
-		remote_link_pane_printf(rp, "\r\n[remote: %s disconnected]\r\n",
-		    rl->host);
+		if (rl->last_error != NULL) {
+			remote_link_pane_printf(rp,
+			    "\r\n[remote: %s disconnected: %s]\r\n", rl->host,
+			    rl->last_error);
+		} else {
+			remote_link_pane_printf(rp,
+			    "\r\n[remote: %s disconnected]\r\n", rl->host);
+		}
 	}
+	remote_link_report_error(rl);
 	if (rl->s != NULL)
 		server_redraw_session(rl->s);
 	remote_link_schedule_retry(rl);
@@ -1544,10 +1643,24 @@ static void
 remote_link_job_complete(struct job *job)
 {
 	struct remote_link	*rl = job_get_data(job);
+	int			 status = job_get_status(job);
+	char			*text;
 
-	log_debug("%s: %s: status %d", __func__, rl->host,
-	    job_get_status(job));
+	log_debug("%s: %s: status %d", __func__, rl->host, status);
 	rl->job = NULL;
+	if (rl->state != REMOTE_UP && !rl->error_this_try) {
+		if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
+			xasprintf(&text, "command exited with status %d",
+			    WEXITSTATUS(status));
+			remote_link_set_error(rl, text);
+			free(text);
+		} else if (WIFSIGNALED(status)) {
+			xasprintf(&text, "command killed by signal %d",
+			    WTERMSIG(status));
+			remote_link_set_error(rl, text);
+			free(text);
+		}
+	}
 	remote_link_down(rl);
 }
 
@@ -1598,6 +1711,12 @@ remote_link_command(struct remote_link *rl)
 	char			*cmd;
 
 	ft = format_create(NULL, NULL, FORMAT_NONE, FORMAT_NOJOBS);
+	/*
+	 * remote_host is a table format, and the table wins over anything
+	 * added to the tree: give the tree the shadow session, so the table
+	 * callback finds the link. remote_session is not in the table.
+	 */
+	format_defaults(ft, NULL, rl->s, NULL, NULL);
 	format_add(ft, "remote_host", "%s", rl->host);
 	format_add(ft, "remote_session", "%s",
 	    rl->remote_session != NULL ? rl->remote_session : "");
@@ -1614,12 +1733,16 @@ remote_link_connect(struct remote_link *rl)
 
 	cmd = remote_link_command(rl);
 	log_debug("%s: %s: %s", __func__, rl->host, cmd);
+	rl->error_this_try = 0;
+	/* ssh reports on stderr; the parser hands those lines to cb_unknown. */
 	rl->job = job_run(cmd, 0, NULL, NULL, NULL, NULL,
 	    remote_link_job_update, remote_link_job_complete, NULL, rl,
-	    JOB_NOWAIT|JOB_KEEPWRITE, 0, 0);
+	    JOB_NOWAIT|JOB_KEEPWRITE|JOB_SHOWSTDERR, 0, 0);
 	free(cmd);
 	if (rl->job == NULL) {
 		rl->state = REMOTE_DOWN;
+		remote_link_set_error(rl, "cannot start the ssh command");
+		remote_link_report_error(rl);
 		remote_link_schedule_retry(rl);
 		return;
 	}
@@ -1752,6 +1875,8 @@ remote_link_destroy(struct remote_link *rl)
 	remote_parser_free(rl->parser);
 	free(rl->host);
 	free(rl->remote_session);
+	free(rl->last_error);
+	free(rl->reported_error);
 	free(rl);
 }
 

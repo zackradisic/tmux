@@ -198,7 +198,14 @@ The sessions live on the remote. The local objects are a view.
 
 1. The ssh job exits. The link keeps every shadow pane, its grid and its
    socketpair (closing the socketpair end would destroy the pane), and
-   writes `[remote: host disconnected]` into each pane.
+   writes `[remote: host disconnected: reason]` into each pane. The
+   reason is the last thing that went wrong while not connected: an ssh
+   stderr line (the job runs with `JOB_SHOWSTDERR`, so the parser hands
+   non-protocol lines to `cb_unknown`), the remote's `%error` reply to
+   the attach ("can't find session: x"), or the exit status. Before the
+   first sync there are no shadow panes, so the reason goes into the
+   placeholder window's name (`connecting to host: reason`) and its
+   pane, once into `show-messages`, and into `#{remote_error}`.
 2. The link retries with backoff (1, 2, 4 .. 60 s). On success it runs
    `list-windows -F` and reconciles the tree: new windows are built, gone
    windows killed, the rest get the `%layout-change` treatment.

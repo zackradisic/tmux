@@ -4130,6 +4130,7 @@ const char *remote_link_host(struct remote_link *);
 const char *remote_link_remote_session(struct remote_link *);
 struct session *remote_link_session(struct remote_link *);
 int	 remote_link_connected(struct remote_link *);
+const char *remote_link_error(struct remote_link *);
 const char *remote_link_pane_cache(struct window_pane *, int);
 int	 remote_link_bridge_send(struct remote_link *, const void *, size_t);
 #define REMOTE_CACHE_CMD 0
