@@ -54,7 +54,7 @@ $TMUX new-session -d -s beta -x 200 -y 50 \
     || fail "new-session beta"
 sleep 0.5
 
-$TMUX load-plugin -s server -c capture-pane -c run-command -c mode \
+$TMUX load-plugin -s server -o trust_env=1 -c capture-pane -c run-command -c mode \
     -c db -c env-read -c pane-fds -c fs-read -c fs-list "$WASM" \
     || fail "load-plugin"
 # init reconcile scans the panes; give it a moment.

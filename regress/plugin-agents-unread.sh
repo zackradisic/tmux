@@ -81,7 +81,7 @@ sleep 0.5
 P1=$($TMUX list-panes -t alpha -F '#{pane_id}' | sed -n 1p)
 P2=$($TMUX list-panes -t alpha -F '#{pane_id}' | sed -n 2p)
 
-$TMUX load-plugin -s server -c capture-pane -c run-command -c mode \
+$TMUX load-plugin -s server -o trust_env=1 -c capture-pane -c run-command -c mode \
     -c db -c env-read -c pane-fds "$DEPLOY/agents.wasm" \
     || fail "load-plugin"
 sleep 1.5

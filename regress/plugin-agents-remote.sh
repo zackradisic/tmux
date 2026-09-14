@@ -45,7 +45,7 @@ XDG_DATA_HOME="$XDG_A" $TMUX new-session -d -s alpha -x 200 -y 50 \
 $TMUX set -s remote-ssh-command \
     "$TEST_TMUX -LtestB$$ -f/dev/null -C attach -t #{remote_session}" ||
     fail "set remote-ssh-command"
-$TMUX load-plugin -s server -c capture-pane -c run-command -c mode -c db \
+$TMUX load-plugin -s server -o trust_env=1 -c capture-pane -c run-command -c mode -c db \
     -c env-read -c pane-fds -c fs-read -c fs-list -c service-serve \
     -c service-call "$WASM" || fail "load-plugin"
 sleep 1.0

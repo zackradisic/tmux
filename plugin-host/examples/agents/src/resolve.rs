@@ -63,7 +63,18 @@ async fn file_mtime_ms(path: &str) -> Option<i64> {
 /// launched under a wrapper, or a stale pid after a restart), fall back to
 /// scanning the directory and matching the `tmux` field.
 pub async fn claude(a: &Agent) -> Option<Resolved> {
-    let pane = a.pane? as u32;
+    claude_for_pane(a.pane? as u32).await
+}
+
+/// Does a Claude session file name this pane? That file is the proof a
+/// Claude runs there: the command name is a version string on macOS and
+/// `AI_AGENT` is inherited by every pane of a server started inside
+/// Claude Code, but only Claude itself writes its pane into its file.
+pub async fn claude_claims_pane(pane: u32) -> bool {
+    claude_for_pane(pane).await.is_some()
+}
+
+async fn claude_for_pane(pane: u32) -> Option<Resolved> {
     let home = home()?;
     let dir = format!("{home}/.claude/sessions");
 

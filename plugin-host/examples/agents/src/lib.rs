@@ -34,11 +34,13 @@
 //!
 //!   * Membership + liveness is OBSERVED, never announced. A pane is an
 //!     agent when its foreground command is one of `claude|codex|pi|
-//!     opencode` (configurable) or it carries an `AI_AGENT`/`OPENCODE`
-//!     marker in its environment (read with the `pane_env` host call)
-//!     that the pane did not inherit from the tmux server's own
-//!     environment: a server started from inside Claude Code hands
-//!     `AI_AGENT` to every pane, and that is not evidence.
+//!     opencode` (configurable), or it carries an `AI_AGENT`/`OPENCODE`
+//!     marker in its environment (read with the `pane_env` host call).
+//!     For claude the marker is a hint only: a server started from
+//!     inside Claude Code hands `AI_AGENT` to every pane, so a claude
+//!     row also needs Claude's own session file to name the pane
+//!     (`~/.claude/sessions/<pid>.json`, `tmux` field). `trust_env = "1"`
+//!     in the config makes the marker proof again (the tests use it).
 //!     The plugin learns of changes from `pane-command-changed`,
 //!     `pane-created` and `pane-destroyed`, so a killed or crashed CLI
 //!     retires itself - no hook can leave a ghost behind. This is also
@@ -80,12 +82,14 @@
 //!           "service-call"]
 //!   config = { keep_days = 14 }
 //!
-//!   [plugins.agents.caps.env-read]
-//!   names = ["AI_AGENT", "OPENCODE"]
-//!
-//!   [plugins.agents.caps.fs-read]
-//!   paths = ["~/.claude/sessions", "~/.codex/sessions", "~/.pi",
-//!            "~/.local/share/opencode"]
+//! The scoped lists (the variables env-read may read, the directories
+//! fs-read may reach) do not live in plugins.toml. They come from the
+//! sidecar `agents.toml` next to the deployed `agents.wasm` (the release
+//! bundle ships it; a dev tree copies `examples/agents/agents.toml` next
+//! to the built wasm). Without the sidecar the host trusts the grants as
+//! given, and fs-read reaches only the plugin's own sandbox, so the
+//! session files that prove a claude are out of reach: grant
+//! `fs-read-any` then, or deploy the sidecar.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -112,6 +116,7 @@ pub(crate) const HISTORY_MAX: i64 = 100;
 struct AgentsConfig {
     keep_days: Option<serde_json::Value>,
     commands: Option<Vec<String>>,
+    trust_env: Option<String>,
     pick_jump: Option<String>,
     pick_filter: Option<String>,
     pick_archive: Option<String>,
@@ -149,6 +154,9 @@ impl Default for PickKeys {
 pub(crate) struct Config {
     pub keep_days: i64,
     pub commands: Vec<String>,
+    /// An `AI_AGENT` marker alone makes a claude row (no session file
+    /// needed). Off by default; the regress tests turn it on.
+    pub trust_env: bool,
     pub keys: PickKeys,
 }
 
@@ -176,9 +184,15 @@ impl Config {
                 .filter(|s| !s.is_empty())
                 .unwrap_or(def)
         };
+        let trust_env = c
+            .trust_env
+            .as_deref()
+            .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
+            .unwrap_or(false);
         Ok(Config {
             keep_days,
             commands,
+            trust_env,
             keys: PickKeys {
                 jump: pick(&c.pick_jump, d.jump),
                 filter: pick(&c.pick_filter, d.filter),

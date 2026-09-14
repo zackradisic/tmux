@@ -87,15 +87,43 @@ pub struct ActReq {
 // detection + identity (observed from the live process)
 // ---------------------------------------------------------------------------
 
-/// The agent kind a pane runs, or None. Command name first (reliable,
-/// and the only signal Codex offers), then the environment markers.
-fn detect(pane: u32, commands: &[String]) -> Option<String> {
+/// What detection found for a pane.
+enum Detected {
+    Kind(String),
+    /// The environment says claude, but no session file names the pane
+    /// yet. Either a Claude that just started (its file comes within a
+    /// second or two) or a variable the pane merely inherited. Worth
+    /// another look soon, not a row.
+    Pending,
+    None,
+}
+
+/// A foreground command like "2.1.271": the macOS Claude launcher execs
+/// `~/.local/share/claude/versions/<version>`, so the command name is the
+/// version, not `claude`.
+fn looks_like_version(base: &str) -> bool {
+    let mut parts = base.split('.');
+    let n = parts.clone().count();
+    (2..=4).contains(&n) && parts.all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The agent kind a pane runs. Command name first (reliable, and the only
+/// signal Codex offers), then the interpreter's launched script, then
+/// the environment. `AI_AGENT` is a hint, not proof: Claude Code sets it
+/// for its children, so a tmux server started from inside Claude Code
+/// hands it to every pane it spawns, and the Claude process itself may
+/// carry the server's copy. A claude row needs the harness's own session
+/// file to name the pane (see `resolve::claude_claims_pane`), unless the
+/// configuration says `trust_env`.
+async fn detect(pane: u32, cfg: &Config) -> Detected {
+    let commands = &cfg.commands;
+    let mut version_like = false;
     if let Ok(cmd) =
         format_expand(OptionTarget::Pane(PaneId(pane)), "#{pane_current_command}")
     {
         let base = cmd.rsplit('/').next().unwrap_or(&cmd);
         if let Some(k) = commands.iter().find(|c| c.as_str() == base) {
-            return Some(k.clone());
+            return Detected::Kind(k.clone());
         }
         // An interpreter-wrapped CLI: match the basename of the launched
         // script (the `_` var), not the interpreter. Gated to interpreters
@@ -105,41 +133,50 @@ fn detect(pane: u32, commands: &[String]) -> Option<String> {
                 let ubase = under.rsplit('/').next().unwrap_or(&under);
                 if let Some(k) = commands.iter().find(|c| c.as_str() == ubase)
                 {
-                    return Some(k.clone());
+                    return Detected::Kind(k.clone());
                 }
             }
         }
+        version_like = looks_like_version(base);
     }
-    if let Some(v) = marker(pane, "AI_AGENT") {
-        let v = v.to_lowercase();
-        for k in ["claude", "codex", "opencode", "pi"] {
-            if v.contains(k) {
-                return Some(k.to_string());
+    let hint = pane_env(PaneId(pane), "AI_AGENT")
+        .ok()
+        .flatten()
+        .map(|v| v.to_lowercase())
+        .and_then(|v| {
+            ["claude", "codex", "opencode", "pi"]
+                .iter()
+                .find(|k| v.contains(*k))
+                .map(|k| k.to_string())
+        });
+    match hint.as_deref() {
+        Some("claude") if !cfg.trust_env => {
+            if crate::resolve::claude_claims_pane(pane).await {
+                return Detected::Kind("claude".into());
             }
+            return Detected::Pending;
         }
+        Some(k) => return Detected::Kind(k.to_string()),
+        None => {}
     }
-    if marker(pane, "OPENCODE").is_some() {
-        return Some("opencode".into());
+    if version_like && crate::resolve::claude_claims_pane(pane).await {
+        return Detected::Kind("claude".into());
     }
-    None
+    if let Ok(Some(_)) = pane_env(PaneId(pane), "OPENCODE") {
+        return Detected::Kind("opencode".into());
+    }
+    Detected::None
 }
 
-/// An environment marker of the pane's foreground process, unless the
-/// pane inherited it. Claude Code sets `AI_AGENT` for its children, so a
-/// tmux server started from inside Claude Code hands the variable to
-/// every pane it spawns, and an idle shell or a `sleep` would look like
-/// an agent. The `#{NAME}` format reads the session and global
-/// environment, which is what the pane's shell got; a value equal to
-/// that is inherited and proves nothing.
-fn marker(pane: u32, name: &str) -> Option<String> {
-    let value = pane_env(PaneId(pane), name).ok()??;
-    let inherited =
-        format_expand(OptionTarget::Pane(PaneId(pane)), &format!("#{{{name}}}")).ok()?;
-    if inherited == value {
-        return None;
-    }
-    Some(value)
+thread_local! {
+    /// Per pane: how many delayed looks a Pending detection has had.
+    static PENDING_LOOKS: std::cell::RefCell<HashMap<u32, u8>> =
+        std::cell::RefCell::new(HashMap::new());
 }
+
+/// Delays between the looks at a Pending pane: a Claude writes its
+/// session file within the first seconds of its life.
+const PENDING_DELAYS_MS: [u64; 3] = [2000, 5000, 15000];
 
 /// Is this pane a shadow of a pane on another server? Its agent belongs
 /// to that server's provider, so this one leaves it alone.
@@ -213,9 +250,42 @@ pub async fn classify(pane: u32, cfg: Rc<Config>) {
         let _ = store::end_by_pane(pane as i64, now, "closed").await;
         return;
     }
-    let Some(kind) = detect(pane, &cfg.commands) else {
-        let _ = store::end_by_pane(pane as i64, now, "closed").await;
-        return;
+    let kind = match detect(pane, &cfg).await {
+        Detected::Kind(k) => {
+            PENDING_LOOKS.with(|p| p.borrow_mut().remove(&pane));
+            k
+        }
+        Detected::Pending => {
+            // A row already here stays: its file was seen once. Otherwise
+            // look again after a while, a bounded number of times.
+            if store::live_by_pane(pane as i64).await.ok().flatten().is_some() {
+                return;
+            }
+            let look = PENDING_LOOKS.with(|p| {
+                let mut p = p.borrow_mut();
+                let n = p.entry(pane).or_insert(0);
+                let look = *n;
+                *n += 1;
+                look
+            });
+            if let Some(delay) = PENDING_DELAYS_MS.get(look as usize) {
+                let delay = *delay;
+                let cfg = Rc::clone(&cfg);
+                spawn(async move {
+                    if sleep_ms(delay).await.is_ok() {
+                        classify(pane, cfg).await;
+                    }
+                });
+            } else {
+                PENDING_LOOKS.with(|p| p.borrow_mut().remove(&pane));
+            }
+            return;
+        }
+        Detected::None => {
+            PENDING_LOOKS.with(|p| p.borrow_mut().remove(&pane));
+            let _ = store::end_by_pane(pane as i64, now, "closed").await;
+            return;
+        }
     };
     let (session, window) = labels(pane);
     let existing = store::live_by_pane(pane as i64).await.ok().flatten();

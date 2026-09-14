@@ -63,7 +63,7 @@ $TMUX split-window -t alpha "sh -c 'AI_AGENT=claude exec sleep 600'"
 $TMUX select-layout -t alpha tiled
 sleep 0.5
 
-$TMUX load-plugin -s server -c capture-pane -c run-command -c mode \
+$TMUX load-plugin -s server -o trust_env=1 -c capture-pane -c run-command -c mode \
     -c db -c env-read -c pane-fds "$DEPLOY/agents.wasm" \
     || fail "load-plugin"
 sleep 1.5

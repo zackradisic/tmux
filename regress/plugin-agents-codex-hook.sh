@@ -83,7 +83,7 @@ $TMUX -f/dev/null new-session -d -s alpha -x 200 -y 50 \
 sleep 0.5
 PANE=$($TMUX list-panes -t alpha -F '#{pane_id}' | head -1)
 
-$TMUX load-plugin -s server -c capture-pane -c run-command -c mode \
+$TMUX load-plugin -s server -o trust_env=1 -c capture-pane -c run-command -c mode \
     -c db -c env-read -c pane-fds -c fs-read -c fs-list "$DEPLOY/agents.wasm" \
     || fail "load-plugin"
 sleep 1.5
