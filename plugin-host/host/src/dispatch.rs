@@ -34,8 +34,28 @@ fn vtable() -> Result<&'static pgh_host_vtable, HostError> {
     crate::vtable().ok_or_else(|| err(ErrorCode::Host, "host vtable unavailable"))
 }
 
+thread_local! {
+    /// (plugin, capability) denials already reported, so a plugin that
+    /// keeps asking does not flood the message log.
+    static DENIED: std::cell::RefCell<std::collections::HashSet<(String, u32)>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
 fn check_cap(mem: &GuestMem<'_, '_>, flag: u32) -> Result<(), HostError> {
     if !mem.data().caps.has(flag) {
+        let plugin = mem.data().plugin.clone();
+        let fresh = DENIED.with(|d| d.borrow_mut().insert((plugin.clone(), flag)));
+        if fresh {
+            // A denied capability is usually a sidecar or a manifest
+            // that forgot to name it; say so where the user looks.
+            crate::hostlog::warn(
+                &plugin,
+                &format!(
+                    "capability {:?} not granted; add it to the plugin's grants (and its sidecar requests, if it has one)",
+                    crate::caps::cap_name(flag)
+                ),
+            );
+        }
         return Err(err(
             ErrorCode::CapDenied,
             format!(

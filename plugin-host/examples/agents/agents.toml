@@ -5,6 +5,12 @@
 # intersected with the user's `load-plugin -c ...` grants. Under
 # trust-the-user (no sidecar) every requested cap is granted, the
 # env-read allowlist is unrestricted, and fs-read reaches anywhere.
+#
+# service-serve and service-call carry the roster across linked servers
+# (the provider half answers list/capture/search/act and publishes
+# `changed`; the view half calls and follows them). Without them the
+# picker shows local agents only, and the log says
+# "register list: capability service-serve not granted".
 
 [caps]
 requests = [
@@ -16,6 +22,8 @@ requests = [
   "pane-fds",
   "fs-read",
   "fs-list",
+  "service-serve",
+  "service-call",
 ]
 
 # The only environment variables the roster ever reads. Everything else

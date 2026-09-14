@@ -12,14 +12,25 @@
 
 . ./remote-common.inc
 
-WASM=$(dirname "$TEST_TMUX")/plugin-host/target/wasm32-unknown-unknown/release/agents.wasm
-[ -f "$WASM" ] || fail "agents.wasm not built"
+BUILT=$(dirname "$TEST_TMUX")/plugin-host/target/wasm32-unknown-unknown/release/agents.wasm
+[ -f "$BUILT" ] || fail "agents.wasm not built"
+SIDECAR=$(dirname "$TEST_TMUX")/plugin-host/examples/agents/agents.toml
+[ -f "$SIDECAR" ] || fail "no agents.toml"
 
 XDG_A="$TMP/a"
 XDG_B="$TMP/b"
 BIN="$TMP/bin"
 mkdir -p "$XDG_A" "$XDG_B" "$BIN"
 ln -s "$(command -v sleep)" "$BIN/codex"
+
+# Deploy the wasm with its sidecar, as a release install does: the host
+# then runs it in restrictive mode, where the sidecar's requests mask the
+# grants. The sidecar must ask for the service caps or the roster stays
+# local. The pushed copy carries the sidecar to B too.
+mkdir -p "$TMP/deploy"
+cp "$BUILT" "$TMP/deploy/agents.wasm"
+cp "$SIDECAR" "$TMP/deploy/agents.toml"
+WASM="$TMP/deploy/agents.wasm"
 
 screen() { $TMUX capture-pane -M -p -t "$FORM" | sed '/^ *$/d'; }
 keys() { $TMUX send-keys -t "$FORM" "$@"; sleep 0.4; }

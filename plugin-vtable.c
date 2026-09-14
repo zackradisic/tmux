@@ -57,11 +57,17 @@ static void	plugin_vtable_flush(struct plugin_buf *, pgh_sink,
 #define PLUGIN_CLIENT_ATTACHED	0x1
 #define PLUGIN_CLIENT_CONTROL	0x2
 
+/*
+ * Plugin and host log lines go to the debug log; a warning or an error
+ * also goes to the message log, where show-messages finds it.
+ */
 void
 plugin_vtable_log(int level, const char *plugin, const char *msg)
 {
 	log_debug("plugin[%s]: %s%s", plugin,
 	    level >= PGH_LOG_ERROR ? "error: " : "", msg);
+	if (level >= PGH_LOG_WARN)
+		server_add_message("plugin %s: %s", plugin, msg);
 }
 
 static void
