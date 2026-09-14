@@ -614,12 +614,6 @@ void pgh_bridge_recv(uint32_t peer, const uint8_t *bytes, uintptr_t len);
 void pgh_bridge_state(uint32_t peer, const char *name, int up);
 
 /**
- * Does a bridge peer run plugins (its hello named providers)? 1 or 0.
- * Synchronous and read-only: safe from any main-thread context.
- */
-int pgh_bridge_peer_provides(uint32_t peer);
-
-/**
  * Run queued plugin work for at most `max_us` microseconds of wall clock
  * (0 = default budget). Returns the number of deliveries still queued;
  * when nonzero the C side re-schedules via its zero-timeout evtimer so the

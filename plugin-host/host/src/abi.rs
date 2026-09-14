@@ -79,6 +79,8 @@ pub struct Guest {
     snapshot: Option<TypedFunc<(i32, i32), i32>>,
     migrate: Option<TypedFunc<(i32, i32, i32), i32>>,
     on_config_changed: Option<TypedFunc<(i32, i32), i32>>,
+    service_version: Option<TypedFunc<(), i64>>,
+    service_accept: Option<TypedFunc<(i32, i32), i32>>,
 }
 
 /// Outcome of a budgeted guest call, for stats and the failure policy.
@@ -242,6 +244,12 @@ pub fn instantiate(
     let on_config_changed = instance
         .get_typed_func(&mut store, exports::ON_CONFIG_CHANGED)
         .ok();
+    let service_version = instance
+        .get_typed_func(&mut store, exports::SERVICE_VERSION)
+        .ok();
+    let service_accept = instance
+        .get_typed_func(&mut store, exports::SERVICE_ACCEPT)
+        .ok();
 
     Ok(Guest {
         store,
@@ -257,6 +265,8 @@ pub fn instantiate(
         snapshot,
         migrate,
         on_config_changed,
+        service_version,
+        service_accept,
     })
 }
 
@@ -329,6 +339,33 @@ impl Guest {
                 g.write_bytes(event).map_err(wasmtime::Error::msg)?;
             g.on_event.call(&mut g.store, (ptr, len))?;
             Ok(())
+        })
+    }
+
+    /// The guest's service version, or None when it lacks the export or
+    /// the call trapped.
+    pub fn call_service_version(&mut self) -> Option<tmux_plugin_abi::Version> {
+        let f = self.service_version.clone()?;
+        let outcome = self.budgeted(HARD_TICKS, |g| Ok(f.call(&mut g.store, ())?));
+        outcome.result.ok().map(tmux_plugin_abi::Version::unpack)
+    }
+
+    /// Ask the guest whether it accepts a peer's copy of itself. `block`
+    /// is a field block with server, version and role. Ok(None) when the
+    /// guest lacks the export.
+    pub fn call_service_accept(&mut self, block: &[u8]) -> CallOutcome<Option<bool>> {
+        let Some(f) = self.service_accept.clone() else {
+            return CallOutcome {
+                result: Ok(None),
+                soft_warned: false,
+                elapsed_ns: 0,
+            };
+        };
+        self.budgeted(HARD_TICKS, |g| {
+            let (ptr, len) =
+                g.write_bytes(block).map_err(wasmtime::Error::msg)?;
+            let rc = f.call(&mut g.store, (ptr, len))?;
+            Ok(Some(rc != 0))
         })
     }
 

@@ -320,7 +320,32 @@ the remote as it is. The remote decides the grants with its
 `run-process`, `fs-write`, `fs-read-any` and `fs-write-any`. A remote
 tmux2 older than the pushed ABI refuses the load and the link logs
 "remote tmux2 is older; run tmux update there". Pushed plugins are
-unloaded ten minutes after their peer stays down.
+unloaded ten minutes after their peer stays down. A push never replaces
+a plugin the remote loaded itself (from its manifest or `load-plugin`):
+the remote keeps its own copy, role and grants, and logs "kept the local
+plugin". That copy already serves the pusher, because `hello` lists it.
+So a machine that is both a workstation and a remote keeps its own UI.
+Its own copies need `service-serve` in their manifest caps, or they
+cannot forward to the pusher; the pusher then suppresses its local toast
+for a mirrored pane only when the remote runs that plugin.
+
+### Service versions
+
+Every plugin reports a service version (`Plugin::SERVICE_VERSION`,
+`major.minor.patch`, all bundled plugins at `0.1.0` for now) through the
+`pgh_service_version` export, and `hello` carries it per plugin. When a
+hello names a plugin this side also runs, the host decides whether the
+two copies talk: the semver rule (same major, and the same minor while
+the major is 0), refined by the plugin's `accepts_provider` and
+`accepts_view` hooks (`pgh_service_accept`). Each side judges on its own.
+A rejected copy fails outgoing calls at once with `E_VERSION`, gets an
+error reply to its own calls, and its topic events are dropped.
+`servers` reports the verdict, and the agents picker shows a rejected
+server as one line: "devbox (agents 0.2.0 there, 0.1.0 here; run tmux
+update)". A push never fixes a mismatch by force; `tmux update` on the
+older side does. A pushed plugin says hello again when its first
+instance runs, so its version is known. `regress/plugin-services-
+version.sh` and `regress/plugin-services-keep-local.sh` drive both rules.
 
 ### Services
 

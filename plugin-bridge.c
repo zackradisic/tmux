@@ -121,18 +121,6 @@ plugin_bridge_client_lost(struct client *c)
 	plugin_schedule_drain();
 }
 
-/*
- * Does the remote end of a link run plugins? Then its own plugins see the
- * events of the panes it mirrors here, and forward what a view wants.
- */
-int
-plugin_bridge_link_provides(struct remote_link *rl)
-{
-	if (!plugin_enabled())
-		return (0);
-	return (pgh_bridge_peer_provides(remote_link_id(rl) | PGH_PEER_LINK));
-}
-
 /* A remote link came up or went down. */
 void
 plugin_bridge_link_state(struct remote_link *rl, int up)

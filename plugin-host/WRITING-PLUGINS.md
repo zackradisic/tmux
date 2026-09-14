@@ -269,6 +269,39 @@ a plugin that is loaded but has not registered the method yet (its init
 is still queued, as right after a push) waits up to ten seconds; a call
 nobody answers fails after thirty seconds with `E_TIMEOUT`.
 
+### Service versions
+
+The two halves of a plugin can run different builds: a workstation with a
+dev build linked to a host that runs a release. `Plugin::SERVICE_VERSION`
+(default `"0.1.0"`) names the shape of the plugin's methods and topics as
+`major.minor.patch`. Bump it when a request, a reply or a topic payload
+changes in a way an old copy cannot read; a field added with
+`#[serde(default)]` needs no bump. Every bundled plugin sits at `0.1.0`
+while the protocol settles.
+
+Two hooks decide whether copies talk; both default to the semver rule
+(same major, and the same minor while the major is 0):
+
+```rust
+fn accepts_provider(&self, _ctx: &Ctx, server: &str, theirs: Version) -> bool {
+    theirs.major == Self::service_version().major   // wider than the default
+}
+
+fn accepts_view(&self, _ctx: &Ctx, _server: &str, theirs: Version) -> bool {
+    Self::service_version().compatible(theirs)
+}
+```
+
+The view side asks `accepts_provider` about each provider copy, the
+provider side asks `accepts_view` about each view copy; each server
+judges on its own. A rejected server fails `service::call` at once with
+`E_VERSION` ("agents: version 0.2.0 on devbox, 0.1.0 here; run tmux
+update on the older side"), its topic events never reach
+`on_service_event`, and `service::servers()` reports it with `accepted`
+false and its `version`, so a view can show one line that says why. The
+agents picker does that. A copy from an old SDK reports no version and
+is accepted.
+
 `Replica<T>` keeps a view's per-server copy of what providers report:
 `apply_full(server, seq, rows)` after a `list`, `apply(server, seq,
 delta)` on every topic event (false means a gap: fetch the list again),
@@ -278,13 +311,18 @@ delta)` on every topic event (false means a gap: fetch the list again),
 In role `Both` the view half reads its own provider half by calling its
 methods directly; the host path is for other plugins and other servers.
 `service::servers()` lists the local server and every linked server with
-its link state. `plugin-host/examples/services-probe` is the smallest
-complete provider/view pair.
+its link state, its version of this plugin and whether this side accepts
+it. `plugin-host/examples/services-probe` is the smallest complete
+provider/view pair.
 
 Over a link the local server pushes every plugin with role `both` or
 `provider` to the remote, which loads it as a provider with the grants
 its `plugin-remote-caps` server option allows (everything but
 `run-process`, `fs-write`, `fs-read-any` and `fs-write-any` by default).
+A plugin the remote loads itself is never replaced by a push: the remote
+keeps its copy, role and grants, and the pusher talks to that copy. So a
+machine that is both a workstation and a remote keeps its own UI; give
+its own copies `service-serve`, or they cannot forward to the pusher.
 Two servers on one machine share a plugin's `store.db` when they share
 `XDG_DATA_HOME`; the regress tests give the second server its own.
 

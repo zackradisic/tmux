@@ -42,6 +42,11 @@ pub fn scope_matches(scope: ScopeId, ev: &EventScope) -> bool {
 
 /// Enqueue a raw binary event from the C bridge. ENQUEUE ONLY - the one
 /// pgh entry point that vtable callbacks may legally re-enter.
+/// Queue any delivery for the next drain.
+pub fn enqueue_delivery(delivery: Delivery) {
+    EVENTS.with(|e| e.borrow_mut().deliveries.push_back(delivery));
+}
+
 pub fn enqueue_raw(bytes: Vec<u8>) {
     EVENTS.with(|e| {
         let mut q = e.borrow_mut();
@@ -142,6 +147,9 @@ pub fn drain(max_us: u32) -> u32 {
             }
             Delivery::BridgeState { peer, name, up } => {
                 crate::bridge::state(peer, name, up);
+            }
+            Delivery::ServiceAccept { peer, plugin, bytes } => {
+                deliver_service_accept(peer, &plugin, &bytes);
             }
         }
 
@@ -327,6 +335,34 @@ fn deliver_to_owner(owner: &crate::services::Owner, mut bytes: Vec<u8>, what: &s
         hostlog::error(&inst.plugin, &format!("on_event({what}) trapped: {e}"));
     }
     check_in(key, inst, trapped);
+}
+
+/// Ask any one instance of `plugin` for its verdict on a peer's copy and
+/// record it. A plugin without the export keeps the host's default.
+fn deliver_service_accept(peer: u32, plugin: &str, bytes: &[u8]) {
+    let scope = REGISTRY.with(|r| {
+        r.borrow()
+            .by_scope
+            .keys()
+            .find(|(p, _)| p == plugin)
+            .map(|(_, scope)| *scope)
+    });
+    let Some(scope) = scope else { return };
+    let Some((key, mut inst)) = checkout(plugin, scope) else { return };
+    let outcome = inst.guest.call_service_accept(bytes);
+    inst.stats.record(&outcome);
+    let trapped = outcome.trapped();
+    let verdict = match &outcome.result {
+        Ok(v) => *v,
+        Err(e) => {
+            hostlog::error(&inst.plugin, &format!("service_accept trapped: {e}"));
+            None
+        }
+    };
+    check_in(key, inst, trapped);
+    if let Some(ok) = verdict {
+        crate::bridge::record_verdict(peer, plugin, ok);
+    }
 }
 
 /// Deliver a mode event to the instance owning the mode, generation-
@@ -545,13 +581,19 @@ fn instantiate_scope(plugin: &str, scope: ScopeId) {
             return;
         }
     };
-    let (guest, generation, stats) = built;
+    let (mut guest, generation, stats) = built;
+    let service_version = guest.call_service_version();
 
     // Phase 3 (borrow): check in.
-    REGISTRY.with(|r| {
+    let started = REGISTRY.with(|r| {
         let mut reg = r.borrow_mut();
         if !reg.is_running(plugin) {
-            return; // disabled while init ran
+            return false; // disabled while init ran
+        }
+        if service_version.is_some() {
+            if let Some(def) = reg.plugins.get_mut(plugin) {
+                def.service_version = service_version;
+            }
         }
         let key = reg.instances.insert(Some(Instance {
             plugin: plugin.to_string(),
@@ -568,7 +610,28 @@ fn instantiate_scope(plugin: &str, scope: ScopeId) {
             plugin,
             &format!("instance {scope} started (generation {generation})"),
         );
+        true
     });
+    if started {
+        // Peers that listed this plugin in their hello get a verdict now.
+        crate::bridge::plugin_started(plugin);
+    }
+}
+
+/// For a pane-notification from a shadow pane, the bridge peer whose
+/// server owns the real pane (the `remote_peer` field), if any.
+fn event_remote_peer(bytes: &[u8]) -> Option<u32> {
+    let (_, cursor) = EventHeader::parse(bytes).ok()?;
+    let key = interner::intern("remote_peer");
+    for field in FieldReader::from_cursor(cursor).ok()? {
+        let (k, value) = field.ok()?;
+        if k == KeyRef::Id(key) {
+            if let ValueRef::I64(v) = value {
+                return u32::try_from(v).ok();
+            }
+        }
+    }
+    None
 }
 
 fn fail(plugin: &str, what: &str) {
@@ -607,6 +670,15 @@ fn route_event(header: &EventHeader, bytes: &[u8]) {
     } else {
         None
     };
+    // A notification from a shadow pane also fires on the remote server,
+    // where the pane really is. A plugin the remote runs too gets it
+    // there and forwards what its view here wants, so it must not see
+    // the local copy as well. Plugins the remote lacks still get it.
+    let remote_peer = if header.event_id == interner::intern("pane-notification") {
+        event_remote_peer(bytes)
+    } else {
+        None
+    };
 
     let keys: Vec<usize> = REGISTRY.with(|r| {
         let reg = r.borrow();
@@ -636,7 +708,9 @@ fn route_event(header: &EventHeader, bytes: &[u8]) {
                 .contains(&header.event_id))
             && command_target
                 .as_deref()
-                .is_none_or(|t| t == inst.plugin.as_str());
+                .is_none_or(|t| t == inst.plugin.as_str())
+            && remote_peer
+                .is_none_or(|p| !crate::bridge::peer_provides_plugin(p, &inst.plugin));
 
         let mut trapped = false;
         if subscribed {

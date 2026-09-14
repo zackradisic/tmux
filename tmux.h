@@ -4373,7 +4373,6 @@ void	 plugin_object_destroyed(enum plugin_obj_kind, u_int);
 void	 plugin_bridge_recv(u_int, const char *);
 void	 plugin_bridge_client_lost(struct client *);
 void	 plugin_bridge_link_state(struct remote_link *, int);
-int	 plugin_bridge_link_provides(struct remote_link *);
 
 /* window-plugin-mode.c */
 extern const struct window_mode window_plugin_mode;

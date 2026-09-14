@@ -14,6 +14,10 @@
 //!   @probe_tick_<server>     the last tick sequence from that server
 //!   @probe_up_<server>       how often the server's link came up
 //!   @probe_down_<server>     how often it went down
+//!   @probe_accept_<server>   the view's verdict on that server's copy
+//!
+//! Config `reject_peer = "1"` makes the view half reject every provider
+//! copy, so a test can drive the E_VERSION path with one build.
 //!
 //! Build: cargo build -p services_probe --target wasm32-unknown-unknown --release
 
@@ -25,6 +29,13 @@ struct Probe {
     role: Role,
     ups: u64,
     downs: u64,
+    reject_peer: bool,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct Config {
+    #[serde(default)]
+    reject_peer: String,
 }
 
 fn store(name: &str, value: &str) {
@@ -53,9 +64,9 @@ fn probe_echo(server: String) {
 
 impl Plugin for Probe {
     const NAME: &'static str = NAME;
-    type Config = serde_json::Value;
+    type Config = Config;
 
-    fn init(ctx: &Ctx, _config: Self::Config) -> Result<Self, String> {
+    fn init(ctx: &Ctx, config: Self::Config) -> Result<Self, String> {
         let role = ctx.role();
         store("@probe_role", &role.to_string());
 
@@ -86,7 +97,13 @@ impl Plugin for Probe {
                 }
             }
         }
-        Ok(Self { role, ups: 0, downs: 0 })
+        Ok(Self { role, ups: 0, downs: 0, reject_peer: config.reject_peer == "1" })
+    }
+
+    fn accepts_provider(&self, _ctx: &Ctx, server: &str, theirs: Version) -> bool {
+        let ok = !self.reject_peer && Self::service_version().compatible(theirs);
+        store(&format!("@probe_accept_{server}"), if ok { "1" } else { "0" });
+        ok
     }
 
     fn on_event(&mut self, _ctx: &Ctx, event: Event) {

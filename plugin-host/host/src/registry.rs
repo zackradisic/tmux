@@ -79,6 +79,9 @@ pub struct PluginDef {
     /// The bridge peer that pushed this plugin, if any. Pushed plugins are
     /// unloaded when their peer stays down past the grace period.
     pub pushed_by: Option<u32>,
+    /// The service version its first instance reported (see abi-types
+    /// Version); None for a plugin without the export.
+    pub service_version: Option<tmux_plugin_abi::Version>,
 }
 
 pub struct Instance {
@@ -192,6 +195,7 @@ impl Registry {
                 failures: Vec::new(),
                 managed: false,
                 pushed_by: None,
+                service_version: None,
             },
         );
         hostlog::info(

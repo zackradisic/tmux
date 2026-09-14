@@ -51,7 +51,7 @@ pub use tmux_plugin_abi as abi;
 pub use service::{Replica, ServiceEvent, ServiceRequest};
 pub use tmux_plugin_abi::{
     ClientInfo, EventScope, HostError, PaneInfo, Role, SelfInfo, ServerInfo,
-    SessionInfo, WindowInfo,
+    SessionInfo, Version, WindowInfo,
 };
 
 pub mod prelude {
@@ -65,7 +65,7 @@ pub mod prelude {
     pub use tmux_plugin_abi::db::{DbValue, ExecResult, Row, Rows};
     pub use tmux_plugin_abi::{
         ClientInfo, EventScope, HostError, PaneInfo, Role, SelfInfo,
-        ServerInfo, SessionInfo, WindowInfo,
+        ServerInfo, SessionInfo, Version, WindowInfo,
     };
 }
 
@@ -107,6 +107,35 @@ pub trait Plugin: Sized + 'static {
     /// Bump when the shape returned by [`Plugin::snapshot`] changes;
     /// [`Plugin::restore`] receives the old version on code reload.
     const STATE_VERSION: i32 = 1;
+
+    /// The service version of this plugin's methods and topics, as
+    /// `major.minor.patch`. Bump it when a request, a reply or a topic
+    /// payload changes shape in a way an old copy cannot read. Two
+    /// copies on linked servers talk only when both accept the other's
+    /// version (see [`Plugin::accepts_provider`] and
+    /// [`Plugin::accepts_view`]).
+    const SERVICE_VERSION: &'static str = "0.1.0";
+
+    /// [`Plugin::SERVICE_VERSION`] parsed; a bad string reads as 0.0.0.
+    fn service_version() -> Version {
+        Version::parse(Self::SERVICE_VERSION).unwrap_or_default()
+    }
+
+    /// May the view half here talk to the provider copy of this plugin
+    /// on `server`, which runs at `theirs`? The default is the semver
+    /// rule: the same major, and the same minor while the major is 0.
+    /// A rejected server fails calls with `E_VERSION` and its topic
+    /// events are dropped.
+    fn accepts_provider(&self, _ctx: &Ctx, _server: &str, theirs: Version) -> bool {
+        Self::service_version().compatible(theirs)
+    }
+
+    /// May the provider half here serve the view copy of this plugin on
+    /// `server`, which runs at `theirs`? Same default as
+    /// [`Plugin::accepts_provider`].
+    fn accepts_view(&self, _ctx: &Ctx, _server: &str, theirs: Version) -> bool {
+        Self::service_version().compatible(theirs)
+    }
 
     /// Configuration shape (from `load-plugin -o key=value ...`). Use
     /// `serde_json::Value` if you don't care. (Config crosses the ABI as
@@ -306,6 +335,52 @@ macro_rules! tmux_plugin {
                 let absorbed = absorbed.unwrap_or(false);
                 executor::run_until_stalled();
                 i32::from(absorbed)
+            }
+
+            #[no_mangle]
+            pub extern "C" fn pgh_service_version() -> i64 {
+                <$ty as $crate::Plugin>::service_version().pack()
+            }
+
+            #[no_mangle]
+            pub extern "C" fn pgh_service_accept(ptr: i32, len: i32) -> i32 {
+                let bytes = runtime::take_buf(ptr, len);
+                let value = event::config_value(&bytes);
+                let server = value
+                    .get("server")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let theirs = value
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .and_then($crate::Version::parse);
+                // An unversioned copy (an old SDK) gives nothing to judge.
+                let Some(theirs) = theirs else { return 1 };
+                let their_role = $crate::Role::from_num(
+                    value.get("role").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                );
+                let ctx = $crate::Ctx::new();
+                let mine = ctx.role();
+                let ok = PLUGIN.with(|p| {
+                    let p = p.borrow();
+                    let Some(plugin) = p.as_ref() else {
+                        return <$ty as $crate::Plugin>::service_version()
+                            .compatible(theirs);
+                    };
+                    let mut ok = true;
+                    if their_role.provides() && mine.views() {
+                        ok &= $crate::Plugin::accepts_provider(
+                            plugin, &ctx, &server, theirs,
+                        );
+                    }
+                    if their_role.views() && mine.provides() {
+                        ok &= $crate::Plugin::accepts_view(plugin, &ctx, &server, theirs);
+                    }
+                    ok
+                });
+                executor::run_until_stalled();
+                i32::from(ok)
             }
 
             #[no_mangle]

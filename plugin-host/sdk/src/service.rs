@@ -42,9 +42,10 @@ pub fn servers() -> Result<Vec<ServerInfo>, HostError> {
     parse_list(&buf, ServerInfo::parse).map_err(|_| wire_err())
 }
 
-/// The local server's record.
+/// The local server's record. The version field stays empty here; the
+/// `servers` import fills it for the calling plugin.
 pub fn local_server() -> ServerInfo {
-    ServerInfo { id: 0, name: LOCAL_SERVER.into(), up: true, local: true }
+    ServerInfo::local("")
 }
 
 // ---------------------------------------------------------------------------

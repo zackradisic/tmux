@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tmux_plugin_abi::{
-    Cursor, EventHeader, EventScope, FieldReader, FieldWriter, KeyRef,
-    LoadDescriptor, Role, ValueRef, ABI_VERSION,
+    service_fields, Cursor, EventHeader, EventScope, FieldReader, FieldWriter,
+    KeyRef, LoadDescriptor, Role, ValueRef, Version, ABI_VERSION,
 };
 
 use crate::ffi::PGH_PEER_LINK;
@@ -30,7 +30,7 @@ use crate::hostlog;
 use crate::intern;
 use crate::registry::PluginState;
 use crate::services;
-use crate::state::REGISTRY;
+use crate::state::{Delivery, REGISTRY};
 
 const MAGIC: &[u8; 4] = b"PGB1";
 const FLAG_ZSTD: u8 = 1;
@@ -84,6 +84,18 @@ pub struct HelloPlugin {
     pub role: Role,
     #[serde(default)]
     pub service_version: u32,
+    /// The plugin's service version as `major.minor.patch`; "" for a
+    /// plugin without the export, which every side accepts.
+    #[serde(default)]
+    pub version: String,
+}
+
+/// What this side decided about a peer's copy of one plugin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verdict {
+    /// The peer's version string as it said hello.
+    pub theirs: String,
+    pub ok: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -345,10 +357,165 @@ pub struct Peer {
     pub initiator: bool,
     pub hello: Option<(i32, Vec<HelloPlugin>)>,
     pub down_since: Option<Instant>,
+    /// Per plugin name: does this side talk to the peer's copy? Filled
+    /// from hello with the semver rule, then refined by the plugin's own
+    /// `pgh_service_accept`.
+    pub verdicts: HashMap<String, Verdict>,
 }
 
 thread_local! {
     static PEERS: RefCell<HashMap<u32, Peer>> = RefCell::new(HashMap::new());
+}
+
+/// Does this side accept the peer's copy of `plugin`? True when the peer
+/// has no copy or gave no version (nothing to compare).
+pub fn peer_accepts(peer: u32, plugin: &str) -> bool {
+    PEERS.with(|p| {
+        p.borrow()
+            .get(&peer)
+            .and_then(|x| x.verdicts.get(plugin))
+            .is_none_or(|v| v.ok)
+    })
+}
+
+/// The peer's version string of `plugin` from its hello, if listed.
+pub fn peer_version_of(peer: u32, plugin: &str) -> Option<String> {
+    PEERS.with(|p| {
+        p.borrow().get(&peer).and_then(|x| {
+            x.hello.as_ref().and_then(|(_, list)| {
+                list.iter().find(|h| h.name == plugin).map(|h| h.version.clone())
+            })
+        })
+    })
+}
+
+fn local_version_of(plugin: &str) -> Option<String> {
+    REGISTRY.with(|r| {
+        r.borrow()
+            .plugins
+            .get(plugin)
+            .and_then(|d| d.service_version)
+            .map(|v| v.to_string())
+    })
+}
+
+/// The E_VERSION message: "agents: version 0.2.0 on devbox, 0.1.0 here".
+pub fn version_message(peer: u32, plugin: &str) -> String {
+    let name = peer_name(peer).unwrap_or_else(|| format!("peer-{peer}"));
+    let theirs = peer_version_of(peer, plugin).filter(|v| !v.is_empty());
+    let mine = local_version_of(plugin);
+    format!(
+        "{plugin}: version {} on {name}, {} here; run tmux update on the older side",
+        theirs.as_deref().unwrap_or("unknown"),
+        mine.as_deref().unwrap_or("unknown"),
+    )
+}
+
+/// Decide, for every plugin the peer listed that this side also runs,
+/// whether the two copies talk: the semver rule now, the plugin's own
+/// `pgh_service_accept` when the queued ask runs.
+fn evaluate(peer: u32, plugins: &[HelloPlugin]) {
+    let server = peer_name(peer).unwrap_or_else(|| format!("peer-{peer}"));
+    for hp in plugins {
+        let local = REGISTRY.with(|r| {
+            let reg = r.borrow();
+            reg.plugins
+                .get(&hp.name)
+                .filter(|d| d.state == PluginState::Running)
+                .map(|d| d.service_version)
+        });
+        let Some(mine) = local else { continue };
+        let theirs = Version::parse(&hp.version);
+        let ok = match (mine, theirs) {
+            (Some(m), Some(t)) => m.compatible(t),
+            _ => true,
+        };
+        PEERS.with(|p| {
+            if let Some(entry) = p.borrow_mut().get_mut(&peer) {
+                entry.verdicts.insert(
+                    hp.name.clone(),
+                    Verdict { theirs: hp.version.clone(), ok },
+                );
+            }
+        });
+        if !ok {
+            hostlog::warn("bridge", &version_message(peer, &hp.name));
+        }
+        let mut w = FieldWriter::new();
+        w.str(KeyRef::Id(intern::intern(service_fields::SERVER)), &server);
+        w.str(KeyRef::Id(intern::intern(service_fields::VERSION)), &hp.version);
+        w.i64(KeyRef::Id(intern::intern(service_fields::ROLE)), i64::from(hp.role.as_num()));
+        crate::events::enqueue_delivery(Delivery::ServiceAccept {
+            peer,
+            plugin: hp.name.clone(),
+            bytes: w.finish(),
+        });
+    }
+}
+
+/// An instance of `plugin` started. On the first one: tell every up peer
+/// (the hello now carries the plugin's version, which a pushed plugin
+/// could not report before it ran), and judge the copies the peers
+/// listed in their hello.
+pub fn plugin_started(plugin: &str) {
+    let (first, provides) = REGISTRY.with(|r| {
+        let reg = r.borrow();
+        let n = reg.by_scope.keys().filter(|(p, _)| p == plugin).count();
+        let provides = reg.plugins.get(plugin).is_some_and(|d| d.role.provides());
+        (n == 1, provides)
+    });
+    if !first {
+        return;
+    }
+    if provides {
+        let ups: Vec<u32> =
+            PEERS.with(|p| p.borrow().values().filter(|x| x.up).map(|x| x.id).collect());
+        if !ups.is_empty() {
+            let frame = hello_frame();
+            for peer in ups {
+                let _ = send(peer, &frame);
+            }
+        }
+    }
+    let targets: Vec<(u32, HelloPlugin)> = PEERS.with(|p| {
+        p.borrow()
+            .values()
+            .filter(|x| x.up)
+            .filter_map(|x| {
+                x.hello.as_ref().and_then(|(_, list)| {
+                    list.iter().find(|h| h.name == plugin).map(|h| (x.id, h.clone()))
+                })
+            })
+            .collect()
+    });
+    for (peer, hp) in targets {
+        evaluate(peer, &[hp]);
+    }
+}
+
+/// The plugin's own answer from `pgh_service_accept`.
+pub fn record_verdict(peer: u32, plugin: &str, ok: bool) {
+    let changed = PEERS.with(|p| {
+        let mut p = p.borrow_mut();
+        let Some(entry) = p.get_mut(&peer) else { return None };
+        let Some(v) = entry.verdicts.get_mut(plugin) else { return None };
+        let changed = v.ok != ok;
+        v.ok = ok;
+        Some((changed, v.theirs.clone(), entry.name.clone()))
+    });
+    if let Some((true, theirs, name)) = changed {
+        if ok {
+            hostlog::info(
+                "bridge",
+                &format!("{plugin}: accepts the copy on {name} (version {theirs})"),
+            );
+        } else {
+            hostlog::warn(
+                "bridge",
+                &format!("{plugin}: rejects the copy on {name} (version {theirs})"),
+            );
+        }
+    }
 }
 
 pub fn peer_name(peer: u32) -> Option<String> {
@@ -376,14 +543,17 @@ pub fn peer_by_name(name: &str) -> Option<u32> {
     })
 }
 
-/// Does the peer run plugins of its own? True when its hello listed at
-/// least one provider and the peer is up. tmux uses it to leave a shadow
-/// pane's notifications to the remote's plugins instead of firing them
-/// twice.
-pub fn peer_provides(peer: u32) -> bool {
+/// Does the peer run a provider copy of `plugin` that this side accepts?
+/// The event router uses it to leave a shadow pane's notifications to
+/// the remote's copy instead of firing them twice.
+pub fn peer_provides_plugin(peer: u32, plugin: &str) -> bool {
     PEERS.with(|p| {
         p.borrow().get(&peer).is_some_and(|x| {
-            x.up && x.hello.as_ref().is_some_and(|(_, plugins)| !plugins.is_empty())
+            x.up
+                && x.hello.as_ref().is_some_and(|(_, plugins)| {
+                    plugins.iter().any(|h| h.name == plugin && h.role.provides())
+                })
+                && x.verdicts.get(plugin).is_none_or(|v| v.ok)
         })
     })
 }
@@ -516,6 +686,7 @@ fn hello_frame() -> Frame {
                 name: d.name.clone(),
                 role: d.role,
                 service_version: u32::from(providers.contains(&d.name)),
+                version: d.service_version.map(|v| v.to_string()).unwrap_or_default(),
             })
             .collect();
         v.sort_by(|a, b| a.name.cmp(&b.name));
@@ -563,6 +734,7 @@ pub fn state(peer_id: u32, name: Option<String>, up: bool) {
                 initiator,
                 hello: None,
                 down_since: None,
+                verdicts: HashMap::new(),
             });
             if let Some(n) = name {
                 entry.name = n;
@@ -570,6 +742,7 @@ pub fn state(peer_id: u32, name: Option<String>, up: bool) {
             entry.up = true;
             entry.down_since = None;
             entry.hello = None;
+            entry.verdicts.clear();
         });
         if initiator {
             if let Err(e) = send(peer_id, &hello_frame()) {
@@ -605,6 +778,7 @@ pub fn recv(peer_id: u32, bytes: &[u8]) {
             initiator,
             hello: None,
             down_since: None,
+            verdicts: HashMap::new(),
         });
         // A client that speaks to us is up by definition.
         if !initiator {
@@ -648,6 +822,7 @@ pub fn recv(peer_id: u32, bytes: &[u8]) {
                     cap_ceiling.join(",")
                 ),
             );
+            evaluate(peer_id, &plugins);
             if !first {
                 return;
             }
@@ -776,6 +951,29 @@ fn accept_push(
         return Err(format!("{}: wasm hash mismatch", desc.name));
     }
     let peer_name = peer_name(peer).unwrap_or_else(|| format!("peer-{peer}"));
+    // A plugin this server loaded itself (manifest or load-plugin) stays
+    // as it is: its owner chose its role and grants. It already answers
+    // the pusher's calls, since hello lists it as a provider.
+    let own = REGISTRY.with(|r| {
+        let reg = r.borrow();
+        reg.plugins
+            .get(&desc.name)
+            .map(|d| d.pushed_by.is_none())
+            .unwrap_or(false)
+    });
+    if own {
+        let theirs = peer_version_of(peer, &desc.name).filter(|v| !v.is_empty());
+        let mine = local_version_of(&desc.name);
+        let note = match (&theirs, &mine) {
+            (Some(t), Some(m)) if t != m => format!(" (version {t} there, {m} here)"),
+            _ => String::new(),
+        };
+        hostlog::info(
+            "bridge",
+            &format!("{} from {peer_name}: kept the local plugin{note}", desc.name),
+        );
+        return Ok(());
+    }
     let dir = crate::fsbox::data_home()?
         .join(CACHE_DIR)
         .join(sanitize(&peer_name));
@@ -821,9 +1019,8 @@ fn accept_push(
         }
     });
     hostlog::info("bridge", &format!("{name} from {peer_name}: {outcome}"));
-    // Announce the new provider to the pusher (its dedupe rules and views
-    // read the provider list).
-    let _ = send(peer, &hello_frame());
+    // The pusher hears about the new provider when its first instance
+    // starts (plugin_started), with the version that instance reports.
     Ok(())
 }
 
@@ -866,16 +1063,26 @@ pub fn sweep() {
 }
 
 /// Serialize the server list for the `servers` import: the local server
-/// first, then every peer.
-pub fn servers_record() -> Vec<u8> {
-    use tmux_plugin_abi::{ServerInfo, LOCAL_SERVER};
+/// first, then every peer, each with its version of `plugin` and this
+/// side's verdict on it.
+pub fn servers_record(plugin: &str) -> Vec<u8> {
+    use tmux_plugin_abi::ServerInfo;
 
     let peers = peers();
+    let mine = local_version_of(plugin).unwrap_or_default();
     let mut out = Vec::new();
     out.extend_from_slice(&(1 + peers.len() as u32).to_le_bytes());
-    ServerInfo { id: 0, name: LOCAL_SERVER.into(), up: true, local: true }.emit(&mut out);
+    ServerInfo::local(&mine).emit(&mut out);
     for p in peers {
-        ServerInfo { id: p.id, name: p.name, up: p.up, local: false }.emit(&mut out);
+        let version = p
+            .hello
+            .as_ref()
+            .and_then(|(_, list)| list.iter().find(|h| h.name == plugin))
+            .map(|h| h.version.clone())
+            .unwrap_or_default();
+        let accepted = p.verdicts.get(plugin).is_none_or(|v| v.ok);
+        ServerInfo { id: p.id, name: p.name, up: p.up, local: false, version, accepted }
+            .emit(&mut out);
     }
     out
 }
@@ -897,6 +1104,7 @@ mod tests {
                     name: "agents".into(),
                     role: Role::Both,
                     service_version: 1,
+                    version: "0.1.0".into(),
                 }],
                 cap_ceiling: vec!["db".into()],
             },

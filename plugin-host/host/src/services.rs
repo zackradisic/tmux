@@ -338,6 +338,9 @@ pub fn call(
             format!("server {server} is not connected"),
         ));
     }
+    if !bridge::peer_accepts(peer, plugin) {
+        return Err(err(ErrorCode::Version, bridge::version_message(peer, plugin)));
+    }
     SERVICES.with(|s| {
         s.borrow_mut().calls.insert(
             token,
@@ -464,7 +467,9 @@ pub fn emit(emitter: &Owner, topic: &str, payload: Vec<u8>) -> Result<(), HostEr
                 push(Delivery::ServiceEvent { target, bytes });
             }
             Subscriber::Peer(peer) => {
-                let _ = bridge::send_event(peer, &plugin, topic, seq, &payload);
+                if bridge::peer_accepts(peer, &plugin) {
+                    let _ = bridge::send_event(peer, &plugin, topic, seq, &payload);
+                }
             }
         }
     }
@@ -517,6 +522,16 @@ pub fn incoming_call(
     method: &str,
     payload: &[u8],
 ) {
+    if !bridge::peer_accepts(peer, plugin) {
+        let _ = bridge::send_reply(
+            peer,
+            remote_call_id,
+            0,
+            service_flags::ERROR,
+            bridge::version_message(peer, plugin).as_bytes(),
+        );
+        return;
+    }
     let origin = Origin::Remote { peer, call_id: remote_call_id };
     match owner_of(plugin, method) {
         Some(owner) => open_local_call(origin, owner, plugin, method, plugin, payload),
@@ -607,6 +622,9 @@ pub fn incoming_unsubscribe(peer: u32, plugin: &str, topic: &str) {
 /// A topic event emitted on a peer, for our subscribers to it.
 pub fn incoming_event(peer: u32, plugin: &str, topic: &str, seq: u64, payload: &[u8]) {
     let Some(server) = bridge::peer_name(peer) else { return };
+    if !bridge::peer_accepts(peer, plugin) {
+        return;
+    }
     let subs = SERVICES.with(|s| {
         s.borrow()
             .subs

@@ -151,6 +151,14 @@ pub mod exports {
     pub const SNAPSHOT: &str = "pgh_snapshot";
     pub const MIGRATE: &str = "pgh_migrate";
     pub const ON_UNLOAD: &str = "pgh_on_unload";
+    /// `() -> i64`: the plugin's service version, packed by
+    /// [`Version::pack`]. Optional; a plugin without it is unversioned.
+    pub const SERVICE_VERSION: &str = "pgh_service_version";
+    /// `(ptr, len) -> i32`: does this plugin accept a peer's copy of
+    /// itself? The field block carries `server`, `version` and `role`
+    /// (the peer copy's role as a number). 1 = accept, 0 = reject.
+    /// Optional; without it the host applies [`Version::compatible`].
+    pub const SERVICE_ACCEPT: &str = "pgh_service_accept";
 }
 
 pub mod db;
@@ -353,35 +361,121 @@ pub mod service_fields {
     pub const TOPIC: &str = "topic";
     pub const SEQ: &str = "seq";
     pub const SERVER: &str = "server";
+    pub const VERSION: &str = "version";
+    pub const ROLE: &str = "role";
+}
+
+/// A plugin's service version: the shape of its methods and topics, as
+/// `major.minor.patch`. Two copies of a plugin talk only when they accept
+/// each other; the default rule is [`Version::compatible`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct Version {
+    pub major: u32,
+    pub minor: u32,
+    pub patch: u32,
+}
+
+impl Version {
+    pub const fn new(major: u32, minor: u32, patch: u32) -> Version {
+        Version { major, minor, patch }
+    }
+
+    /// Parse `major.minor.patch`; a missing minor or patch reads as 0, a
+    /// `-pre` or `+build` tail is ignored.
+    pub fn parse(text: &str) -> Option<Version> {
+        let core = text.trim().split(['-', '+']).next()?;
+        let mut parts = core.split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = match parts.next() {
+            Some(p) => p.parse().ok()?,
+            None => 0,
+        };
+        let patch = match parts.next() {
+            Some(p) => p.parse().ok()?,
+            None => 0,
+        };
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(Version { major, minor, patch })
+    }
+
+    /// The semver rule: the same major, and for major 0 also the same
+    /// minor. Patch never matters.
+    pub fn compatible(self, other: Version) -> bool {
+        self.major == other.major && (self.major != 0 || self.minor == other.minor)
+    }
+
+    /// One i64 for the `pgh_service_version` export: major in the high
+    /// 32 bits, minor and patch in 16 bits each.
+    pub fn pack(self) -> i64 {
+        (i64::from(self.major) << 32)
+            | (i64::from(self.minor.min(0xffff)) << 16)
+            | i64::from(self.patch.min(0xffff))
+    }
+
+    pub fn unpack(v: i64) -> Version {
+        Version {
+            major: (v >> 32) as u32,
+            minor: ((v >> 16) & 0xffff) as u32,
+            patch: (v & 0xffff) as u32,
+        }
+    }
+}
+
+impl fmt::Display for Version {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
 }
 
 /// A server as listed by the `servers` import: the local server (id 0,
-/// name "local") and every linked remote server.
+/// name "local") and every linked remote server. `version` is that
+/// server's service version of the calling plugin ("" when the server
+/// has no copy of it); `accepted` says whether this side talks to it.
 ///
-///   record := u32 id, str name, u32 flags
+///   record := u32 id, str name, u32 flags, str version
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerInfo {
     pub id: u32,
     pub name: String,
     pub up: bool,
     pub local: bool,
+    pub version: String,
+    pub accepted: bool,
 }
 
 pub mod server_flags {
     pub const UP: u32 = 1 << 0;
     pub const LOCAL: u32 = 1 << 1;
+    pub const ACCEPTED: u32 = 1 << 2;
 }
 
 impl ServerInfo {
+    /// The local server's own record.
+    pub fn local(version: &str) -> ServerInfo {
+        ServerInfo {
+            id: 0,
+            name: LOCAL_SERVER.into(),
+            up: true,
+            local: true,
+            version: version.into(),
+            accepted: true,
+        }
+    }
+
     pub fn parse(c: &mut Cursor<'_>) -> Result<Self, WireError> {
         let id = c.u32()?;
         let name = c.str()?.to_string();
         let flags = c.u32()?;
+        let version = c.str()?.to_string();
         Ok(Self {
             id,
             name,
             up: flags & server_flags::UP != 0,
             local: flags & server_flags::LOCAL != 0,
+            version,
+            accepted: flags & server_flags::ACCEPTED != 0,
         })
     }
 
@@ -395,7 +489,11 @@ impl ServerInfo {
         if self.local {
             flags |= server_flags::LOCAL;
         }
+        if self.accepted {
+            flags |= server_flags::ACCEPTED;
+        }
         out.extend_from_slice(&flags.to_le_bytes());
+        emit_str(out, &self.version);
     }
 }
 
@@ -429,6 +527,10 @@ pub enum ErrorCode {
     /// A service call got no reply within its deadline.
     #[serde(rename = "E_TIMEOUT")]
     Timeout,
+    /// The two copies of a plugin do not accept each other's service
+    /// version (see `Version`).
+    #[serde(rename = "E_VERSION")]
+    Version,
 }
 
 impl ErrorCode {
@@ -446,6 +548,7 @@ impl ErrorCode {
             ErrorCode::Unsupported => 9,
             ErrorCode::Unreachable => 10,
             ErrorCode::Timeout => 11,
+            ErrorCode::Version => 12,
         }
     }
 
@@ -461,6 +564,7 @@ impl ErrorCode {
             9 => ErrorCode::Unsupported,
             10 => ErrorCode::Unreachable,
             11 => ErrorCode::Timeout,
+            12 => ErrorCode::Version,
             _ => ErrorCode::Host,
         }
     }
@@ -478,6 +582,7 @@ impl ErrorCode {
             ErrorCode::Unsupported => "E_UNSUPPORTED",
             ErrorCode::Unreachable => "E_UNREACHABLE",
             ErrorCode::Timeout => "E_TIMEOUT",
+            ErrorCode::Version => "E_VERSION",
         }
     }
 }
@@ -1226,6 +1331,23 @@ pub const MAX_DB_ROWS_BYTES: usize = 8 * 1024 * 1024;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn version_parse_pack_compat() {
+        use super::Version;
+        assert_eq!(Version::parse("0.1.0"), Some(Version::new(0, 1, 0)));
+        assert_eq!(Version::parse("2"), Some(Version::new(2, 0, 0)));
+        assert_eq!(Version::parse("1.4.7-rc1"), Some(Version::new(1, 4, 7)));
+        assert_eq!(Version::parse("1.2.3.4"), None);
+        assert_eq!(Version::parse("x"), None);
+        let v = Version::new(3, 70000, 5);
+        assert_eq!(Version::unpack(v.pack()), Version::new(3, 0xffff, 5));
+        assert!(Version::new(1, 2, 0).compatible(Version::new(1, 9, 3)));
+        assert!(!Version::new(1, 2, 0).compatible(Version::new(2, 0, 0)));
+        assert!(Version::new(0, 1, 0).compatible(Version::new(0, 1, 9)));
+        assert!(!Version::new(0, 1, 0).compatible(Version::new(0, 2, 0)));
+        assert_eq!(Version::new(0, 1, 0).to_string(), "0.1.0");
+    }
+
     use super::*;
 
     #[test]

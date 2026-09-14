@@ -226,6 +226,8 @@ Optional:
 | `pgh_snapshot` | `(out_ptr_ptr: i32, out_len_ptr: i32) -> i32` | 0 = wrote {ptr,len}; nonzero = stateless |
 | `pgh_migrate` | `(old_version: i32, ptr: i32, len: i32) -> i32` | nonzero refuses (old code keeps running) |
 | `pgh_on_config_changed` | `(ptr: i32, len: i32) -> i32` | 1 = absorbed, 0 = restart me |
+| `pgh_service_version` | `() -> i64` | the plugin's service version, `major << 32 \| minor << 16 \| patch`; absent = unversioned |
+| `pgh_service_accept` | `(ptr: i32, len: i32) -> i32` | field block `{server, version, role}` of a peer's copy of this plugin; 1 = talk to it, 0 = reject; absent = the semver rule |
 
 Snapshot/migrate bytes are opaque to the host (the SDK uses JSON there;
 that is plugin-internal, not ABI).
@@ -239,7 +241,9 @@ Errors: sync imports return `0` or `-code`; value-returning imports
 `E_CAP_DENIED`(3), `E_NO_SUCH_OBJECT`(4), `E_OUT_OF_SCOPE`(5),
 `E_LIMIT`(6), `E_HOST`(7), `E_CANCELLED`(8), `E_UNSUPPORTED`(9),
 `E_UNREACHABLE`(10, the server a service call names is not linked or
-its link is down), `E_TIMEOUT`(11, a service call got no reply in time).
+its link is down), `E_TIMEOUT`(11, a service call got no reply in time),
+`E_VERSION`(12, this side rejects the service version of the plugin's
+copy on that server).
 
 `kind` values: -1 server/global, 0 session, 1 window, 2 pane, 3 client.
 
@@ -251,7 +255,7 @@ its link is down), `E_TIMEOUT`(11, a service call got no reply in time).
 | `list` | `(kind, owned_out) -> i32` — object list buffer | read-state |
 | `resolve` | `(kind, id, owned_out) -> i32` — one object record | read-state |
 | `self_info` | `(out) -> i32` — 24-byte `{scope_kind: i32, scope_id: u32, generation: u64, role: u32, pad: u32}`; a guest that reads 16 bytes gets the first three, an old host writes 16 and the guest reads role 0 = both | read-state |
-| `servers` | `(owned_out) -> i32` — `u32 count` list of `{u32 id, str name, u32 flags(1 up | 2 local)}`: the local server (id 0, "local") and every linked server | read-state |
+| `servers` | `(owned_out) -> i32` — `u32 count` list of `{u32 id, str name, u32 flags(1 up \| 2 local \| 4 accepted), str version}`: the local server (id 0, "local") and every linked server; `version` is that server's service version of the calling plugin ("" = no copy or unversioned), `accepted` this side's verdict on it | read-state |
 | `service_register` | `(method Str) -> i32` — answer `method` for this plugin; calls arrive as `service-request` events | service-serve |
 | `service_reply` | `(call: i64, payload Bytes, flags) -> i32` — one page of the answer; flags bit 0 MORE (another page follows), bit 1 ERROR (the payload is the message) | service-serve |
 | `service_emit` | `(topic Str, payload Bytes) -> i32` — publish on a topic of this plugin; the host stamps a sequence per (plugin, topic) | service-serve |
@@ -512,9 +516,21 @@ the grants its `plugin-remote-caps` server option allows (by default
 everything but `run-process`, `fs-write`, `fs-read-any`, `fs-write-any`).
 The wasm is byte-portable, so the same build runs on both machines; a
 remote host older than the pushed ABI refuses the load and the link logs
-"run tmux update there". Pushed plugins are unloaded ten minutes after
-their peer stays down, so a flapping link does not thrash. Frames above
-4 KiB are zstd-compressed.
+"run tmux update there". A push never replaces a plugin the remote
+loaded itself: that copy, its role and its grants stay, and hello lists
+it, so the pusher talks to it. Pushed plugins are unloaded ten minutes
+after their peer stays down, so a flapping link does not thrash. Frames
+above 4 KiB are zstd-compressed.
+
+Each hello entry carries the plugin's *service version*
+(`pgh_service_version`, `major.minor.patch`). When a hello names a plugin
+this side also runs, the host decides whether the two copies talk: the
+semver rule first (same major, and the same minor while the major is 0),
+then the plugin's own `pgh_service_accept` if it has one. A rejected
+copy fails outgoing calls at once with `E_VERSION`, gets an error reply
+to its calls, and its topic events are dropped; `servers` reports the
+verdict. A pushed plugin says hello again when its first instance runs,
+so its version is known. A copy without a version is accepted.
 
 ## Scopes, lifecycle, reload
 

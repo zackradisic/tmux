@@ -1614,9 +1614,11 @@ pub fn service_subscribe(
 }
 
 /// The local server and every bridge peer, as a `u32 count` list of
-/// server records.
+/// server records. Each record carries that server's version of the
+/// calling plugin and whether this side accepts it.
 pub fn servers(mem: &mut GuestMem<'_, '_>, owned_out: i32) -> Result<(), HostError> {
     check_cap(mem, crate::caps::READ_STATE)?;
-    let buf = crate::bridge::servers_record();
+    let own = mem.data().plugin.clone();
+    let buf = crate::bridge::servers_record(&own);
     mem.give_owned(&buf, owned_out)
 }

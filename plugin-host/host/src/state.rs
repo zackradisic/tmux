@@ -46,6 +46,10 @@ pub enum Delivery {
     BridgeFrame { peer: u32, bytes: Vec<u8> },
     /// A bridge peer came up (with a name) or went down.
     BridgeState { peer: u32, name: Option<String>, up: bool },
+    /// Ask one instance of `plugin` whether it accepts the peer's copy
+    /// (a field block with server, version and role); the answer lands
+    /// in the bridge's verdicts.
+    ServiceAccept { peer: u32, plugin: String, bytes: Vec<u8> },
 }
 
 pub struct EventQueue {

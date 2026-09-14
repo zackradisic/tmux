@@ -59,6 +59,9 @@ pub struct RemoteRows {
 #[derive(Debug, Default)]
 pub struct Remotes {
     pub servers: HashMap<String, RemoteRows>,
+    /// Servers whose copy of this plugin this side does not accept, with
+    /// the reason to show ("agents 0.2.0 there, 0.1.0 here").
+    pub mismatch: HashMap<String, String>,
 }
 
 impl Remotes {
@@ -69,6 +72,7 @@ impl Remotes {
         e.skew_ms = now as i64 - snap.now_ms;
         e.fetched_ms = now;
         e.down_since = None;
+        self.mismatch.remove(server);
         e.agents = snap
             .agents
             .into_iter()
@@ -92,6 +96,15 @@ impl Remotes {
         }
     }
 
+    /// The server's copy runs a service version this side rejects: no
+    /// rows from it, one line that says why.
+    pub fn mark_mismatch(&mut self, server: &str, why: String) {
+        if let Some(e) = self.servers.get_mut(server) {
+            e.agents.clear();
+        }
+        self.mismatch.insert(server.to_string(), why);
+    }
+
     /// Every remote row, in server-name order.
     fn rows(&self) -> Vec<Agent> {
         let mut names: Vec<&String> = self.servers.keys().collect();
@@ -107,7 +120,19 @@ impl Remotes {
 /// the finished rows too.
 pub async fn fetch_remotes(remotes: Rc<RefCell<Remotes>>, history: bool) {
     let list = service::servers().unwrap_or_default();
+    let mine = list
+        .iter()
+        .find(|s| s.local)
+        .map(|s| s.version.clone())
+        .unwrap_or_default();
     for s in list.into_iter().filter(|s| !s.local && s.up) {
+        if !s.accepted {
+            remotes.borrow_mut().mark_mismatch(
+                &s.name,
+                format!("agents {} there, {} here; run tmux update", s.version, mine),
+            );
+            continue;
+        }
         let target = format!("@{}", s.name);
         match service::call_json::<_, Snapshot>(
             &target,
@@ -122,6 +147,8 @@ pub async fn fetch_remotes(remotes: Rc<RefCell<Remotes>>, history: bool) {
                 // yet): nothing to show, but nothing to break either.
                 if e.code == ErrorCode::Unreachable {
                     remotes.borrow_mut().mark_down(&s.name);
+                } else if e.code == ErrorCode::Version {
+                    remotes.borrow_mut().mark_mismatch(&s.name, e.message.clone());
                 }
             }
         }
@@ -228,6 +255,8 @@ pub struct Picker {
     pub skew: HashMap<String, i64>,
     /// Per server: when its link went down (local clock), while it is.
     pub down: HashMap<String, u64>,
+    /// Per server: why this side rejects its copy of the plugin.
+    pub mismatch: HashMap<String, String>,
     /// (server, remote pane) -> the local shadow pane that mirrors it.
     pub mirrors: HashMap<(String, u32), u32>,
     /// The captured text of the highlighted remote row that has no local
@@ -258,6 +287,17 @@ impl Picker {
                 prev = Some(b);
             }
             self.lines.push(Line::Item(vpos));
+        }
+        // A server whose copy this side rejects has no rows; give it a
+        // line anyway, so the reason is on screen.
+        let mut odd: Vec<&String> = self
+            .mismatch
+            .keys()
+            .filter(|s| !self.rows.iter().any(|a| a.server == **s))
+            .collect();
+        odd.sort();
+        for s in odd {
+            self.lines.push(Line::Server(s.clone()));
         }
     }
 
@@ -356,7 +396,12 @@ async fn gather_rows(
     remotes: &Rc<RefCell<Remotes>>,
     show_history: bool,
     enrich: bool,
-) -> (Vec<Agent>, HashMap<String, i64>, HashMap<String, u64>) {
+) -> (
+    Vec<Agent>,
+    HashMap<String, i64>,
+    HashMap<String, u64>,
+    HashMap<String, String>,
+) {
     let mut rows = store::live_agents().await.unwrap_or_default();
     if enrich {
         provider::enrich_live(&mut rows).await;
@@ -372,7 +417,7 @@ async fn gather_rows(
         .iter()
         .filter_map(|(k, v)| v.down_since.map(|t| (k.clone(), t)))
         .collect();
-    (rows, skew, down)
+    (rows, skew, down, r.mismatch.clone())
 }
 
 fn is_multi(rows: &[Agent]) -> bool {
@@ -416,7 +461,7 @@ pub async fn pick_open(
     }
     // Fresh remote rosters first, so the picker opens complete.
     fetch_remotes(Rc::clone(&remotes), false).await;
-    let (mut rows, skew, down) = gather_rows(&remotes, false, true).await;
+    let (mut rows, skew, down, mismatch) = gather_rows(&remotes, false, true).await;
     let mut order: HashMap<String, u64> = HashMap::new();
     let mut order_next: u64 = 0;
     stable_sort(&mut order, &mut order_next, &mut rows);
@@ -464,6 +509,7 @@ pub async fn pick_open(
         current_pane: here,
         skew,
         down,
+        mismatch,
         mirrors: if multi { find_mirrors() } else { HashMap::new() },
         remote_capture: None,
         multi,
@@ -493,7 +539,8 @@ pub async fn reload_picker(
 ) {
     let show_history =
         picker.borrow().as_ref().map(|p| p.show_history).unwrap_or(false);
-    let (mut rows, skew, down) = gather_rows(&remotes, show_history, enrich).await;
+    let (mut rows, skew, down, mismatch) =
+        gather_rows(&remotes, show_history, enrich).await;
     let multi = is_multi(&rows);
     let mirrors = if multi { find_mirrors() } else { HashMap::new() };
     let mut b = picker.borrow_mut();
@@ -510,6 +557,7 @@ pub async fn reload_picker(
         p.now_ms = now_ms();
         p.skew = skew;
         p.down = down;
+        p.mismatch = mismatch;
         p.mirrors = mirrors;
         p.multi = multi;
         // A refresh keeps the scroll where it is (only filter typing snaps
@@ -1444,15 +1492,19 @@ pub fn pick_render(p: &mut Picker) {
             let row = 4 + line_i;
             match &p.lines[li] {
                 Line::Server(server) => {
-                    // A server line: bold, with the link state when down.
-                    let label = match p.down.get(server) {
-                        Some(since) => format!(
-                            "{server}  (disconnected {})",
-                            fmt_age(p.now_ms.saturating_sub(*since) / 1000)
+                    // A server line: bold, with the link state when down
+                    // and the reason when its copy is rejected.
+                    let (label, colour) = match (p.down.get(server), p.mismatch.get(server)) {
+                        (Some(since), _) => (
+                            format!(
+                                "{server}  (disconnected {})",
+                                fmt_age(p.now_ms.saturating_sub(*since) / 1000)
+                            ),
+                            "1;31",
                         ),
-                        None => server.clone(),
+                        (None, Some(why)) => (format!("{server}  ({why})"), "1;33"),
+                        (None, None) => (server.clone(), "1;34"),
                     };
-                    let colour = if p.down.contains_key(server) { "1;31" } else { "1;34" };
                     out.push_str(&format!(
                         "\x1b[{row};1H\x1b[{colour}m▪ {}\x1b[0m",
                         clip(&label, list_w.saturating_sub(3)),

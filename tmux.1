@@ -6885,6 +6885,12 @@ or
 to it; the remote loads the plugin as a provider with the capabilities its
 .Ic plugin-remote-caps
 option allows.
+A plugin the remote loaded itself is kept as it is; the push does not
+replace it.
+Each plugin reports a service version; two copies of a plugin on linked
+servers talk only when each accepts the other's version, and a call to a
+rejected copy fails with
+.Ql E_VERSION .
 The two halves talk through services: methods and topics a plugin
 registers and other plugins, on this server or a linked one, call and
 follow.

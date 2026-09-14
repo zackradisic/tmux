@@ -371,17 +371,18 @@ plugin_notify(const char *name, struct client *c, struct session *s,
 	if (!plugin_enabled())
 		return;
 
+	pb = plugin_event_create(name);
 	/*
 	 * A notification from a shadow pane also fires on the remote server,
-	 * where the pane really is. When the remote runs plugins, its
-	 * provider halves forward what a view here wants (notify-toast does),
-	 * so firing it here too would show everything twice.
+	 * where the pane really is. Name the link's bridge peer, so the host
+	 * leaves the event to plugins the remote runs too: their provider
+	 * halves forward what a view here wants (notify-toast does), and
+	 * firing it here as well would show everything twice.
 	 */
-	if (wp != NULL && wp->remote != NULL &&
-	    plugin_bridge_link_provides(wp->remote->link))
-		return;
-
-	pb = plugin_event_create(name);
+	if (wp != NULL && wp->remote != NULL) {
+		plugin_event_i64(pb, "remote_peer", (long long)
+		    (remote_link_id(wp->remote->link) | PGH_PEER_LINK));
+	}
 	if (c != NULL) {
 		plugin_event_scope(pb, PGH_OBJ_CLIENT, c->id);
 		if (c->name != NULL)
