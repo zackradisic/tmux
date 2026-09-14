@@ -35,7 +35,10 @@
 //!   * Membership + liveness is OBSERVED, never announced. A pane is an
 //!     agent when its foreground command is one of `claude|codex|pi|
 //!     opencode` (configurable) or it carries an `AI_AGENT`/`OPENCODE`
-//!     marker in its environment (read with the `pane_env` host call).
+//!     marker in its environment (read with the `pane_env` host call)
+//!     that the pane did not inherit from the tmux server's own
+//!     environment: a server started from inside Claude Code hands
+//!     `AI_AGENT` to every pane, and that is not evidence.
 //!     The plugin learns of changes from `pane-command-changed`,
 //!     `pane-created` and `pane-destroyed`, so a killed or crashed CLI
 //!     retires itself - no hook can leave a ghost behind. This is also

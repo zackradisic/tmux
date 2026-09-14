@@ -351,7 +351,8 @@ error reply to its own calls, and its topic events are dropped.
 server as one line: "devbox (agents 0.2.0 there, 0.1.0 here; run tmux
 update)". A push never fixes a mismatch by force; `tmux update` on the
 older side does. A pushed plugin says hello again when its first
-instance runs, so its version is known. `regress/plugin-services-
+instance runs, so its version is known. A copy that reports no version
+(built before versions existed) is rejected by one that does. `regress/plugin-services-
 version.sh` and `regress/plugin-services-keep-local.sh` drive both rules.
 
 ### Services

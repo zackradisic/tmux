@@ -355,8 +355,9 @@ macro_rules! tmux_plugin {
                     .get("version")
                     .and_then(|v| v.as_str())
                     .and_then($crate::Version::parse);
-                // An unversioned copy (an old SDK) gives nothing to judge.
-                let Some(theirs) = theirs else { return 1 };
+                // An unversioned copy is a build from before versions
+                // existed: too old to talk to.
+                let Some(theirs) = theirs else { return 0 };
                 let their_role = $crate::Role::from_num(
                     value.get("role").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
                 );

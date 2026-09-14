@@ -530,7 +530,8 @@ then the plugin's own `pgh_service_accept` if it has one. A rejected
 copy fails outgoing calls at once with `E_VERSION`, gets an error reply
 to its calls, and its topic events are dropped; `servers` reports the
 verdict. A pushed plugin says hello again when its first instance runs,
-so its version is known. A copy without a version is accepted.
+so its version is known. A copy without a version, facing one with a
+version, is rejected: it predates versions.
 
 ## Scopes, lifecycle, reload
 

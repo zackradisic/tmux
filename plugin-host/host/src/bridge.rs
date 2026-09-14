@@ -404,11 +404,16 @@ pub fn version_message(peer: u32, plugin: &str) -> String {
     let name = peer_name(peer).unwrap_or_else(|| format!("peer-{peer}"));
     let theirs = peer_version_of(peer, plugin).filter(|v| !v.is_empty());
     let mine = local_version_of(plugin);
-    format!(
-        "{plugin}: version {} on {name}, {} here; run tmux update on the older side",
-        theirs.as_deref().unwrap_or("unknown"),
-        mine.as_deref().unwrap_or("unknown"),
-    )
+    match theirs {
+        Some(t) => format!(
+            "{plugin}: version {t} on {name}, {} here; run tmux update on the older side",
+            mine.as_deref().unwrap_or("unknown"),
+        ),
+        None => format!(
+            "{plugin}: no service version on {name} (a build from before versions), {} here; rebuild or update it there",
+            mine.as_deref().unwrap_or("unknown"),
+        ),
+    }
 }
 
 /// Decide, for every plugin the peer listed that this side also runs,
@@ -428,7 +433,10 @@ fn evaluate(peer: u32, plugins: &[HelloPlugin]) {
         let theirs = Version::parse(&hp.version);
         let ok = match (mine, theirs) {
             (Some(m), Some(t)) => m.compatible(t),
-            _ => true,
+            // Our copy has a version and theirs has none: theirs is a
+            // build from before versions existed, too old to talk to.
+            (Some(_), None) => false,
+            (None, _) => true,
         };
         PEERS.with(|p| {
             if let Some(entry) = p.borrow_mut().get_mut(&peer) {

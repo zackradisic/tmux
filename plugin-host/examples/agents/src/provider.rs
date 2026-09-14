@@ -110,7 +110,7 @@ fn detect(pane: u32, commands: &[String]) -> Option<String> {
             }
         }
     }
-    if let Ok(Some(v)) = pane_env(PaneId(pane), "AI_AGENT") {
+    if let Some(v) = marker(pane, "AI_AGENT") {
         let v = v.to_lowercase();
         for k in ["claude", "codex", "opencode", "pi"] {
             if v.contains(k) {
@@ -118,10 +118,27 @@ fn detect(pane: u32, commands: &[String]) -> Option<String> {
             }
         }
     }
-    if let Ok(Some(_)) = pane_env(PaneId(pane), "OPENCODE") {
+    if marker(pane, "OPENCODE").is_some() {
         return Some("opencode".into());
     }
     None
+}
+
+/// An environment marker of the pane's foreground process, unless the
+/// pane inherited it. Claude Code sets `AI_AGENT` for its children, so a
+/// tmux server started from inside Claude Code hands the variable to
+/// every pane it spawns, and an idle shell or a `sleep` would look like
+/// an agent. The `#{NAME}` format reads the session and global
+/// environment, which is what the pane's shell got; a value equal to
+/// that is inherited and proves nothing.
+fn marker(pane: u32, name: &str) -> Option<String> {
+    let value = pane_env(PaneId(pane), name).ok()??;
+    let inherited =
+        format_expand(OptionTarget::Pane(PaneId(pane)), &format!("#{{{name}}}")).ok()?;
+    if inherited == value {
+        return None;
+    }
+    Some(value)
 }
 
 /// Is this pane a shadow of a pane on another server? Its agent belongs

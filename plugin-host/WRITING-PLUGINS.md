@@ -300,7 +300,7 @@ update on the older side"), its topic events never reach
 `on_service_event`, and `service::servers()` reports it with `accepted`
 false and its `version`, so a view can show one line that says why. The
 agents picker does that. A copy from an old SDK reports no version and
-is accepted.
+is rejected by a copy that has one: it predates the protocol.
 
 `Replica<T>` keeps a view's per-server copy of what providers report:
 `apply_full(server, seq, rows)` after a `list`, `apply(server, seq,
