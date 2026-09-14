@@ -538,6 +538,13 @@ pub unsafe extern "C" fn pgh_bridge_state(peer: u32, name: *const c_char, up: c_
     })
 }
 
+/// Does a bridge peer run plugins (its hello named providers)? 1 or 0.
+/// Synchronous and read-only: safe from any main-thread context.
+#[no_mangle]
+pub extern "C" fn pgh_bridge_peer_provides(peer: u32) -> c_int {
+    ffi_guard!(0, c_int::from(bridge::peer_provides(peer)))
+}
+
 /// Run queued plugin work for at most `max_us` microseconds of wall clock
 /// (0 = default budget). Returns the number of deliveries still queued;
 /// when nonzero the C side re-schedules via its zero-timeout evtimer so the

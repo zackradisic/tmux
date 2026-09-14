@@ -5,11 +5,16 @@ session, window or pane that lives on another machine. The user stays in the
 local tmux. Keys, resizes and structural commands go to the remote. Output
 comes back and renders in a local grid.
 
-Status: phase 1 (remote sessions) is built. `remote-attach` mirrors one
-remote session as `host/session`, with output, keys, resize, command
-forwarding, reconnect, the format cache and server restart. The files are
-`remote-parse.c` (the control mode line parser), `remote-link.c` (the link)
-and `cmd-remote-attach.c`. The tests are `regress/remote-*.sh`.
+Status: three phases are built. Phase 1, remote sessions: `remote-attach`
+mirrors one remote session as `host/session`, with output, keys, resize,
+command forwarding, reconnect, the format cache and server restart
+(`remote-parse.c`, `remote-link.c`, `cmd-remote-attach.c`; tests
+`regress/remote-*.sh`). Phase 2, plugins: roles, services and a bridge
+over the link that pushes plugins to the remote (see "Plugins" below;
+tests `regress/plugin-services-remote.sh`, `plugin-host/host/tests`).
+Phase 3, the first consumer: the agents picker shows every linked
+server's agents grouped by server, and notify-toast forwards remote
+notifications (`regress/plugin-agents-remote.sh`).
 
 Use:
 
@@ -253,11 +258,11 @@ These host calls inspect a local process or the local filesystem:
 
 | Plugin | Effect |
 |---|---|
-| agents | command detection works; env checks need the `pane_env` proxy |
-| notify-toast | works; remote processes can still send OSC 9 |
-| resurrect | must save the link (`host:session`), not the panes |
-| git-status | needs the remote `run-process` call |
-| session_creator | needs a host target for `new-session` |
+| agents | split into a provider (detection, store, `list`/`capture`/`search`/`act` services, `changed` topic) and a view (the picker, grouped by server; Enter jumps to the mirrored shadow pane; a disconnected server greys its group). Built. |
+| notify-toast | the provider forwards `pane-notification` on the `notify` topic; the view shows it against the local shadow pane. tmux does not fire the local event for a shadow pane whose remote runs plugins, so nothing shows twice. Built. |
+| resurrect | should save the link (`host/session`), not the panes; not done |
+| git-status | needs the remote `run-process` call; not done |
+| session_creator | needs a host target for `new-session`; not done |
 | cron, ticker, hello-raw | no effect |
 
 ### Plugin records

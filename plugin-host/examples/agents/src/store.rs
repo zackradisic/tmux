@@ -17,9 +17,15 @@
 //! durable harness id, [`rename_id`] / [`merge_id`] migrates the row, so
 //! a resumed session re-links to its own history.
 
+use serde::{Deserialize, Serialize};
 use tmux_plugin_sdk::prelude::*;
 
-pub const USER_VERSION: i64 = 5;
+pub const USER_VERSION: i64 = 6;
+
+/// The server a row belongs to. A provider only ever writes rows for its
+/// own server, so every stored row says "local"; the view stamps the link
+/// name on rows it fetched from a remote provider.
+pub const LOCAL: &str = "local";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS agents (
@@ -44,11 +50,13 @@ CREATE TABLE IF NOT EXISTS agents (
   last_active_ms INTEGER,
   source_path TEXT,
   ended_ms INTEGER,
-  reason TEXT);
+  reason TEXT,
+  server TEXT NOT NULL DEFAULT 'local');
 CREATE INDEX IF NOT EXISTS agents_live ON agents(ended_ms, last_active_ms);
--- At most one live agent per pane; NULL panes (ended) do not collide.
+-- At most one live agent per pane per server; NULL panes (ended) do not
+-- collide.
 CREATE UNIQUE INDEX IF NOT EXISTS agents_one_live_pane
-  ON agents(pane) WHERE ended_ms IS NULL AND pane IS NOT NULL;
+  ON agents(server, pane) WHERE ended_ms IS NULL AND pane IS NOT NULL;
 CREATE TABLE IF NOT EXISTS captures (
   id TEXT PRIMARY KEY,
   text TEXT,
@@ -56,7 +64,7 @@ CREATE TABLE IF NOT EXISTS captures (
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT);
-PRAGMA user_version = 5;";
+PRAGMA user_version = 6;";
 
 /// The v1 -> v2 upgrade: the resolved columns did not exist in v1.
 const MIGRATE_V2: &str = "
@@ -90,14 +98,29 @@ ALTER TABLE agents ADD COLUMN waiting_ms INTEGER;
 ALTER TABLE agents ADD COLUMN acked_ms INTEGER;
 PRAGMA user_version = 5;";
 
+/// The v5 -> v6 upgrade: rows carry the server they were observed on, and
+/// the one-live-agent-per-pane rule is per server.
+const MIGRATE_V6: &str = "
+ALTER TABLE agents ADD COLUMN server TEXT NOT NULL DEFAULT 'local';
+DROP INDEX IF EXISTS agents_one_live_pane;
+CREATE UNIQUE INDEX IF NOT EXISTS agents_one_live_pane
+  ON agents(server, pane) WHERE ended_ms IS NULL AND pane IS NOT NULL;
+PRAGMA user_version = 6;";
+
 const COLS: &str = "id, kind, status, life, pane, session, window, task, name, \
                     name_ms, user_name, user_name_ms, waiting_ms, acked_ms, \
                     first_seen_ms, \
                     last_status_ms, started_ms, last_active_ms, source_path, \
-                    ended_ms, reason";
+                    ended_ms, reason, server";
 
-#[derive(Debug, Clone)]
+/// One agent. Serialized as JSON when a provider ships its rows to a view
+/// on another server, so every field is plain data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Agent {
+    /// "local" in the store; the link name on a row fetched from a remote
+    /// provider.
+    #[serde(default = "default_server")]
+    pub server: String,
     pub id: String,
     pub kind: String,
     pub status: String,
@@ -121,9 +144,24 @@ pub struct Agent {
     pub reason: Option<String>,
 }
 
+fn default_server() -> String {
+    LOCAL.to_string()
+}
+
 impl Agent {
     pub fn live(&self) -> bool {
         self.ended_ms.is_none()
+    }
+
+    /// Is this a row of the local server?
+    pub fn is_local(&self) -> bool {
+        self.server == LOCAL
+    }
+
+    /// The key a view uses for marks and ranks: an id is unique per
+    /// server only.
+    pub fn key(&self) -> String {
+        format!("{}\u{1}{}", self.server, self.id)
     }
 
     /// When the agent was last active: the resolved harness time, else the
@@ -162,6 +200,7 @@ fn i(v: Option<&DbValue>) -> Option<i64> {
 fn agents_from(rows: &Rows) -> Vec<Agent> {
     rows.iter()
         .map(|row| Agent {
+            server: s(row.get_named("server")).unwrap_or_else(default_server),
             id: s(row.get_named("id")).unwrap_or_default(),
             kind: s(row.get_named("kind")).unwrap_or_default(),
             status: s(row.get_named("status")).unwrap_or_default(),
@@ -220,6 +259,10 @@ pub fn migrate_sync() -> Result<(), String> {
         }
         if version <= 4 {
             db_exec_sync(MIGRATE_V5, params![])
+                .map_err(|e| format!("db: {e}"))?;
+        }
+        if version <= 5 {
+            db_exec_sync(MIGRATE_V6, params![])
                 .map_err(|e| format!("db: {e}"))?;
         }
     }
@@ -559,6 +602,26 @@ pub async fn save_capture(id: &str, text: &str) -> Result<(), HostError> {
     )
     .await?;
     Ok(())
+}
+
+/// The saved capture of an agent, if any.
+pub async fn get_capture(id: &str) -> Result<Option<String>, HostError> {
+    let rows = db_query(
+        "SELECT text FROM captures WHERE id = ?1 LIMIT 1",
+        params![id],
+    )
+    .await?;
+    Ok(rows.scalar().and_then(DbValue::as_str).map(str::to_owned))
+}
+
+/// One live or archived agent by id.
+pub async fn by_id(id: &str) -> Result<Option<Agent>, HostError> {
+    let rows = db_query(
+        &format!("SELECT {COLS} FROM agents WHERE id = ?1 LIMIT 1"),
+        params![id],
+    )
+    .await?;
+    Ok(agents_from(&rows).into_iter().next())
 }
 
 // ---------------------------------------------------------------------------

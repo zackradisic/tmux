@@ -10,9 +10,11 @@
 //! bytes; the `_json` helpers use serde_json.
 //!
 //! A target is `plugin` (this server) or `plugin@server`, where `server`
-//! is a name from [`servers`]. A plugin in role `Both` reaches its own
-//! provider half by calling its methods directly; the host path exists
-//! for other plugins and other servers.
+//! is a name from [`servers`]; `@server` alone means this plugin under the
+//! name it was loaded with (the file stem by default), which is how a
+//! view reaches its own provider half elsewhere. A plugin in role `Both`
+//! reaches its own provider half on this server by calling its methods
+//! directly; the host path exists for other plugins and other servers.
 
 use std::collections::{BTreeMap, HashMap};
 

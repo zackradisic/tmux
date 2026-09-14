@@ -318,7 +318,7 @@ guest frees (the error message bytes when `err != 0`; empty = none).
 | `db_exec` | `(sql Bytes, params Bytes) -> i64` | v0 = changes, v1 = last_insert_rowid | db |
 | `db_query` | `(sql Bytes, params Bytes) -> i64` | v0 = nrows, v1 = ncols, data = rows block | db |
 | `db_batch` | `(block Bytes) -> i64` — one transaction | v0 = total changes, v1 = last_insert_rowid | db |
-| `service_call` | `(target Str, method Str, payload Bytes) -> i64` — `target` is `plugin` or `plugin@server` | one completion per reply page: v0 = page index, v1 = flags (bit 0 MORE: the token stays alive for the next page), data = the payload; an ERROR reply completes with `err` = `E_HOST` and the message | service-call |
+| `service_call` | `(target Str, method Str, payload Bytes) -> i64` — `target` is `plugin`, `plugin@server` or `@server` (the caller's own plugin, as loaded, on that server) | one completion per reply page: v0 = page index, v1 = flags (bit 0 MORE: the token stays alive for the next page), data = the payload; an ERROR reply completes with `err` = `E_HOST` and the message | service-call |
 
 A service call for a plugin that is loaded but has not registered the
 method yet (its init is still queued, as right after a push) waits up to

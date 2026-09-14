@@ -376,6 +376,18 @@ pub fn peer_by_name(name: &str) -> Option<u32> {
     })
 }
 
+/// Does the peer run plugins of its own? True when its hello listed at
+/// least one provider and the peer is up. tmux uses it to leave a shadow
+/// pane's notifications to the remote's plugins instead of firing them
+/// twice.
+pub fn peer_provides(peer: u32) -> bool {
+    PEERS.with(|p| {
+        p.borrow().get(&peer).is_some_and(|x| {
+            x.up && x.hello.as_ref().is_some_and(|(_, plugins)| !plugins.is_empty())
+        })
+    })
+}
+
 /// Every peer, for the `servers` import.
 pub fn peers() -> Vec<Peer> {
     PEERS.with(|p| {
@@ -609,25 +621,36 @@ pub fn recv(peer_id: u32, bytes: &[u8]) {
     };
     match frame {
         Frame::Hello { abi, host, plugins, cap_ceiling } => {
-            let peer = PEERS.with(|p| {
-                let mut p = p.borrow_mut();
-                let entry = p.get_mut(&peer_id)?;
-                if !initiator {
-                    entry.name = host.clone();
-                }
-                entry.hello = Some((abi, plugins.clone()));
-                Some(entry.clone())
-            });
-            let Some(peer) = peer else { return };
+            // A peer says hello again after it loaded a pushed plugin, so
+            // its provider list stays current; only the first hello of a
+            // connection starts a push and announces the link.
+            let (peer, first) = {
+                let r = PEERS.with(|p| {
+                    let mut p = p.borrow_mut();
+                    let entry = p.get_mut(&peer_id)?;
+                    let first = entry.hello.is_none();
+                    if !initiator {
+                        entry.name = host.clone();
+                    }
+                    entry.hello = Some((abi, plugins.clone()));
+                    Some((entry.clone(), first))
+                });
+                let Some(r) = r else { return };
+                r
+            };
             hostlog::info(
                 "bridge",
                 &format!(
-                    "hello from {} (abi {abi}, {} providers, caps {})",
+                    "hello{} from {} (abi {abi}, {} providers, caps {})",
+                    if first { "" } else { " again" },
                     peer.name,
                     plugins.len(),
                     cap_ceiling.join(",")
                 ),
             );
+            if !first {
+                return;
+            }
             if initiator {
                 if abi >= ABI_VERSION {
                     push_all(peer_id);
@@ -798,6 +821,9 @@ fn accept_push(
         }
     });
     hostlog::info("bridge", &format!("{name} from {peer_name}: {outcome}"));
+    // Announce the new provider to the pusher (its dedupe rules and views
+    // read the provider list).
+    let _ = send(peer, &hello_frame());
     Ok(())
 }
 

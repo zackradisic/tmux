@@ -118,12 +118,16 @@ fn push(delivery: Delivery) {
     EVENTS.with(|e| e.borrow_mut().deliveries.push_back(delivery));
 }
 
-/// Split `plugin@server` into (plugin, server); a bare name means local.
-pub fn parse_target(target: &str) -> Result<(String, String), HostError> {
+/// Split `plugin@server` into (plugin, server); a bare name means local,
+/// and an empty plugin part (`@server`) means the caller's own plugin as
+/// loaded, which the caller fills in: a plugin does not know the name it
+/// was loaded under.
+pub fn parse_target(target: &str, own: &str) -> Result<(String, String), HostError> {
     let (plugin, server) = match target.split_once('@') {
         Some((p, s)) => (p, s),
         None => (target, LOCAL_SERVER),
     };
+    let plugin = if plugin.is_empty() { own } else { plugin };
     if plugin.is_empty() || server.is_empty() {
         return Err(err(ErrorCode::BadRequest, "empty service target"));
     }
@@ -795,14 +799,18 @@ mod tests {
     #[test]
     fn target_parsing() {
         assert_eq!(
-            parse_target("agents").unwrap(),
+            parse_target("agents", "me").unwrap(),
             ("agents".to_string(), "local".to_string())
         );
         assert_eq!(
-            parse_target("agents@devbox").unwrap(),
+            parse_target("agents@devbox", "me").unwrap(),
             ("agents".to_string(), "devbox".to_string())
         );
-        assert!(parse_target("@devbox").is_err());
-        assert!(parse_target("agents@").is_err());
+        assert_eq!(
+            parse_target("@devbox", "me").unwrap(),
+            ("me".to_string(), "devbox".to_string())
+        );
+        assert!(parse_target("@devbox", "").is_err());
+        assert!(parse_target("agents@", "me").is_err());
     }
 }

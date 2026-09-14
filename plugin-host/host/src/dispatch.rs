@@ -1534,7 +1534,8 @@ pub fn service_call(
     check_cap(mem, crate::caps::SERVICE_CALL)?;
     let target = mem.read_str(target_ptr, target_len)?;
     let method = mem.read_str(method_ptr, method_len)?;
-    let (plugin, server) = crate::services::parse_target(&target)?;
+    let own = mem.data().plugin.clone();
+    let (plugin, server) = crate::services::parse_target(&target, &own)?;
     if !mem.data().caps.service_target_allowed(&plugin, &server) {
         return Err(err(
             ErrorCode::CapDenied,
@@ -1600,7 +1601,8 @@ pub fn service_subscribe(
     check_cap(mem, crate::caps::SERVICE_CALL)?;
     let target = mem.read_str(target_ptr, target_len)?;
     let topic = mem.read_str(topic_ptr, topic_len)?;
-    let (plugin, server) = crate::services::parse_target(&target)?;
+    let own = mem.data().plugin.clone();
+    let (plugin, server) = crate::services::parse_target(&target, &own)?;
     if !mem.data().caps.service_target_allowed(&plugin, &server) {
         return Err(err(
             ErrorCode::CapDenied,

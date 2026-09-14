@@ -241,6 +241,10 @@ struct Chooser {
 }
 
 struct NotifyToast {
+    /// Which halves run here: a provider forwards its server's
+    /// notifications on the `notify` topic; a view shows toasts, its own
+    /// and the forwarded ones.
+    role: Role,
     /// None = lines never expire (dismiss from the chooser).
     duration: Option<u64>,
     width: u64,
@@ -1600,8 +1604,11 @@ impl Plugin for NotifyToast {
         let (duration, width, show_when_visible, chooser_width, chooser_height) =
             parse_config(&config);
 
+        let role = ctx.role();
         ctx.subscribe(&[
             "pane-notification",
+            // A linked server appeared: follow its notifications.
+            "link-up",
             // The view follows the user: repaint on anything that
             // changes which window is on display.
             "session-window-changed",
@@ -1618,7 +1625,16 @@ impl Plugin for NotifyToast {
         ])
         .map_err(|e| e.message.clone())?;
 
+        if role.views() {
+            for s in service::servers().unwrap_or_default() {
+                if !s.local && s.up {
+                    follow(&s.name);
+                }
+            }
+        }
+
         Ok(Self {
+            role,
             duration,
             width,
             show_when_visible,
@@ -1736,6 +1752,14 @@ impl Plugin for NotifyToast {
 
         match event.name().as_str() {
             "pane-notification" => {}
+            "link-up" => {
+                if self.role.views() {
+                    if let Some(server) = event.get_str("server") {
+                        follow(server);
+                    }
+                }
+                return;
+            }
             // Key binding: toggle the chooser in the target window.
             "plugin-command" => {
                 if event.get_str("text") != Some("chooser") {
@@ -1949,6 +1973,7 @@ impl Plugin for NotifyToast {
         self.seq += 1;
         let seq = self.seq;
         let duration = self.duration;
+        let role = self.role;
 
         let src_pane = u64::from(src_pane);
         ctx.spawn(async move {
@@ -1974,36 +1999,122 @@ impl Plugin for NotifyToast {
                     ..probe
                 }
             };
-            {
-                let mut st = state.borrow_mut();
-                // A pane holds one row however often it pings: a repeat
-                // replaces the old entry, carrying its tally and taking
-                // a fresh seq. The old entry's expiry task fires later,
-                // finds that seq gone and does nothing.
-                let count = st
-                    .entries
-                    .iter()
-                    .find(|e| e.src_pane == src_pane)
-                    .map_or(0, |e| e.count.max(1));
-                st.entries.retain(|e| e.src_pane != src_pane);
-                st.entries.push_back(Entry { count: count + 1, ..entry });
-                while st.entries.len() > MAX_LINES {
-                    st.entries.pop_front();
-                }
+            // The provider half forwards the notification to the views
+            // on linked servers (this server's panes are theirs too when
+            // a link mirrors them). A provider on its own is done here.
+            if role.provides() {
+                let _ = service::emit_json(TOPIC, &entry);
             }
-            log(&format!("notification from %{src_pane}: added to feed"));
-            sync_views(&state, width, keeper_secs, show_when_visible).await;
-
-            // Expire this line, then reconcile again. With an infinite
-            // duration the line stays until the pane is dismissed.
-            let Some(duration_ms) = duration else { return };
-            if sleep_ms(duration_ms).await.is_err() {
-                return; // instance torn down
+            if !role.views() {
+                return;
             }
-            state.borrow_mut().entries.retain(|e| e.seq != seq);
-            sync_views(&state, width, keeper_secs, show_when_visible).await;
+            add_entry(&state, entry, seq, duration, width, keeper_secs, show_when_visible)
+                .await;
         });
     }
+
+    /// A provider on a linked server forwarded a notification: show it
+    /// here, against the local shadow of its pane when a link mirrors it.
+    fn on_service_event(&mut self, ctx: &Ctx, ev: ServiceEvent) {
+        if ev.topic != TOPIC || ev.server == "local" || !self.role.views() {
+            return;
+        }
+        let Ok(mut entry) = ev.json::<Entry>() else { return };
+        let (width, keeper_secs, show_when_visible) = self.view_params();
+        let state = Rc::clone(&self.state);
+        self.seq += 1;
+        let seq = self.seq;
+        let duration = self.duration;
+        // The pane the notification names is on the other server. When a
+        // shadow pane mirrors it here, the toast points at that (so the
+        // chooser can jump to it); otherwise it keeps a synthetic id
+        // that no local pane can match.
+        match mirror_of(&ev.server, entry.src_pane) {
+            Some((pane, window)) => {
+                entry.src_pane = pane;
+                entry.src_window = Some(window);
+            }
+            None => {
+                entry.src_pane = REMOTE_PANE_BASE | entry.src_pane;
+                entry.src_window = None;
+            }
+        }
+        entry.session_name = format!("{}/{}", ev.server, entry.session_name);
+        entry.seq = seq;
+        entry.count = 0;
+        ctx.spawn(async move {
+            add_entry(&state, entry, seq, duration, width, keeper_secs, show_when_visible)
+                .await;
+        });
+    }
+}
+
+/// The service topic a provider forwards notifications on.
+const TOPIC: &str = "notify";
+
+/// Synthetic pane ids for forwarded notifications whose pane has no local
+/// mirror, clear of any real pane id.
+const REMOTE_PANE_BASE: u64 = 1 << 40;
+
+/// Follow the notifications of the provider on a linked server.
+fn follow(server: &str) {
+    let _ = service::subscribe(&format!("@{server}"), TOPIC);
+}
+
+/// The local shadow pane (and its window) that mirrors `pane` on `server`.
+fn mirror_of(server: &str, pane: u64) -> Option<(u64, u64)> {
+    for p in list_panes().unwrap_or_default() {
+        if !p.remote || p.host != server {
+            continue;
+        }
+        let rid = format_expand(OptionTarget::Pane(PaneId(p.id)), "#{pane_remote_id}").ok()?;
+        let n = rid.strip_prefix('%').and_then(|s| s.parse::<u64>().ok());
+        if n == Some(pane) {
+            return Some((u64::from(p.id), u64::from(p.window)));
+        }
+    }
+    None
+}
+
+/// Put one entry into the feed, repaint, and expire it after `duration`.
+async fn add_entry(
+    state: &State,
+    entry: Entry,
+    seq: u64,
+    duration: Option<u64>,
+    width: u64,
+    keeper_secs: u64,
+    show_when_visible: bool,
+) {
+    let src_pane = entry.src_pane;
+    {
+        let mut st = state.borrow_mut();
+        // A pane holds one row however often it pings: a repeat
+        // replaces the old entry, carrying its tally and taking
+        // a fresh seq. The old entry's expiry task fires later,
+        // finds that seq gone and does nothing.
+        let count = st
+            .entries
+            .iter()
+            .find(|e| e.src_pane == src_pane)
+            .map_or(0, |e| e.count.max(1));
+        st.entries.retain(|e| e.src_pane != src_pane);
+        st.entries.push_back(Entry { count: count + 1, ..entry });
+        while st.entries.len() > MAX_LINES {
+            st.entries.pop_front();
+        }
+    }
+    log(&format!("notification from %{src_pane}: added to feed"));
+    sync_views(state, width, keeper_secs, show_when_visible).await;
+
+    // Expire this line, then reconcile again. With an infinite
+    // duration the line stays until the pane is dismissed.
+    let Some(duration_ms) = duration else { return };
+    if sleep_ms(duration_ms).await.is_err() {
+        return; // instance torn down
+    }
+    state.borrow_mut().entries.retain(|e| e.seq != seq);
+    sync_views(state, width, keeper_secs, show_when_visible).await;
 }
 
 tmux_plugin!(NotifyToast);

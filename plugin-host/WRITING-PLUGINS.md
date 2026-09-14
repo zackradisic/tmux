@@ -226,7 +226,8 @@ loaded with `load-plugin -r view`. A provider cannot open UI modes.
 
 The halves talk through *services*. The provider registers methods and
 publishes topics; the view calls and follows them, naming a target as
-`plugin` (this server) or `plugin@server`:
+`plugin` (this server), `plugin@server`, or `@server` for its own plugin
+on another server (under the name it was loaded with there):
 
 ```rust
 fn init(ctx: &Ctx, _c: Self::Config) -> Result<Self, String> {
