@@ -476,8 +476,20 @@ pub fn plugin_started(plugin: &str) {
         return;
     }
     if provides {
+        // Links we made and that are already up never saw this plugin: it
+        // loaded after they connected. Push it now, so a plugin added to
+        // the manifest reaches live remotes without a reconnect. Then a
+        // fresh hello, so the version handshake runs.
         let ups: Vec<u32> =
             PEERS.with(|p| p.borrow().values().filter(|x| x.up).map(|x| x.id).collect());
+        let initiators: Vec<u32> = ups
+            .iter()
+            .copied()
+            .filter(|id| id & PGH_PEER_LINK != 0)
+            .collect();
+        for peer in initiators {
+            push_one(peer, plugin);
+        }
         if !ups.is_empty() {
             let frame = hello_frame();
             for peer in ups {
@@ -882,50 +894,69 @@ pub fn recv(peer_id: u32, bytes: &[u8]) {
 
 /// Send every local provider-capable plugin to a peer.
 fn push_all(peer: u32) {
-    let defs: Vec<(String, std::path::PathBuf, LoadDescriptor)> = REGISTRY.with(|r| {
-        let reg = r.borrow();
-        reg.plugins
+    for name in local_pushable() {
+        push_one(peer, &name);
+    }
+}
+
+/// The names of the local plugins worth pushing: running, provider-
+/// capable and not themselves pushed to us.
+fn local_pushable() -> Vec<String> {
+    REGISTRY.with(|r| {
+        r.borrow()
+            .plugins
             .values()
             .filter(|d| {
                 d.state == PluginState::Running
                     && d.role.provides()
                     && d.pushed_by.is_none()
             })
-            .map(|d| {
-                (
-                    d.name.clone(),
-                    d.path.clone(),
-                    LoadDescriptor {
-                        name: d.name.clone(),
-                        path: String::new(),
-                        scope: d.scope_type,
-                        config: d.config.clone(),
-                        caps: Vec::new(),
-                        role: Role::Provider,
-                    },
-                )
-            })
+            .map(|d| d.name.clone())
             .collect()
+    })
+}
+
+/// Push one local plugin to a peer.
+fn push_one(peer: u32, name: &str) {
+    let def: Option<(std::path::PathBuf, LoadDescriptor)> = REGISTRY.with(|r| {
+        let reg = r.borrow();
+        reg.plugins.get(name).filter(|d| {
+            d.state == PluginState::Running
+                && d.role.provides()
+                && d.pushed_by.is_none()
+        }).map(|d| {
+            (
+                d.path.clone(),
+                LoadDescriptor {
+                    name: d.name.clone(),
+                    path: String::new(),
+                    scope: d.scope_type,
+                    config: d.config.clone(),
+                    caps: Vec::new(),
+                    role: Role::Provider,
+                },
+            )
+        })
     });
-    for (name, path, desc) in defs {
-        let wasm = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(e) => {
-                hostlog::warn("bridge", &format!("push {name}: {}: {e}", path.display()));
-                continue;
-            }
-        };
-        let sidecar = std::fs::read_to_string(path.with_extension("toml")).ok();
-        let frame = Frame::Push {
-            descriptor: serde_json::to_string(&desc).unwrap_or_default(),
-            sidecar,
-            hash: blake3::hash(&wasm).to_hex().to_string(),
-            wasm,
-        };
-        match send(peer, &frame) {
-            Ok(()) => hostlog::info("bridge", &format!("pushed {name} to peer {peer}")),
-            Err(e) => hostlog::warn("bridge", &format!("push {name}: {e}")),
+    let Some((path, desc)) = def else { return };
+    let name = desc.name.clone();
+    let wasm = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            hostlog::warn("bridge", &format!("push {name}: {}: {e}", path.display()));
+            return;
         }
+    };
+    let sidecar = std::fs::read_to_string(path.with_extension("toml")).ok();
+    let frame = Frame::Push {
+        descriptor: serde_json::to_string(&desc).unwrap_or_default(),
+        sidecar,
+        hash: blake3::hash(&wasm).to_hex().to_string(),
+        wasm,
+    };
+    match send(peer, &frame) {
+        Ok(()) => hostlog::info("bridge", &format!("pushed {name} to peer {peer}")),
+        Err(e) => hostlog::warn("bridge", &format!("push {name}: {e}")),
     }
 }
 

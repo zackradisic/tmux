@@ -58,4 +58,27 @@ wait_for 10 "XDG_DATA_HOME=$XDG_B $TMUX2 plugin-command mailbox 'inbox beta'; \
 XDG_DATA_HOME=$XDG_B $TMUX2 show-options -s -v @mailbox_beta |
     grep -Eq '"sender":"[^"]+@[^"]+"' ||
     fail "sender not qualified: $(XDG_DATA_HOME=$XDG_B $TMUX2 show-options -s -v @mailbox_beta)"
+
+# A plugin loaded AFTER a link is up still reaches the remote: adding
+# mailbox to a live server needs no reconnect. Link C to B with no plugin,
+# then load mailbox on C and send across the already-up link.
+$TMUX2 new-session -d -s late -x 80 -y 24 2>/dev/null
+XDG_C="$TMP/c"
+mkdir -p "$XDG_C"
+TMUXC="$TEST_TMUX -Ltestc$$ -f/dev/null"
+XDG_DATA_HOME="$XDG_C" $TMUXC new-session -d -s c -x 80 -y 24 || fail "new-session on C"
+XDG_DATA_HOME="$XDG_C" $TMUXC set -s remote-ssh-command \
+    "$TEST_TMUX -LtestB$$ -f/dev/null #{remote_command}" || fail "C ssh-command"
+XDG_DATA_HOME="$XDG_C" $TMUXC remote-attach -t late fakelate || fail "C link"
+wait_for 10 "[ \"\$(XDG_DATA_HOME=$XDG_C $TMUXC display-message -p -t fakelate/late '#{remote_connected}')\" = 1 ]" ||
+    fail "C link not up"
+XDG_DATA_HOME="$XDG_C" $TMUXC load-plugin -s server $CAPS "$WASM" ||
+    fail "load mailbox on C after link"
+wait_for 10 "XDG_DATA_HOME=$XDG_B $TMUX2 show-plugins | grep -q 'mailbox: .*running'" ||
+    fail "mailbox not pushed to B after a live link"
+XDG_DATA_HOME="$XDG_C" $TMUXC plugin-command mailbox "send gamma@fakelate after the link" ||
+    fail "C send"
+wait_for 10 "XDG_DATA_HOME=$XDG_B $TMUX2 plugin-command mailbox 'inbox gamma'; XDG_DATA_HOME=$XDG_B $TMUX2 show-options -s -v @mailbox_gamma | grep -q 'after the link'" ||
+    fail "late-load delivery"
+XDG_DATA_HOME="$XDG_C" $TMUXC kill-server 2>/dev/null
 exit 0
