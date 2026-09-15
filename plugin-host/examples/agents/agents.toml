@@ -26,6 +26,11 @@ requests = [
   "service-call",
 ]
 
+# The services this plugin calls: its own provider on any server, and the
+# mailbox plugin (for the picker's message send and unread badge).
+[caps.services]
+call = ["agents@*", "mailbox@*"]
+
 # The only environment variables the roster ever reads. Everything else
 # in a pane's environment (tokens, secrets) stays unreadable. Used only
 # for detection fallback; identity comes from the harness session files.

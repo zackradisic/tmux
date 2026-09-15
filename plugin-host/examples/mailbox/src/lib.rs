@@ -23,7 +23,9 @@
 //! A stdout-returning command is the ergonomic follow-up; it needs the
 //! host to let a plugin-command write to the caller, which it cannot yet.
 //!
-//! Delivery uses one service, `deliver`, so a mailbox plugin on any server
+//! Services: `deliver` stores a message, `boxes` reports the message count
+//! per box, so a view (the agents picker) can badge an agent with its
+//! unread count. A mailbox plugin on any server
 //! accepts a message from any other. The gate is the ordinary one:
 //! `plugin-remote-caps` on the receiving server, the sidecar's services
 //! allowlist, and (planned) an accept-from option checked against the
@@ -44,6 +46,14 @@ struct DeliverReq {
     to: String,
     from: String,
     body: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct BoxCount {
+    #[serde(rename = "box")]
+    box_: String,
+    unread: i64,
+    total: i64,
 }
 
 #[derive(serde::Serialize)]
@@ -200,6 +210,7 @@ impl Plugin for Mailbox {
         if role.provides() {
             db_exec_sync(TABLE, &[]).map_err(|e| e.message)?;
             service::register("deliver").map_err(|e| e.message.clone())?;
+            service::register("boxes").map_err(|e| e.message.clone())?;
         }
         // plugin-command is addressed by name and needs a subscription.
         ctx.subscribe(&["plugin-command"]).map_err(|e| e.message.clone())?;
@@ -244,6 +255,43 @@ impl Plugin for Mailbox {
     }
 
     fn on_service_request(&mut self, ctx: &Ctx, req: ServiceRequest) {
+        if req.method == "boxes" {
+            ctx.spawn(async move {
+                match db_query(
+                    "SELECT box, SUM(read = 0) AS unread, COUNT(*) AS total \
+                     FROM messages GROUP BY box ORDER BY box",
+                    &[],
+                )
+                .await
+                {
+                    Ok(rows) => {
+                        let list: Vec<BoxCount> = rows
+                            .iter()
+                            .map(|row| BoxCount {
+                                box_: row
+                                    .get_named("box")
+                                    .and_then(DbValue::as_str)
+                                    .unwrap_or("")
+                                    .to_string(),
+                                unread: row
+                                    .get_named("unread")
+                                    .and_then(DbValue::as_i64)
+                                    .unwrap_or(0),
+                                total: row
+                                    .get_named("total")
+                                    .and_then(DbValue::as_i64)
+                                    .unwrap_or(0),
+                            })
+                            .collect();
+                        let _ = req.reply_json(&list);
+                    }
+                    Err(e) => {
+                        let _ = req.fail(&e.message);
+                    }
+                }
+            });
+            return;
+        }
         if req.method != "deliver" {
             let _ = req.fail("unknown method");
             return;

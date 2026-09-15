@@ -474,6 +474,8 @@ pub enum PickAfter {
     Resize(ModeId, u32, u32),
     /// Rename (server, id) to the name.
     Rename(String, String, String),
+    /// Send a message to (server, id) through its mailbox.
+    Message(String, String, String),
 }
 
 /// One rendered line: a server header (only when rows come from more than
@@ -540,6 +542,12 @@ pub struct Picker {
     pub down: HashMap<String, u64>,
     /// Per server: why this side rejects its copy of the plugin.
     pub mismatch: HashMap<String, String>,
+    /// Composing a message to the selected agent.
+    pub composing: bool,
+    pub msg_buf: String,
+    /// Unread message count per (server, agent id), from each server's
+    /// mailbox plugin. Absent or zero means no badge.
+    pub unread: HashMap<(String, String), i64>,
     /// Per server: when the fetch now in flight for it started (local
     /// clock). Drives the header's spinner.
     pub fetching: HashMap<String, u64>,
@@ -828,6 +836,9 @@ pub async fn pick_open(
         down,
         mismatch,
         fetching,
+        composing: false,
+        msg_buf: String::new(),
+        unread: HashMap::new(),
         mirrors: if multi { find_mirrors() } else { HashMap::new() },
         remote_capture: None,
         multi,
@@ -848,6 +859,7 @@ pub async fn pick_open(
     // spin in their headers meanwhile. Reopening in a hurry does not
     // stack up rounds of ssh - see fetch_remotes_on_open.
     spawn(fetch_remotes_on_open(Rc::clone(&picker), Rc::clone(&remotes), false));
+    fetch_unread(Rc::clone(&picker));
     request_capture(&picker);
 }
 
@@ -890,6 +902,7 @@ pub async fn reload_picker(
         pick_render(p);
     }
     drop(b);
+    fetch_unread(Rc::clone(&picker));
     request_capture(&picker);
 }
 
@@ -1063,7 +1076,37 @@ pub fn on_mode_key(
         // modes; they are never text.
         let is_down = matches!(key.as_str(), "Down" | "C-n" | "C-j");
         let is_up = matches!(key.as_str(), "Up" | "C-p" | "C-k");
-        if p.renaming {
+        if p.composing {
+            // Compose mode: keys are text, except accept / cancel.
+            if key == k.close {
+                p.composing = false;
+                p.msg_buf.clear();
+                pick_render(p);
+            } else if key == "Enter" {
+                if let Some(a) = p.selected() {
+                    let text = p.msg_buf.trim().to_string();
+                    if !text.is_empty() {
+                        after = PickAfter::Message(a.server.clone(), a.id.clone(), text);
+                    }
+                }
+                p.composing = false;
+                p.msg_buf.clear();
+            } else if key == "BSpace" {
+                p.msg_buf.pop();
+                pick_render(p);
+            } else if key == "C-u" {
+                p.msg_buf.clear();
+                pick_render(p);
+            } else if key == "Space" {
+                p.msg_buf.push(' ');
+                pick_render(p);
+            } else if key.chars().count() == 1
+                && !key.chars().next().unwrap().is_control()
+            {
+                p.msg_buf.push_str(&key);
+                pick_render(p);
+            }
+        } else if p.renaming {
             // Rename mode: keys are text, except accept / cancel.
             if key == k.close {
                 p.renaming = false;
@@ -1162,6 +1205,14 @@ pub fn on_mode_key(
             if let Some(a) = p.selected() {
                 p.rename_buf = a.user_name.clone().unwrap_or_default();
                 p.renaming = true;
+                pick_render(p);
+            }
+        } else if key == "m" {
+            // Message the selected agent: its mailbox holds it until the
+            // agent reads it, on this server or the agent's own.
+            if p.selected().is_some() {
+                p.msg_buf.clear();
+                p.composing = true;
                 pick_render(p);
             }
         } else if key == k.jump {
@@ -1288,7 +1339,131 @@ pub fn on_mode_key(
                 reload_picker(picker, remotes, false).await;
             });
         }
+        PickAfter::Message(server, id, text) => {
+            let picker = Rc::clone(picker);
+            let sender = picker
+                .borrow()
+                .as_ref()
+                .and_then(|p| p.current_pane)
+                .map(|pn| format!("%{pn}"))
+                .unwrap_or_else(|| "picker".into());
+            ctx.spawn(async move {
+                let ok = message_agent(&server, &id, &sender, &text).await;
+                if let Some(p) = picker.borrow_mut().as_mut() {
+                    p.status = Some(match ok {
+                        Ok(()) => format!("sent to {id}"),
+                        Err(e) => format!("send failed: {e}"),
+                    });
+                    pick_render(p);
+                }
+            });
+        }
     }
+}
+
+/// Deliver a message to an agent's mailbox. A local agent's mailbox is on
+/// this server; a remote agent's is on its own, reached over the bridge.
+/// The box name is the agent's durable id, so the agent reads it with
+/// `plugin-command mailbox 'inbox <id>'`.
+fn server_of(remotes: &Rc<RefCell<Remotes>>, id: &str) -> Option<String> {
+    remotes
+        .borrow()
+        .servers
+        .iter()
+        .find(|(_, rows)| rows.agents.iter().any(|a| a.id == id))
+        .map(|(name, _)| name.clone())
+}
+
+pub async fn message_by_id(
+    picker: Rc<RefCell<Option<Picker>>>,
+    remotes: Rc<RefCell<Remotes>>,
+    id: &str,
+    from: &str,
+    text: &str,
+) {
+    // Which server hosts this id? The remotes rosters know. When the id is
+    // in no roster it is either a local agent or a remote one the roster
+    // has not fetched yet; fetch once and look again before falling back
+    // to the local server, so a message right after linking still routes.
+    let mut server = server_of(&remotes, id);
+    if server.is_none() {
+        fetch_remotes_now(Rc::clone(&picker), Rc::clone(&remotes), false).await;
+        server = server_of(&remotes, id);
+    }
+    let server = server.unwrap_or_else(|| LOCAL.to_string());
+    match message_agent(&server, id, from, text).await {
+        Ok(()) => {
+            let _ = display_message(&format!("agents: sent to {id}"));
+        }
+        Err(e) => {
+            let _ = display_message(&format!("agents: send failed: {e}"));
+        }
+    }
+}
+
+async fn message_agent(server: &str, id: &str, from: &str, text: &str) -> Result<(), String> {
+    let target = if server == LOCAL {
+        "mailbox".to_string()
+    } else {
+        format!("mailbox@{server}")
+    };
+    let req = serde_json::json!({ "to": id, "from": from, "body": text });
+    service::call_json::<_, serde_json::Value>(&target, "deliver", &req)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.message)
+}
+
+/// Ask each server's mailbox for its unread counts and fold them into the
+/// picker's `unread` map, keyed by (server, agent id). Best effort: a
+/// server without a mailbox, or a call that fails, just leaves no badge.
+fn fetch_unread(picker: Rc<RefCell<Option<Picker>>>) {
+    let (mode, servers) = {
+        let b = picker.borrow();
+        let Some(p) = b.as_ref() else { return };
+        let mut servers: HashSet<String> =
+            p.rows.iter().map(|a| a.server.clone()).collect();
+        servers.insert(LOCAL.to_string());
+        (p.mode, servers)
+    };
+    for server in servers {
+        let picker = Rc::clone(&picker);
+        let mode = mode;
+        spawn(async move {
+            let target = if server == LOCAL {
+                "mailbox".to_string()
+            } else {
+                format!("mailbox@{server}")
+            };
+            let Ok(boxes) =
+                service::call_json::<_, Vec<MailboxCount>>(&target, "boxes", &()).await
+            else {
+                return;
+            };
+            let mut b = picker.borrow_mut();
+            let Some(p) = b.as_mut() else { return };
+            if p.mode.0 != mode.0 {
+                return;
+            }
+            p.unread.retain(|(s, _), _| *s != server);
+            for bc in boxes {
+                if bc.unread > 0 {
+                    p.unread.insert((server.clone(), bc.box_), bc.unread);
+                }
+            }
+            pick_render(p);
+        });
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct MailboxCount {
+    #[serde(rename = "box")]
+    box_: String,
+    unread: i64,
+    #[allow(dead_code)]
+    #[serde(default)]
+    total: i64,
 }
 
 /// Move the selection by `delta` rows, clamped, then scroll and redraw.
@@ -1777,7 +1952,15 @@ pub fn pick_render(p: &mut Picker) {
         "\x1b[1;1H\x1b[1m agents\x1b[0m \x1b[2m({live} live{}{unread_tag}{servers_tag}{content_tag}{selected})\x1b[0m",
         if p.show_history { ", +history" } else { "" },
     ));
-    if p.renaming {
+    if p.composing {
+        // Compose mode takes over the prompt line, with a block cursor.
+        let to = p.selected().map(display_name).unwrap_or_default();
+        out.push_str(&format!(
+            "\x1b[2;1H  \x1b[2mmsg {}\x1b[0m {}\x1b[7m \x1b[0m",
+            clip(&to, 16),
+            p.msg_buf
+        ));
+    } else if p.renaming {
         // Rename mode takes over the prompt line, with a block cursor.
         out.push_str(&format!(
             "\x1b[2;1H  \x1b[2mrename\x1b[0m {}\x1b[7m \x1b[0m",
@@ -1881,7 +2064,16 @@ pub fn pick_render(p: &mut Picker) {
                         .saturating_sub(1)
                         .saturating_sub(4 + 2 + right.chars().count())
                         .max(8);
-                    let mut label = display_name(a);
+                    let unread = p
+                        .unread
+                        .get(&(a.server.clone(), a.id.clone()))
+                        .copied()
+                        .unwrap_or(0);
+                    let mut label = if unread > 0 {
+                        format!("\u{2709}{unread} {}", display_name(a))
+                    } else {
+                        display_name(a)
+                    };
                     // An archived row (only in the history view) says so,
                     // so the `a` un-archive is obvious. Otherwise a
                     // content-search hit shows the matching line, else the
@@ -1974,13 +2166,15 @@ pub fn pick_render(p: &mut Picker) {
     // The archive key un-archives when the highlighted row is archived.
     let cursor_archived = p.selected().is_some_and(|a| a.life == "archived");
     let arch = if cursor_archived { "unarch" } else { "arch" };
-    let footer = if p.renaming {
+    let footer = if p.composing {
+        "type a message · Enter send · Esc cancel".to_string()
+    } else if p.renaming {
         "type a name · Enter accept · Esc cancel".to_string()
     } else if p.filtering {
         format!("type to search · {ctok} · Esc unfocus")
     } else {
         format!(
-            "j/k move · gg/G ends · {} search · {} jump · {ctok} · {} rename · {} {arch} · +/- size · q/{} close",
+            "j/k move · gg/G ends · {} search · {} jump · m msg · {ctok} · {} rename · {} {arch} · q/{} close",
             keyname(&k.filter),
             keyname(&k.jump),
             keyname(&k.rename),

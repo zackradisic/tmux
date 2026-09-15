@@ -84,13 +84,26 @@ messaging; between agents on different servers it would be a topic the
 reader's harness follows. The store and the `deliver` service do not
 change for it.
 
+## The agents picker
+
+The agents plugin addresses a message by the durable agent id, not a box
+name, and knows which server hosts each id from its roster. In the picker,
+`m` on a row opens a compose line; Enter sends. `plugin-command agents
+message <id> <text>` does the same without the picker, so a script or
+another agent can send too. A local agent's mailbox is on this server; a
+remote agent's is on its own, reached over the bridge. When the id is in
+no roster yet (a message right after linking) the view fetches the rosters
+once, then routes. Each server's mailbox is asked for its unread counts,
+and a row with unread shows an envelope badge with the number.
+
 ## Status
 
-Built and tested. `regress/plugin-mailbox.sh` runs two servers: a message
-left for a local box is read back, a message sent to a box on the linked
-server crosses the bridge into that server's store, and the sender is
-qualified with its server. The release bundles `mailbox.wasm`.
+Built and tested. `regress/plugin-mailbox.sh` runs the mailbox alone
+across two (then three) servers, including a plugin loaded after a link is
+already up. `regress/plugin-agents-message.sh` runs the whole feature: a
+message to a local agent id stored here, and a message to a remote agent
+id routed over the bridge into that agent's server, sender qualified. The
+release bundles `mailbox.wasm`.
 
-Not built yet: the agents-plugin integration (address by agent id, a send
-key in the picker, unread in the roster), the `accept-from` option, and
-the stdout-returning read command.
+Not built yet: the `accept-from` gate option, the stdout-returning read
+command, and the RPC push that wakes a reader instead of it pulling.

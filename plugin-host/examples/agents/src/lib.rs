@@ -407,6 +407,36 @@ impl Agents {
             ctx.spawn(view::pick_open(picker, cfg, remotes, client, here));
             return;
         }
+        if verb == "message" {
+            // "message <agent-id> <text>": leave a message in the agent's
+            // mailbox, on this server or the agent's own. The view knows
+            // which server an id is on, from its roster.
+            if !self.role.views() {
+                let _ = display_message("agents: a provider has no roster to address");
+                return;
+            }
+            let mut rest = text.splitn(3, char::is_whitespace).skip(1);
+            let Some(id) = rest.next().map(str::to_string) else {
+                let _ = display_message("agents: message <agent-id> <text>");
+                return;
+            };
+            let body = rest.next().map(str::to_string).unwrap_or_default();
+            if body.trim().is_empty() {
+                let _ = display_message("agents: an empty message");
+                return;
+            }
+            let remotes = Rc::clone(&self.remotes);
+            let picker = Rc::clone(&self.picker);
+            let from = event
+                .scope
+                .pane
+                .map(|p| format!("%{p}"))
+                .unwrap_or_else(|| "command".into());
+            ctx.spawn(async move {
+                view::message_by_id(picker, remotes, &id, &from, body.trim()).await;
+            });
+            return;
+        }
         if !self.role.provides() {
             let _ = display_message("agents: this instance is a view");
             return;
