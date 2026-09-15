@@ -21,7 +21,9 @@ WASM=$(dirname "$TEST_TMUX")/plugin-host/target/wasm32-unknown-unknown/release/a
 XDG_DATA_HOME=$(mktemp -d)
 export XDG_DATA_HOME
 BIN=$(mktemp -d)
-ln -s "$(command -v sleep)" "$BIN/codex"
+# A copy of the shell under the agent's name: a symlink to sleep would
+# not do, a multi-call coreutils dispatches on argv[0] and refuses it.
+cp /bin/sh "$BIN/codex"
 
 trap 'kill $CTL 2>/dev/null; $TMUX kill-server 2>/dev/null; rm -rf "$XDG_DATA_HOME" "$BIN"' EXIT
 
@@ -47,7 +49,7 @@ sleep 0.5
 
 # Pane one: the Codex case - detected by command name, no env marker.
 $TMUX -f/dev/null new-session -d -s alpha -x 200 -y 50 \
-    "sh -c 'exec $BIN/codex 600'" || fail "new-session alpha"
+    "sh -c 'exec $BIN/codex -c \"read -r _\"'" || fail "new-session alpha"
 # Pane two: the Claude case - detected by env, with a session id.
 $TMUX new-session -d -s beta -x 200 -y 50 \
     "sh -c 'AI_AGENT=claude CLAUDE_CODE_SESSION_ID=sess-abc exec sleep 600'" \

@@ -43,7 +43,10 @@
 //!     in the config makes the marker proof again (the tests use it).
 //!     The plugin learns of changes from `pane-command-changed`,
 //!     `pane-created` and `pane-destroyed`, so a killed or crashed CLI
-//!     retires itself - no hook can leave a ghost behind. This is also
+//!     retires itself - no hook can leave a ghost behind. A pane that
+//!     dies while its classification is still in flight is caught by a
+//!     liveness check before the row is written, and a sweep every 30 s
+//!     retires any row whose pane is gone all the same. This is also
 //!     how `done` is decided: the pane dying, not an exit hook.
 //!   * Identity is two-phase. A freshly seen agent joins under a
 //!     provisional, pane-bound id and its `#{pane_title}` name. A resolver
@@ -242,6 +245,7 @@ impl Plugin for Agents {
         if role.provides() {
             provider::register_services();
             ctx.spawn(provider::reconcile(Rc::clone(&cfg)));
+            ctx.spawn(provider::sweep_loop());
         }
         if role.views() {
             // Follow the providers on servers that are linked already.

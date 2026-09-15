@@ -31,7 +31,9 @@ BIN="$TMP/bin"
 mkdir -p "$HOME_DIR/.claude/sessions" "$BIN"
 # The macOS launcher execs a version-named binary: the pane's command is
 # "2.1.271", not "claude".
-ln -s "$(command -v sleep)" "$BIN/2.1.271"
+# A copy of the shell under the agent's name: a symlink to sleep would
+# not do, a multi-call coreutils dispatches on argv[0] and refuses it.
+cp /bin/sh "$BIN/2.1.271"
 
 # The sidecar next to the wasm gives the scoped fs-read prefix
 # ~/.claude/sessions (under the server's HOME), which the session file
@@ -70,7 +72,7 @@ AI_AGENT=claude-code_2-1-270_agent HOME="$HOME_DIR" XDG_DATA_HOME="$TMP/data" \
 cat >"$HOME_DIR/.claude/sessions/4242.json" <<JSON
 {"tmux":"beta:@1.%1","sessionId":"sess-real","name":"Real one","status":"busy"}
 JSON
-$TMUX new-session -d -s beta -x 200 -y 50 "sh -c 'exec $BIN/2.1.271 600'" ||
+$TMUX new-session -d -s beta -x 200 -y 50 "sh -c 'exec $BIN/2.1.271 -c \"read -r _\"'" ||
     fail "new-session beta"
 [ "$($TMUX list-panes -t beta -F '#{pane_id}')" = '%1' ] || fail "beta is not %1"
 
@@ -80,7 +82,7 @@ $TMUX new-session -d -s beta -x 200 -y 50 "sh -c 'exec $BIN/2.1.271 600'" ||
 cat >"$HOME_DIR/.claude/sessions/66622.json" <<JSON
 {"tmux":"zackoverflow:@9.%2","sessionId":"sess-stale","name":"Stale one","status":"idle"}
 JSON
-$TMUX new-session -d -s gamma -x 200 -y 50 "sh -c 'exec $BIN/2.1.271 600'" ||
+$TMUX new-session -d -s gamma -x 200 -y 50 "sh -c 'exec $BIN/2.1.271 -c \"read -r _\"'" ||
     fail "new-session gamma"
 [ "$($TMUX list-panes -t gamma -F '#{pane_id}')" = '%2' ] || fail "gamma is not %2"
 

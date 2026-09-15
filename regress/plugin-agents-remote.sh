@@ -21,7 +21,9 @@ XDG_A="$TMP/a"
 XDG_B="$TMP/b"
 BIN="$TMP/bin"
 mkdir -p "$XDG_A" "$XDG_B" "$BIN"
-ln -s "$(command -v sleep)" "$BIN/codex"
+# A copy of the shell under the agent's name: a symlink to sleep would
+# not do, a multi-call coreutils dispatches on argv[0] and refuses it.
+cp /bin/sh "$BIN/codex"
 
 # Deploy the wasm with its sidecar, as a release install does: the host
 # then runs it in restrictive mode, where the sidecar's requests mask the
@@ -37,7 +39,7 @@ keys() { $TMUX send-keys -t "$FORM" "$@"; sleep 0.4; }
 
 # B: a codex agent (detected by command name) in session "work".
 XDG_DATA_HOME="$XDG_B" $TMUX2 new-session -d -s work -x 200 -y 50 \
-    "sh -c 'exec $BIN/codex 600'" || fail "new-session on B"
+    "sh -c 'exec $BIN/codex -c \"read -r _\"'" || fail "new-session on B"
 # A: a claude agent (detected by environment) in session "alpha".
 XDG_DATA_HOME="$XDG_A" $TMUX new-session -d -s alpha -x 200 -y 50 \
     "sh -c 'AI_AGENT=claude CLAUDE_CODE_SESSION_ID=sess-abc exec sleep 600'" \

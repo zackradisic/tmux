@@ -297,6 +297,13 @@ pub async fn classify(pane: u32, cfg: Rc<Config>) {
             return;
         }
     };
+    // detect() awaited; the pane may have died meanwhile, and its
+    // pane-destroyed handler found no row to end. A row for a dead pane
+    // would be a ghost until the sweep, so look once more first.
+    if resolve_pane(PaneId(pane)).is_err() {
+        let _ = store::end_by_pane(pane as i64, now, "closed").await;
+        return;
+    }
     let (session, window) = labels(pane);
     let existing = store::live_by_pane(pane as i64).await.ok().flatten();
     // Keep the pane's current id (provisional or already-resolved); mint a
@@ -486,16 +493,43 @@ pub async fn reconcile(cfg: Rc<Config>) {
     for p in &panes {
         classify(p.id, Rc::clone(&cfg)).await;
     }
+    sweep_gone().await;
+    let _ = store::prune(cfg.keep_days, now_ms() as i64).await;
+}
+
+/// Retire live rows whose pane no longer exists. Returns how many went.
+/// The event path can still lose a race (a pane that dies while its
+/// classify awaits, after the liveness check), so this also runs on a
+/// timer; see `SWEEP_MS`.
+pub async fn sweep_gone() -> usize {
+    let panes = list_panes().unwrap_or_default();
     let live = store::live_agents().await.unwrap_or_default();
     let now = now_ms() as i64;
+    let mut gone = 0;
     for a in live {
         if let Some(pane) = a.pane {
             if !panes.iter().any(|p| p.id as i64 == pane) {
                 let _ = store::end_by_pane(pane, now, "gone").await;
+                gone += 1;
             }
         }
     }
-    let _ = store::prune(cfg.keep_days, now).await;
+    gone
+}
+
+/// How often the provider sweeps for rows whose pane is gone.
+pub const SWEEP_MS: u64 = 30_000;
+
+/// The periodic sweep: forever, while the instance lives.
+pub async fn sweep_loop() {
+    loop {
+        if sleep_ms(SWEEP_MS).await.is_err() {
+            return;
+        }
+        if sweep_gone().await > 0 {
+            broadcast_changed().await;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
