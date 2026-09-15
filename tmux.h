@@ -4228,6 +4228,9 @@ enum hanguljamo_state hanguljamo_check_state(const struct utf8_data *,
 
 /* log.c */
 void	log_add_level(void);
+void	log_event_init(void);
+void	log_set_event_hook(void (*)(const char *));
+const char *log_event_last(void);
 int	log_get_level(void);
 void	log_open(const char *);
 void	log_toggle(const char *);

@@ -183,6 +183,7 @@ proc_start(const char *name)
 	struct utsname	 u;
 
 	log_open(name);
+	log_event_init();
 	setproctitle("%s (%s)", name, socket_path);
 
 	if (uname(&u) < 0)
@@ -206,13 +207,37 @@ proc_start(const char *name)
 	return (tp);
 }
 
+/*
+ * A failing event loop must not be retried forever. select() fails for good
+ * once a bad descriptor is in its set (EBADF), and every exit path, signals
+ * included, needs one working pass of the loop, so a loop that keeps failing
+ * is a process at full CPU that answers nothing. Give up instead, saying
+ * what libevent said.
+ */
+#define PROC_LOOP_FAILURES 100
+
 void
 proc_loop(struct tmuxproc *tp, int (*loopcb)(void))
 {
+	int	failures = 0, saved;
+
 	log_debug("%s loop enter", tp->name);
-	do
-		event_loop(EVLOOP_ONCE);
-	while (!tp->exit && (loopcb == NULL || !loopcb ()));
+	do {
+		if (event_loop(EVLOOP_ONCE) != -1) {
+			failures = 0;
+			continue;
+		}
+		saved = errno;
+		failures++;
+		log_debug("%s: event loop failed (%d): %s; libevent: %s",
+		    tp->name, failures, strerror(saved), log_event_last());
+		if (failures >= PROC_LOOP_FAILURES) {
+			errno = saved;
+			fatal("event loop failed %d times in a row (%s)",
+			    failures, log_event_last());
+		}
+		usleep(10000);
+	} while (!tp->exit && (loopcb == NULL || !loopcb ()));
 	log_debug("%s loop exit", tp->name);
 }
 

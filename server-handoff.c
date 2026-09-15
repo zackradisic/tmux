@@ -675,6 +675,26 @@ handoff_seal_fds(int socketfd)
 	free(keep);
 }
 
+/*
+ * Is this an open descriptor for the pty the pane was saved with? The
+ * descriptor is the master side, so ptsname() gives the slave name that
+ * wp->tty holds. A saved tty of "" only asks for an open descriptor.
+ */
+static int
+handoff_fd_ok(int fd, const char *tty)
+{
+	const char	*name;
+
+	if (fcntl(fd, F_GETFD) == -1)
+		return (0);
+	if (tty == NULL || *tty == '\0')
+		return (1);
+	name = ptsname(fd);
+	if (name == NULL)
+		return (0);
+	return (strcmp(name, tty) == 0);
+}
+
 /* Write the state and replace this image. Only returns if exec failed. */
 static void
 handoff_exec(void)
@@ -1190,6 +1210,23 @@ handoff_open_pane(struct handoff_ctx *ctx, char **fields, u_int nfields)
 	sc.adopt_fd = handoff_num(fields[2], -1, INT_MAX, -1);
 	sc.adopt_pid = handoff_num(fields[3], -1, INT_MAX, -1);
 	sc.adopt_tty = fields[4];
+	/*
+	 * The descriptor is only a number from a file. One that is not open,
+	 * or not the tty it was saved with, must not reach the event loop:
+	 * select() would fail on it for good and the server would hang at
+	 * full CPU. That pane comes back dead instead.
+	 */
+	if (sc.adopt_fd != -1 && !handoff_fd_ok(sc.adopt_fd, sc.adopt_tty)) {
+		server_add_message("restore: pane %%%u: descriptor %d is not "
+		    "the saved tty %s; the pane comes back dead", id,
+		    sc.adopt_fd, *sc.adopt_tty != '\0' ? sc.adopt_tty : "(none)");
+		log_debug("%s: %%%u: bad descriptor %d (%s)", __func__, id,
+		    sc.adopt_fd, sc.adopt_tty);
+		sc.adopt_fd = -1;
+		sc.adopt_pid = -1;
+		/* Dead as pane_dead sees it: no descriptor, status known. */
+		dead |= HANDOFF_EXITED|HANDOFF_STATUSREADY;
+	}
 	sc.flags = SPAWN_ADOPT|SPAWN_DETACHED|SPAWN_NONOTIFY;
 	if (argc > 0) {
 		sc.argc = argc;

@@ -162,6 +162,27 @@ Notes on the format:
   image we replaced, and its result is in the file; reading it again would
   double every binding.
 
+## A bad descriptor must not hang the server
+
+A pane record carries a descriptor number, and a number is all it is. One
+that is not open, or not the tty it was saved with, would go into the
+event loop, `select()` would fail on it with `EBADF` for good, and every
+exit path (signals included) needs one working pass of the loop: the
+server would sit at full CPU and answer nothing, as happened once on an
+`update`. Two guards:
+
+- The reader checks each adopted descriptor with `fcntl(F_GETFD)` and
+  compares `ttyname()` with the saved tty (`handoff_fd_ok`). A bad one
+  costs that pane, which comes back dead with a line in `show-messages`,
+  not the server. `regress/handoff-bad-fd.sh` starts a server from a
+  hand-made state file with such a record.
+- `proc_loop` no longer ignores `event_loop()` failing. After a hundred
+  failures in a row it exits with the last libevent message in the fatal
+  text. libevent's messages go through the log from process start, and
+  in the server a warning also lands in `show-messages` and in
+  `server-events.log` next to the socket, because the server's stderr is
+  `/dev/null`.
+
 ## Rollback
 
 Write your resurrect file first. `execve` failing is safe, but a state file

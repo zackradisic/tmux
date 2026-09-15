@@ -24,6 +24,7 @@
 #include <sys/wait.h>
 
 #include <errno.h>
+#include <libgen.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
@@ -178,6 +179,33 @@ server_tidy_event(__unused int fd, __unused short events, __unused void *data)
     evtimer_add(&server_ev_tidy, &tv);
 }
 
+/*
+ * A libevent warning in the server. Its stderr is /dev/null, so the message
+ * goes to the message log and to server-events.log next to the socket,
+ * where a person can find it after the fact.
+ */
+static void
+server_event_warning(const char *msg)
+{
+	char	*dir, *path, ts[64];
+	FILE	*f;
+	time_t	 t;
+
+	server_add_message("event: %s", msg);
+
+	dir = xstrdup(socket_path);
+	xasprintf(&path, "%s/server-events.log", dirname(dir));
+	f = fopen(path, "a");
+	if (f != NULL) {
+		t = time(NULL);
+		strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", localtime(&t));
+		fprintf(f, "%s pid %ld: %s\n", ts, (long)getpid(), msg);
+		fclose(f);
+	}
+	free(path);
+	free(dir);
+}
+
 /* Fork new server. */
 int
 server_start(struct tmuxproc *client, uint64_t flags, struct event_base *base,
@@ -204,6 +232,7 @@ server_start(struct tmuxproc *client, uint64_t flags, struct event_base *base,
 	if (event_reinit(base) != 0)
 		fatalx("event_reinit failed");
 	server_proc = proc_start("server");
+	log_set_event_hook(server_event_warning);
 
 	proc_set_signals(server_proc, server_signal);
 	sigprocmask(SIG_SETMASK, &oldset, NULL);

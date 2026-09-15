@@ -29,11 +29,43 @@
 static FILE	*log_file;
 static int	 log_level;
 
-/* Log callback for libevent. */
+/*
+ * The last thing libevent said, and a hook for its warnings. The server's
+ * stderr is /dev/null, so without these a failing event loop leaves no
+ * trace of why.
+ */
+static char	 log_event_last_msg[512];
+static void	(*log_event_hook)(const char *);
+
+/* Log callback for libevent, installed for the whole process. */
 static void
-log_event_cb(__unused int severity, const char *msg)
+log_event_cb(int severity, const char *msg)
 {
 	log_debug("%s", msg);
+	strlcpy(log_event_last_msg, msg, sizeof log_event_last_msg);
+	if (severity >= EVENT_LOG_WARN && log_event_hook != NULL)
+		log_event_hook(msg);
+}
+
+/* Route libevent's messages through the log from the start. */
+void
+log_event_init(void)
+{
+	event_set_log_callback(log_event_cb);
+}
+
+/* Set where libevent warnings go besides the log. */
+void
+log_set_event_hook(void (*hook)(const char *))
+{
+	log_event_hook = hook;
+}
+
+/* The last libevent message, or "". */
+const char *
+log_event_last(void)
+{
+	return (log_event_last_msg);
 }
 
 /* Increment log level. */
@@ -67,7 +99,6 @@ log_open(const char *name)
 		return;
 
 	setvbuf(log_file, NULL, _IOLBF, 0);
-	event_set_log_callback(log_event_cb);
 }
 
 /* Toggle logging. */
@@ -92,8 +123,6 @@ log_close(void)
 	if (log_file != NULL)
 		fclose(log_file);
 	log_file = NULL;
-
-	event_set_log_callback(NULL);
 }
 
 /* Write a log message. */
