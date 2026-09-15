@@ -150,17 +150,27 @@ async fn detect(pane: u32, cfg: &Config) -> Detected {
                 .map(|k| k.to_string())
         });
     match hint.as_deref() {
-        Some("claude") if !cfg.trust_env => {
-            if crate::resolve::claude_claims_pane(pane).await {
-                return Detected::Kind("claude".into());
-            }
-            return Detected::Pending;
-        }
+        // An inherited AI_AGENT is not evidence, and neither is a session
+        // file on its own: what runs in the pane decides. A shell, a
+        // `sleep`, anything whose command is an ordinary program, is not
+        // an agent however loudly a file claims the pane - a session file
+        // outlives its Claude and the server reuses pane ids after a
+        // restart, so a stale file will name a pane that now holds a
+        // shell. Only a command we cannot read as itself - the macOS
+        // launcher execs a version-named binary - earns a look at the
+        // files, just below.
+        Some("claude") if !cfg.trust_env => {}
         Some(k) => return Detected::Kind(k.to_string()),
         None => {}
     }
-    if version_like && crate::resolve::claude_claims_pane(pane).await {
-        return Detected::Kind("claude".into());
+    if version_like {
+        return if crate::resolve::claude_claims_pane(pane).await {
+            Detected::Kind("claude".into())
+        } else {
+            // The process looks like a harness but has not written its
+            // file yet; look again shortly.
+            Detected::Pending
+        };
     }
     if let Ok(Some(_)) = pane_env(PaneId(pane), "OPENCODE") {
         return Detected::Kind("opencode".into());
