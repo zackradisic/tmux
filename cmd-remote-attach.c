@@ -35,8 +35,8 @@ const struct cmd_entry cmd_remote_attach_entry = {
 	.name = "remote-attach",
 	.alias = "remote",
 
-	.args = { "kt:", 1, 1, NULL },
-	.usage = "[-k] [-t remote-session] host",
+	.args = { "c:kLt:", 1, 1, NULL },
+	.usage = "[-kL] [-c working-directory] [-t remote-session] host",
 
 	.flags = CMD_STARTSERVER,
 	.exec = cmd_remote_attach_exec
@@ -48,6 +48,7 @@ cmd_remote_attach_exec(struct cmd *self, struct cmdq_item *item)
 	struct args		*args = cmd_get_args(self);
 	const char		*host = args_string(args, 0);
 	const char		*session = args_get(args, 't');
+	const char		*cwd = args_get(args, 'c');
 	struct remote_link	*rl, *next;
 	char			*cause = NULL;
 	u_int			 killed = 0;
@@ -56,6 +57,9 @@ cmd_remote_attach_exec(struct cmd *self, struct cmdq_item *item)
 		cmdq_error(item, "empty host");
 		return (CMD_RETURN_ERROR);
 	}
+
+	if (args_has(args, 'L'))
+		return (remote_link_list(item, host));
 
 	if (args_has(args, 'k')) {
 		rl = remote_link_first();
@@ -82,7 +86,7 @@ cmd_remote_attach_exec(struct cmd *self, struct cmdq_item *item)
 		cmdq_error(item, "already linked to %s", host);
 		return (CMD_RETURN_ERROR);
 	}
-	if (remote_link_create(host, session, -1, &cause) == NULL) {
+	if (remote_link_create(host, session, cwd, -1, &cause) == NULL) {
 		cmdq_error(item, "%s", cause);
 		free(cause);
 		return (CMD_RETURN_ERROR);

@@ -4109,7 +4109,8 @@ char	*remote_parse_layout_strip(const char *);
 u_int	*remote_parse_layout_leaf_ids(const char *, u_int *);
 
 /* remote-link.c */
-struct remote_link *remote_link_create(const char *, const char *, int,
+struct remote_link *remote_link_create(const char *, const char *,
+		    const char *, int,
 	    char **);
 void	 remote_link_destroy(struct remote_link *);
 struct remote_link *remote_link_find(const char *, const char *);
@@ -4132,6 +4133,7 @@ struct session *remote_link_session(struct remote_link *);
 int	 remote_link_connected(struct remote_link *);
 const char *remote_link_error(struct remote_link *);
 const char *remote_link_state_name(struct remote_link *);
+enum cmd_retval	 remote_link_list(struct cmdq_item *, const char *);
 const char *remote_link_pane_cache(struct window_pane *, int);
 int	 remote_link_bridge_send(struct remote_link *, const void *, size_t);
 #define REMOTE_CACHE_CMD 0

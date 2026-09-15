@@ -511,11 +511,14 @@ const struct options_table_entry options_table[] = {
 	{ .name = "remote-ssh-command",
 	  .type = OPTIONS_TABLE_STRING,
 	  .scope = OPTIONS_TABLE_SERVER,
-	  .default_str = "ssh -T -o BatchMode=yes #{q:remote_host} tmux -C "
-			 "attach #{?remote_session,-t #{q:remote_session},}",
-	  .text = "Command run by remote-attach to reach a remote tmux in "
-		  "control mode. Expanded with 'remote_host' and "
-		  "'remote_session'."
+	  .default_str = "ssh -T -o BatchMode=yes -o ConnectTimeout=10 "
+			 "#{q:remote_host} 'PATH=$HOME/.local/bin:/usr/local/bin:"
+			 "$PATH; exec \"$(command -v tmux2 || echo tmux)\"' "
+			 "#{q:remote_command}",
+	  .text = "Command run by remote-attach to reach a remote tmux. "
+		  "Expanded with 'remote_host', 'remote_session' and "
+		  "'remote_command' (the tmux arguments for the remote end: "
+		  "attach, new-session -A or list-sessions)."
 	},
 
 	{ .name = "plugin-remote-caps",

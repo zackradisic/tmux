@@ -1564,7 +1564,7 @@ server_handoff_restore(const char *path, int *socketfd, char **cause)
 			id = handoff_num(ctx.remotes[i * 3 + 2], 0, INT_MAX,
 			    -1);
 			if (remote_link_create(host, *rs != '\0' ? rs : NULL,
-			    id, &rcause) == NULL) {
+			    NULL, id, &rcause) == NULL) {
 				log_debug("%s: remote %s: %s", __func__, host,
 				    rcause);
 				free(rcause);

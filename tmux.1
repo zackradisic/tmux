@@ -1609,7 +1609,8 @@ See the
 option.
 .Tg remote
 .It Xo Ic remote\-attach
-.Op Fl k
+.Op Fl kL
+.Op Fl c Ar working\-directory
 .Op Fl t Ar remote\-session
 .Ar host
 .Xc
@@ -1620,6 +1621,15 @@ server on
 .Ar host
 as a local session named
 .Ar host Ns / Ns Ar session .
+With
+.Fl t ,
+the session is created on the remote if it does not exist (through
+.Ic new\-session Fl A
+there), with
+.Fl c
+as its working directory; an existing session is attached as it is.
+Once the link has come up, a drop and reconnect only attaches, so a session
+the remote kills does not come back.
 Any
 .Ql \&:
 or
@@ -1657,6 +1667,12 @@ without
 and destroys the local session.
 .Ic kill\-session
 on the local session does the same.
+.Fl L
+lists the sessions on
+.Ar host ,
+one name per line, through the same
+.Ic remote\-ssh\-command ,
+and makes no link.
 .Tg rename
 .It Xo Ic rename\-session
 .Op Fl t Ar target\-session
@@ -5159,16 +5175,42 @@ runs to reach a remote
 .Nm
 server in control mode.
 It is expanded as a format with
-.Ql remote_host
-and
+.Ql remote_host ,
 .Ql remote_session
-(empty when no session was given) and must speak the control mode protocol on
-its standard input and output.
+(empty when no session was given) and
+.Ql remote_command ,
+the arguments for the
+.Nm
+at the remote end:
+.Ql -C attach ,
+.Ql -C new-session -A ...
+or, for
+.Ic remote\-attach Fl L ,
+.Ql list-sessions ... ,
+quoted for the remote shell.
+The command must speak the control mode protocol on its standard input and
+output.
 The default is:
 .Bd -literal -offset indent
-ssh -T -o BatchMode=yes #{q:remote_host} tmux -C attach \e
-    #{?remote_session,-t #{q:remote_session},}
+ssh -T -o BatchMode=yes -o ConnectTimeout=10 #{q:remote_host} \e
+    'PATH=$HOME/.local/bin:/usr/local/bin:$PATH; \e
+     exec "$(command -v tmux2 || echo tmux)"' #{q:remote_command}
 .Ed
+.Pp
+A shell that
+.Xr ssh 1
+starts for a command is not interactive and often has a short
+.Ev PATH ,
+so the default puts the installer's directory on it, runs
+.Ql tmux2
+when the host has one and plain
+.Ql tmux
+otherwise.
+A command that spells out
+.Ql tmux -C attach
+instead of
+.Ql remote_command
+still attaches, but cannot create sessions or list them.
 .Pp
 Two servers on one machine can be linked for testing by pointing this at the
 other server's socket, for example

@@ -138,6 +138,8 @@ struct remote_link {
 
 	char			*host;
 	char			*remote_session;	/* as given, or NULL */
+	char			*remote_cwd;		/* -c for a new session */
+	int			 may_create;		/* new-session -A until synced */
 	u_int			 remote_session_id;
 	int			 have_session_id;
 
@@ -1202,6 +1204,11 @@ remote_link_windows_cb(struct remote_link *rl, __unused struct remote_request *r
 	rl->state = REMOTE_UP;
 	rl->backoff = 0;
 	rl->synced_once = 1;
+	/*
+	 * The session exists now. From here every connect attaches; a
+	 * session the remote kills on purpose must not come back.
+	 */
+	rl->may_create = 0;
 	free(rl->last_error);
 	rl->last_error = NULL;
 	free(rl->reported_error);
@@ -1728,27 +1735,146 @@ remote_link_schedule_retry(struct remote_link *rl)
 	evtimer_add(&rl->retry_timer, &tv);
 }
 
-/* Build the ssh command from the remote-ssh-command option. */
+/*
+ * Expand the remote-ssh-command option for a host. remote_command is the
+ * tmux command line for the remote end (quoted for its shell); the shadow
+ * session, when there is one, lets the table formats find the link.
+ */
 static char *
-remote_link_command(struct remote_link *rl)
+remote_link_expand_command(const char *host, const char *session,
+    struct session *s, const char *remote_command)
 {
 	struct format_tree	*ft;
 	char			*cmd;
 
 	ft = format_create(NULL, NULL, FORMAT_NONE, FORMAT_NOJOBS);
 	/*
-	 * remote_host is a table format, and the table wins over anything
-	 * added to the tree: give the tree the shadow session, so the table
-	 * callback finds the link. remote_session is not in the table.
+	 * remote_host is a table format. With a shadow session its callback
+	 * finds the link; without one (remote-attach -L) it has nothing and
+	 * the value added below is used.
 	 */
-	format_defaults(ft, NULL, rl->s, NULL, NULL);
-	format_add(ft, "remote_host", "%s", rl->host);
-	format_add(ft, "remote_session", "%s",
-	    rl->remote_session != NULL ? rl->remote_session : "");
+	format_defaults(ft, NULL, s, NULL, NULL);
+	format_add(ft, "remote_host", "%s", host);
+	format_add(ft, "remote_session", "%s", session != NULL ? session : "");
+	format_add(ft, "remote_command", "%s", remote_command);
 	cmd = format_expand(ft, options_get_string(global_options,
 	    "remote-ssh-command"));
 	format_free(ft);
 	return (cmd);
+}
+
+/*
+ * The tmux command line for the remote end of this link. Until the first
+ * sync it is new-session -A, which attaches the named session or creates
+ * it; after that plain attach, so a session the remote killed stays dead.
+ * Without a name the remote picks its current session.
+ */
+static char *
+remote_link_remote_command(struct remote_link *rl)
+{
+	char	*qs, *qc, *cmd;
+
+	if (rl->remote_session == NULL)
+		return (xstrdup("-C attach"));
+	qs = server_handoff_shell_quote(rl->remote_session);
+	if (rl->may_create) {
+		if (rl->remote_cwd != NULL) {
+			qc = server_handoff_shell_quote(rl->remote_cwd);
+			xasprintf(&cmd, "-C new-session -A -s %s -c %s", qs, qc);
+			free(qc);
+		} else
+			xasprintf(&cmd, "-C new-session -A -s %s", qs);
+	} else
+		xasprintf(&cmd, "-C attach -t %s", qs);
+	free(qs);
+	return (cmd);
+}
+
+/* Build the ssh command from the remote-ssh-command option. */
+static char *
+remote_link_command(struct remote_link *rl)
+{
+	char	*remote, *cmd;
+
+	remote = remote_link_remote_command(rl);
+	cmd = remote_link_expand_command(rl->host, rl->remote_session, rl->s,
+	    remote);
+	free(remote);
+	return (cmd);
+}
+
+/* remote-attach -L: list the sessions on a host, one name per line. */
+struct remote_list {
+	struct cmdq_item	*item;
+	char			*host;
+};
+
+static void
+remote_link_list_callback(struct job *job)
+{
+	struct remote_list	*rlist = job_get_data(job);
+	struct bufferevent	*event = job_get_event(job);
+	char			*line;
+	size_t			 size;
+	int			 status = job_get_status(job);
+
+	for (;;) {
+		line = evbuffer_readln(event->input, NULL, EVBUFFER_EOL_LF);
+		if (line == NULL)
+			break;
+		cmdq_print(rlist->item, "%s", line);
+		free(line);
+	}
+	size = EVBUFFER_LENGTH(event->input);
+	if (size != 0) {
+		line = xmalloc(size + 1);
+		memcpy(line, EVBUFFER_DATA(event->input), size);
+		line[size] = '\0';
+		cmdq_print(rlist->item, "%s", line);
+		free(line);
+	}
+	if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
+		cmdq_error(rlist->item, "%s: command exited with status %d",
+		    rlist->host, WEXITSTATUS(status));
+	} else if (WIFSIGNALED(status)) {
+		cmdq_error(rlist->item, "%s: command killed by signal %d",
+		    rlist->host, WTERMSIG(status));
+	}
+	cmdq_continue(rlist->item);
+}
+
+static void
+remote_link_list_free(void *data)
+{
+	struct remote_list	*rlist = data;
+
+	free(rlist->host);
+	free(rlist);
+}
+
+enum cmd_retval
+remote_link_list(struct cmdq_item *item, const char *host)
+{
+	struct remote_list	*rlist;
+	char			*cmd;
+
+	/* The remote shell strips these quotes; tmux there sees the format. */
+	cmd = remote_link_expand_command(host, NULL, NULL,
+	    "list-sessions -F '#{session_name}'");
+	log_debug("%s: %s: %s", __func__, host, cmd);
+	rlist = xcalloc(1, sizeof *rlist);
+	rlist->item = item;
+	rlist->host = xstrdup(host);
+	if (job_run(cmd, 0, NULL, NULL, NULL, NULL, NULL,
+	    remote_link_list_callback, remote_link_list_free, rlist,
+	    JOB_NOWAIT, -1, -1) == NULL) {
+		cmdq_error(item, "%s: cannot run %s", host, cmd);
+		free(cmd);
+		remote_link_list_free(rlist);
+		return (CMD_RETURN_ERROR);
+	}
+	free(cmd);
+	return (CMD_RETURN_WAIT);
 }
 
 static void
@@ -1783,8 +1909,8 @@ remote_link_connect(struct remote_link *rl)
  * (from a server handoff) or -1.
  */
 struct remote_link *
-remote_link_create(const char *host, const char *session, int pinned_id,
-    char **cause)
+remote_link_create(const char *host, const char *session, const char *cwd,
+    int pinned_id, char **cause)
 {
 	struct remote_link	*rl;
 	struct session		*s;
@@ -1805,6 +1931,10 @@ remote_link_create(const char *host, const char *session, int pinned_id,
 	rl->host = xstrdup(host);
 	if (session != NULL)
 		rl->remote_session = xstrdup(session);
+	if (cwd != NULL && *cwd != '\0')
+		rl->remote_cwd = xstrdup(cwd);
+	/* A link handed over by restart-server mirrors a session that exists. */
+	rl->may_create = (pinned_id < 0);
 	rl->placeholder_id = -1;
 	RB_INIT(&rl->windows);
 	RB_INIT(&rl->panes);
@@ -1900,6 +2030,7 @@ remote_link_destroy(struct remote_link *rl)
 	remote_parser_free(rl->parser);
 	free(rl->host);
 	free(rl->remote_session);
+	free(rl->remote_cwd);
 	free(rl->last_error);
 	free(rl->reported_error);
 	free(rl);

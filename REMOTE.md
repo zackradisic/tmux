@@ -24,8 +24,17 @@ $ tmux remote-attach -t work host      # mirror one session as "host/work"
 $ tmux remote-attach -k host           # drop the link(s) to host
 ```
 
-Not built yet: `new-session -H host`, `new-window -H host`, remote panes
-inside local windows, mouse forwarding, remote floating panes.
+`remote-attach -t name host` attaches the session or creates it: until
+the link's first sync the remote end runs `new-session -A -s name [-c
+dir]`, after that plain `attach -t name`, so a session the remote kills
+on purpose stays dead. `remote-attach -L host` lists a host's sessions.
+The remote end's arguments reach `remote-ssh-command` as
+`#{remote_command}`; the default command puts `~/.local/bin` and
+`/usr/local/bin` on the remote PATH (a non-interactive ssh shell has a
+short one) and runs `tmux2` when the host has it, `tmux` otherwise.
+
+Not built yet: `new-window -H host`, remote panes inside local windows,
+mouse forwarding, remote floating panes.
 
 The local name is `host/session`, not `host:session`: tmux forbids `:` and
 `.` in session names, and `:` separates the window part of a target. The
@@ -428,8 +437,9 @@ forwarder on the remote with no persistence.
 - Clipboard. `set-clipboard` OSC 52 from the remote arrives as bytes and
   works. Remote `paste-buffer` needs the local buffer sent with `load-buffer`.
 - The ssh command comes from the `remote-ssh-command` server option, a
-  format with `remote_host` and `remote_session`. Multiplex with
-  `ControlMaster` so a second link to the same host is cheap.
+  format with `remote_host`, `remote_session` and `remote_command`.
+  Multiplex with `ControlMaster` so a second link to the same host is
+  cheap.
 
 ## Work items
 

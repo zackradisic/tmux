@@ -4564,14 +4564,21 @@ format_find(struct format_tree *ft, const char *key, uint64_t modifiers,
 		goto found;
 	}
 
+	/*
+	 * A table format whose callback has nothing for this tree (no object
+	 * of the right kind) falls through to the tree, so a value added with
+	 * format_add under the same name is found instead of an empty one.
+	 */
 	fte = format_table_get(key);
 	if (fte != NULL) {
 		value = fte->cb(ft);
-		if (fte->type == FORMAT_TABLE_TIME && value != NULL)
-			t = ((struct timeval *)value)->tv_sec;
-		else
-			found = value;
-		goto found;
+		if (value != NULL) {
+			if (fte->type == FORMAT_TABLE_TIME)
+				t = ((struct timeval *)value)->tv_sec;
+			else
+				found = value;
+			goto found;
+		}
 	}
 	fe_find.key = (char *)key;
 	fe = RB_FIND(format_entry_tree, &ft->tree, &fe_find);
