@@ -1,0 +1,17 @@
+# Capability sidecar for the mailbox plugin. Restrictive mode reads this
+# next to the deployed mailbox.wasm; effective caps are these requests
+# intersected with the load-plugin grants.
+#
+# db          the message store
+# service-*   carry a message to a mailbox on a linked server, and answer
+#             deliveries from one
+# write-options  stash an inbox as @mailbox_<box> for a shell to read
+# display-message  a one-line acknowledgement to the caller
+[caps]
+requests = [
+  "db",
+  "service-serve",
+  "service-call",
+  "write-options",
+  "display-message",
+]

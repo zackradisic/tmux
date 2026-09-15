@@ -13,6 +13,7 @@ members = [
     "examples/session_creator",
     "examples/cron",
     "examples/agents",
+    "examples/mailbox",
     "examples/services-probe",
 ]
 default-members = ["host"]
