@@ -195,13 +195,38 @@ shadow pane, and it fails silently rather than saying why. `git_status`
 is `scope pane` and currently runs 52 instances against 29 shadow panes,
 every one of them resolving a remote path locally.
 
-Worth considering: a plugin needs to be able to tell that a pane is
-remote and act accordingly — `#{pane_remote_id}` already distinguishes
-them — and probably needs the host to run its filesystem and process
-calls *on the owning server* for such a pane, the way the agents provider
-already runs on the remote rather than reaching across. Failing that, a
-form that cannot act on a remote pane should say so instead of offering
-an empty list and an error on submit.
+The fix is the provider/view split these plugins never got.
+`WRITING-PLUGINS.md` documents it: the provider runs on each server and
+sees only that machine's panes, processes and files; the view runs
+locally and owns the UI. `agents` is built this way and works across five
+servers. `session_creator` references `role`, `service_register` and
+`provides()` exactly zero times; `agents` references them twelve. So the
+form's directory scan and its `mkdir` belong in a provider that runs on
+the server owning the target pane, with the view keeping only the UI.
+
+The machinery is not the missing part. The ABI already reports it per
+pane — `pane.flags` bit `8 remote`, with `host` naming the owning server
+and `cwd` documented as "the remote's cached current path", both empty
+for a local pane. Neither plugin checks any of it.
+
+Two things make this easy to walk into. First, both plugins predate
+`c8171f6e`, which added roles, and were never revisited. Second,
+`WRITING-PLUGINS.md` introduces the split as an opt-in for "a plugin that
+wants to see every linked server" — framed as a feature for building
+multi-server UIs, not as a hazard that any plugin touching a pane's path
+or processes must handle or silently act on the wrong machine. A note at
+the point an author would hit it would have caught both.
+
+And `session_creator` is already pushed to every remote as `role
+provider` while containing no provider code, so it runs as a live no-op
+on three of Zack's boxes. The deployment assumed a split the plugin does
+not have.
+
+Half of the create path no longer needs a provider at all: `remote-attach
+-t name -c dir host` (16090b66) creates the session on the remote and
+mirrors it. What has no equivalent is listing *directories* on the remote
+for completion — `remote-attach -L` lists sessions. That gap is the part
+a provider is genuinely needed for.
 
 ## Fixed, kept for the record
 
