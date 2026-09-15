@@ -162,6 +162,47 @@ session creator that makes remote sessions easy to add will make people
 add hosts casually, and whatever writes those entries needs somewhere
 per-host to write them.
 
+## 6. Plugins act locally on paths that only exist on the remote
+
+A shadow pane reports the *remote* path, because that is what the link
+syncs (`rl_path`). A plugin reading `#{pane_current_path}` gets it and
+then does local work with it, against a path that does not exist here:
+
+```
+$ tmux2 display -p -t %276 '#{pane_current_path}'
+/home/ubuntu/training
+$ ls -d /home/ubuntu/training
+ls: /home/ubuntu/training: No such file or directory
+```
+
+Two user-visible failures in `session_creator`, both from this. Opening
+the form on a shadow pane prefills the folder field with the remote path,
+so **the completion list is empty** — the directory scan that fills it
+runs locally and finds nothing to scan. And accepting it to create the
+folder fails, because macOS will not create anything under `/home`:
+
+```
+$ mkdir -p /home/ubuntu/training
+mkdir: /home/ubuntu: Operation not supported
+```
+
+(Reported in the field as "Operation not permitted"; the exact errno
+varies with the path, the cause is the same.)
+
+This is not specific to `session_creator`. Any plugin that reads a path
+format from a pane and then touches the filesystem has the same bug on a
+shadow pane, and it fails silently rather than saying why. `git_status`
+is `scope pane` and currently runs 52 instances against 29 shadow panes,
+every one of them resolving a remote path locally.
+
+Worth considering: a plugin needs to be able to tell that a pane is
+remote and act accordingly — `#{pane_remote_id}` already distinguishes
+them — and probably needs the host to run its filesystem and process
+calls *on the owning server* for such a pane, the way the agents provider
+already runs on the remote rather than reaching across. Failing that, a
+form that cannot act on a remote pane should say so instead of offering
+an empty list and an error on submit.
+
 ## Fixed, kept for the record
 
 - **Pre-first-connect failures were completely invisible.** A bad session
