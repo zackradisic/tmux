@@ -56,6 +56,11 @@ const OPEN_FRESH_MS: u64 = REFRESH_MS;
 /// past a handful of servers that stops being true (each hop is an ssh
 /// process on this machine), so the rest queue behind these.
 const MAX_INFLIGHT: usize = 4;
+/// A fetch stays invisible until it has been outstanding this long. The
+/// 2s tick refetches every server, and a healthy remote answers well
+/// inside this, so the spinner does not blink at you twice a second for
+/// nothing - it appears only when a server is actually being slow.
+const SPIN_GRACE_MS: u64 = 500;
 /// A fetch outstanding this long has stopped being a blink; the header
 /// says how long it has been waiting instead of only spinning.
 const FETCH_STUCK_MS: u64 = 3000;
@@ -409,14 +414,23 @@ fn start_spinner(picker: &Rc<RefCell<Option<Picker>>>, remotes: &Rc<RefCell<Remo
             if fetching.is_empty() {
                 break;
             }
+            let now = now_ms();
+            // Nothing has been outstanding long enough to draw yet: keep
+            // ticking (one of these may get slow) but do not repaint. A
+            // fetch that finishes inside the grace costs no renders at
+            // all, which is the whole point - the 2s tick refetches
+            // every server and must not blink a spinner each time.
+            if !fetching.values().any(|t| now.saturating_sub(*t) >= SPIN_GRACE_MS) {
+                continue;
+            }
             let mut b = picker.borrow_mut();
             let Some(p) = b.as_mut() else { break };
             // Only the frame and the server headers move: re-render off
             // the rows already in hand - no DB read, no file scan, and
             // no refilter (content search would re-grep every tick).
-            p.now_ms = now_ms();
+            p.now_ms = now;
             p.fetching = fetching;
-            p.multi = is_multi(&p.rows, &p.fetching);
+            p.multi = is_multi(&p.rows, &p.fetching, now);
             p.rebuild_lines();
             pick_render(p);
         }
@@ -562,11 +576,19 @@ impl Picker {
         }
         // A server whose copy this side rejects has no rows, and nor
         // does one being fetched for the first time; give both a line
-        // anyway, so the reason (or the spinner) is on screen.
+        // anyway, so the reason (or the spinner) is on screen. A fetch
+        // still inside its grace is not one of them: a line that appears
+        // and vanishes within 500ms is worse than no line.
+        let now = self.now_ms;
         let mut odd: Vec<&String> = self
             .mismatch
             .keys()
-            .chain(self.fetching.keys())
+            .chain(
+                self.fetching
+                    .iter()
+                    .filter(|(_, t)| now.saturating_sub(**t) >= SPIN_GRACE_MS)
+                    .map(|(k, _)| k),
+            )
             .collect::<HashSet<_>>()
             .into_iter()
             .filter(|s| !self.rows.iter().any(|a| a.server == **s))
@@ -698,10 +720,22 @@ async fn gather_rows(
 }
 
 /// Server headers are worth the lines once rows come from more than this
-/// server - or once a remote is being fetched, so its spinner has a
-/// header to sit on before its first row arrives.
-fn is_multi(rows: &[Agent], fetching: &HashMap<String, u64>) -> bool {
-    rows.iter().any(|a| !a.is_local()) || !fetching.is_empty()
+/// server - or once a remote has been slow enough to show a spinner, so
+/// it has a header to sit on before its first row arrives.
+fn is_multi(rows: &[Agent], fetching: &HashMap<String, u64>, now: u64) -> bool {
+    rows.iter().any(|a| !a.is_local())
+        || fetching.values().any(|t| now.saturating_sub(*t) >= SPIN_GRACE_MS)
+}
+
+/// When a server's outstanding fetch started, once it has been
+/// outstanding long enough to be worth showing (see [`SPIN_GRACE_MS`]).
+/// `fetching` holds every call in flight; this is the subset the picker
+/// admits to, so a fetch that finishes quickly is never drawn at all.
+fn spin_since(fetching: &HashMap<String, u64>, server: &str, now: u64) -> Option<u64> {
+    fetching
+        .get(server)
+        .copied()
+        .filter(|t| now.saturating_sub(*t) >= SPIN_GRACE_MS)
 }
 
 pub async fn pick_open(
@@ -762,7 +796,7 @@ pub async fn pick_open(
     let mut order: HashMap<String, u64> = HashMap::new();
     let mut order_next: u64 = 0;
     stable_sort(&mut order, &mut order_next, &mut rows);
-    let multi = is_multi(&rows, &fetching);
+    let multi = is_multi(&rows, &fetching, now_ms());
     let mut p = Picker {
         mode,
         width,
@@ -830,7 +864,7 @@ pub async fn reload_picker(
         picker.borrow().as_ref().map(|p| p.show_history).unwrap_or(false);
     let (mut rows, skew, down, mismatch, fetching) =
         gather_rows(&remotes, show_history, enrich).await;
-    let multi = is_multi(&rows, &fetching);
+    let multi = is_multi(&rows, &fetching, now_ms());
     let mirrors = if multi { find_mirrors() } else { HashMap::new() };
     let mut b = picker.borrow_mut();
     if let Some(p) = b.as_mut() {
@@ -1791,7 +1825,7 @@ pub fn pick_render(p: &mut Picker) {
                     let (label, colour) = match (
                         p.down.get(server),
                         p.mismatch.get(server),
-                        p.fetching.get(server),
+                        spin_since(&p.fetching, server, p.now_ms),
                     ) {
                         (Some(since), _, _) => (
                             format!(
@@ -1802,7 +1836,7 @@ pub fn pick_render(p: &mut Picker) {
                         ),
                         (None, Some(why), _) => (format!("{server}  ({why})"), "1;33"),
                         (None, None, Some(since)) => {
-                            let waited = p.now_ms.saturating_sub(*since);
+                            let waited = p.now_ms.saturating_sub(since);
                             let frame = SPIN_FRAMES
                                 [(p.now_ms / SPIN_MS) as usize % SPIN_FRAMES.len()];
                             if waited >= FETCH_STUCK_MS {
