@@ -19,6 +19,7 @@ mod hostlog;
 mod intern;
 mod manifest;
 mod modes;
+mod peers;
 mod registry;
 mod reload;
 mod services;
@@ -577,5 +578,85 @@ pub unsafe extern "C" fn pgh_query_plugins(verbose: c_int, sink: pgh_sink, ctx: 
     ffi_guard!((), {
         let text = REGISTRY.with(|r| r.borrow().query_text(verbose != 0));
         sink_str(sink, ctx, &text);
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Peer grants: the C `plugin-peers` command and the link menu client.
+// ---------------------------------------------------------------------------
+
+/// Remember the client that ran remote-attach for a link, so the grant
+/// handshake can open its menu there. `peer` is the link id | PGH_PEER_LINK.
+///
+/// # Safety
+/// `client` NUL-terminated or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn pgh_peers_set_client(peer: u32, client: *const c_char) {
+    ffi_guard!((), {
+        if let Some(name) = cstr_lossy(client) {
+            bridge::set_menu_client(peer, name);
+        }
+    })
+}
+
+/// `plugin-peers list`: emit the grant rows through the sink.
+///
+/// # Safety
+/// `sink` valid; `ctx` its context.
+#[no_mangle]
+pub unsafe extern "C" fn pgh_peers_list(sink: pgh_sink, ctx: *mut c_void) {
+    ffi_guard!((), {
+        sink_str(sink, ctx, &peers::cmd_list());
+    })
+}
+
+/// `plugin-peers allow|deny <server> [plugin]`. `state` is "allow" or
+/// "deny"; `plugin` NULL means every plugin.
+///
+/// # Safety
+/// `server`, `state` NUL-terminated; `plugin` NUL-terminated or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn pgh_peers_set(
+    server: *const c_char,
+    plugin: *const c_char,
+    state: *const c_char,
+) -> c_int {
+    ffi_guard!(-1, {
+        let (Some(server), Some(state)) = (cstr_lossy(server), cstr_lossy(state)) else {
+            return -1;
+        };
+        let plugin = cstr_lossy(plugin);
+        peers::cmd_set(&server, plugin.as_deref(), &state);
+        0
+    })
+}
+
+/// `plugin-peers revoke <server> [plugin]`: delete the row. Returns 1 if a
+/// row went, 0 if none, -1 on bad input.
+///
+/// # Safety
+/// `server` NUL-terminated; `plugin` NUL-terminated or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn pgh_peers_revoke(
+    server: *const c_char,
+    plugin: *const c_char,
+) -> c_int {
+    ffi_guard!(-1, {
+        let Some(server) = cstr_lossy(server) else { return -1 };
+        let plugin = cstr_lossy(plugin);
+        c_int::from(peers::cmd_revoke(&server, plugin.as_deref()))
+    })
+}
+
+/// `plugin-peers menu <server>`: reopen the grant menu on `client`.
+///
+/// # Safety
+/// `server`, `client` NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn pgh_peers_menu(server: *const c_char, client: *const c_char) {
+    ffi_guard!((), {
+        if let (Some(server), Some(client)) = (cstr_lossy(server), cstr_lossy(client)) {
+            peers::cmd_menu(&server, &client);
+        }
     })
 }

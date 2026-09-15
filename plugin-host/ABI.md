@@ -243,7 +243,8 @@ Errors: sync imports return `0` or `-code`; value-returning imports
 `E_UNREACHABLE`(10, the server a service call names is not linked or
 its link is down), `E_TIMEOUT`(11, a service call got no reply in time),
 `E_VERSION`(12, this side rejects the service version of the plugin's
-copy on that server).
+copy on that server), `E_DENIED`(13, the peer is not granted to call this
+plugin here; see `plugin-peers`).
 
 `kind` values: -1 server/global, 0 session, 1 window, 2 pane, 3 client.
 

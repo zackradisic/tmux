@@ -129,5 +129,9 @@ plugin_bridge_link_state(struct remote_link *rl, int up)
 		return;
 	pgh_bridge_state(remote_link_id(rl) | PGH_PEER_LINK,
 	    remote_link_host(rl), up);
+	if (up) {
+		pgh_peers_set_client(remote_link_id(rl) | PGH_PEER_LINK,
+		    remote_link_menu_client(rl));
+	}
 	plugin_schedule_drain();
 }

@@ -2,7 +2,8 @@
 # A push never replaces a plugin the remote loaded itself. B loads the
 # services_probe plugin from its own configuration (role both) before the
 # link; A links and pushes the same plugin. B keeps its copy, role and
-# grants, and A's view talks to that copy.
+# grants, and A's view talks to that copy once B grants A (a self-loaded
+# copy is gated; only a pushed copy is auto-allowed).
 #
 # Needs the wasm example built:
 #   cargo build -p services_probe --target wasm32-unknown-unknown --release
@@ -35,6 +36,21 @@ wait_for 6 "[ \"\$($AOPT @probe_role)\" = both ]" || fail "role on A"
 
 $TMUX remote-attach -t work fakehost || fail "remote-attach"
 wait_for 10 "[ \"\$($AOPT @probe_up_fakehost)\" = 1 ]" || fail "link-up event"
+
+# B keeps its OWN copy, so the push does not auto-allow A: B must grant A.
+# (A pushed copy would be auto-allowed; a self-loaded one is gated.)
+wait_for 6 "$TMUX2 plugin-peers list | grep -q '	services_probe	deny'" ||
+    fail "no deny row on B: $($TMUX2 plugin-peers list)"
+ANAME=$($TMUX2 plugin-peers list | awk -F'\t' '$2=="services_probe"&&$3=="deny"{print $1; exit}')
+[ -n "$ANAME" ] || fail "no A name on B"
+$TMUX2 plugin-peers allow "$ANAME" services_probe || fail "allow A on B"
+
+# The echo fired once at link-up, before the grant, so it was denied.
+# Force a reconnect: the grant persists, and the probe re-echoes on the
+# fresh link-up, now allowed.
+client=$($TMUX2 list-clients -F '#{client_name}' | head -1)
+$TMUX2 detach-client -t "$client" || fail "detach-client"
+wait_for 15 "[ \"\$($AOPT @probe_up_fakehost)\" = 2 ]" || fail "no reconnect"
 
 # A's view gets its answer from B's own copy, which says "both".
 wait_for 10 "[ \"\$($AOPT @probe_echo_fakehost)\" = both:ping ]" ||

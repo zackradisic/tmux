@@ -364,6 +364,20 @@ Its own copies need `service-serve` in their manifest caps, or they
 cannot forward to the pusher; the pusher then suppresses its local toast
 for a mirrored pane only when the remote runs that plugin.
 
+### Peer grants
+
+The bridge is bidirectional, so a linked server can call this server's
+plugin services back. A host-owned grant table gates that, keyed by
+(server, plugin), stored at `<data>/tmux/plugin-host/peers.db` (not any
+plugin's store: the gate runs before a plugin sees the call). A plugin a
+peer pushed here is auto-allowed for that peer. A plugin this server
+loaded itself is gated: when a link comes up, the client that ran
+`remote-attach` gets a menu of the peer's plugins this side also serves,
+and an inbound peer defaults to deny. Until a pair is `allow`, an incoming
+call fails with `E_DENIED`. `plugin-peers list|allow|deny|revoke|menu`
+edits the table. The caller-side sidecar `[caps.services] call` list and
+`plugin-remote-caps` are separate and unchanged.
+
 ### Service versions
 
 Every plugin reports a service version (`Plugin::SERVICE_VERSION`,

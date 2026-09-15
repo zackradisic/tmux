@@ -23,7 +23,8 @@ $TMUX set -s remote-ssh-command \
 
 CAPS="-c db -c service-serve -c service-call -c write-options -c display-message"
 $TMUX load-plugin -s server $CAPS "$WASM" || fail "load-plugin on A"
-XDG_DATA_HOME="$XDG_B" $TMUX2 load-plugin -s server $CAPS "$WASM" || fail "load-plugin on B"
+# B gets mailbox by push when the link comes up (auto-allowed as pushed);
+# it is not loaded here, which is the real cross-machine flow.
 
 AOPT="$TMUX show-options -s -v"
 

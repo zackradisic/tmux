@@ -266,6 +266,7 @@ if ENABLE_PLUGINS
 dist_tmux_SOURCES += \
 	cmd-plugin.c \
 	cmd-plugin-bridge.c \
+	cmd-plugin-peers.c \
 	plugin-async.c \
 	plugin-bridge.c \
 	plugin-buf.c \

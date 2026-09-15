@@ -648,6 +648,49 @@ void pgh_fs_drain(void);
  */
 void pgh_query_plugins(int verbose, pgh_sink sink, void *ctx);
 
+/**
+ * Remember the client that ran remote-attach for a link, so the grant
+ * handshake can open its menu there. `peer` is the link id | PGH_PEER_LINK.
+ *
+ * # Safety
+ * `client` NUL-terminated or NULL.
+ */
+void pgh_peers_set_client(uint32_t peer, const char *client);
+
+/**
+ * `plugin-peers list`: emit the grant rows through the sink.
+ *
+ * # Safety
+ * `sink` valid; `ctx` its context.
+ */
+void pgh_peers_list(pgh_sink sink, void *ctx);
+
+/**
+ * `plugin-peers allow|deny <server> [plugin]`. `state` is "allow" or
+ * "deny"; `plugin` NULL means every plugin.
+ *
+ * # Safety
+ * `server`, `state` NUL-terminated; `plugin` NUL-terminated or NULL.
+ */
+int pgh_peers_set(const char *server, const char *plugin, const char *state);
+
+/**
+ * `plugin-peers revoke <server> [plugin]`: delete the row. Returns 1 if a
+ * row went, 0 if none, -1 on bad input.
+ *
+ * # Safety
+ * `server` NUL-terminated; `plugin` NUL-terminated or NULL.
+ */
+int pgh_peers_revoke(const char *server, const char *plugin);
+
+/**
+ * `plugin-peers menu <server>`: reopen the grant menu on `client`.
+ *
+ * # Safety
+ * `server`, `client` NUL-terminated.
+ */
+void pgh_peers_menu(const char *server, const char *client);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus

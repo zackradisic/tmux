@@ -7023,6 +7023,34 @@ Carry one plugin bridge frame (base64) from a control mode client to the
 plugin host.
 .Ic remote-attach
 sends this on the link; it is not meant to be typed.
+.It Xo Ic plugin-peers
+.Ar list Ns | Ns Ar allow Ns | Ns Ar deny Ns | Ns Ar revoke Ns | Ns Ar menu
+.Op Ar server
+.Op Ar plugin
+.Xc
+Read and write the peer grant table, which decides whether a linked
+.Nm
+server may call this server's plugin services back over the bridge.
+A plugin a peer pushed here is allowed for that peer automatically; a
+plugin this server loaded itself is denied until granted.
+.Ar list
+shows the rows;
+.Ar allow
+and
+.Ar deny
+set a
+.Ar server Ns / Ns Ar plugin
+grant
+.Pq Ar plugin No defaults to every plugin ;
+.Ar revoke
+deletes the row so the next link asks again;
+.Ar menu
+reopens the grant menu for
+.Ar server
+on the current client.
+When a link comes up, the client that ran
+.Ic remote-attach
+gets this menu for the peer's plugins with no decision yet.
 .It Ic unload-plugin Ar name
 Unload a plugin and destroy its instances.
 Plugins loaded with

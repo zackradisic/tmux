@@ -361,6 +361,9 @@ pub struct Peer {
     /// from hello with the semver rule, then refined by the plugin's own
     /// `pgh_service_accept`.
     pub verdicts: HashMap<String, Verdict>,
+    /// The client that ran remote-attach for this link, for the grant
+    /// menu (initiator links only).
+    pub menu_client: Option<String>,
 }
 
 thread_local! {
@@ -511,6 +514,13 @@ pub fn plugin_started(plugin: &str) {
     for (peer, hp) in targets {
         evaluate(peer, &[hp]);
     }
+    // A plugin this side now serves may add (server, plugin) pairs for
+    // every up peer; run the handshake for each.
+    let ups: Vec<u32> =
+        PEERS.with(|p| p.borrow().values().filter(|x| x.up).map(|x| x.id).collect());
+    for peer in ups {
+        peers_handshake(peer);
+    }
 }
 
 /// The plugin's own answer from `pgh_service_accept`.
@@ -544,6 +554,36 @@ pub fn peer_name(peer: u32) -> Option<String> {
 
 pub fn peer_is_up(peer: u32) -> bool {
     PEERS.with(|p| p.borrow().get(&peer).is_some_and(|x| x.up))
+}
+
+/// Did this side make the link to the peer (so its name is an ssh
+/// target and its callbacks get a grant prompt)?
+pub fn peer_is_initiator(peer: u32) -> bool {
+    PEERS.with(|p| p.borrow().get(&peer).is_some_and(|x| x.initiator))
+}
+
+/// The plugin names a peer said it runs, from its hello.
+pub fn peer_plugin_names(peer: u32) -> Vec<String> {
+    PEERS.with(|p| {
+        p.borrow()
+            .get(&peer)
+            .and_then(|x| x.hello.as_ref())
+            .map(|(_, list)| list.iter().map(|h| h.name.clone()).collect())
+            .unwrap_or_default()
+    })
+}
+
+/// Remember the client that ran remote-attach for a link, for the menu.
+pub fn set_menu_client(peer: u32, client: String) {
+    PEERS.with(|p| {
+        if let Some(entry) = p.borrow_mut().get_mut(&peer) {
+            entry.menu_client = Some(client);
+        }
+    });
+}
+
+fn peer_menu_client(peer: u32) -> Option<String> {
+    PEERS.with(|p| p.borrow().get(&peer).and_then(|x| x.menu_client.clone()))
 }
 
 /// The peer with this name, an up one first.
@@ -755,6 +795,7 @@ pub fn state(peer_id: u32, name: Option<String>, up: bool) {
                 hello: None,
                 down_since: None,
                 verdicts: HashMap::new(),
+                menu_client: None,
             });
             if let Some(n) = name {
                 entry.name = n;
@@ -799,6 +840,7 @@ pub fn recv(peer_id: u32, bytes: &[u8]) {
             hello: None,
             down_since: None,
             verdicts: HashMap::new(),
+            menu_client: None,
         });
         // A client that speaks to us is up by definition.
         if !initiator {
@@ -843,6 +885,7 @@ pub fn recv(peer_id: u32, bytes: &[u8]) {
                 ),
             );
             evaluate(peer_id, &plugins);
+            peers_handshake(peer_id);
             if !first {
                 return;
             }
@@ -890,6 +933,20 @@ pub fn recv(peer_id: u32, bytes: &[u8]) {
         }
         Frame::Pong { .. } => {}
     }
+}
+
+/// Reconcile the peer's grant rows and, for an initiator link with new
+/// pending pairs, open the grant menu on the client that ran
+/// remote-attach.
+fn peers_handshake(peer: u32) {
+    let new_pending = crate::peers::reconcile(peer);
+    if new_pending.is_empty() {
+        return;
+    }
+    let (Some(server), Some(client)) = (peer_name(peer), peer_menu_client(peer)) else {
+        return; // rows are pending; `plugin-peers menu` can reopen
+    };
+    crate::peers::open_menu(&server, &client);
 }
 
 /// Send every local provider-capable plugin to a peer.
@@ -1058,6 +1115,11 @@ fn accept_push(
         }
     });
     hostlog::info("bridge", &format!("{name} from {peer_name}: {outcome}"));
+    // A peer may call the plugin it pushed here: it provided the code and
+    // clearly means to use it. Auto-allow that one (server, plugin) pair,
+    // so the roster and mailbox flows work without a manual grant; the
+    // handshake still gates every other plugin (`peers::reconcile`).
+    crate::peers::allow_pushed(&peer_name, &name);
     // The pusher hears about the new provider when its first instance
     // starts (plugin_started), with the version that instance reports.
     Ok(())

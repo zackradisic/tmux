@@ -36,7 +36,7 @@ $TMUX set -s remote-ssh-command \
     "$TEST_TMUX -LtestB$$ -f/dev/null #{remote_command}" || fail "ssh-command"
 XDG_DATA_HOME="$XDG_A" $TMUX load-plugin -s server $AGCAPS "$AG" || fail "load agents A"
 XDG_DATA_HOME="$XDG_A" $TMUX load-plugin -s server $MBCAPS "$MB" || fail "load mailbox A"
-XDG_DATA_HOME="$XDG_B" $TMUX2 load-plugin -s server $MBCAPS "$MB" || fail "load mailbox B"
+# mailbox reaches B by push on link-up (auto-allowed), the real flow.
 sleep 1.5
 
 AOPT="$TMUX show-options -s -v"

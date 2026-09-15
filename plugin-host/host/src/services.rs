@@ -532,6 +532,17 @@ pub fn incoming_call(
         );
         return;
     }
+    let server = bridge::peer_name(peer).unwrap_or_default();
+    if !crate::peers::allowed(&server, plugin) {
+        let _ = bridge::send_reply(
+            peer,
+            remote_call_id,
+            0,
+            service_flags::ERROR,
+            crate::peers::deny_message(&server, plugin).as_bytes(),
+        );
+        return;
+    }
     let origin = Origin::Remote { peer, call_id: remote_call_id };
     match owner_of(plugin, method) {
         Some(owner) => open_local_call(origin, owner, plugin, method, plugin, payload),

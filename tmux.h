@@ -4127,6 +4127,8 @@ void	 remote_link_session_destroyed(struct session *);
 void	 remote_link_pane_destroyed(struct window_pane *);
 void	 remote_link_window_destroyed(struct window *);
 u_int	 remote_link_id(struct remote_link *);
+void	 remote_link_set_menu_client(struct remote_link *, const char *);
+const char *remote_link_menu_client(struct remote_link *);
 const char *remote_link_host(struct remote_link *);
 const char *remote_link_remote_session(struct remote_link *);
 struct session *remote_link_session(struct remote_link *);

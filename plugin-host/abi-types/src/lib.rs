@@ -531,6 +531,10 @@ pub enum ErrorCode {
     /// version (see `Version`).
     #[serde(rename = "E_VERSION")]
     Version,
+    /// The peer is not granted to call this plugin here (see the peer
+    /// grants; `plugin-peers`).
+    #[serde(rename = "E_DENIED")]
+    Denied,
 }
 
 impl ErrorCode {
@@ -549,6 +553,7 @@ impl ErrorCode {
             ErrorCode::Unreachable => 10,
             ErrorCode::Timeout => 11,
             ErrorCode::Version => 12,
+            ErrorCode::Denied => 13,
         }
     }
 
@@ -565,6 +570,7 @@ impl ErrorCode {
             10 => ErrorCode::Unreachable,
             11 => ErrorCode::Timeout,
             12 => ErrorCode::Version,
+            13 => ErrorCode::Denied,
             _ => ErrorCode::Host,
         }
     }
@@ -583,6 +589,7 @@ impl ErrorCode {
             ErrorCode::Unreachable => "E_UNREACHABLE",
             ErrorCode::Timeout => "E_TIMEOUT",
             ErrorCode::Version => "E_VERSION",
+            ErrorCode::Denied => "E_DENIED",
         }
     }
 }

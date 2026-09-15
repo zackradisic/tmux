@@ -139,6 +139,7 @@ struct remote_link {
 	char			*host;
 	char			*remote_session;	/* as given, or NULL */
 	char			*remote_cwd;		/* -c for a new session */
+	char			*menu_client;		/* client that ran remote-attach */
 	int			 may_create;		/* new-session -A until synced */
 	u_int			 remote_session_id;
 	int			 have_session_id;
@@ -272,6 +273,20 @@ u_int
 remote_link_id(struct remote_link *rl)
 {
 	return (rl->id);
+}
+
+/* Record the client that ran remote-attach, for the peer grant menu. */
+void
+remote_link_set_menu_client(struct remote_link *rl, const char *name)
+{
+	free(rl->menu_client);
+	rl->menu_client = name != NULL ? xstrdup(name) : NULL;
+}
+
+const char *
+remote_link_menu_client(struct remote_link *rl)
+{
+	return (rl->menu_client);
 }
 
 const char *
@@ -2031,6 +2046,7 @@ remote_link_destroy(struct remote_link *rl)
 	free(rl->host);
 	free(rl->remote_session);
 	free(rl->remote_cwd);
+	free(rl->menu_client);
 	free(rl->last_error);
 	free(rl->reported_error);
 	free(rl);

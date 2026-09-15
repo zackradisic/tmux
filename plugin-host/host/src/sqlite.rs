@@ -926,3 +926,179 @@ mod tests {
         assert_eq!(first_keyword("-- only"), "");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Peer grants: the host-owned table that gates bridge callbacks. A second
+// connection, at <data>/tmux/plugin-host/peers.db, opened on the main
+// thread (the command-queue drain is the only caller). rusqlite stays
+// here; the policy lives in peers.rs.
+// ---------------------------------------------------------------------------
+
+const PEERS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS grants (\
+    server TEXT NOT NULL, plugin TEXT NOT NULL, \
+    state TEXT NOT NULL CHECK(state IN ('allow','deny','pending')), \
+    first_seen INTEGER NOT NULL, decided_at INTEGER, \
+    PRIMARY KEY(server, plugin))";
+
+thread_local! {
+    static PEERS: RefCell<Option<Conn>> = const { RefCell::new(None) };
+}
+
+fn peers_path() -> Result<PathBuf, HostError> {
+    let dir = crate::fsbox::data_home()
+        .map_err(|e| err(ErrorCode::Host, e))?
+        .join("tmux/plugin-host");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| err(ErrorCode::Host, format!("{}: {e}", dir.display())))?;
+    Ok(dir.join("peers.db"))
+}
+
+/// Run `f` with the peers connection, opening and migrating it once.
+fn with_peers<T>(f: impl FnOnce(&mut Conn) -> Result<T, HostError>) -> Result<T, HostError> {
+    PEERS.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            let path = peers_path()?;
+            let conn = Conn::open(&path, Duration::from_millis(2000))?;
+            conn.arm(SYNC_STATEMENT_MS);
+            conn.conn.execute_batch(PEERS_SCHEMA).map_err(map_err)?;
+            conn.disarm();
+            *slot = Some(conn);
+        }
+        let conn = slot.as_mut().unwrap();
+        conn.arm(SYNC_STATEMENT_MS);
+        let r = f(conn);
+        conn.disarm();
+        r
+    })
+}
+
+/// The state of one (server, plugin) grant, or None when no row exists.
+pub fn peers_get(server: &str, plugin: &str) -> Option<String> {
+    with_peers(|c| {
+        let mut stmt = c
+            .conn
+            .prepare("SELECT state FROM grants WHERE server = ?1 AND plugin = ?2")
+            .map_err(map_err)?;
+        let mut rows = stmt.query(rusqlite::params![server, plugin]).map_err(map_err)?;
+        if let Some(row) = rows.next().map_err(map_err)? {
+            let s: String = row.get(0).map_err(map_err)?;
+            Ok(Some(s))
+        } else {
+            Ok(None)
+        }
+    })
+    .ok()
+    .flatten()
+}
+
+/// Insert a row if none exists. Returns true when it inserted one.
+pub fn peers_ensure(server: &str, plugin: &str, state: &str) -> bool {
+    with_peers(|c| {
+        let now = now_ms() as i64;
+        let n = c
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO grants (server, plugin, state, first_seen, decided_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    server,
+                    plugin,
+                    state,
+                    now,
+                    if state == "pending" { None } else { Some(now) }
+                ],
+            )
+            .map_err(map_err)?;
+        Ok(n > 0)
+    })
+    .unwrap_or(false)
+}
+
+/// Set (upsert) a grant to `state`, stamping decided_at unless pending.
+pub fn peers_set(server: &str, plugin: &str, state: &str) {
+    let _ = with_peers(|c| {
+        let now = now_ms() as i64;
+        c.conn
+            .execute(
+                "INSERT INTO grants (server, plugin, state, first_seen, decided_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(server, plugin) DO UPDATE SET state = ?3, decided_at = ?5",
+                rusqlite::params![
+                    server,
+                    plugin,
+                    state,
+                    now,
+                    if state == "pending" { None } else { Some(now) }
+                ],
+            )
+            .map_err(map_err)?;
+        Ok(())
+    });
+}
+
+/// Delete a (server, plugin) row; returns true if one went.
+pub fn peers_delete(server: &str, plugin: &str) -> bool {
+    with_peers(|c| {
+        let n = c
+            .conn
+            .execute(
+                "DELETE FROM grants WHERE server = ?1 AND plugin = ?2",
+                rusqlite::params![server, plugin],
+            )
+            .map_err(map_err)?;
+        Ok(n > 0)
+    })
+    .unwrap_or(false)
+}
+
+/// Every row as (server, plugin, state, first_seen), server then plugin.
+pub fn peers_list() -> Vec<(String, String, String, i64)> {
+    with_peers(|c| {
+        let mut stmt = c
+            .conn
+            .prepare(
+                "SELECT server, plugin, state, first_seen FROM grants \
+                 ORDER BY server, plugin",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    })
+    .unwrap_or_default()
+}
+
+/// The plugins of one server that are still `pending`.
+pub fn peers_pending(server: &str) -> Vec<String> {
+    with_peers(|c| {
+        let mut stmt = c
+            .conn
+            .prepare(
+                "SELECT plugin FROM grants WHERE server = ?1 AND state = 'pending' \
+                 ORDER BY plugin",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![server], |row| row.get::<_, String>(0))
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    })
+    .unwrap_or_default()
+}

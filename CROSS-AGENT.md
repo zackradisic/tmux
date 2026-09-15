@@ -58,15 +58,26 @@ also a remote is not disturbed.
 
 ## The permission gate
 
-Three layers, all where the receiving side controls them:
+The bridge is bidirectional: once a link is up, either side can call the
+other's services. A grant table the host owns decides who may. It is keyed
+by (server, plugin); `plugin = "*"` means every plugin; the local server is
+always allowed.
 
-- `plugin-remote-caps` on the receiving server decides what a pushed plugin
-  from a linked server may do at all.
-- The sidecar `[caps.services] call` allowlist decides which services a
-  plugin may call.
-- A receiving-server option (planned) names which servers may reach its
-  boxes, checked against the sender's server on the `deliver` request.
-  Default would be the local server only.
+- A plugin a peer **pushed** to a server is auto-allowed for that peer to
+  call: it provided the code and means to use it. This is why the roster
+  and mailbox flows work with no manual step, since a workstation pushes
+  its plugins to the servers it links.
+- A plugin a server **loaded itself** is gated. When a link comes up, the
+  initiator's client gets a menu naming the peer's plugins it also serves;
+  an inbound peer's pairs default to deny. Until a pair is `allow`, a call
+  for it fails with `E_DENIED` and a message naming the fix.
+- `plugin-peers list|allow|deny|revoke|menu` edits the table; the menu
+  reopens with `plugin-peers menu <server>`.
+
+Two older layers still stand and are different things: `plugin-remote-caps`
+caps what a pushed plugin may do at all, and the sidecar `[caps.services]
+call` list is a plugin author narrowing what their own plugin reaches out
+to.
 
 ## Driving a raw pane on purpose
 
@@ -105,5 +116,5 @@ message to a local agent id stored here, and a message to a remote agent
 id routed over the bridge into that agent's server, sender qualified. The
 release bundles `mailbox.wasm`.
 
-Not built yet: the `accept-from` gate option, the stdout-returning read
-command, and the RPC push that wakes a reader instead of it pulling.
+Not built yet: the stdout-returning read command, and the RPC push that
+wakes a reader instead of it pulling.

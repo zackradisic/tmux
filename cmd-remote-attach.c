@@ -50,6 +50,7 @@ cmd_remote_attach_exec(struct cmd *self, struct cmdq_item *item)
 	const char		*session = args_get(args, 't');
 	const char		*cwd = args_get(args, 'c');
 	struct remote_link	*rl, *next;
+	struct client		*c = cmdq_get_client(item);
 	char			*cause = NULL;
 	u_int			 killed = 0;
 
@@ -86,10 +87,13 @@ cmd_remote_attach_exec(struct cmd *self, struct cmdq_item *item)
 		cmdq_error(item, "already linked to %s", host);
 		return (CMD_RETURN_ERROR);
 	}
-	if (remote_link_create(host, session, cwd, -1, &cause) == NULL) {
+	rl = remote_link_create(host, session, cwd, -1, &cause);
+	if (rl == NULL) {
 		cmdq_error(item, "%s", cause);
 		free(cause);
 		return (CMD_RETURN_ERROR);
 	}
+	if (c != NULL && c->name != NULL)
+		remote_link_set_menu_client(rl, c->name);
 	return (CMD_RETURN_NORMAL);
 }
