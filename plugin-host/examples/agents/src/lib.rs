@@ -306,7 +306,9 @@ impl Plugin for Agents {
                 let picker = Rc::clone(&self.picker);
                 let remotes = Rc::clone(&self.remotes);
                 ctx.spawn(async move {
-                    view::fetch_remotes(Rc::clone(&remotes), false).await;
+                    // fetch_remotes repaints per server as it lands.
+                    view::fetch_remotes(Rc::clone(&picker), Rc::clone(&remotes), false)
+                        .await;
                     view::refresh_if_open(&picker, &remotes).await;
                 });
             }

@@ -12,7 +12,10 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::rc::Rc;
+use std::task::{Context, Poll};
 
 use tmux_plugin_sdk::abi::ErrorCode;
 use tmux_plugin_sdk::prelude::*;
@@ -37,6 +40,31 @@ const LIST_MAX: usize = 60;
 /// While the picker stays open, re-read the harness session files (and
 /// the remote rosters) on this cadence.
 const REFRESH_MS: u64 = 2000;
+/// While at least one remote fetch is outstanding, repaint on this
+/// cadence so the per-server spinner turns. It runs ONLY while something
+/// is in flight, so an idle picker never repaints on it.
+const SPIN_MS: u64 = 100;
+/// A server that answered this recently is not fetched again: the refresh
+/// tick and a link-up event can land on the same server at once.
+const FETCH_DEBOUNCE_MS: u64 = 300;
+/// Opening the picker reuses a roster this fresh instead of refetching.
+/// It is the cadence an open picker refreshes at anyway, so reopening in
+/// a hurry never shows anything an open picker would not have shown.
+const OPEN_FRESH_MS: u64 = REFRESH_MS;
+/// At most this many remote calls are on the wire at once. The point of
+/// fetching together is to pay the max round trip instead of the sum;
+/// past a handful of servers that stops being true (each hop is an ssh
+/// process on this machine), so the rest queue behind these.
+const MAX_INFLIGHT: usize = 4;
+/// A fetch outstanding this long has stopped being a blink; the header
+/// says how long it has been waiting instead of only spinning.
+const FETCH_STUCK_MS: u64 = 3000;
+/// An in-flight mark older than this is not believed (the host fails a
+/// service call at 30s), so a lost task cannot wedge a server forever.
+const FETCH_STALE_MS: u64 = 35_000;
+/// Spinner frames, one per [`SPIN_MS`].
+const SPIN_FRAMES: [&str; 10] =
+    ["\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}", "\u{2807}", "\u{280f}"];
 
 // ---------------------------------------------------------------------------
 // remote rosters
@@ -52,6 +80,10 @@ pub struct RemoteRows {
     pub fetched_ms: u64,
     /// When the server's link went down (local clock); None while up.
     pub down_since: Option<u64>,
+    /// When the fetch now in flight started (local clock); None when
+    /// nothing is outstanding. Doubles as the in-flight flag the
+    /// debounce reads and as the spinner's clock for this server.
+    pub fetching_since: Option<u64>,
 }
 
 /// The remote rosters, by server name. Shared between the plugin (which
@@ -62,6 +94,11 @@ pub struct Remotes {
     /// Servers whose copy of this plugin this side does not accept, with
     /// the reason to show ("agents 0.2.0 there, 0.1.0 here").
     pub mismatch: HashMap<String, String>,
+    /// A spinner task is turning; one is enough for every server.
+    pub spinning: bool,
+    /// When the fetch round a picker-open started began (local clock).
+    /// Opening again while one is outstanding starts nothing new.
+    pub open_round_since: Option<u64>,
 }
 
 impl Remotes {
@@ -105,6 +142,51 @@ impl Remotes {
         self.mismatch.insert(server.to_string(), why);
     }
 
+    /// Claim a server for a fetch, or refuse it. Refused when one is
+    /// already in flight, or when the last snapshot landed less than
+    /// `min_age_ms` ago: the open, the 2s tick and a link-up event all
+    /// reach for the same servers, and a second claim would mean a
+    /// second ssh hop for a roster we are already holding or already
+    /// waiting on. A mark older than [`FETCH_STALE_MS`] outlived any
+    /// call the host would still be holding, so it is not believed.
+    fn begin_fetch(&mut self, server: &str, min_age_ms: u64) -> bool {
+        let now = now_ms();
+        let e = self.servers.entry(server.to_string()).or_default();
+        if e.fetching_since
+            .is_some_and(|t| now.saturating_sub(t) < FETCH_STALE_MS)
+        {
+            return false;
+        }
+        if now.saturating_sub(e.fetched_ms) < min_age_ms {
+            return false;
+        }
+        e.fetching_since = Some(now);
+        true
+    }
+
+    /// A claimed server's call is starting now: restart its clock, so a
+    /// server that waited for a slot does not show the wait as if the
+    /// remote were slow to answer.
+    fn start_fetch(&mut self, server: &str) {
+        if let Some(e) = self.servers.get_mut(server) {
+            e.fetching_since = Some(now_ms());
+        }
+    }
+
+    fn end_fetch(&mut self, server: &str) {
+        if let Some(e) = self.servers.get_mut(server) {
+            e.fetching_since = None;
+        }
+    }
+
+    /// Per server with a fetch in flight: when it started.
+    fn fetching(&self) -> HashMap<String, u64> {
+        self.servers
+            .iter()
+            .filter_map(|(k, v)| v.fetching_since.map(|t| (k.clone(), t)))
+            .collect()
+    }
+
     /// Every remote row, in server-name order.
     fn rows(&self) -> Vec<Agent> {
         let mut names: Vec<&String> = self.servers.keys().collect();
@@ -118,13 +200,79 @@ impl Remotes {
 
 /// Fetch the roster of every connected remote server. `history` asks for
 /// the finished rows too.
-pub async fn fetch_remotes(remotes: Rc<RefCell<Remotes>>, history: bool) {
+///
+/// The calls run TOGETHER, not one after another: these are expensive
+/// hops (a ProxyCommand, a Tailscale link, a box in a cloud region), so
+/// serially the wait is their sum rather than their max. Each snapshot is
+/// applied and repainted the moment it lands, so a fast server is not
+/// held back by a slow one. Servers already being fetched, or fetched a
+/// moment ago, are left alone (see [`Remotes::begin_fetch`]).
+pub async fn fetch_remotes(
+    picker: Rc<RefCell<Option<Picker>>>,
+    remotes: Rc<RefCell<Remotes>>,
+    history: bool,
+) {
+    fetch_all(picker, remotes, history, FETCH_DEBOUNCE_MS).await
+}
+
+/// [`fetch_remotes`] without the debounce: after acting on a remote row
+/// we want that server's new state now, however recently it answered. A
+/// fetch already in flight is still not doubled - the act itself took a
+/// round trip, so the outstanding call is almost certainly newer than it.
+pub async fn fetch_remotes_now(
+    picker: Rc<RefCell<Option<Picker>>>,
+    remotes: Rc<RefCell<Remotes>>,
+    history: bool,
+) {
+    fetch_all(picker, remotes, history, 0).await
+}
+
+/// The fetch a picker-open starts. Opening the picker is a key press, so
+/// it can happen a dozen times in a few seconds; none of that may turn
+/// into a dozen rounds of ssh. Two brakes: a round already running from
+/// an earlier open starts nothing at all, and a server whose roster is
+/// younger than [`OPEN_FRESH_MS`] is left alone.
+pub async fn fetch_remotes_on_open(
+    picker: Rc<RefCell<Option<Picker>>>,
+    remotes: Rc<RefCell<Remotes>>,
+    history: bool,
+) {
+    {
+        let mut r = remotes.borrow_mut();
+        let now = now_ms();
+        // A round outstanding longer than any call the host would still
+        // be holding is not believed - it must never wedge the open.
+        if r.open_round_since
+            .is_some_and(|t| now.saturating_sub(t) < FETCH_STALE_MS)
+        {
+            // Still show the spinner: the outstanding round owns the
+            // servers this open would have asked for.
+            start_spinner(&picker, &remotes);
+            return;
+        }
+        r.open_round_since = Some(now);
+    }
+    fetch_all(Rc::clone(&picker), Rc::clone(&remotes), history, OPEN_FRESH_MS).await;
+    remotes.borrow_mut().open_round_since = None;
+}
+
+/// Claim what is worth fetching, then work it off at most
+/// [`MAX_INFLIGHT`] calls at a time. Claiming up front (before any await)
+/// is what keeps a second caller - another tick, another open - from
+/// asking the same server twice.
+async fn fetch_all(
+    picker: Rc<RefCell<Option<Picker>>>,
+    remotes: Rc<RefCell<Remotes>>,
+    history: bool,
+    min_age_ms: u64,
+) {
     let list = service::servers().unwrap_or_default();
     let mine = list
         .iter()
         .find(|s| s.local)
         .map(|s| s.version.clone())
         .unwrap_or_default();
+    let mut queue: Vec<String> = Vec::new();
     for s in list.into_iter().filter(|s| !s.local && s.up) {
         if !s.accepted {
             remotes.borrow_mut().mark_mismatch(
@@ -133,26 +281,147 @@ pub async fn fetch_remotes(remotes: Rc<RefCell<Remotes>>, history: bool) {
             );
             continue;
         }
-        let target = format!("@{}", s.name);
-        match service::call_json::<_, Snapshot>(
-            &target,
-            "list",
-            &provider::ListReq { history },
-        )
-        .await
-        {
-            Ok(snap) => remotes.borrow_mut().apply(&s.name, snap),
+        if !remotes.borrow_mut().begin_fetch(&s.name, min_age_ms) {
+            continue;
+        }
+        queue.push(s.name);
+    }
+    // Even with nothing to start, a fetch from another task may still be
+    // outstanding and want a spinner; the task exits on its own when
+    // none is.
+    start_spinner(&picker, &remotes);
+    if queue.is_empty() {
+        return;
+    }
+    // Oldest roster first, so the group most out of date comes back
+    // first when there are more servers than slots.
+    queue.sort_by_key(|n| {
+        remotes.borrow().servers.get(n).map(|e| e.fetched_ms).unwrap_or(0)
+    });
+    queue.reverse(); // workers pop from the end
+    let n = MAX_INFLIGHT.min(queue.len());
+    let queue = Rc::new(RefCell::new(queue));
+    let futs: Vec<Pin<Box<dyn Future<Output = ()>>>> = (0..n)
+        .map(|_| {
+            Box::pin(fetch_worker(
+                Rc::clone(&picker),
+                Rc::clone(&remotes),
+                Rc::clone(&queue),
+                history,
+            )) as Pin<Box<dyn Future<Output = ()>>>
+        })
+        .collect();
+    JoinAll { futs }.await;
+}
+
+/// One slot on the wire: take the next claimed server, fetch it, repeat
+/// until the queue is empty.
+async fn fetch_worker(
+    picker: Rc<RefCell<Option<Picker>>>,
+    remotes: Rc<RefCell<Remotes>>,
+    queue: Rc<RefCell<Vec<String>>>,
+    history: bool,
+) {
+    loop {
+        let next = queue.borrow_mut().pop();
+        let Some(server) = next else { return };
+        fetch_one(Rc::clone(&picker), Rc::clone(&remotes), server, history).await;
+    }
+}
+
+/// One server's roster, applied and repainted as it lands.
+async fn fetch_one(
+    picker: Rc<RefCell<Option<Picker>>>,
+    remotes: Rc<RefCell<Remotes>>,
+    server: String,
+    history: bool,
+) {
+    remotes.borrow_mut().start_fetch(&server);
+    let target = format!("@{server}");
+    let res = service::call_json::<_, Snapshot>(
+        &target,
+        "list",
+        &provider::ListReq { history },
+    )
+    .await;
+    {
+        let mut r = remotes.borrow_mut();
+        r.end_fetch(&server);
+        match res {
+            Ok(snap) => r.apply(&server, snap),
             Err(e) => {
                 // Not linked for plugins (an old remote, or no provider
                 // yet): nothing to show, but nothing to break either.
                 if e.code == ErrorCode::Unreachable {
-                    remotes.borrow_mut().mark_down(&s.name);
+                    r.mark_down(&server);
                 } else if e.code == ErrorCode::Version {
-                    remotes.borrow_mut().mark_mismatch(&s.name, e.message.clone());
+                    r.mark_mismatch(&server, e.message.clone());
                 }
             }
         }
     }
+    refresh_if_open(&picker, &remotes).await;
+}
+
+/// Poll a handful of futures together to completion. The guest carries no
+/// futures crate; this is the whole of it - re-poll whatever is still
+/// pending on each wake, finish when nothing is.
+struct JoinAll {
+    futs: Vec<Pin<Box<dyn Future<Output = ()>>>>,
+}
+
+impl Future for JoinAll {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let futs = &mut self.get_mut().futs;
+        futs.retain_mut(|f| f.as_mut().poll(cx).is_pending());
+        if futs.is_empty() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+/// Turn the per-server spinner while any fetch is outstanding. One task
+/// at a time (the `spinning` flag), and it ends the moment nothing is in
+/// flight, so an idle picker is not repainting forever on a 100ms tick.
+fn start_spinner(picker: &Rc<RefCell<Option<Picker>>>, remotes: &Rc<RefCell<Remotes>>) {
+    if picker.borrow().is_none() {
+        return;
+    }
+    {
+        let mut r = remotes.borrow_mut();
+        if r.spinning {
+            return;
+        }
+        r.spinning = true;
+    }
+    let picker = Rc::clone(picker);
+    let remotes = Rc::clone(remotes);
+    spawn(async move {
+        loop {
+            if sleep_ms(SPIN_MS).await.is_err() {
+                break;
+            }
+            let fetching = remotes.borrow().fetching();
+            if fetching.is_empty() {
+                break;
+            }
+            let mut b = picker.borrow_mut();
+            let Some(p) = b.as_mut() else { break };
+            // Only the frame and the server headers move: re-render off
+            // the rows already in hand - no DB read, no file scan, and
+            // no refilter (content search would re-grep every tick).
+            p.now_ms = now_ms();
+            p.fetching = fetching;
+            p.multi = is_multi(&p.rows, &p.fetching);
+            p.rebuild_lines();
+            pick_render(p);
+        }
+        remotes.borrow_mut().spinning = false;
+    });
 }
 
 /// Follow the roster topic of a server, so changes arrive without a poll.
@@ -257,6 +526,9 @@ pub struct Picker {
     pub down: HashMap<String, u64>,
     /// Per server: why this side rejects its copy of the plugin.
     pub mismatch: HashMap<String, String>,
+    /// Per server: when the fetch now in flight for it started (local
+    /// clock). Drives the header's spinner.
+    pub fetching: HashMap<String, u64>,
     /// (server, remote pane) -> the local shadow pane that mirrors it.
     pub mirrors: HashMap<(String, u32), u32>,
     /// The captured text of the highlighted remote row that has no local
@@ -288,11 +560,15 @@ impl Picker {
             }
             self.lines.push(Line::Item(vpos));
         }
-        // A server whose copy this side rejects has no rows; give it a
-        // line anyway, so the reason is on screen.
+        // A server whose copy this side rejects has no rows, and nor
+        // does one being fetched for the first time; give both a line
+        // anyway, so the reason (or the spinner) is on screen.
         let mut odd: Vec<&String> = self
             .mismatch
             .keys()
+            .chain(self.fetching.keys())
+            .collect::<HashSet<_>>()
+            .into_iter()
             .filter(|s| !self.rows.iter().any(|a| a.server == **s))
             .collect();
         odd.sort();
@@ -401,6 +677,7 @@ async fn gather_rows(
     HashMap<String, i64>,
     HashMap<String, u64>,
     HashMap<String, String>,
+    HashMap<String, u64>,
 ) {
     let mut rows = store::live_agents().await.unwrap_or_default();
     if enrich {
@@ -417,11 +694,14 @@ async fn gather_rows(
         .iter()
         .filter_map(|(k, v)| v.down_since.map(|t| (k.clone(), t)))
         .collect();
-    (rows, skew, down, r.mismatch.clone())
+    (rows, skew, down, r.mismatch.clone(), r.fetching())
 }
 
-fn is_multi(rows: &[Agent]) -> bool {
-    rows.iter().any(|a| !a.is_local())
+/// Server headers are worth the lines once rows come from more than this
+/// server - or once a remote is being fetched, so its spinner has a
+/// header to sit on before its first row arrives.
+fn is_multi(rows: &[Agent], fetching: &HashMap<String, u64>) -> bool {
+    rows.iter().any(|a| !a.is_local()) || !fetching.is_empty()
 }
 
 pub async fn pick_open(
@@ -459,12 +739,10 @@ pub async fn pick_open(
             height = clamp_dim(n, MIN_HEIGHT, wh);
         }
     }
-    // Fresh remote rosters first, so the picker opens complete.
-    fetch_remotes(Rc::clone(&remotes), false).await;
-    let (mut rows, skew, down, mismatch) = gather_rows(&remotes, false, true).await;
-    let mut order: HashMap<String, u64> = HashMap::new();
-    let mut order_next: u64 = 0;
-    stable_sort(&mut order, &mut order_next, &mut rows);
+    // Open the window BEFORE touching the remotes. Waiting for every
+    // server to answer first made the picker appear only as fast as the
+    // slowest hop; the rosters already in hand are at most REFRESH_MS
+    // old, and every row carries its own age, so nothing shown lies.
     let mode = match mode_open(&ModeOpts {
         window: Some(WindowId(window)),
         width,
@@ -479,7 +757,12 @@ pub async fn pick_open(
             return;
         }
     };
-    let multi = is_multi(&rows);
+    let (mut rows, skew, down, mismatch, fetching) =
+        gather_rows(&remotes, false, true).await;
+    let mut order: HashMap<String, u64> = HashMap::new();
+    let mut order_next: u64 = 0;
+    stable_sort(&mut order, &mut order_next, &mut rows);
+    let multi = is_multi(&rows, &fetching);
     let mut p = Picker {
         mode,
         width,
@@ -510,6 +793,7 @@ pub async fn pick_open(
         skew,
         down,
         mismatch,
+        fetching,
         mirrors: if multi { find_mirrors() } else { HashMap::new() },
         remote_capture: None,
         multi,
@@ -525,6 +809,11 @@ pub async fn pick_open(
     if let Some(p) = picker.borrow_mut().as_mut() {
         p.timer = Some(tid);
     }
+    // Now go ask the remotes. Detached: each snapshot repaints through
+    // refresh_if_open as it lands, and the servers still outstanding
+    // spin in their headers meanwhile. Reopening in a hurry does not
+    // stack up rounds of ssh - see fetch_remotes_on_open.
+    spawn(fetch_remotes_on_open(Rc::clone(&picker), Rc::clone(&remotes), false));
     request_capture(&picker);
 }
 
@@ -539,9 +828,9 @@ pub async fn reload_picker(
 ) {
     let show_history =
         picker.borrow().as_ref().map(|p| p.show_history).unwrap_or(false);
-    let (mut rows, skew, down, mismatch) =
+    let (mut rows, skew, down, mismatch, fetching) =
         gather_rows(&remotes, show_history, enrich).await;
-    let multi = is_multi(&rows);
+    let multi = is_multi(&rows, &fetching);
     let mirrors = if multi { find_mirrors() } else { HashMap::new() };
     let mut b = picker.borrow_mut();
     if let Some(p) = b.as_mut() {
@@ -558,6 +847,7 @@ pub async fn reload_picker(
         p.skew = skew;
         p.down = down;
         p.mismatch = mismatch;
+        p.fetching = fetching;
         p.mirrors = mirrors;
         p.multi = multi;
         // A refresh keeps the scroll where it is (only filter typing snaps
@@ -602,7 +892,7 @@ async fn refresh_timer(
         if !live {
             return;
         }
-        fetch_remotes(Rc::clone(&remotes), history).await;
+        fetch_remotes(Rc::clone(&picker), Rc::clone(&remotes), history).await;
         reload_picker(Rc::clone(&picker), Rc::clone(&remotes), true).await;
     }
 }
@@ -670,7 +960,7 @@ pub async fn apply_life(
             p.marked.clear();
         }
     }
-    fetch_remotes(Rc::clone(&remotes), false).await;
+    fetch_remotes_now(Rc::clone(&picker), Rc::clone(&remotes), false).await;
     reload_picker(picker, remotes, false).await;
 }
 
@@ -938,7 +1228,7 @@ pub fn on_mode_key(
             let remotes = Rc::clone(remotes);
             ctx.spawn(async move {
                 let history = picker.borrow().as_ref().is_some_and(|p| p.show_history);
-                fetch_remotes(Rc::clone(&remotes), history).await;
+                fetch_remotes_now(Rc::clone(&picker), Rc::clone(&remotes), history).await;
                 reload_picker(picker, remotes, false).await;
             });
         }
@@ -959,7 +1249,7 @@ pub fn on_mode_key(
                     let _ = store::rename_by_user(&id, n, now_ms() as i64).await;
                 } else {
                     act_remote(&server, &id, "rename", n).await;
-                    fetch_remotes(Rc::clone(&remotes), false).await;
+                    fetch_remotes_now(Rc::clone(&picker), Rc::clone(&remotes), false).await;
                 }
                 reload_picker(picker, remotes, false).await;
             });
@@ -1492,18 +1782,42 @@ pub fn pick_render(p: &mut Picker) {
             let row = 4 + line_i;
             match &p.lines[li] {
                 Line::Server(server) => {
-                    // A server line: bold, with the link state when down
-                    // and the reason when its copy is rejected.
-                    let (label, colour) = match (p.down.get(server), p.mismatch.get(server)) {
-                        (Some(since), _) => (
+                    // A server line: bold, with the link state when down,
+                    // the reason when its copy is rejected, and a spinner
+                    // while its roster is still in flight. A healthy
+                    // remote barely flashes; one that keeps the call
+                    // hanging says for how long, which is the whole point
+                    // (the alternative is a stale group with no reason).
+                    let (label, colour) = match (
+                        p.down.get(server),
+                        p.mismatch.get(server),
+                        p.fetching.get(server),
+                    ) {
+                        (Some(since), _, _) => (
                             format!(
                                 "{server}  (disconnected {})",
                                 fmt_age(p.now_ms.saturating_sub(*since) / 1000)
                             ),
                             "1;31",
                         ),
-                        (None, Some(why)) => (format!("{server}  ({why})"), "1;33"),
-                        (None, None) => (server.clone(), "1;34"),
+                        (None, Some(why), _) => (format!("{server}  ({why})"), "1;33"),
+                        (None, None, Some(since)) => {
+                            let waited = p.now_ms.saturating_sub(*since);
+                            let frame = SPIN_FRAMES
+                                [(p.now_ms / SPIN_MS) as usize % SPIN_FRAMES.len()];
+                            if waited >= FETCH_STUCK_MS {
+                                (
+                                    format!(
+                                        "{server}  {frame} (fetching {})",
+                                        fmt_age(waited / 1000)
+                                    ),
+                                    "1;33",
+                                )
+                            } else {
+                                (format!("{server}  {frame}"), "1;34")
+                            }
+                        }
+                        (None, None, None) => (server.clone(), "1;34"),
                     };
                     out.push_str(&format!(
                         "\x1b[{row};1H\x1b[{colour}m▪ {}\x1b[0m",
