@@ -1,11 +1,14 @@
 #!/bin/sh
-# AI_AGENT alone is not proof of a Claude. A tmux server started from
-# inside Claude Code hands AI_AGENT to every pane it spawns, so an idle
-# shell or a sleep carries it too. Only a pane that a Claude session file
-# names (~/.claude/sessions/<pid>.json, `tmux` field) is a claude row.
-# The server here carries the variable itself, as such a server does.
-# A stale file from an earlier server names a live pane id with another
-# window id; that pane is not a row either.
+# What runs in the pane decides whether it is a Claude. A tmux server
+# started from inside Claude Code hands AI_AGENT to every pane it spawns,
+# so an idle shell or a sleep carries it too, and a Claude session file
+# (~/.claude/sessions/<pid>.json, `tmux` field) outlives its Claude and
+# can name a pane that now holds a shell. So: a pane whose command is a
+# harness (by name, or a version string as the macOS launcher execs) and
+# whose pane and window a session file names is a claude row. A sleep
+# with the variable is not, even with a file that names it; a harness
+# whose file names another window is not either. The server here
+# carries the variable itself, as such a server does.
 #
 # Needs the wasm example built:
 #   cargo build -p agents --target wasm32-unknown-unknown --release
@@ -24,7 +27,11 @@ SIDECAR=$(dirname "$TEST_TMUX")/plugin-host/examples/agents/agents.toml
 
 TMP=$(mktemp -d)
 HOME_DIR="$TMP/home"
-mkdir -p "$HOME_DIR/.claude/sessions"
+BIN="$TMP/bin"
+mkdir -p "$HOME_DIR/.claude/sessions" "$BIN"
+# The macOS launcher execs a version-named binary: the pane's command is
+# "2.1.271", not "claude".
+ln -s "$(command -v sleep)" "$BIN/2.1.271"
 
 # The sidecar next to the wasm gives the scoped fs-read prefix
 # ~/.claude/sessions (under the server's HOME), which the session file
@@ -58,22 +65,34 @@ AI_AGENT=claude-code_2-1-270_agent HOME="$HOME_DIR" XDG_DATA_HOME="$TMP/data" \
 [ "$($TMUX display-message -p -t alpha '#{AI_AGENT}')" = claude-code_2-1-270_agent ] ||
     fail "the server does not carry AI_AGENT"
 
-# Pane %1: a real Claude. Its session file names the pane it runs in.
+# Pane %1: a real Claude, a version-named command whose session file
+# names the pane it runs in.
 cat >"$HOME_DIR/.claude/sessions/4242.json" <<JSON
 {"tmux":"beta:@1.%1","sessionId":"sess-real","name":"Real one","status":"busy"}
 JSON
-$TMUX new-session -d -s beta -x 200 -y 50 "sh -c 'exec sleep 600'" ||
+$TMUX new-session -d -s beta -x 200 -y 50 "sh -c 'exec $BIN/2.1.271 600'" ||
     fail "new-session beta"
 [ "$($TMUX list-panes -t beta -F '#{pane_id}')" = '%1' ] || fail "beta is not %1"
 
-# Pane %2: a stale file from an earlier server names pane %2 in window
-# @9, which this server never made.
+# Pane %2: a version-named command, but the only file that names %2 is a
+# stale one from an earlier server, in window @9, which this server never
+# made.
 cat >"$HOME_DIR/.claude/sessions/66622.json" <<JSON
 {"tmux":"zackoverflow:@9.%2","sessionId":"sess-stale","name":"Stale one","status":"idle"}
 JSON
-$TMUX new-session -d -s gamma -x 200 -y 50 "sh -c 'exec sleep 600'" ||
+$TMUX new-session -d -s gamma -x 200 -y 50 "sh -c 'exec $BIN/2.1.271 600'" ||
     fail "new-session gamma"
 [ "$($TMUX list-panes -t gamma -F '#{pane_id}')" = '%2' ] || fail "gamma is not %2"
+
+# Pane %3: a sleep with the inherited variable AND a file that names it
+# exactly. An ordinary command is not an agent, however loudly a file
+# claims the pane.
+cat >"$HOME_DIR/.claude/sessions/7777.json" <<JSON
+{"tmux":"delta:@3.%3","sessionId":"sess-shell","name":"Shell one","status":"idle"}
+JSON
+$TMUX new-session -d -s delta -x 200 -y 50 "sh -c 'exec sleep 600'" ||
+    fail "new-session delta"
+[ "$($TMUX list-panes -t delta -F '#{pane_id}')" = '%3' ] || fail "delta is not %3"
 
 $TMUX load-plugin -s server -c capture-pane -c run-command -c mode \
     -c db -c env-read -c pane-fds -c fs-read -c fs-list \
@@ -94,4 +113,5 @@ screen | grep -q '(1 live' || fail "expected one live row: $(screen | head -3)"
 screen | grep -q 'Real one' || fail "the real Claude is missing: $(screen)"
 screen | grep -q 'alpha' && fail "the inherited pane became a row: $(screen)"
 screen | grep -q 'Stale one' && fail "a stale session file claimed a pane: $(screen)"
+screen | grep -q 'Shell one' && fail "a file made a shell into an agent: $(screen)"
 exit 0
