@@ -303,6 +303,22 @@ remote_link_error(struct remote_link *rl)
 	return (rl->last_error != NULL ? rl->last_error : "");
 }
 
+/* One word for the status line: connecting, connected or disconnected. */
+const char *
+remote_link_state_name(struct remote_link *rl)
+{
+	switch (rl->state) {
+	case REMOTE_CONNECTING:
+	case REMOTE_SYNCING:
+		return ("connecting");
+	case REMOTE_UP:
+		return ("connected");
+	case REMOTE_DOWN:
+		return ("disconnected");
+	}
+	return ("");
+}
+
 /* Remember a failure text, without its trailing line break. */
 static void
 remote_link_set_error(struct remote_link *rl, const char *text)
@@ -333,11 +349,13 @@ remote_link_report_error(struct remote_link *rl)
 {
 	struct window	*w;
 	char		*name, *text;
+	int		 fresh;
 
 	if (rl->last_error == NULL)
 		return;
-	if (rl->reported_error == NULL ||
-	    strcmp(rl->reported_error, rl->last_error) != 0) {
+	fresh = (rl->reported_error == NULL ||
+	    strcmp(rl->reported_error, rl->last_error) != 0);
+	if (fresh) {
 		free(rl->reported_error);
 		rl->reported_error = xstrdup(rl->last_error);
 		server_add_message("remote %s: %s", rl->host, rl->last_error);
@@ -350,7 +368,9 @@ remote_link_report_error(struct remote_link *rl)
 	xasprintf(&name, "connecting to %s: %s", rl->host, rl->last_error);
 	window_set_name(w, name, 0);
 	free(name);
-	if (w->active != NULL) {
+	/* The pane gets each new text once; a retry with the same one adds
+	 * nothing. */
+	if (fresh && w->active != NULL) {
 		xasprintf(&text, "\r\n[remote: %s: %s]\r\n", rl->host,
 		    rl->last_error);
 		input_parse_buffer(w->active, text, strlen(text));
@@ -1620,17 +1640,22 @@ remote_link_down(struct remote_link *rl)
 	remote_link_fail_requests(rl, "remote link disconnected");
 	if (rl->dying)
 		return;
+	/*
+	 * One line per pane when the link goes down, not on every failed
+	 * retry: the grid is a mirror of the remote, and the refill on
+	 * reconnect replaces the line anyway. The status line carries the
+	 * live state (remote_state, remote_error). Start on a fresh line when
+	 * the remote left the cursor mid-line.
+	 */
 	RB_FOREACH(rp, remote_panes, &rl->panes) {
 		rp->awaiting_capture = 0;
 		rp->paused = 0;
-		if (rl->last_error != NULL) {
-			remote_link_pane_printf(rp,
-			    "\r\n[remote: %s disconnected: %s]\r\n", rl->host,
-			    rl->last_error);
-		} else {
-			remote_link_pane_printf(rp,
-			    "\r\n[remote: %s disconnected]\r\n", rl->host);
-		}
+		if (!was_up)
+			continue;
+		remote_link_pane_printf(rp, "%s[remote: %s disconnected%s%s]\r\n",
+		    rp->wp->base.cx != 0 ? "\r\n" : "", rl->host,
+		    rl->last_error != NULL ? ": " : "",
+		    rl->last_error != NULL ? rl->last_error : "");
 	}
 	remote_link_report_error(rl);
 	if (rl->s != NULL)

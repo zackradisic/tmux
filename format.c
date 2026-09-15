@@ -2691,6 +2691,17 @@ format_cb_remote_error(struct format_tree *ft)
 	return (NULL);
 }
 
+/* Callback for remote_state. */
+static void *
+format_cb_remote_state(struct format_tree *ft)
+{
+	struct remote_link	*rl = format_remote_link(ft);
+
+	if (rl != NULL)
+		return (xstrdup(remote_link_state_name(rl)));
+	return (NULL);
+}
+
 /* Callback for pane_width. */
 static void *
 format_cb_pane_width(struct format_tree *ft)
@@ -3907,6 +3918,9 @@ static const struct format_table_entry format_table[] = {
 	{ "remote_host", FORMAT_TABLE_STRING,
 	  format_cb_remote_host
 	},
+	{ "remote_state", FORMAT_TABLE_STRING,
+	  format_cb_remote_state
+	},
 	{ "scroll_region_lower", FORMAT_TABLE_STRING,
 	  format_cb_scroll_region_lower
 	},
@@ -3985,14 +3999,14 @@ static const struct format_table_entry format_table[] = {
 	{ "session_path", FORMAT_TABLE_STRING,
 	  format_cb_session_path
 	},
-	{ "session_silence_flag", FORMAT_TABLE_STRING,
-	  format_cb_session_silence_flag
-	},
 	{ "session_remote_host", FORMAT_TABLE_STRING,
 	  format_cb_session_remote_host
 	},
 	{ "session_remote_id", FORMAT_TABLE_STRING,
 	  format_cb_session_remote_id
+	},
+	{ "session_silence_flag", FORMAT_TABLE_STRING,
+	  format_cb_session_silence_flag
 	},
 	{ "session_stack", FORMAT_TABLE_STRING,
 	  format_cb_session_stack

@@ -32,6 +32,24 @@ wait_for 12 "[ \"\$($TMUX display-message -p -t fakehost/nosuch \
     '#{remote_connected}')\" = 1 ]" || fail "did not connect"
 [ -z "$($TMUX display-message -p -t fakehost/nosuch '#{remote_error}')" ] ||
     fail "error not cleared"
+[ "$($TMUX display-message -p -t fakehost/nosuch '#{remote_state}')" = connected ] ||
+    fail "remote_state while up"
+
+# The remote dies: one disconnected line per pane, not one per retry, and
+# the status line format from example_tmux.conf shows the state.
+STATUS="#{?session_remote_host,#{?remote_connected,[#{session_remote_host}],#{session_remote_host} #{remote_state}#{?remote_error,: #{=/48/...:remote_error},}},local}"
+[ "$($TMUX display-message -p -t fakehost/nosuch "$STATUS")" = '[fakehost]' ] ||
+    fail "status while up: $($TMUX display-message -p -t fakehost/nosuch "$STATUS")"
+[ "$($TMUX display-message -p -t local "$STATUS")" = local ] ||
+    fail "status on a local session"
+$TMUX2 kill-server || fail "kill-server B"
+wait_for 6 "[ \"\$($TMUX display-message -p -t fakehost/nosuch \
+    '#{remote_state}')\" = disconnected ]" || fail "remote_state while down"
+sleep 4
+n=$($TMUX capture-pane -p -t fakehost/nosuch:0.0 | grep -c 'fakehost disconnected')
+[ "$n" -eq 1 ] || fail "disconnected lines after retries: $n"
+$TMUX display-message -p -t fakehost/nosuch "$STATUS" | grep -q '^fakehost disconnected: ' ||
+    fail "status while down: $($TMUX display-message -p -t fakehost/nosuch "$STATUS")"
 $TMUX kill-session -t fakehost/nosuch || fail "kill-session"
 
 # The ssh command fails with text on stderr.

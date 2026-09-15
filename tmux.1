@@ -7769,6 +7769,7 @@ The following variables are available, where appropriate:
 .It Li "remote_connected" Ta "" Ta "1 if the remote link is connected, 0 if not (empty for local objects)"
 .It Li "remote_error" Ta "" Ta "Why the remote link is not connected, empty while it is"
 .It Li "remote_host" Ta "" Ta "Host of the remote link, if a remote object"
+.It Li "remote_state" Ta "" Ta "connecting, connected or disconnected (empty for local objects)"
 .It Li "scroll_position" Ta "" Ta "Scroll position in copy mode"
 .It Li "scroll_region_lower" Ta "" Ta "Bottom of scroll region in pane"
 .It Li "scroll_region_upper" Ta "" Ta "Top of scroll region in pane"
@@ -9432,8 +9433,15 @@ and into the
 .Ql remote_error
 format.
 When the connection drops, the local session, windows and panes stay with
-their ids, every pane shows a disconnected message with the reason and the
-link tries again with a growing delay.
+their ids, every pane shows one disconnected line with the reason, and the
+link tries again with a growing delay; the retries add nothing to the panes.
+The status line is the place for the live state, through the
+.Ql remote_state ,
+.Ql remote_error
+and
+.Ql session_remote_host
+formats; the example configuration shows one way.
+To drop a link, kill the shadow session: the remote session stays as it is.
 When it returns, the tree is brought in line with the remote and every pane
 is filled again.
 .Ic restart\-server

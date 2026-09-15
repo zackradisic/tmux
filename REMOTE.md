@@ -198,7 +198,10 @@ The sessions live on the remote. The local objects are a view.
 
 1. The ssh job exits. The link keeps every shadow pane, its grid and its
    socketpair (closing the socketpair end would destroy the pane), and
-   writes `[remote: host disconnected: reason]` into each pane. The
+   writes one line, `[remote: host disconnected: reason]`, into each
+   pane on the transition from up to down, on a fresh line when the
+   remote left the cursor mid-line. Failed retries add nothing: the
+   grid is a mirror, and the refill on reconnect replaces the line. The
    reason is the last thing that went wrong while not connected: an ssh
    stderr line (the job runs with `JOB_SHOWSTDERR`, so the parser hands
    non-protocol lines to `cb_unknown`), the remote's `%error` reply to
@@ -219,6 +222,22 @@ The sessions live on the remote. The local objects are a view.
 a capture, so a pane that fell behind snaps to the current remote grid.
 
 The local scrollback depth after reconnect is what `capture-pane` returned.
+
+### Status line and dropping a link
+
+The pane body is the wrong channel for link state: it is a mirror. The
+formats are the right one. `#{session_remote_host}` is set only on a
+shadow session, `#{remote_state}` is one word (`connecting`, `connected`,
+`disconnected`), `#{remote_connected}` is 1 or 0, and `#{remote_error}`
+is the last failure text while the link is down. `example_tmux.conf`
+carries a `status-left` that shows a dim `[host]` while up and a red
+`host disconnected: reason` while down. A comma inside a `#{?...}`
+conditional splits it, so the styles there are one per `#[...]`.
+
+To drop a link, kill the shadow session (`kill-session`, or `x` in
+`choose-tree`): `session_destroy` reaches `remote_link_session_destroyed`,
+the deferred destroy kills the ssh job, and the remote session stays as
+it is. `regress/remote-attach-basic.sh` checks it.
 
 ## Plugins
 
