@@ -77,13 +77,19 @@ pub async fn claude_claims_pane(pane: u32) -> bool {
 async fn claude_for_pane(pane: u32) -> Option<Resolved> {
     let home = home()?;
     let dir = format!("{home}/.claude/sessions");
+    // A session file outlives the server that made it: after a restart
+    // the new server hands out the same pane ids again, so a stale file
+    // can name a live pane by number alone. The window id must match
+    // too. The session name is left out: a rename must not lose a row.
+    let window = resolve_pane(PaneId(pane)).ok().map(|p| p.window);
+    let claims = |p: u32, w: Option<u32>| p == pane && (w.is_none() || w == window);
 
     // Direct hit: <pid>.json, verified by its tmux field.
     if let Ok(Some(pid)) = pane_pid(PaneId(pane)) {
         let path = format!("{dir}/{pid}.json");
         if let Ok((bytes, _)) = fs_read(&path, 0, 16 * 1024).await {
-            if let Some((p, r)) = parse_claude(&path, &bytes) {
-                if p == pane {
+            if let Some((p, w, r)) = parse_claude(&path, &bytes) {
+                if claims(p, w) {
                     return Some(r);
                 }
             }
@@ -103,8 +109,8 @@ async fn claude_for_pane(pane: u32) -> Option<Resolved> {
         let Ok((bytes, _)) = fs_read(&path, 0, 16 * 1024).await else {
             continue;
         };
-        if let Some((p, r)) = parse_claude(&path, &bytes) {
-            if p == pane {
+        if let Some((p, w, r)) = parse_claude(&path, &bytes) {
+            if claims(p, w) {
                 return Some(r);
             }
         }
@@ -112,18 +118,20 @@ async fn claude_for_pane(pane: u32) -> Option<Resolved> {
     None
 }
 
-/// Parse one Claude session file into (pane, resolved). Returns None when
-/// the JSON is malformed or lacks a usable `tmux` field.
-fn parse_claude(path: &str, bytes: &[u8]) -> Option<(u32, Resolved)> {
+/// Parse one Claude session file into (pane, window, resolved). Returns
+/// None when the JSON is malformed or lacks a usable `tmux` field; the
+/// window is None when the field carries no `@N` part.
+fn parse_claude(path: &str, bytes: &[u8]) -> Option<(u32, Option<u32>, Resolved)> {
     let v = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
-    // tmux is "session:@window.%pane"; take the %N pane id.
-    let pane = v
-        .get("tmux")
-        .and_then(|x| x.as_str())?
-        .rsplit('.')
+    // tmux is "session:@window.%pane".
+    let field = v.get("tmux").and_then(|x| x.as_str())?;
+    let (rest, pane_part) = field.rsplit_once('.').unwrap_or(("", field));
+    let pane = pane_part.strip_prefix('%').and_then(|n| n.parse::<u32>().ok())?;
+    let window = rest
+        .rsplit(':')
         .next()
-        .and_then(|p| p.strip_prefix('%'))
-        .and_then(|n| n.parse::<u32>().ok())?;
+        .and_then(|w| w.strip_prefix('@'))
+        .and_then(|n| n.parse::<u32>().ok());
     let sid = v.get("sessionId").and_then(|x| x.as_str());
     let status = match v.get("status").and_then(|x| x.as_str()) {
         Some("busy") => Some("working".to_string()),
@@ -132,6 +140,7 @@ fn parse_claude(path: &str, bytes: &[u8]) -> Option<(u32, Resolved)> {
     };
     Some((
         pane,
+        window,
         Resolved {
             real_id: sid.map(|s| format!("claude:{s}")),
             name: v.get("name").and_then(|x| x.as_str()).map(str::to_string),

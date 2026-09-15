@@ -4,6 +4,8 @@
 # shell or a sleep carries it too. Only a pane that a Claude session file
 # names (~/.claude/sessions/<pid>.json, `tmux` field) is a claude row.
 # The server here carries the variable itself, as such a server does.
+# A stale file from an earlier server names a live pane id with another
+# window id; that pane is not a row either.
 #
 # Needs the wasm example built:
 #   cargo build -p agents --target wasm32-unknown-unknown --release
@@ -64,6 +66,15 @@ $TMUX new-session -d -s beta -x 200 -y 50 "sh -c 'exec sleep 600'" ||
     fail "new-session beta"
 [ "$($TMUX list-panes -t beta -F '#{pane_id}')" = '%1' ] || fail "beta is not %1"
 
+# Pane %2: a stale file from an earlier server names pane %2 in window
+# @9, which this server never made.
+cat >"$HOME_DIR/.claude/sessions/66622.json" <<JSON
+{"tmux":"zackoverflow:@9.%2","sessionId":"sess-stale","name":"Stale one","status":"idle"}
+JSON
+$TMUX new-session -d -s gamma -x 200 -y 50 "sh -c 'exec sleep 600'" ||
+    fail "new-session gamma"
+[ "$($TMUX list-panes -t gamma -F '#{pane_id}')" = '%2' ] || fail "gamma is not %2"
+
 $TMUX load-plugin -s server -c capture-pane -c run-command -c mode \
     -c db -c env-read -c pane-fds -c fs-read -c fs-list \
     -c service-serve -c service-call "$WASM" || fail "load-plugin"
@@ -82,4 +93,5 @@ FORM=$($TMUX list-panes -a -F '#{pane_id} #{pane_mode}' |
 screen | grep -q '(1 live' || fail "expected one live row: $(screen | head -3)"
 screen | grep -q 'Real one' || fail "the real Claude is missing: $(screen)"
 screen | grep -q 'alpha' && fail "the inherited pane became a row: $(screen)"
+screen | grep -q 'Stale one' && fail "a stale session file claimed a pane: $(screen)"
 exit 0
