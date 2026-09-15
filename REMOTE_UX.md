@@ -228,6 +228,49 @@ mirrors it. What has no equivalent is listing *directories* on the remote
 for completion — `remote-attach -L` lists sessions. That gap is the part
 a provider is genuinely needed for.
 
+## 7. A descriptor reaches the event loop unvalidated
+
+`58eb8c66` added `handoff_fd_ok()` — `fcntl(fd, F_GETFD)` plus a
+`ptsname(fd)` cross-check against the tty the pane was saved with — and
+its comment states the stake exactly: "One that is not open, or not the
+tty it was saved with, must not reach the event loop: select() would fail
+on it for good and the server would hang at full CPU."
+
+That check guards the handoff path only. It touched `server-handoff.c`,
+`server.c`, `proc.c` and `log.c`; it did not touch `spawn.c` or
+`window.c`. So every other way a pane is created still hands libevent a
+number nobody verified:
+
+```c
+if (sc->adopt_fd != -1) {
+        new_wp->fd = sc->adopt_fd;      /* spawn.c:481 - no check */
+        new_wp->pid = sc->adopt_pid;
+}
+```
+
+and two lines before the descriptor reaches libevent, `window.c` performs
+the very check it needs and discards the answer:
+
+```c
+setblocking(wp->fd, 0);                 /* fcntl(F_GETFL), result dropped */
+wp->event = bufferevent_new(wp->fd, ...);
+```
+
+`setblocking()` (`tmux.c`) returns void and silently does nothing when
+`fcntl` fails, so a dead descriptor sails into the event loop.
+
+`window_pane_set_event()` is the chokepoint every path funnels through -
+adopt, respawn, ordinary spawn - and is where `handoff_fd_ok()`'s logic
+belongs, generalised. One bad pane should cost that pane, not the server:
+the fd is shared with the accept socket and libevent's own signal pipe,
+so poisoning it takes down command handling and signal handling together,
+leaving `kill -9` as the only exit.
+
+macOS makes this easy to hit. `revoke(2)`/vhangup invalidates *every*
+descriptor to a tty at once when its session leader goes, with no close
+the owner can observe; `lsof` then shows the fd as `(revoked)`. Such a
+descriptor was present on a wedged server here.
+
 ## Fixed, kept for the record
 
 - **Pre-first-connect failures were completely invisible.** A bad session
