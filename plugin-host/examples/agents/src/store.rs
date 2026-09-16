@@ -20,7 +20,7 @@
 use serde::{Deserialize, Serialize};
 use tmux_plugin_sdk::prelude::*;
 
-pub const USER_VERSION: i64 = 6;
+pub const USER_VERSION: i64 = 7;
 
 /// The server a row belongs to. A provider only ever writes rows for its
 /// own server, so every stored row says "local"; the view stamps the link
@@ -57,14 +57,18 @@ CREATE INDEX IF NOT EXISTS agents_live ON agents(ended_ms, last_active_ms);
 -- collide.
 CREATE UNIQUE INDEX IF NOT EXISTS agents_one_live_pane
   ON agents(server, pane) WHERE ended_ms IS NULL AND pane IS NOT NULL;
+-- A capture follows its agent through an id migration. ON DELETE
+-- CASCADE alone made the provisional -> durable rename fail the key for
+-- any agent whose text had already been saved.
 CREATE TABLE IF NOT EXISTS captures (
   id TEXT PRIMARY KEY,
   text TEXT,
-  FOREIGN KEY(id) REFERENCES agents(id) ON DELETE CASCADE);
+  FOREIGN KEY(id) REFERENCES agents(id)
+    ON DELETE CASCADE ON UPDATE CASCADE);
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT);
-PRAGMA user_version = 6;";
+PRAGMA user_version = 7;";
 
 /// The v1 -> v2 upgrade: the resolved columns did not exist in v1.
 const MIGRATE_V2: &str = "
@@ -106,6 +110,31 @@ DROP INDEX IF EXISTS agents_one_live_pane;
 CREATE UNIQUE INDEX IF NOT EXISTS agents_one_live_pane
   ON agents(server, pane) WHERE ended_ms IS NULL AND pane IS NOT NULL;
 PRAGMA user_version = 6;";
+
+/// The v6 -> v7 upgrade: a capture follows its agent through an id
+/// migration. Until now `captures` referenced `agents(id)` with ON DELETE
+/// CASCADE only, so [`rename_id`] - the provisional -> durable move every
+/// resolved agent makes - failed the foreign key for any agent whose text
+/// had already been saved under the old id. The error went nowhere: the
+/// row kept its provisional id in the db while the running plugin moved on
+/// to the durable one, and every later write (name, status, ack, rename)
+/// addressed a row that did not exist. SQLite cannot alter a constraint,
+/// so the table is rebuilt. A capture whose agent is already gone - an
+/// orphan from before the key was enforced - is dropped rather than
+/// failing the upgrade, and the leading DROP lets a half-finished run be
+/// retried.
+const MIGRATE_V7: &str = "
+DROP TABLE IF EXISTS captures_v7;
+CREATE TABLE captures_v7 (
+  id TEXT PRIMARY KEY,
+  text TEXT,
+  FOREIGN KEY(id) REFERENCES agents(id)
+    ON DELETE CASCADE ON UPDATE CASCADE);
+INSERT INTO captures_v7 (id, text)
+  SELECT c.id, c.text FROM captures c JOIN agents a ON a.id = c.id;
+DROP TABLE captures;
+ALTER TABLE captures_v7 RENAME TO captures;
+PRAGMA user_version = 7;";
 
 const COLS: &str = "id, kind, status, life, pane, session, window, task, name, \
                     name_ms, user_name, user_name_ms, waiting_ms, acked_ms, \
@@ -263,6 +292,10 @@ pub fn migrate_sync() -> Result<(), String> {
         }
         if version <= 5 {
             db_exec_sync(MIGRATE_V6, params![])
+                .map_err(|e| format!("db: {e}"))?;
+        }
+        if version <= 6 {
+            db_exec_sync(MIGRATE_V7, params![])
                 .map_err(|e| format!("db: {e}"))?;
         }
     }

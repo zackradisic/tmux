@@ -15,7 +15,7 @@
 //! every write. Times are the provider's clock; `now_ms` in the Snapshot
 //! lets a view on another machine correct for skew.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use serde::{Deserialize, Serialize};
@@ -356,18 +356,35 @@ pub async fn enrich_live(rows: &mut [Agent]) {
     }
 }
 
+/// Must a resolved status yield to the one the row already carries? A
+/// shim reports `needs_input` - an idle turn that is waiting on the USER -
+/// and no session file can say that much: the most a harness writes is
+/// `idle`, which reads here as plain `waiting`. Flattening one into the
+/// other on every render is what made a row flip between the two bands, so
+/// a resolved `waiting` never overrides a `needs_input` report; only
+/// activity in the file dated after that report - a new turn - does.
+fn keeps_status(a: &Agent, resolved: &str, last_active_ms: Option<i64>) -> bool {
+    a.status == "needs_input"
+        && resolved == "waiting"
+        && last_active_ms.unwrap_or(0) <= a.last_status_ms
+}
+
 /// Fold one resolver result onto a row: migrate the id first (so enrich
 /// lands on the durable row), then persist the resolved fields, then
 /// mirror both onto the in-memory `Agent` for this render.
-async fn apply(a: &mut Agent, r: Resolved) {
+async fn apply(a: &mut Agent, mut r: Resolved) {
     if let Some(real) = r.real_id.as_deref().filter(|id| *id != a.id) {
         migrate_id(a, real).await;
     }
     let now = now_ms() as i64;
+    // One decision, taken before either write: a status the row keeps must
+    // not be persisted away behind the render's back.
+    let status =
+        r.status.take().filter(|v| !keeps_status(a, v, r.last_active_ms));
     let _ = store::enrich(
         &a.id,
         r.name.as_deref(),
-        r.status.as_deref(),
+        status.as_deref(),
         r.started_ms,
         r.last_active_ms,
         r.source_path.as_deref(),
@@ -384,7 +401,7 @@ async fn apply(a: &mut Agent, r: Resolved) {
         }
         a.name = Some(v);
     }
-    if let Some(v) = r.status {
+    if let Some(v) = status {
         a.status = v;
     }
     if r.started_ms.is_some() {
@@ -398,14 +415,29 @@ async fn apply(a: &mut Agent, r: Resolved) {
     }
 }
 
+thread_local! {
+    /// Id migrations already reported, so a failure that repeats on every
+    /// render is said once rather than a thousand times.
+    static MIGRATE_LOGGED: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
+}
+
 /// Move a row from a provisional id to the durable one. When the durable
 /// id already has a row (a resumed session), merge into it; otherwise
-/// rename in place. Updates the in-memory id either way.
+/// rename in place.
+///
+/// The in-memory id follows ONLY a move the store took. It used to follow
+/// unconditionally, which turned any refused move into a silent one: the
+/// row kept its old id on disk while everything here addressed the new
+/// one, so the name, the status, an ack and a rename all updated zero rows
+/// and reported success. The row stayed nameless forever. Keeping the
+/// provisional id costs nothing - it addresses a real row, and the next
+/// render tries the move again.
 async fn migrate_id(a: &mut Agent, real: &str) {
     let exists = store::id_exists(real).await.unwrap_or(false);
-    if exists {
-        if let Some(pane) = a.pane {
-            let _ = store::merge_id(
+    let moved = match (exists, a.pane) {
+        (true, Some(pane)) => {
+            store::merge_id(
                 &a.id,
                 real,
                 pane,
@@ -413,12 +445,27 @@ async fn migrate_id(a: &mut Agent, real: &str) {
                 a.window.as_deref(),
                 now_ms() as i64,
             )
-            .await;
+            .await
         }
-    } else {
-        let _ = store::rename_id(&a.id, real).await;
+        // A durable row exists but this one has no pane to give it: there
+        // is nothing to merge, and the provisional id still addresses a
+        // real row.
+        (true, None) => return,
+        (false, _) => store::rename_id(&a.id, real).await,
+    };
+    match moved {
+        Ok(()) => a.id = real.to_string(),
+        Err(e) => {
+            let key = format!("{}\u{1}{real}", a.id);
+            let first = MIGRATE_LOGGED.with(|s| s.borrow_mut().insert(key));
+            if first {
+                log(&format!(
+                    "agents: {} -> {real}: {}; keeping the provisional id",
+                    a.id, e.message
+                ));
+            }
+        }
     }
-    a.id = real.to_string();
 }
 
 /// The `identify` verb: a pi/opencode hook reports its durable id and
