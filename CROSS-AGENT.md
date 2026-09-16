@@ -58,26 +58,31 @@ also a remote is not disturbed.
 
 ## The permission gate
 
-The bridge is bidirectional: once a link is up, either side can call the
-other's services. A grant table the host owns decides who may. It is keyed
-by (server, plugin); `plugin = "*"` means every plugin; the local server is
-always allowed.
+The bridge is bidirectional, but the two directions are not equal.
 
-- A plugin a peer **pushed** to a server is auto-allowed for that peer to
-  call: it provided the code and means to use it. This is why the roster
-  and mailbox flows work with no manual step, since a workstation pushes
-  its plugins to the servers it links.
-- A plugin a server **loaded itself** is gated. When a link comes up, the
-  initiator's client gets a menu naming the peer's plugins it also serves;
-  an inbound peer's pairs default to deny. Until a pair is `allow`, a call
-  for it fails with `E_DENIED` and a message naming the fix.
-- `plugin-peers list|allow|deny|revoke|menu` edits the table; the menu
-  reopens with `plugin-peers menu <server>`.
+- **Initiator to remote: always allowed.** When you `remote-attach` to a
+  server you ssh'd in, so it already trusts you at the OS level. Your
+  calls into it (the roster fetch, delivering a message there) are never
+  gated. This is why the picker and outbound messaging just work.
+- **Remote to initiator: declared and granted.** A server you linked to
+  calling back into yours is gated twice. First the callee plugin must
+  have opted the method in with `[caps.services] serve_remote = [...]` in
+  its sidecar; a call for any other method is denied outright with
+  `E_DENIED` (no row, no menu). Second, you must have allowed the
+  (server, plugin) pair. When a link comes up, the client that ran
+  `remote-attach` gets a menu of the peer's plugins that declare a
+  remote-callable method; until you allow one, its calls fail `E_DENIED`.
 
-Two older layers still stand and are different things: `plugin-remote-caps`
-caps what a pushed plugin may do at all, and the sidecar `[caps.services]
-call` list is a plugin author narrowing what their own plugin reaches out
-to.
+For Zack today that is one line: mailbox declares `serve_remote =
+["deliver"]`, agents declares nothing, so linking a server offers only
+"allow this server to deliver messages to agents here". Nothing can read
+your roster or capture your panes from a linked server.
+
+`plugin-peers list|allow|deny|revoke|menu` edits the table (stored at
+`<data>/tmux/plugin-host/peers.db`, keyed (server, plugin), `*` for every
+plugin). `plugin-remote-caps` (what a pushed plugin may do at all) and the
+caller-side `[caps.services] call` list (what a plugin reaches out to) are
+separate and unchanged.
 
 ## Driving a raw pane on purpose
 

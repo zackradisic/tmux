@@ -15,3 +15,10 @@ requests = [
   "write-options",
   "display-message",
 ]
+
+# The only method a remote peer may call: deliver a message here. A remote
+# calling anything else (e.g. boxes) is denied before any grant. The user
+# still has to allow the (server, mailbox) pair for a linked server; see
+# plugin-peers.
+[caps.services]
+serve_remote = ["deliver"]

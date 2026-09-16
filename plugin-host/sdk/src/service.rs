@@ -48,6 +48,16 @@ pub fn local_server() -> ServerInfo {
     ServerInfo::local("")
 }
 
+/// Servers this side linked to (ran remote-attach). A view fetches
+/// rosters only from these, never from an inbound peer that linked in.
+pub fn linked_servers() -> Vec<ServerInfo> {
+    servers()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| s.linked)
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Provider side.
 // ---------------------------------------------------------------------------

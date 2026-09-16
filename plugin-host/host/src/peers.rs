@@ -25,6 +25,7 @@ use std::ffi::CString;
 use crate::bridge;
 use crate::services;
 use crate::sqlite;
+use crate::state::REGISTRY;
 
 const ALL: &str = "*";
 
@@ -48,29 +49,45 @@ pub fn deny_message(server: &str, plugin: &str) -> String {
     )
 }
 
-/// A peer that pushed `plugin` here may call it: option 1, auto-allow the
-/// pushed pair. Overwrites a `pending`/`deny` row left by the handshake.
-pub fn allow_pushed(server: &str, plugin: &str) {
-    sqlite::peers_set(server, plugin, "allow");
+/// The served methods of `plugin` that a remote peer may call, from its
+/// sidecar's `[caps.services] serve_remote`. Empty means the plugin
+/// accepts no remote callers.
+fn serve_remote(plugin: &str) -> Vec<String> {
+    REGISTRY.with(|r| {
+        r.borrow()
+            .plugins
+            .get(plugin)
+            .map(|d| d.caps.serve_remote.clone())
+            .unwrap_or_default()
+    })
 }
 
-/// A peer said hello (or a new plugin appeared on it): reconcile the
-/// grant rows for the (server, plugin) pairs it runs that this side
-/// serves. Returns the plugin names that are newly `pending` (an
-/// initiator link only), for the caller to open a menu.
+/// Does `plugin` accept any remote caller (it declared serve_remote)?
+fn accepts_remote(plugin: &str) -> bool {
+    !serve_remote(plugin).is_empty()
+}
+
+/// A peer said hello (or a new plugin appeared): reconcile the grant rows.
+/// Only a link this side made is gated (remote -> initiator), and only
+/// plugins that declare serve_remote can reach `pending`. Returns the
+/// plugin names newly `pending`, for the caller to open a menu. An inbound
+/// peer (someone who linked to us) needs no rows: its calls are always
+/// allowed.
 pub fn reconcile(peer: u32) -> Vec<String> {
+    if !bridge::peer_is_initiator(peer) {
+        return Vec::new();
+    }
     let Some(server) = bridge::peer_name(peer) else {
         return Vec::new();
     };
     if server == tmux_plugin_abi::LOCAL_SERVER {
         return Vec::new();
     }
-    let initiator = bridge::peer_is_initiator(peer);
     let remote_plugins = bridge::peer_plugin_names(peer);
     let served = services::providers();
     let mut new_pending = Vec::new();
     for name in remote_plugins {
-        if !served.iter().any(|p| *p == name) {
+        if !served.iter().any(|p| *p == name) || !accepts_remote(&name) {
             continue;
         }
         if sqlite::peers_get(&server, &name).is_some()
@@ -78,16 +95,34 @@ pub fn reconcile(peer: u32) -> Vec<String> {
         {
             continue; // already decided (or wildcarded)
         }
-        if initiator {
-            if sqlite::peers_ensure(&server, &name, "pending") {
-                new_pending.push(name);
-            }
-        } else {
-            // Inbound: default deny, no prompt.
-            sqlite::peers_ensure(&server, &name, "deny");
+        if sqlite::peers_ensure(&server, &name, "pending") {
+            new_pending.push(name);
         }
     }
     new_pending
+}
+
+/// Why a remote call was refused (see `check_remote_call`).
+pub enum Refusal {
+    /// The method is not in the plugin's serve_remote list: silent, no
+    /// row, one log line.
+    NotServed,
+    /// The pair is not `allow` yet: the caller gets the grant message.
+    NotGranted(String),
+}
+
+/// Gate an incoming call from a link this side made (remote -> initiator).
+/// Ok means proceed. Only for initiator peers; an inbound peer's calls do
+/// not come here (the caller allows them outright).
+pub fn check_remote_call(server: &str, plugin: &str, method: &str) -> Result<(), Refusal> {
+    if !serve_remote(plugin).iter().any(|m| m == method) {
+        return Err(Refusal::NotServed);
+    }
+    if allowed(server, plugin) {
+        Ok(())
+    } else {
+        Err(Refusal::NotGranted(deny_message(server, plugin)))
+    }
 }
 
 /// Open the grant menu for `server` on `client`, listing its pending

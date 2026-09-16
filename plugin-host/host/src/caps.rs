@@ -144,6 +144,10 @@ pub struct EffectiveCaps {
     /// `plugin` or `plugin@server` patterns (`*` matches any server).
     /// Empty = any target, if service-call is granted.
     pub services_allow: Vec<String>,
+    /// Served methods a remote peer may call (empty = none). See the
+    /// peer grants: a remote call for a method not here is denied before
+    /// any grant is even consulted.
+    pub serve_remote: Vec<String>,
 }
 
 impl EffectiveCaps {
@@ -205,6 +209,12 @@ struct ManifestCapsFsRead {
 struct ManifestCapsServices {
     #[serde(default)]
     call: Vec<String>,
+    /// The served methods a remote peer may call (empty = none). Names of
+    /// methods this plugin registers; the user still has to grant the
+    /// (server, plugin) pair. This is how a plugin opts a method in to
+    /// remote callers.
+    #[serde(default, rename = "serve_remote")]
+    serve_remote: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -260,6 +270,7 @@ pub fn compute(wasm_path: &Path, grants: &[String]) -> Result<EffectiveCaps, Str
             env_allow: Vec::new(),
             fs_allow: Vec::new(),
             services_allow: Vec::new(),
+            serve_remote: Vec::new(),
         }),
         Some(m) => {
             let requested =
@@ -270,6 +281,7 @@ pub fn compute(wasm_path: &Path, grants: &[String]) -> Result<EffectiveCaps, Str
                 env_allow: m.caps.env_read.names,
                 fs_allow: m.caps.fs_read.paths,
                 services_allow: m.caps.services.call,
+                serve_remote: m.caps.services.serve_remote,
             })
         }
     }

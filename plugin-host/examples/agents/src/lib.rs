@@ -248,9 +248,10 @@ impl Plugin for Agents {
             ctx.spawn(provider::sweep_loop());
         }
         if role.views() {
-            // Follow the providers on servers that are linked already.
+            // Follow the providers on servers this side linked to (never an
+            // inbound peer: its roster is not ours to pull).
             for s in service::servers().unwrap_or_default() {
-                if !s.local && s.up {
+                if !s.local && s.up && s.linked {
                     view::follow(&s.name);
                 }
             }
@@ -297,10 +298,19 @@ impl Plugin for Agents {
                 }
             }
             "link-up" => {
-                // A server (re)appeared: follow its roster and fetch it.
+                // A server (re)appeared. Only a server this side linked to
+                // is followed and fetched; a peer that linked to us is not
+                // ours to pull a roster from.
                 let Some(server) = event.get_str("server").map(str::to_string) else {
                     return;
                 };
+                let linked = service::servers()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .any(|s| s.name == server && s.linked);
+                if !linked {
+                    return;
+                }
                 view::follow(&server);
                 self.remotes.borrow_mut().mark_up(&server);
                 let picker = Rc::clone(&self.picker);

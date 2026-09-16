@@ -26,6 +26,7 @@ use tmux_plugin_abi::{
 
 use crate::abi::{err, HostError};
 use crate::bridge;
+use crate::hostlog;
 use crate::intern;
 use crate::registry::ScopeId;
 use crate::state::{Delivery, EVENTS};
@@ -532,16 +533,43 @@ pub fn incoming_call(
         );
         return;
     }
-    let server = bridge::peer_name(peer).unwrap_or_default();
-    if !crate::peers::allowed(&server, plugin) {
-        let _ = bridge::send_reply(
-            peer,
-            remote_call_id,
-            0,
-            service_flags::ERROR,
-            crate::peers::deny_message(&server, plugin).as_bytes(),
-        );
-        return;
+    // The gate is one-directional. A call from an inbound peer (someone who
+    // linked to us) is always allowed: they ssh'd in, the OS already trusts
+    // that user. A call from a link this side made (remote -> initiator) is
+    // gated: the method must be one the plugin serves to remote peers, and
+    // the user must have allowed the (server, plugin) pair.
+    if bridge::peer_is_initiator(peer) {
+        let server = bridge::peer_name(peer).unwrap_or_default();
+        match crate::peers::check_remote_call(&server, plugin, method) {
+            Ok(()) => {}
+            Err(crate::peers::Refusal::NotServed) => {
+                crate::hostlog::info(
+                    plugin,
+                    &format!(
+                        "{server} called {plugin}.{method}, not served to                          remote peers"
+                    ),
+                );
+                let _ = bridge::send_reply(
+                    peer,
+                    remote_call_id,
+                    0,
+                    service_flags::ERROR,
+                    format!("{plugin}.{method} is not served to remote peers")
+                        .as_bytes(),
+                );
+                return;
+            }
+            Err(crate::peers::Refusal::NotGranted(msg)) => {
+                let _ = bridge::send_reply(
+                    peer,
+                    remote_call_id,
+                    0,
+                    service_flags::ERROR,
+                    msg.as_bytes(),
+                );
+                return;
+            }
+        }
     }
     let origin = Origin::Remote { peer, call_id: remote_call_id };
     match owner_of(plugin, method) {

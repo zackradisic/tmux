@@ -1115,11 +1115,6 @@ fn accept_push(
         }
     });
     hostlog::info("bridge", &format!("{name} from {peer_name}: {outcome}"));
-    // A peer may call the plugin it pushed here: it provided the code and
-    // clearly means to use it. Auto-allow that one (server, plugin) pair,
-    // so the roster and mailbox flows work without a manual grant; the
-    // handshake still gates every other plugin (`peers::reconcile`).
-    crate::peers::allow_pushed(&peer_name, &name);
     // The pusher hears about the new provider when its first instance
     // starts (plugin_started), with the version that instance reports.
     Ok(())
@@ -1182,8 +1177,17 @@ pub fn servers_record(plugin: &str) -> Vec<u8> {
             .map(|h| h.version.clone())
             .unwrap_or_default();
         let accepted = p.verdicts.get(plugin).is_none_or(|v| v.ok);
-        ServerInfo { id: p.id, name: p.name, up: p.up, local: false, version, accepted }
-            .emit(&mut out);
+        let linked = p.initiator;
+        ServerInfo {
+            id: p.id,
+            name: p.name,
+            up: p.up,
+            local: false,
+            version,
+            accepted,
+            linked,
+        }
+        .emit(&mut out);
     }
     out
 }

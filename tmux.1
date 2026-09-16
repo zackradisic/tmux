@@ -7028,11 +7028,17 @@ sends this on the link; it is not meant to be typed.
 .Op Ar server
 .Op Ar plugin
 .Xc
-Read and write the peer grant table, which decides whether a linked
-.Nm
-server may call this server's plugin services back over the bridge.
-A plugin a peer pushed here is allowed for that peer automatically; a
-plugin this server loaded itself is denied until granted.
+Read and write the peer grant table.
+A server this one linked to may call a plugin service back over the bridge
+only when the callee plugin declares the method in its
+.Ql [caps.services] serve_remote
+sidecar list and the user allows the
+.Ar server Ns / Ns Ar plugin
+pair here.
+An undeclared method is refused outright; a declared one is refused until
+granted.
+A peer that linked in the other way needs no grant: an initiator's calls
+into the server it linked to are always allowed.
 .Ar list
 shows the rows;
 .Ar allow

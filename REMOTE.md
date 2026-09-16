@@ -366,17 +366,18 @@ for a mirrored pane only when the remote runs that plugin.
 
 ### Peer grants
 
-The bridge is bidirectional, so a linked server can call this server's
-plugin services back. A host-owned grant table gates that, keyed by
-(server, plugin), stored at `<data>/tmux/plugin-host/peers.db` (not any
-plugin's store: the gate runs before a plugin sees the call). A plugin a
-peer pushed here is auto-allowed for that peer. A plugin this server
-loaded itself is gated: when a link comes up, the client that ran
-`remote-attach` gets a menu of the peer's plugins this side also serves,
-and an inbound peer defaults to deny. Until a pair is `allow`, an incoming
-call fails with `E_DENIED`. `plugin-peers list|allow|deny|revoke|menu`
-edits the table. The caller-side sidecar `[caps.services] call` list and
-`plugin-remote-caps` are separate and unchanged.
+The bridge is bidirectional, but the gate is not. An initiator's calls
+into a server it linked to are always allowed (it ssh'd in). A call the
+other way, from a linked server back into this one, is gated twice: the
+callee plugin must declare the method in `[caps.services] serve_remote`,
+and the user must allow the (server, plugin) pair. A call for an
+undeclared method is `E_DENIED` outright (no row, no menu); a declared but
+ungranted one is `E_DENIED` until the handshake menu on the
+`remote-attach` client is answered. The table is host-owned, at
+`<data>/tmux/plugin-host/peers.db`, keyed (server, plugin), edited with
+`plugin-peers list|allow|deny|revoke|menu`. An inbound peer needs no
+identity or row. `plugin-remote-caps` and the caller-side `[caps.services]
+call` list are separate and unchanged.
 
 ### Service versions
 

@@ -326,6 +326,25 @@ its own copies `service-serve`, or they cannot forward to the pusher.
 Two servers on one machine share a plugin's `store.db` when they share
 `XDG_DATA_HOME`; the regress tests give the second server its own.
 
+## Serving a method to remote peers
+
+By default a plugin's registered methods are callable only on the same
+server and by a plugin on a server this one linked to which that server
+trusts (an initiator's calls out are always allowed). For a linked server
+to call *back* into a plugin here, the plugin must opt the method in:
+
+```toml
+[caps.services]
+serve_remote = ["deliver"]   # mailbox: a linked server may call deliver
+```
+
+A remote call for a method not on the list is denied with `E_DENIED`
+before any grant is consulted, and the user still has to allow the
+(server, plugin) pair with `plugin-peers`. A plugin that lists nothing
+(the agents plugin, whose `list`/`capture` are for its own view) is never
+remote-callable. This is the only knob a plugin author needs; the user
+owns the grant.
+
 ## Events
 
 Events cross the ABI as binary buffers (interned name id + scope ids +

@@ -278,7 +278,9 @@ async fn fetch_all(
         .map(|s| s.version.clone())
         .unwrap_or_default();
     let mut queue: Vec<String> = Vec::new();
-    for s in list.into_iter().filter(|s| !s.local && s.up) {
+    // Only servers this side linked to: never fetch a roster from an
+    // inbound peer (it would be a gated remote -> initiator call).
+    for s in list.into_iter().filter(|s| !s.local && s.up && s.linked) {
         if !s.accepted {
             remotes.borrow_mut().mark_mismatch(
                 &s.name,
@@ -1375,25 +1377,42 @@ fn server_of(remotes: &Rc<RefCell<Remotes>>, id: &str) -> Option<String> {
 }
 
 pub async fn message_by_id(
-    picker: Rc<RefCell<Option<Picker>>>,
+    _picker: Rc<RefCell<Option<Picker>>>,
     remotes: Rc<RefCell<Remotes>>,
     id: &str,
     from: &str,
     text: &str,
 ) {
-    // Which server hosts this id? The remotes rosters know. When the id is
-    // in no roster it is either a local agent or a remote one the roster
-    // has not fetched yet; fetch once and look again before falling back
-    // to the local server, so a message right after linking still routes.
-    let mut server = server_of(&remotes, id);
-    if server.is_none() {
-        fetch_remotes_now(Rc::clone(&picker), Rc::clone(&remotes), false).await;
-        server = server_of(&remotes, id);
-    }
-    let server = server.unwrap_or_else(|| LOCAL.to_string());
-    match message_agent(&server, id, from, text).await {
+    // Resolve the target server. An explicit `<id>@<server>` names it (a
+    // fresh message to an agent this side has never rostered). A bare id
+    // is looked up only in the local rosters this side already has (from
+    // servers it linked to); it is never resolved by fetching a roster
+    // from an inbound peer. A bare unknown id is refused.
+    let (bare, server) = match id.rsplit_once('@') {
+        Some((i, s)) => (i.to_string(), Some(s.to_string())),
+        None => (id.to_string(), None),
+    };
+    let server = match server {
+        Some(s) => s,
+        None => {
+            // A local agent id routes to the local mailbox; a remote one
+            // must already be in a roster this side pulled. An id in
+            // neither is refused, never resolved by asking an inbound peer.
+            if store::by_id(&bare).await.ok().flatten().is_some() {
+                LOCAL.to_string()
+            } else if let Some(s) = server_of(&remotes, &bare) {
+                s
+            } else {
+                let _ = display_message(&format!(
+                    "agents: unknown agent {bare}; use {bare}@<server>"
+                ));
+                return;
+            }
+        }
+    };
+    match message_agent(&server, &bare, from, text).await {
         Ok(()) => {
-            let _ = display_message(&format!("agents: sent to {id}"));
+            let _ = display_message(&format!("agents: sent to {bare}@{server}"));
         }
         Err(e) => {
             let _ = display_message(&format!("agents: send failed: {e}"));
@@ -1421,8 +1440,20 @@ fn fetch_unread(picker: Rc<RefCell<Option<Picker>>>) {
     let (mode, servers) = {
         let b = picker.borrow();
         let Some(p) = b.as_ref() else { return };
-        let mut servers: HashSet<String> =
-            p.rows.iter().map(|a| a.server.clone()).collect();
+        // The local mailbox always; remote mailboxes only on servers this
+        // side linked to (an inbound peer's mailbox is not ours to poll).
+        let linked: HashSet<String> = service::servers()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| s.linked)
+            .map(|s| s.name)
+            .collect();
+        let mut servers: HashSet<String> = p
+            .rows
+            .iter()
+            .map(|a| a.server.clone())
+            .filter(|s| linked.contains(s))
+            .collect();
         servers.insert(LOCAL.to_string());
         (p.mode, servers)
     };

@@ -443,12 +443,18 @@ pub struct ServerInfo {
     pub local: bool,
     pub version: String,
     pub accepted: bool,
+    /// This side initiated the link to that server (ran remote-attach).
+    pub linked: bool,
 }
 
 pub mod server_flags {
     pub const UP: u32 = 1 << 0;
     pub const LOCAL: u32 = 1 << 1;
     pub const ACCEPTED: u32 = 1 << 2;
+    /// This side made the link to that server (ran remote-attach). A view
+    /// fetches rosters only from servers it linked to, never from an
+    /// inbound peer.
+    pub const LINKED: u32 = 1 << 3;
 }
 
 impl ServerInfo {
@@ -461,6 +467,7 @@ impl ServerInfo {
             local: true,
             version: version.into(),
             accepted: true,
+            linked: false,
         }
     }
 
@@ -476,6 +483,7 @@ impl ServerInfo {
             local: flags & server_flags::LOCAL != 0,
             version,
             accepted: flags & server_flags::ACCEPTED != 0,
+            linked: flags & server_flags::LINKED != 0,
         })
     }
 
@@ -491,6 +499,9 @@ impl ServerInfo {
         }
         if self.accepted {
             flags |= server_flags::ACCEPTED;
+        }
+        if self.linked {
+            flags |= server_flags::LINKED;
         }
         out.extend_from_slice(&flags.to_le_bytes());
         emit_str(out, &self.version);
