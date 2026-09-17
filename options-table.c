@@ -530,7 +530,7 @@ const struct options_table_entry options_table[] = {
 			 "env-read-any,pane-fds,service-call,service-serve",
 	  .text = "Capabilities a plugin pushed by a linked server may get "
 		  "on this server. The default leaves out run-process, "
-		  "fs-write, fs-read-any and fs-write-any."
+		  "fs-write, fs-read-any, fs-write-any and claude-notify."
 	},
 
 	{ .name = "prompt-history-limit",

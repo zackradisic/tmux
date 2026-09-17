@@ -11,6 +11,10 @@
 # `changed`; the view half calls and follows them). Without them the
 # picker shows local agents only, and the log says
 # "register list: capability service-serve not granted".
+#
+# claude-notify pushes a mailbox message into the Claude session that owns
+# the box, over its inbox socket, so the agent wakes with it. Without it
+# messages stay in the mailbox for `inbox`.
 
 [caps]
 requests = [
@@ -24,6 +28,7 @@ requests = [
   "fs-list",
   "service-serve",
   "service-call",
+  "claude-notify",
 ]
 
 # The services this plugin calls: its own provider on any server, and the

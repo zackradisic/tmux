@@ -8,9 +8,11 @@ Enter. Zack's incident, where `send-keys` appended to a live draft and the
 Enter submitted the mix, does not happen on this path, because there are no
 keystrokes.
 
-It is a wasm plugin. No Python, no external program, no Claude socket. An
-agent talks to it with `plugin-command`, and the plugin's own services
-carry a message between servers over the tmux2 bridge.
+It is a wasm plugin. No Python, no external program. An agent talks to it
+with `plugin-command`, and the plugin's own services carry a message
+between servers over the tmux2 bridge. The last hop, from the mailbox
+into the reader's live Claude session, is one line on the inbox socket
+that Claude Code binds for every session (see "Push" below).
 
 ## The mailbox plugin
 
@@ -91,14 +93,54 @@ TUI, still can: `tmux2 send-keys -t <shadow-pane>` forwards over the link
 today. That path is destructive by construction, so it stays an explicit
 choice an agent makes, never the default for a message to an agent.
 
-## An RPC step later
+## Push: the reader wakes
 
-Delivery is pull today: the reader runs `inbox` when it wants its
-messages. A push, where the plugin wakes the reader on a new message, is
-the natural next step. Inside one Claude Code session that is its own peer
-messaging; between agents on different servers it would be a topic the
-reader's harness follows. The store and the `deliver` service do not
-change for it.
+Delivery is push. A message left for a Claude agent reaches its session
+at once, so the agent wakes with it instead of finding it on its next
+`inbox`.
+
+Every Claude Code session binds an inbox socket and names it in its
+session file (`~/.claude/sessions/<pid>.json`, `messagingSocketPath`).
+A line `{"type":"user","message":{"role":"user","content":...}}` on that
+socket is one queued user turn: Claude reads it between tool calls, or
+starts a new turn with it when idle. It is not keystrokes, so a
+half-typed prompt in that pane is untouched. Claude Code documents this
+socket for scripts to post into a session; on Linux and macOS the OS user
+permission on the socket is the guard and no token is needed.
+
+The chain, all inside the tmux event loop:
+
+1. The mailbox stores the message and emits its `mailbox` topic with the
+   message in it.
+2. The agents plugin (the provider half, on the reader's own server)
+   follows that topic. When the box is a live Claude agent here, it reads
+   the agent's session file for the socket path.
+3. It calls the host builtin `claude_notify(path, text)`, which writes the
+   line. The text names the sender (`<id>` or `<id>@<server>`).
+4. On success it asks the mailbox to `mark_read` the message. The picker
+   badge clears.
+
+Across a link nothing is added: the message rides the bridge to the
+reader's server as before, and that server's agents plugin does the push
+locally. A box that is not a Claude agent here (a plain box, a codex or
+pi agent, a Claude with no socket) is left unread for `inbox`.
+
+`claude_notify` needs the `claude-notify` capability. The agents sidecar
+requests it; it is never in the default grants for a plugin a remote
+pushed here, so a linked server cannot speak into your sessions through
+its own copy.
+
+### One setting on the reader's machine
+
+Claude Code holds a peer message for approval when the receiving session
+bypasses permission prompts and the sender does not identify as bypassing
+too. A push from tmux2 identifies as nothing, so in a bypass session it
+would pop an approval dialog instead of waking the agent. Set this in
+`~/.claude/settings.json` on each machine whose agents should wake:
+
+```json
+{ "crossSessionInbound": "accept" }
+```
 
 ## The agents picker
 
@@ -121,5 +163,9 @@ message to a local agent id stored here, and a message to a remote agent
 id routed over the bridge into that agent's server, sender qualified. The
 release bundles `mailbox.wasm`.
 
-Not built yet: the stdout-returning read command, and the RPC push that
-wakes a reader instead of it pulling.
+`regress/plugin-mailbox-push.sh` runs the push: a stub Claude listens on
+an inbox socket, a local message lands on it as one user turn and is
+marked read, a plain box is left alone, and a message from the remote
+crosses the link and lands on the same socket once allowed.
+
+Not built yet: the stdout-returning read command.

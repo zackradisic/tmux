@@ -486,6 +486,28 @@ pub fn display_message_to(
     check(unsafe { raw::display_message(client.0 as i32, p, l) })
 }
 
+/// Deliver `text` into a running Claude Code session as a queued user
+/// turn, over its inbox socket: `messagingSocketPath` in the session's
+/// `~/.claude/sessions/<pid>.json`. Claude reads it between tool calls,
+/// or wakes with it when idle. Not keystrokes: a half-typed prompt in
+/// that pane is untouched. Needs `claude-notify`; the path must be a
+/// socket in a `cc-socks` directory.
+pub fn claude_notify(
+    path: impl AsTmuxStr,
+    text: impl AsTmuxStr,
+) -> Result<(), HostError> {
+    // Str params: the host wants a NUL-terminated buffer, len without it.
+    let path = path.to_tmux();
+    let text = text.to_tmux();
+    let (pp, pl) = path.parts();
+    let (tp, tl) = text.parts();
+    let r = unsafe { raw::claude_notify(pp, pl, tp, tl) };
+    if r < 0 {
+        return Err(host_err(r as i32));
+    }
+    Ok(())
+}
+
 pub fn log(msg: &str) {
     runtime::log(1, msg);
 }

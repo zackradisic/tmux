@@ -1002,6 +1002,67 @@ pub fn fs_write_async(
     Ok(token as i64)
 }
 
+/// Deliver `text` into a running Claude Code session as a queued user
+/// turn, over its inbox socket. That socket is `messagingSocketPath` in
+/// the session's `~/.claude/sessions/<pid>.json`; Claude reads the line
+/// between tool calls, or starts a new turn with it when idle. It is not
+/// keystrokes, so a half-typed prompt is untouched. The path must be a
+/// socket inside a `cc-socks` directory, so this cannot write to any
+/// other socket. Non-blocking: a socket whose reader has stalled fails
+/// instead of holding the event loop. No auth line: on Linux and macOS
+/// the OS user permission on the socket is the guard, and the line is
+/// optional.
+pub fn claude_notify(
+    mem: &mut GuestMem<'_, '_>,
+    path_ptr: i32,
+    path_len: i32,
+    text_ptr: i32,
+    text_len: i32,
+) -> Result<i64, HostError> {
+    use std::io::Write;
+    use std::os::unix::fs::FileTypeExt;
+    check_cap(mem, crate::caps::CLAUDE_NOTIFY)?;
+    let path = mem.read_str(path_ptr, path_len)?;
+    let text = mem.read_str(text_ptr, text_len)?;
+    let p = std::path::Path::new(&path);
+    let dir_ok = p
+        .parent()
+        .and_then(|d| d.file_name())
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == "cc-socks" || n.starts_with("cc-socks-"));
+    if !dir_ok {
+        return Err(err(
+            ErrorCode::CapDenied,
+            "claude_notify: not a Claude inbox socket path",
+        ));
+    }
+    let is_sock = std::fs::metadata(p)
+        .map(|m| m.file_type().is_socket())
+        .unwrap_or(false);
+    if !is_sock {
+        return Err(err(ErrorCode::NoSuchObject, "claude_notify: no such socket"));
+    }
+    let line = serde_json::json!({
+        "type": "user",
+        "message": { "role": "user", "content": text },
+    });
+    let mut bytes = serde_json::to_vec(&line)
+        .map_err(|e| err(ErrorCode::Host, e.to_string()))?;
+    bytes.push(b'\n');
+    let mut s = std::os::unix::net::UnixStream::connect(p)
+        .map_err(|e| err(ErrorCode::Host, format!("claude_notify: connect: {e}")))?;
+    s.set_nonblocking(true)
+        .map_err(|e| err(ErrorCode::Host, format!("claude_notify: {e}")))?;
+    match s.write_all(&bytes) {
+        Ok(()) => Ok(0),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Err(err(
+            ErrorCode::Host,
+            "claude_notify: the session is not reading its socket",
+        )),
+        Err(e) => Err(err(ErrorCode::Host, format!("claude_notify: write: {e}"))),
+    }
+}
+
 pub fn fs_read_async(
     mem: &mut GuestMem<'_, '_>,
     path_ptr: i32,

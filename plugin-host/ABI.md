@@ -285,6 +285,7 @@ an inbound peer's calls are always allowed).
 | `home_dir` | `(out, cap, len_out) -> i32` — the server user's home directory | none |
 | `fs_write_sync` | `(path, data Bytes, append) -> i64` (bytes written) | fs-write |
 | `fs_read_sync` | `(path, offset: i64, out, cap, len_out, eof_out) -> i32` | fs-read |
+| `claude_notify` | `(path Str, text Str) -> i64` — deliver `text` as one queued user turn into the Claude Code session listening on the inbox socket at `path` (the `messagingSocketPath` of its `~/.claude/sessions/<pid>.json`). Not keystrokes: a half-typed prompt is untouched; an idle session starts a turn with it. The path must be a socket inside a `cc-socks` directory; non-blocking, so a stalled reader fails instead of holding the loop | claude-notify |
 | `db_exec_sync` | `(sql Bytes, params Bytes, out_ptr) -> i32` — out = 16-byte exec struct; main thread, 500 ms cap | db |
 | `db_query_sync` | `(sql Bytes, params Bytes, owned_out) -> i32` — OwnedBuf = rows block | db |
 | `db_decompress` | `(src Bytes, owned_out) -> i32` — OwnedBuf = the bytes behind a stored zstd frame | db |

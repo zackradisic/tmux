@@ -1119,6 +1119,12 @@ fn register_imports(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
         }))
     })?;
 
+    linker.func_wrap(m, im::CLAUDE_NOTIFY, |mut c: Caller<'_, StoreData>, path_ptr: i32, path_len: i32, text_ptr: i32, text_len: i32| -> i64 {
+        ret_i64(with_mem(&mut c, |mem| {
+            dispatch::claude_notify(mem, path_ptr, path_len, text_ptr, text_len)
+        }))
+    })?;
+
     linker.func_wrap(m, im::FS_ROOT, |mut c: Caller<'_, StoreData>, out: i32, cap: i32, len_out: i32| -> i32 {
         ret_i32(with_mem(&mut c, |mem| dispatch::fs_root(mem, out, cap, len_out)))
     })?;

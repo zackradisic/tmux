@@ -61,9 +61,14 @@ pub const SERVICE_CALL: u32 = 1 << 21;
 /// Register service methods and emit topics (`service_register`,
 /// `service_reply`, `service_emit`).
 pub const SERVICE_SERVE: u32 = 1 << 22;
+/// Deliver a message into a running Claude Code session over its inbox
+/// socket (`claude_notify`). A queued user turn, not keystrokes. Never in
+/// the default grants for a pushed plugin: a remote must not be able to
+/// speak into this user's sessions.
+pub const CLAUDE_NOTIFY: u32 = 1 << 23;
 
 /// Highest bit used above, for `describe`.
-const CAP_BITS: u32 = 23;
+const CAP_BITS: u32 = 24;
 
 /// Granted to every plugin without being asked for.
 pub const DEFAULT_CAPS: u32 = READ_STATE | DISPLAY_MESSAGE | TIMERS;
@@ -93,6 +98,7 @@ pub fn cap_from_name(name: &str) -> Option<u32> {
         "pane-fds" => PANE_FDS,
         "service-call" => SERVICE_CALL,
         "service-serve" => SERVICE_SERVE,
+        "claude-notify" => CLAUDE_NOTIFY,
         _ => return None,
     })
 }
@@ -122,6 +128,7 @@ pub fn cap_name(flag: u32) -> &'static str {
         PANE_FDS => "pane-fds",
         SERVICE_CALL => "service-call",
         SERVICE_SERVE => "service-serve",
+        CLAUDE_NOTIFY => "claude-notify",
         _ => "?",
     }
 }

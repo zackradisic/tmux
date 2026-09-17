@@ -101,6 +101,7 @@ use serde::Deserialize;
 use tmux_plugin_sdk::prelude::*;
 
 mod provider;
+mod push;
 mod resolve;
 mod store;
 mod view;
@@ -244,6 +245,9 @@ impl Plugin for Agents {
         view::PICKER.with(|c| *c.borrow_mut() = Some(Rc::clone(&picker)));
         if role.provides() {
             provider::register_services();
+            // Follow the local mailbox: a message to a Claude agent here is
+            // pushed into its session (see push.rs).
+            push::follow();
             ctx.spawn(provider::reconcile(Rc::clone(&cfg)));
             ctx.spawn(provider::sweep_loop());
         }
@@ -374,8 +378,22 @@ impl Plugin for Agents {
         ctx.spawn(provider::handle(req, Rc::clone(&self.cfg)));
     }
 
-    /// A provider on a linked server published its roster.
+    /// A provider on a linked server published its roster, or the local
+    /// mailbox stored a message.
     fn on_service_event(&mut self, ctx: &Ctx, event: ServiceEvent) {
+        if event.topic == push::TOPIC && event.server == store::LOCAL {
+            if !self.role.provides() {
+                return;
+            }
+            let Ok(d) = event.json::<push::Delivered>() else { return };
+            let picker = Rc::clone(&self.picker);
+            let remotes = Rc::clone(&self.remotes);
+            ctx.spawn(async move {
+                push::deliver(d).await;
+                view::refresh_if_open(&picker, &remotes).await;
+            });
+            return;
+        }
         if event.topic != provider::TOPIC || event.server == store::LOCAL {
             return;
         }
@@ -437,12 +455,27 @@ impl Agents {
             }
             let remotes = Rc::clone(&self.remotes);
             let picker = Rc::clone(&self.picker);
-            let from = event
-                .scope
-                .pane
-                .map(|p| format!("%{p}"))
-                .unwrap_or_else(|| "command".into());
+            let pane = event.scope.pane;
+            let provides = self.role.provides();
             ctx.spawn(async move {
+                // Materialize durable ids so a message addressed by one
+                // resolves without a picker having opened first (enrich
+                // persists the migration and the session-file path).
+                if provides {
+                    let mut rows = store::live_agents().await.unwrap_or_default();
+                    provider::enrich_live(&mut rows).await;
+                }
+                // The sender is the agent in the calling pane when there is
+                // one, so the reader sees an agent id, not a pane number.
+                let from = match pane {
+                    Some(p) => store::live_by_pane(i64::from(p))
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|a| a.id)
+                        .unwrap_or_else(|| format!("%{p}")),
+                    None => "command".to_string(),
+                };
                 view::message_by_id(picker, remotes, &id, &from, body.trim()).await;
             });
             return;

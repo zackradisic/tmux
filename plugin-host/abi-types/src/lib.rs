@@ -313,6 +313,7 @@ pub mod imports {
     pub const FS_READ: &str = "fs_read";
     pub const FS_LIST: &str = "fs_list";
     pub const FS_WRITE_SYNC: &str = "fs_write_sync";
+    pub const CLAUDE_NOTIFY: &str = "claude_notify";
     pub const FS_READ_SYNC: &str = "fs_read_sync";
     pub const FS_RENAME: &str = "fs_rename";
     pub const FS_REMOVE: &str = "fs_remove";

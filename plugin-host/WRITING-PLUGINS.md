@@ -594,6 +594,7 @@ load-plugin -c send-keys -c run-process ... myplugin.wasm
 | `db` | the plugin's own SQLite database (`db_*` calls) |
 | `env-read` / `env-read-any` | `pane_env` (allowlisted / unrestricted) |
 | `pane-fds` | `pane_fds` (open-file paths of a pane's foreground process) |
+| `claude-notify` | `claude_notify` (one queued user turn into a Claude Code session, over its inbox socket; never granted to a pushed plugin by default) |
 | `fs-read` + `[caps.fs-read] paths` | `fs_read`/`fs_list` under named prefixes only |
 
 Denied calls return `HostError { code: E_CAP_DENIED }` — handle errors, do

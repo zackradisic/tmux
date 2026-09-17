@@ -26,7 +26,6 @@ use tmux_plugin_abi::{
 
 use crate::abi::{err, HostError};
 use crate::bridge;
-use crate::hostlog;
 use crate::intern;
 use crate::registry::ScopeId;
 use crate::state::{Delivery, EVENTS};

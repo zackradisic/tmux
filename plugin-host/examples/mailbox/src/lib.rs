@@ -23,7 +23,8 @@
 //! A stdout-returning command is the ergonomic follow-up; it needs the
 //! host to let a plugin-command write to the caller, which it cannot yet.
 //!
-//! Services: `deliver` stores a message, `boxes` reports the message count
+//! Services: `deliver` stores a message, `mark_read` marks one read once a
+//! push delivered it, `boxes` reports the message count
 //! per box, so a view (the agents picker) can badge an agent with its
 //! unread count. A mailbox plugin on any server
 //! accepts a message from any other. The gate is the ordinary one:
@@ -38,7 +39,9 @@ const TABLE: &str = "CREATE TABLE IF NOT EXISTS messages (\
     id INTEGER PRIMARY KEY AUTOINCREMENT, \
     box TEXT NOT NULL, sender TEXT NOT NULL, body TEXT NOT NULL, \
     ts INTEGER NOT NULL, read INTEGER NOT NULL DEFAULT 0)";
-/// Topic published on every delivery, so a view can track unread counts.
+/// Topic published on every delivery, carrying the stored message. The
+/// agents plugin follows it to push a message into the Claude session
+/// that owns the box; a view can use it to track unread counts.
 const TOPIC: &str = "mailbox";
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -54,6 +57,17 @@ struct BoxCount {
     box_: String,
     unread: i64,
     total: i64,
+}
+
+/// What `TOPIC` carries: one stored message and the box it went to.
+#[derive(serde::Serialize)]
+struct Delivered<'a> {
+    #[serde(rename = "box")]
+    box_: &'a str,
+    id: i64,
+    sender: &'a str,
+    body: &'a str,
+    ts: i64,
 }
 
 #[derive(serde::Serialize)]
@@ -77,8 +91,9 @@ async fn store(box_: &str, sender: &str, body: &str) -> Result<i64, HostError> {
         &[box_.into(), sender.into(), body.into(), ts.into()],
     )
     .await?;
-    let _ = service::emit_json(TOPIC, &box_);
-    Ok(r.last_insert_rowid)
+    let id = r.last_insert_rowid;
+    let _ = service::emit_json(TOPIC, &Delivered { box_, id, sender, body, ts });
+    Ok(id)
 }
 
 /// `box` or `box@server` -> (box, server); empty server means local.
@@ -211,6 +226,7 @@ impl Plugin for Mailbox {
             db_exec_sync(TABLE, &[]).map_err(|e| e.message)?;
             service::register("deliver").map_err(|e| e.message.clone())?;
             service::register("boxes").map_err(|e| e.message.clone())?;
+            service::register("mark_read").map_err(|e| e.message.clone())?;
         }
         // plugin-command is addressed by name and needs a subscription.
         ctx.subscribe(&["plugin-command"]).map_err(|e| e.message.clone())?;
@@ -284,6 +300,29 @@ impl Plugin for Mailbox {
                             })
                             .collect();
                         let _ = req.reply_json(&list);
+                    }
+                    Err(e) => {
+                        let _ = req.fail(&e.message);
+                    }
+                }
+            });
+            return;
+        }
+        if req.method == "mark_read" {
+            // A message the agents plugin pushed into its Claude is read:
+            // the reader got it without running `inbox`.
+            ctx.spawn(async move {
+                let id = req
+                    .json::<serde_json::Value>()
+                    .ok()
+                    .and_then(|v| v.get("id")?.as_i64());
+                let Some(id) = id else {
+                    let _ = req.fail("mark_read: {\"id\": n}");
+                    return;
+                };
+                match db_exec("UPDATE messages SET read = 1 WHERE id = ?1", &[id.into()]).await {
+                    Ok(_) => {
+                        let _ = req.reply(b"ok");
                     }
                     Err(e) => {
                         let _ = req.fail(&e.message);
