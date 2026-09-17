@@ -30,12 +30,15 @@ fail() {
 	exit 1
 }
 
-# One scalar from the store (empty for NULL / no row).
+# One scalar from the store (empty for NULL / no row). The store is a
+# WAL database, and a mode=ro connection cannot create the -shm file it
+# needs to read one, so open it read-write - $DB is a throwaway copy
+# under our own XDG_DATA_HOME, never the user's real store.
 q() {
 	python3 -c "import sqlite3, sys
-c = sqlite3.connect('file:$DB?mode=ro', uri=True)
-r = c.execute(sys.argv[1]).fetchone()
-print('' if r is None or r[0] is None else r[0])" "$1"
+c = sqlite3.connect(sys.argv[1])
+r = c.execute(sys.argv[2]).fetchone()
+print('' if r is None or r[0] is None else r[0])" "$DB" "$1"
 }
 
 [ -f "$WASM" ] || fail "resurrect.wasm not built"
@@ -93,8 +96,8 @@ $TMUX ls >/dev/null 2>&1 && fail "server still alive after kill"
 # With the zstd CLI at hand, inflate one frame and find its marker.
 if command -v zstd >/dev/null; then
 	python3 -c "import sqlite3, sys
-c = sqlite3.connect('file:$DB?mode=ro', uri=True)
-sys.stdout.buffer.write(c.execute('SELECT data FROM pane_blob ORDER BY pane_id LIMIT 1').fetchone()[0])" |
+c = sqlite3.connect(sys.argv[1])
+sys.stdout.buffer.write(c.execute('SELECT data FROM pane_blob ORDER BY pane_id LIMIT 1').fetchone()[0])" "$DB" |
 	    zstd -d -c | grep -aq 'MARK-' || fail "inflated frame has no marker"
 fi
 

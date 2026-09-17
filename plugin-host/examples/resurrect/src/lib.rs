@@ -32,6 +32,13 @@
 //! above the fresh prompt (cat-wrapper, tmux-resurrect style). Processes
 //! do not survive - that is the future server-handoff feature.
 //!
+//! A shadow session is the exception: the remote server still holds its
+//! real state, so only the link (host and remote session) is saved, and
+//! restore runs `remote-attach` and lets the sync bring the windows and
+//! panes back live - processes included. Capturing the shadow instead
+//! would save the remote's scrollback into every snapshot and restore
+//! it as local shells wearing the remote's name.
+//!
 //! Load (tmux.conf):
 //!   load-plugin -c capture-pane -c run-command -c fs-read -c fs-write \
 //!       -c db -c mode ~/.tmux/plugins/resurrect.wasm
@@ -74,8 +81,9 @@ const WRITE_CHUNK: usize = 256 * 1024;
 const STATE_BIN: &str = "state.bin";
 /// Container magic; the trailing digit is the format version.
 const MAGIC: &[u8; 8] = b"TMUXRES2";
-/// The metadata format stored in `snapshot.version`.
-const META_VERSION: i64 = 3;
+/// The metadata format stored in `snapshot.version`. v4 stores a linked
+/// remote session as its link alone, with no windows or panes.
+const META_VERSION: i64 = 4;
 /// Raw bytes per pane_blob row. Compressed, a chunk stays far under the
 /// 8 MiB result-set cap when it is read back one row at a time.
 const CHUNK_RAW: usize = 4 * 1024 * 1024;
@@ -132,6 +140,22 @@ struct SavedSession {
     name: String,
     current_window_index: Option<u32>,
     windows: Vec<SavedWindow>,
+    /// v4: a shadow session of a remote server. Its windows and panes
+    /// belong to the remote, so they are not saved here and `windows`
+    /// stays empty; restore re-links and the remote fills it back in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remote: Option<SavedRemote>,
+}
+
+/// What `remote-attach` needs to build the link again.
+#[derive(Serialize, Deserialize, Clone)]
+struct SavedRemote {
+    /// The host exactly as it was given to `remote-attach` - not the
+    /// session name, which has had "." and ":" replaced by "_".
+    host: String,
+    /// The remote session (`-t`). None means the remote's choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -1372,7 +1396,15 @@ fn capture_world() -> Result<Capture, String> {
                 .find(|(_, id)| Some(*id) == s.current_window)
                 .map(|(idx, _)| *idx),
             windows: Vec::new(),
+            remote: session_link(s),
         };
+        // The remote server holds this session's real state; capturing
+        // the shadow would save its panes twice over and restore them
+        // as local shells. Save the link and let the sync do the rest.
+        if saved.remote.is_some() {
+            out.sessions.push(saved);
+            continue;
+        }
         for &(index, win_id) in &s.windows {
             let Some(w) = window_by_id.get(&win_id) else { continue };
             let layout = format_expand(
@@ -1471,6 +1503,20 @@ async fn do_save(reason: Reason, retention: Retention) -> Result<Saved, String> 
     store::insert(&snap, &chunks).await?;
     store::retain(retention, now_ms() as i64).await?;
     Ok(Saved { sessions: file.sessions.len(), panes: npanes, id: Some(id) })
+}
+
+/// The link behind a shadow session, or None for a local one. The host
+/// comes from the link itself rather than the session name, which is
+/// only a label ("." and ":" in a host become "_").
+fn session_link(s: &SessionInfo) -> Option<SavedRemote> {
+    let target = OptionTarget::Session(SessionId(s.id));
+    let host = format_expand(target, c"#{session_remote_host}")
+        .ok()
+        .filter(|h| !h.is_empty())?;
+    let session = format_expand(target, c"#{remote_session}")
+        .ok()
+        .filter(|v| !v.is_empty());
+    Some(SavedRemote { host, session })
 }
 
 /// Describe one pane and capture its text. Dead panes have no text.
@@ -1854,11 +1900,31 @@ fn find_session(name: &str) -> Result<SessionInfo, String> {
         .ok_or_else(|| format!("session {name:?} did not appear"))
 }
 
+/// Re-link a shadow session. `remote-attach` makes the session itself
+/// and the sync brings back its windows and panes, so there is nothing
+/// else to rebuild - the same thing a server handoff does. It returns
+/// before the link is up, so an unreachable host leaves a disconnected
+/// session carrying the reason instead of failing the whole restore.
+async fn restore_remote(remote: &SavedRemote) -> Result<(), String> {
+    let mut cmd = String::from("remote-attach");
+    if let Some(session) = &remote.session {
+        cmd.push_str(&format!(" -t {}", q(session)));
+    }
+    cmd.push_str(&format!(" {}", q(&remote.host)));
+    run_command(&cmd).await.map_err(|e| {
+        format!("remote-attach {}: {e}", remote.host)
+    })?;
+    Ok(())
+}
+
 async fn restore_session(
     session: &SavedSession,
     root: &str,
     shell: &str,
 ) -> Result<(), String> {
+    if let Some(remote) = &session.remote {
+        return restore_remote(remote).await;
+    }
     let mut windows = session.windows.clone();
     windows.sort_by_key(|w| w.index);
     let Some(first_window) = windows.first() else {
