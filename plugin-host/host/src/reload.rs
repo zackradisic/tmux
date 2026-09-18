@@ -246,6 +246,7 @@ fn swap_instances(name: &str, migrate: bool) {
             .collect()
     });
 
+    let mut swapped = 0usize;
     for (key, scope) in keys {
         // Check out v1.
         let inst = REGISTRY.with(|r| {
@@ -324,7 +325,19 @@ fn swap_instances(name: &str, migrate: bool) {
             name,
             &format!("instance {scope} reloaded (generation {generation})"),
         );
+        swapped += 1;
         drop(old);
+    }
+    // The bridge is told about a plugin when an instance STARTS, and a
+    // reload starts none - it swaps them in place. Without this, a peer
+    // keeps running the bytes it was pushed at link time, and a peer that
+    // has no copy at all never gets one until the link is bounced.
+    //
+    // Only when something actually swapped: every instance can keep v1
+    // (a build or migration failure), and then the peers are right as
+    // they are.
+    if swapped != 0 {
+        crate::bridge::plugin_reloaded(name);
     }
 }
 

@@ -515,6 +515,34 @@ pub fn plugin_started(plugin: &str) {
     if !first {
         return;
     }
+    announce(plugin, provides);
+}
+
+/// `plugin` was reloaded: same instances, new bytes. Peers were told about
+/// the OLD module and nothing has corrected that - a reload swaps
+/// instances in place, so no instance "starts" and [`plugin_started`]
+/// never runs. Announce it the same way, so a legacy peer takes the new
+/// bytes and a revision-1 peer sees the new hash in the hello and asks
+/// for what it wants.
+///
+/// Unlike a start this does not gate on the instance count: a reload is
+/// one event for the whole plugin, and a pane-scoped plugin with sixty
+/// instances would never look like "the first" one.
+///
+/// A peer that dropped its copy while this side was down gets it back
+/// here. That is the same state as a fresh link - the peer has no copy of
+/// something we provide - and leaving it out would mean a remote whose
+/// roster stays empty until the link is bounced.
+pub fn plugin_reloaded(plugin: &str) {
+    let provides = REGISTRY
+        .with(|r| r.borrow().plugins.get(plugin).is_some_and(|d| d.role.provides()));
+    announce(plugin, provides);
+}
+
+/// Tell the peers about a local plugin: push the bytes to the links we
+/// made that cannot ask for them, re-hello everyone else, then judge the
+/// copies the peers listed and re-run the service handshake.
+fn announce(plugin: &str, provides: bool) {
     if provides {
         // Links we made and that are already up never saw this plugin: it
         // loaded after they connected. Push it now, so a plugin added to
