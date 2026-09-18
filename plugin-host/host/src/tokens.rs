@@ -54,6 +54,13 @@ pub fn allocate(plugin: &str, scope: ScopeId, generation: u64) -> u64 {
     })
 }
 
+/// Allocate a token for a job the host itself started (a download, see
+/// fetch.rs). Such a token has no instance: `plugin` is empty, and
+/// `deliver_async` hands its completion to `fetch::complete`.
+pub fn allocate_host() -> u64 {
+    allocate("", ScopeId::Server, 0)
+}
+
 /// Attach a C-side timer id to a token (after timer_start returns).
 pub fn set_timer_id(token: u64, timer_id: u64) {
     TOKENS.with(|t| {

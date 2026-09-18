@@ -300,6 +300,12 @@ impl Registry {
             return String::from("no plugins loaded\n");
         }
         let mut out = String::new();
+        if verbose {
+            let n = crate::fetch::in_flight();
+            if n > 0 {
+                let _ = writeln!(out, "{n} download{} in flight", if n == 1 { "" } else { "s" });
+            }
+        }
         let mut names: Vec<&String> = self.plugins.keys().collect();
         names.sort();
         for name in names {

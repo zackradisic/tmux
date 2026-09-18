@@ -231,6 +231,12 @@ fn deliver_async(token: u64, err: i32, v0: i64, v1: i64, data: &[u8]) {
     // token was cancelled - drop silently.
     let Some(pending) = crate::tokens::take(token) else { return };
 
+    // A job the host started itself (see tokens::allocate_host).
+    if pending.plugin.is_empty() {
+        crate::fetch::complete(token, err, v0, v1, data);
+        return;
+    }
+
     let key = REGISTRY.with(|r| {
         r.borrow()
             .by_scope

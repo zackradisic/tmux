@@ -100,6 +100,20 @@ const struct cmd_entry cmd_sync_plugins_entry = {
 	.exec = cmd_sync_plugins_exec
 };
 
+static enum cmd_retval	cmd_update_plugins_exec(struct cmd *,
+			    struct cmdq_item *);
+
+const struct cmd_entry cmd_update_plugins_entry = {
+	.name = "update-plugins",
+	.alias = NULL,
+
+	.args = { "n", 1, 1, NULL },
+	.usage = "[-n] manifest-path",
+
+	.flags = CMD_CLIENT_CANFAIL,
+	.exec = cmd_update_plugins_exec
+};
+
 static enum cmd_retval	cmd_reload_plugin_exec(struct cmd *,
 			    struct cmdq_item *);
 static enum cmd_retval	cmd_enable_plugin_exec(struct cmd *,
@@ -391,6 +405,62 @@ cmd_sync_plugins_exec(struct cmd *self, struct cmdq_item *item)
 	/* Instantiations and unloads are queued; run at the safe point. */
 	plugin_schedule_drain();
 	return (CMD_RETURN_NORMAL);
+}
+
+/* The host finished an update-plugins run: print and continue the item. */
+static void
+cmd_update_plugins_done(void *ctx, int rc, const char *text, size_t len)
+{
+	struct cmdq_item	*item = ctx;
+	struct evbuffer		*evb;
+
+	evb = evbuffer_new();
+	if (evb == NULL)
+		fatalx("out of memory");
+	evbuffer_add(evb, text, len);
+	if (rc != 0) {
+		evbuffer_add(evb, "", 1);
+		cmdq_error(item, "update-plugins: %s",
+		    (const char *)EVBUFFER_DATA(evb));
+	} else
+		cmd_plugin_print(item, evb);
+	evbuffer_free(evb);
+	plugin_schedule_drain();
+	cmdq_continue(item);
+}
+
+/*
+ * Resolve a manifest's registry again and move its lock; with -n only
+ * report what would change. The host answers later through
+ * cmd_update_plugins_done (never inside pgh_plugin_update, so the item
+ * is waiting by then), and errors before that print directly.
+ */
+static enum cmd_retval
+cmd_update_plugins_exec(struct cmd *self, struct cmdq_item *item)
+{
+	struct args	*args = cmd_get_args(self);
+	const char	*path = args_string(args, 0);
+	struct evbuffer	*evb;
+
+	if (!plugin_enabled()) {
+		cmdq_error(item, "plugin support not available");
+		return (CMD_RETURN_ERROR);
+	}
+
+	evb = evbuffer_new();
+	if (evb == NULL)
+		fatalx("out of memory");
+	if (pgh_plugin_update(path, args_has(args, 'n'), cmd_plugin_sink, evb,
+	    cmd_update_plugins_done, item) != 0) {
+		evbuffer_add(evb, "", 1);
+		cmdq_error(item, "update-plugins: %s",
+		    (const char *)EVBUFFER_DATA(evb));
+		evbuffer_free(evb);
+		return (CMD_RETURN_ERROR);
+	}
+	evbuffer_free(evb);
+	plugin_schedule_drain();
+	return (CMD_RETURN_WAIT);
 }
 
 static enum cmd_retval

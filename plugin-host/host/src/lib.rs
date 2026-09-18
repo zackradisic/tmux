@@ -9,9 +9,11 @@
 mod abi;
 mod bridge;
 mod caps;
+mod cas;
 mod dispatch;
 mod engine;
 mod events;
+mod fetch;
 mod ffi;
 mod fsbox;
 mod fsworker;
@@ -21,6 +23,7 @@ mod manifest;
 mod modes;
 mod peers;
 mod registry;
+mod release;
 mod reload;
 mod services;
 mod sqlite;
@@ -264,6 +267,70 @@ pub unsafe extern "C" fn pgh_plugin_load(
 ///
 /// # Safety
 /// `manifest_path` must be NUL-terminated; `err_sink` must be valid.
+/// `update-plugins [-n] manifest`: resolve the manifest's registry again,
+/// report what changes against the lock and, unless `check_only`, write
+/// the new lock and sync. `done` is called exactly once from a later
+/// drain with the report; it is never called before this returns. When
+/// the manifest is unusable (or the work fails before anything is
+/// queued), the error goes to `err_sink`, -1 is returned and `done` is
+/// never called.
+///
+/// # Safety
+/// `manifest_path` NUL-terminated; `err_sink` and `done` valid function
+/// pointers; `done_ctx` must stay valid until `done` runs.
+#[no_mangle]
+pub unsafe extern "C" fn pgh_plugin_update(
+    manifest_path: *const c_char,
+    check_only: c_int,
+    err_sink: pgh_sink,
+    err_ctx: *mut c_void,
+    done: ffi::pgh_done,
+    done_ctx: *mut c_void,
+) -> c_int {
+    ffi_guard!(-1, {
+        let Some(path) = cstr_lossy(manifest_path) else {
+            sink_str(err_sink, err_ctx, "null manifest path");
+            return -1;
+        };
+        // A pinned release with an unusable url can fail before any job
+        // starts; such a synchronous result becomes the -1 path so the C
+        // side never sees `done` run inside this call.
+        let armed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let early: std::rc::Rc<std::cell::RefCell<Option<String>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let ctx = done_ctx as usize;
+        let cb: fetch::Done<String> = {
+            let armed = armed.clone();
+            let early = early.clone();
+            Box::new(move |res| {
+                let (rc, text) = match res {
+                    Ok(t) => (0, t),
+                    Err(e) => (-1, e),
+                };
+                if !armed.get() {
+                    *early.borrow_mut() = Some(if rc == 0 { text } else { text });
+                    return;
+                }
+                let c = std::ffi::CString::new(text.replace('\0', " ")).unwrap_or_default();
+                unsafe { done(ctx as *mut c_void, rc, c.as_ptr(), c.as_bytes().len()) };
+            })
+        };
+        let rc = match manifest::update_plugins(&path, check_only != 0, cb) {
+            Ok(()) => 0,
+            Err(e) => {
+                sink_str(err_sink, err_ctx, &e);
+                return -1;
+            }
+        };
+        if let Some(text) = early.borrow_mut().take() {
+            sink_str(err_sink, err_ctx, &text);
+            return -1;
+        }
+        armed.set(true);
+        rc
+    })
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn pgh_plugin_sync(
     manifest_path: *const c_char,

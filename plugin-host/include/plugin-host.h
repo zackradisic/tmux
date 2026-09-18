@@ -114,6 +114,14 @@
 #define SERVICE_SERVE (1 << 22)
 
 /**
+ * Deliver a message into a running Claude Code session over its inbox
+ * socket (`claude_notify`). A queued user turn, not keystrokes. Never in
+ * the default grants for a pushed plugin: a remote must not be able to
+ * speak into this user's sessions.
+ */
+#define CLAUDE_NOTIFY (1 << 23)
+
+/**
  * Granted to every plugin without being asked for.
  */
 #define DEFAULT_CAPS ((READ_STATE | DISPLAY_MESSAGE) | TIMERS)
@@ -421,6 +429,13 @@ typedef struct {
   int (*bridge_send)(uint32_t peer, const uint8_t *data, uintptr_t len);
 } pgh_host_vtable;
 
+/**
+ * Completion callback of `pgh_plugin_update`: called exactly once, later,
+ * from a drain, with the report (`rc` 0) or an error message (`rc` -1).
+ * `text` is NUL-terminated as well as `len` bytes long.
+ */
+typedef void (*pgh_done)(void *ctx, int rc, const char *text, uintptr_t len);
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -478,7 +493,25 @@ int pgh_plugin_load(const char *name,
  *
  * # Safety
  * `manifest_path` must be NUL-terminated; `err_sink` must be valid.
+ * `update-plugins [-n] manifest`: resolve the manifest's registry again,
+ * report what changes against the lock and, unless `check_only`, write
+ * the new lock and sync. `done` is called exactly once from a later
+ * drain with the report; it is never called before this returns. When
+ * the manifest is unusable (or the work fails before anything is
+ * queued), the error goes to `err_sink`, -1 is returned and `done` is
+ * never called.
+ *
+ * # Safety
+ * `manifest_path` NUL-terminated; `err_sink` and `done` valid function
+ * pointers; `done_ctx` must stay valid until `done` runs.
  */
+int pgh_plugin_update(const char *manifest_path,
+                      int check_only,
+                      pgh_sink err_sink,
+                      void *err_ctx,
+                      pgh_done done,
+                      void *done_ctx);
+
 int pgh_plugin_sync(const char *manifest_path, pgh_sink err_sink, void *err_ctx);
 
 /**

@@ -605,6 +605,36 @@ pub fn capture_pane(
     mem.finish_out(sink, len_out)
 }
 
+/// Read a server option as text (None when the vtable is missing or the
+/// option does not exist).
+pub fn server_option(name: &str) -> Option<String> {
+    let vt = crate::vtable()?;
+    let cname = std::ffi::CString::new(name).ok()?;
+    let mut buf: Vec<u8> = Vec::new();
+    let rc = unsafe {
+        (vt.get_option)(
+            -1,
+            0,
+            cname.as_ptr(),
+            crate::abi::collect_sink,
+            &mut buf as *mut Vec<u8> as *mut std::ffi::c_void,
+        )
+    };
+    (rc == 0).then(|| String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// A status-line message from the host itself, to every attached client.
+pub fn host_message(msg: &str) {
+    let Some(vt) = crate::vtable() else { return };
+    let (Ok(plugin), Ok(cmsg)) = (std::ffi::CString::new("plugins"), std::ffi::CString::new(msg))
+    else {
+        return;
+    };
+    unsafe {
+        (vt.display_message)(-1, plugin.as_ptr(), cmsg.as_ptr());
+    }
+}
+
 pub fn display_message(
     mem: &mut GuestMem<'_, '_>,
     client: i32,

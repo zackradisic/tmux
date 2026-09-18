@@ -7007,18 +7007,84 @@ are unloaded.
 Each
 .Ql [plugins.NAME]
 table gives the plugin name and may set
-.Ql path
-(required; relative paths resolve against the manifest),
 .Ql scope ,
 .Ql role ,
 .Ql caps ,
 .Ql config
 and
-.Ql enabled .
+.Ql enabled ,
+and says where the module comes from:
+.Ql path
+(a local file; relative paths resolve against the manifest),
+.Ql url
+with
+.Ql hash
+(one file
+.Xr curl 1
+can fetch, pinned by its blake3 hash as
+.Ql blake3:<hex> ,
+with an optional
+.Ql sidecar
+url), or neither, which means the release registry.
+An optional
+.Ql [registry]
+table names it:
+.Ql repo
+(default
+.Ql zackradisic/tmux ,
+whose GitHub releases carry the bundled plugins and an
+.Pa index.toml ) ,
+.Ql release
+(a tag, or the default
+.Ql latest ) ,
+and for mirrors and tests
+.Ql base_url
+(the directory of the release files;
+.Ql {tag}
+in it stands for the tag) and
+.Ql api_url .
+What the registry entries resolved to is written to a lock file next to
+the manifest
+.Pf ( Pa plugins.lock
+for
+.Pa plugins.toml ) :
+the tag, and each plugin's version, hash and url.
+Commit the lock with the manifest; two machines with one lock run the
+same bytes.
+A sync follows the lock and never moves it, except to resolve entries
+the lock does not cover yet.
+Fetched modules are kept in a content-addressed cache under
+.Pa $XDG_DATA_HOME/tmux/plugin-cache ;
+a sync loads what is cached at once and starts downloads for the rest,
+which load when they complete (the summary counts them as
+.Ql fetching ,
+and
+.Ic plugin-log
+shows the outcome).
+Once a day, a sync of a manifest on the
+.Ql latest
+release also asks the registry whether newer plugins exist and shows a
+message when they do; the server option
+.Ic plugin-update-check
+(default on) turns this off.
 Plugins loaded interactively with
 .Ic load-plugin
 are never unloaded by a sync.
 A manifest that fails to parse or validate changes nothing.
+.It Xo Ic update-plugins
+.Op Fl n
+.Ar manifest-path
+.Xc
+Ask the manifest's registry for its release again, report what would
+change against the lock (one line per plugin, such as
+.Ql agents: 0.1.0 -> 0.2.0 ) ,
+and unless
+.Fl n
+is given write the new lock and sync the manifest, which fetches and
+live-reloads the changed plugins.
+An index built for another plugin ABI is refused; run
+.Ic update
+first.
 .It Ic plugin-bridge Ar frame
 Carry one plugin bridge frame (base64) from a control mode client to the
 plugin host.

@@ -33,6 +33,12 @@ pub const PGH_OBJ_CLIENT: c_int = 3;
 pub type pgh_sink =
     unsafe extern "C" fn(ctx: *mut c_void, ptr: *const c_char, len: usize);
 
+/// Completion callback of `pgh_plugin_update`: called exactly once, later,
+/// from a drain, with the report (`rc` 0) or an error message (`rc` -1).
+/// `text` is NUL-terminated as well as `len` bytes long.
+pub type pgh_done =
+    unsafe extern "C" fn(ctx: *mut c_void, rc: c_int, text: *const c_char, len: usize);
+
 /// Error codes for the `err` parameter of `pgh_async_complete` (the wire
 /// numbers of tmux-plugin-abi's ErrorCode; 0 = success).
 pub const PGH_ERR_BAD_REQUEST: c_int = 1;

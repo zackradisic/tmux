@@ -521,6 +521,16 @@ const struct options_table_entry options_table[] = {
 		  "attach, new-session -A or list-sessions)."
 	},
 
+	{ .name = "plugin-update-check",
+	  .type = OPTIONS_TABLE_FLAG,
+	  .scope = OPTIONS_TABLE_SERVER,
+	  .default_num = 1,
+	  .text = "Whether sync-plugins asks the release registry for "
+		  "plugin updates once a day and shows a message when "
+		  "there are any. It changes nothing on its own; "
+		  "update-plugins applies them."
+	},
+
 	{ .name = "plugin-remote-caps",
 	  .type = OPTIONS_TABLE_STRING,
 	  .scope = OPTIONS_TABLE_SERVER,

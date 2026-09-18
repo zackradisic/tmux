@@ -146,6 +146,59 @@ Rules worth knowing:
 - `show-plugins` marks managed plugins; the sync prints a summary
   (`synced ...: 1 loaded, 1 updated, 2 unchanged, 1 unloaded`).
 
+### Sources: path, url, or the release registry
+
+An entry says where its module comes from. `path` is a local file, as
+above. `url` plus `hash` is one file anywhere `curl` reaches, pinned by
+its blake3 hash (with an optional `sidecar` url). An entry with neither
+comes from the release registry: the tmux2 GitHub releases, which carry
+every bundled plugin, its sidecar and an `index.toml` with the ABI, the
+tag and each plugin's version, hash and size.
+
+```toml
+[registry]                      # optional; these are the defaults
+repo = "zackradisic/tmux"
+release = "latest"              # or a tag such as "v3.8-wasm.4"
+
+[plugins.agents]                # no path or url: from the registry
+caps = ["service-serve", "service-call", "capture-pane", "run-command"]
+
+[plugins.mailbox]
+url = "https://example.com/mailbox.wasm"
+hash = "blake3:<hex>"
+```
+
+The first sync resolves the release (the latest through the GitHub
+API, or the pinned tag), fetches `index.toml`, and writes `plugins.lock`
+next to the manifest: the tag, and each registry plugin's version, hash
+and url. Commit the lock with the manifest. Two machines with one lock
+run the same bytes. A sync follows the lock; only `update-plugins`
+moves it:
+
+```
+tmux update-plugins -n ~/.tmux/plugins.toml   # report: agents 0.1.0 -> 0.2.0
+tmux update-plugins ~/.tmux/plugins.toml      # write the lock, fetch, reload
+```
+
+Fetched modules live in a content-addressed cache
+(`$XDG_DATA_HOME/tmux/plugin-cache/cas/<blake3>.wasm`). A sync loads
+what is cached at once and starts downloads for the rest; those entries
+load when the download lands, and the summary counts them as
+`fetching`. `plugin-log` shows each fetch and its outcome. A download
+whose bytes do not match the pinned hash is dropped and logged. An
+index built for another plugin ABI is refused with a message to run
+`tmux update` first.
+
+Once a day, a sync of a manifest on `latest` asks the registry whether
+newer plugins exist and shows a status message when they do. The server
+option `plugin-update-check off` turns that off. It never changes the
+lock.
+
+For mirrors and tests, `base_url` (the release directory; `{tag}` in it
+stands for the tag) and `api_url` (a file with `{"tag_name": ...}`)
+replace the GitHub urls; `regress/plugin-registry-file.sh` runs the
+whole flow over `file://` urls.
+
 ## The `Plugin` trait
 
 ```rust
