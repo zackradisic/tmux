@@ -2162,11 +2162,15 @@ pub fn pick_render(p: &mut Picker) {
                     }
                     // "You are here": the pane the picker was opened from
                     // gets a bright left border, drawn last so it shows over
-                    // any row state (cursor, marked, or plain). Only a
-                    // local row can be the pane we sit in.
-                    let here = a.is_local()
-                        && a.live()
-                        && a.pane.map(|pn| pn as u32) == p.current_pane;
+                    // any row state (cursor, marked, or plain). The pane we
+                    // sit in is always local, so a remote row has to be
+                    // compared through its shadow: `a.pane` there is an id on
+                    // the REMOTE server and would never match (and could
+                    // collide with an unrelated local pane's id). `None`
+                    // never matches - an unmirrored remote row and a picker
+                    // opened from nowhere must not agree.
+                    let here = p.current_pane.is_some()
+                        && p.local_pane_of(a) == p.current_pane;
                     if here {
                         let g = if cur { "▸" } else { "▎" };
                         out.push_str(&format!("\x1b[{row};1H\x1b[1;94m{g}\x1b[0m"));
