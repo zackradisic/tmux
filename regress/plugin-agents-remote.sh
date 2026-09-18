@@ -11,6 +11,7 @@
 #   cargo build -p agents --target wasm32-unknown-unknown --release
 
 . ./remote-common.inc
+. ./fake-bin.inc
 
 BUILT=$(dirname "$TEST_TMUX")/plugin-host/target/wasm32-unknown-unknown/release/agents.wasm
 [ -f "$BUILT" ] || fail "agents.wasm not built"
@@ -21,9 +22,7 @@ XDG_A="$TMP/a"
 XDG_B="$TMP/b"
 BIN="$TMP/bin"
 mkdir -p "$XDG_A" "$XDG_B" "$BIN"
-# A copy of the shell under the agent's name: a symlink to sleep would
-# not do, a multi-call coreutils dispatches on argv[0] and refuses it.
-cp /bin/sh "$BIN/codex"
+fake_bin "$BIN/codex"
 
 # Deploy the wasm with its sidecar, as a release install does: the host
 # then runs it in restrictive mode, where the sidecar's requests mask the

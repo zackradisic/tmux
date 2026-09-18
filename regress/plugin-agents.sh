@@ -21,9 +21,8 @@ WASM=$(dirname "$TEST_TMUX")/plugin-host/target/wasm32-unknown-unknown/release/a
 XDG_DATA_HOME=$(mktemp -d)
 export XDG_DATA_HOME
 BIN=$(mktemp -d)
-# A copy of the shell under the agent's name: a symlink to sleep would
-# not do, a multi-call coreutils dispatches on argv[0] and refuses it.
-cp /bin/sh "$BIN/codex"
+. ./fake-bin.inc
+fake_bin "$BIN/codex"
 
 trap 'kill $CTL 2>/dev/null; $TMUX kill-server 2>/dev/null; rm -rf "$XDG_DATA_HOME" "$BIN"' EXIT
 

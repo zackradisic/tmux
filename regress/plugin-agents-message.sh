@@ -9,6 +9,7 @@
 #   cargo build -p agents -p mailbox --target wasm32-unknown-unknown --release
 
 . ./remote-common.inc
+. ./fake-bin.inc
 
 AGBUILT=$(dirname "$TEST_TMUX")/plugin-host/target/wasm32-unknown-unknown/release/agents.wasm
 MBBUILT=$(dirname "$TEST_TMUX")/plugin-host/target/wasm32-unknown-unknown/release/mailbox.wasm
@@ -19,7 +20,7 @@ MBSIDE=$(dirname "$TEST_TMUX")/plugin-host/examples/mailbox/mailbox.toml
 
 XDG_A="$TMP/a"; XDG_B="$TMP/b"; BIN="$TMP/bin"
 mkdir -p "$XDG_A" "$XDG_B" "$BIN" "$TMP/dep"
-cp /bin/sh "$BIN/codex"
+fake_bin "$BIN/codex"
 cp "$AGBUILT" "$TMP/dep/agents.wasm"; cp "$AGSIDE" "$TMP/dep/agents.toml"
 cp "$MBBUILT" "$TMP/dep/mailbox.wasm"; cp "$MBSIDE" "$TMP/dep/mailbox.toml"
 AG="$TMP/dep/agents.wasm"; MB="$TMP/dep/mailbox.wasm"

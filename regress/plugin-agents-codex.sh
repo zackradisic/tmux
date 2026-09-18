@@ -16,7 +16,8 @@ TERM=screen
 TMUX="$TEST_TMUX -Lagents-codex-test"
 WASM=$(dirname "$TEST_TMUX")/plugin-host/target/wasm32-unknown-unknown/release/agents.wasm
 XDG_DATA_HOME=$(mktemp -d); export XDG_DATA_HOME
-FAKE=$(mktemp -d); cp /bin/sh "$FAKE/node"   # a binary whose comm is "node"
+. ./fake-bin.inc
+FAKE=$(mktemp -d); fake_bin "$FAKE/node"   # a binary whose comm is "node"
 DEPLOY=$(mktemp -d); cp "$WASM" "$DEPLOY/agents.wasm"
 cat >"$DEPLOY/agents.toml" <<'TOML'
 [caps]
@@ -49,8 +50,11 @@ open_picker() {
 $TMUX kill-server 2>/dev/null
 sleep 0.5
 # A node pane whose `_` names a "codex" script (the npm launcher shape).
+# The trailing `:` keeps the shell alive: given a single simple command a
+# shell execs it and is gone, and the pane's foreground command would be
+# `sleep` rather than the interpreter name this test is about.
 $TMUX -f/dev/null new-session -d -s alpha -x 200 -y 50 \
-    "env _=/opt/agents/codex $FAKE/node -c 'sleep 600'" || fail "new-session"
+    "env _=/opt/agents/codex $FAKE/node -c 'sleep 600; :'" || fail "new-session"
 sleep 0.5
 [ "$($TMUX display-message -p -t alpha '#{pane_current_command}')" = "node" ] ||
     fail "test setup: foreground command is not node"

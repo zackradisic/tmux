@@ -20,7 +20,8 @@ WASM=$(dirname "$TEST_TMUX")/plugin-host/target/wasm32-unknown-unknown/release/a
 
 HOME=$(mktemp -d); export HOME
 XDG_DATA_HOME="$HOME/.local/share"; export XDG_DATA_HOME
-FAKE=$(mktemp -d); cp /bin/sh "$FAKE/node"
+. ./fake-bin.inc
+FAKE=$(mktemp -d); fake_bin "$FAKE/node"
 # A fake codex rollout transcript with a session_meta first line.
 TDIR="$HOME/.codex/sessions/2026/09/09"; mkdir -p "$TDIR"
 TRANSCRIPT="$TDIR/rollout-2026-09-09T07-48-00-$SID.jsonl"
@@ -78,8 +79,11 @@ open_picker() {
 
 $TMUX kill-server 2>/dev/null
 sleep 0.5
+# The trailing `:` keeps the shell alive: given a single simple command a
+# shell execs it and is gone, and the pane's foreground command would be
+# `sleep` rather than the interpreter name this test is about.
 $TMUX -f/dev/null new-session -d -s alpha -x 200 -y 50 \
-    "env _=/opt/agents/codex $FAKE/node -c 'sleep 600'" || fail "new-session"
+    "env _=/opt/agents/codex $FAKE/node -c 'sleep 600; :'" || fail "new-session"
 sleep 0.5
 PANE=$($TMUX list-panes -t alpha -F '#{pane_id}' | head -1)
 

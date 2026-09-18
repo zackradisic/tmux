@@ -31,9 +31,8 @@ BIN="$TMP/bin"
 mkdir -p "$HOME_DIR/.claude/sessions" "$BIN"
 # The macOS launcher execs a version-named binary: the pane's command is
 # "2.1.271", not "claude".
-# A copy of the shell under the agent's name: a symlink to sleep would
-# not do, a multi-call coreutils dispatches on argv[0] and refuses it.
-cp /bin/sh "$BIN/2.1.271"
+. ./fake-bin.inc
+fake_bin "$BIN/2.1.271"
 
 # The sidecar next to the wasm gives the scoped fs-read prefix
 # ~/.claude/sessions (under the server's HOME), which the session file
