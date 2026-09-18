@@ -63,9 +63,9 @@ $TMUX send-keys -t "$FORM" Escape; sleep 0.5
 # Esc in the search box only UNFOCUSES (never closes), empty or not; a
 # second Esc, back in the list, then closes.
 open_picker
-$TMUX send-keys -t "$FORM" Up; sleep 0.4    # focus the (empty) box
+$TMUX send-keys -t "$FORM" /; sleep 0.4     # focus the (empty) box
 $TMUX capture-pane -M -p -t "$FORM" | grep -q 'Esc unfocus' ||
-    fail "up did not focus the search box"
+    fail "/ did not focus the search box"
 $TMUX send-keys -t "$FORM" Escape; sleep 0.5
 [ "$(mode_of)" = "plugin-mode" ] ||
     fail "Esc on the empty box should unfocus, not close (mode '$(mode_of)')"

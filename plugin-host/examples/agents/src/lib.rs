@@ -6,9 +6,9 @@
 //! first. A live preview of the highlighted pane sits to the right.
 //! `j`/`k` move, `gg`/`G` jump to the ends, Enter jumps to the pane, `a`
 //! archives, `h` folds in the finished ones. `q` or Esc closes the picker.
-//! Press `/`, or navigate the cursor up past the top row, to focus the
-//! search box; Esc there unfocuses it and keeps the query (but an empty box
-//! closes the picker, so a stray move up never swallows a close). `J`/`K` (shift) mark rows into a selection; `a` then archives the whole
+//! Press `/` to focus the search box; Esc there unfocuses it and keeps the
+//! query. `k` at the top row stays at the top - only `/` reaches the box.
+//! `J`/`K` (shift) mark rows into a selection; `a` then archives the whole
 //! selection at once (and un-archives when every marked row is archived).
 //! Esc clears the selection before it closes the picker. `+`/`-` grow and
 //! shrink the popup; the size is remembered across opens. The popup opens

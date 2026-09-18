@@ -1192,7 +1192,7 @@ pub fn on_mode_key(
                 pick_render(p);
             }
         } else if key == k.filter {
-            // `/` focuses the search box (so does navigating up).
+            // `/` focuses the search box, and is the only way in.
             p.filtering = true;
             pick_render(p);
         } else if key == "g" {
@@ -1278,15 +1278,8 @@ pub fn on_mode_key(
             move_sel(p, 1);
             moved = true;
         } else if is_up || key == "k" {
-            if p.sel == 0 {
-                // Already at the top: bring the cursor up into the
-                // search box.
-                p.filtering = true;
-                pick_render(p);
-            } else {
-                move_sel(p, -1);
-                moved = true;
-            }
+            move_sel(p, -1);
+            moved = true;
         }
         // Landing the cursor on an unread waiting row acknowledges it
         // (only real navigation acks; opening the picker does not).
@@ -2014,7 +2007,7 @@ pub fn pick_render(p: &mut Picker) {
     } else if p.filter.is_empty() {
         // Idle, no query: a hint. The box is reached by navigating up.
         out.push_str(
-            "\x1b[2;1H  \x1b[2msearch\x1b[0m \x1b[2m(/ or ↑ to search)\x1b[0m",
+            "\x1b[2;1H  \x1b[2msearch\x1b[0m \x1b[2m(/ to search)\x1b[0m",
         );
     } else {
         // Idle, query applied: show it, no cursor.

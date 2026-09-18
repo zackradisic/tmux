@@ -84,10 +84,17 @@ keys g; keys g
 BACK=$(curline)
 [ "$BACK" = "$TOP" ] || fail "gg did not return to the top ($BOT -> $BACK, want $TOP)"
 
-# Navigate up from the top row: the search box takes focus. Its footer is
-# distinct ("Esc unfocus"), and typed text lands in the query.
+# Up at the top row stays at the top. Navigating up used to fall into the
+# search box; it does not any more, `/` is the only way in.
 keys Up
-screen | grep -q 'Esc unfocus' || fail "up at top did not focus the search box"
+screen | grep -q 'Esc unfocus' && fail "up at the top focused the search box"
+ATTOP=$(curline)
+[ "$ATTOP" = "$TOP" ] || fail "up at the top moved the cursor ($TOP -> $ATTOP)"
+
+# `/` focuses the search box. Its footer is distinct ("Esc unfocus"), and
+# typed text lands in the query.
+keys /
+screen | grep -q 'Esc unfocus' || fail "/ did not focus the search box"
 $TMUX send-keys -t "$FORM" zzqz; sleep 0.4
 screen | grep -q 'zzqz' || fail "typing did not reach the search box"
 
@@ -95,10 +102,6 @@ screen | grep -q 'zzqz' || fail "typing did not reach the search box"
 keys Escape
 screen | grep -q 'Esc unfocus' && fail "Esc did not unfocus the search box"
 screen | grep -q 'zzqz' || fail "Esc cleared the query (it should keep it)"
-
-# `/` also focuses the search box.
-keys /
-screen | grep -q 'Esc unfocus' || fail "/ did not focus the search box"
 
 cleanup
 exit 0
