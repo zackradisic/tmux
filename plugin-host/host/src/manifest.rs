@@ -271,7 +271,14 @@ impl Tally {
 }
 
 /// Upsert one entry from the module at `module` and stamp it managed.
-fn apply_entry(planned: &Planned, module: &Path) -> Result<&'static str, String> {
+/// `source` is the url (and sidecar url) a peer could fetch the same
+/// module from; None for a local file.
+fn apply_entry(
+    planned: &Planned,
+    module: &Path,
+    manifest: &Path,
+    source: Option<(&str, Option<&str>)>,
+) -> Result<&'static str, String> {
     let entry = &planned.entry;
     let desc = LoadDescriptor {
         name: planned.name.clone(),
@@ -289,6 +296,9 @@ fn apply_entry(planned: &Planned, module: &Path) -> Result<&'static str, String>
     REGISTRY.with(|r| {
         if let Some(def) = r.borrow_mut().plugins.get_mut(name) {
             def.managed = true;
+            def.manifest = Some(manifest.to_path_buf());
+            def.source_url = source.map(|(u, _)| u.to_string());
+            def.sidecar_url = source.and_then(|(_, s)| s.map(str::to_string));
         }
     });
     // Honor the enabled flag; sync is explicit user intent, so it also
@@ -305,24 +315,38 @@ fn apply_entry(planned: &Planned, module: &Path) -> Result<&'static str, String>
 /// download started.
 fn apply_remote(
     planned: &Planned,
+    manifest: &Path,
     url: &str,
     hash: &str,
     sidecar: Option<&str>,
     what: &str,
 ) -> Result<&'static str, String> {
     if crate::cas::has(hash) {
-        return apply_entry(planned, &crate::cas::path_for(hash)?);
+        return apply_entry(planned, &crate::cas::path_for(hash)?, manifest, Some((url, sidecar)));
     }
     let name = planned.name.clone();
     hostlog::info(&name, &format!("fetching {what} from {url}"));
     let owned = planned.clone();
+    let manifest = manifest.to_path_buf();
+    let source_url = url.to_string();
+    let source_sidecar = sidecar.map(str::to_string);
     fetch::fetch_module(
         url,
         hash.to_string(),
         sidecar.map(str::to_string),
-        Box::new(move |res| match res.and_then(|module| apply_entry(&owned, &module)) {
-            Ok(outcome) => hostlog::info(&name, &format!("fetched: {outcome}")),
-            Err(e) => hostlog::error(&name, &format!("fetch failed: {e}")),
+        Box::new(move |res| {
+            let applied = res.and_then(|module| {
+                apply_entry(
+                    &owned,
+                    &module,
+                    &manifest,
+                    Some((&source_url, source_sidecar.as_deref())),
+                )
+            });
+            match applied {
+                Ok(outcome) => hostlog::info(&name, &format!("fetched: {outcome}")),
+                Err(e) => hostlog::error(&name, &format!("fetch failed: {e}")),
+            }
         }),
     );
     Ok("fetching")
@@ -334,13 +358,14 @@ fn apply(plan: &Plan) -> Tally {
     let mut tally = Tally::default();
     for planned in &plan.entries {
         let outcome = match &planned.source {
-            Source::Path(wasm) => apply_entry(planned, wasm),
+            Source::Path(wasm) => apply_entry(planned, wasm, &plan.manifest_path, None),
             Source::Url { url, hash, sidecar } => {
-                apply_remote(planned, url, hash, sidecar.as_deref(), "module")
+                apply_remote(planned, &plan.manifest_path, url, hash, sidecar.as_deref(), "module")
             }
             Source::Registry => match plan.locked(&planned.name) {
                 Some(le) => apply_remote(
                     planned,
+                    &plan.manifest_path,
                     &le.url,
                     &le.blake3,
                     le.sidecar.as_deref(),
@@ -562,72 +587,147 @@ fn diff_lock(old: &Lock, new: &Lock) -> Changes {
 /// lock and sync. `done` gets the report (or the error) once, later.
 pub fn update_plugins(path: &str, check_only: bool, done: Done<String>) -> Result<(), String> {
     let plan = Plan::load(path)?;
-    let names = plan.registry_names();
-    if names.is_empty() {
-        return Err(format!("{}: no registry plugins (every entry has a path or url)", plan.manifest_path.display()));
+    if plan.registry_names().is_empty() {
+        return Err(format!(
+            "{}: no registry plugins (every entry has a path or url)",
+            plan.manifest_path.display()
+        ));
     }
     let cfg = plan.registry.clone();
+    release::resolve_index(
+        &cfg,
+        Box::new(move |res| match res {
+            Ok(index) => done(finish_update(plan, &index, check_only)),
+            Err(e) => done(Err(e)),
+        }),
+    );
+    Ok(())
+}
+
+/// The second half of an update, once the index is in: the report, and
+/// unless `check_only` the new lock and a sync.
+fn finish_update(plan: Plan, index: &release::Index, check_only: bool) -> Result<String, String> {
+    let cfg = &plan.registry;
+    let (mut fresh, missing) = Lock::from_index(cfg, index, plan.registry_names());
+    let old = plan.lock.clone().unwrap_or_default();
+    let changes = diff_lock(&old, &fresh);
+    let mut text = String::new();
+    if old.registry.tag.is_empty() {
+        let _ = writeln!(text, "release {} of {}", index.tag, cfg.describe());
+    } else if old.registry.tag != index.tag {
+        let _ = writeln!(
+            text,
+            "release {} of {} (lock had {})",
+            index.tag,
+            cfg.describe(),
+            old.registry.tag
+        );
+    } else {
+        let _ = writeln!(text, "release {} of {} (as locked)", index.tag, cfg.describe());
+    }
+    for line in &changes.lines {
+        let _ = writeln!(text, "{line}");
+    }
+    for name in &missing {
+        let _ = writeln!(text, "{name}: not in this release");
+    }
+    if changes.changed == 0 && missing.is_empty() {
+        let _ = writeln!(text, "up to date");
+    }
+    if check_only {
+        if let Some(mut lock) = plan.lock.clone() {
+            lock.registry.checked = release::now_rfc3339();
+            let _ = lock.write(&plan.lock_path);
+        }
+        return Ok(text.trim_end().to_string());
+    }
+    // Keep lock rows for plugins the new release lacks: their bytes are
+    // still what the manifest last resolved to.
+    for name in &missing {
+        if let Some(oe) = old.plugins.get(name) {
+            fresh.plugins.insert(name.clone(), oe.clone());
+        }
+    }
+    fresh.write(&plan.lock_path)?;
     let manifest = plan.manifest_path.to_string_lossy().into_owned();
+    let plan = Plan::load(&manifest)?;
+    let tally = apply(&plan);
+    let _ = write!(text, "{}", tally.report);
+    Ok(text.trim_end().to_string())
+}
+
+/// A linked server runs a newer build of `plugin` than the own copy this
+/// manifest manages. Ask the manifest's registry: when its current
+/// release carries exactly the peer's bytes (`hash`), move the lock and
+/// sync, so the two copies converge through this side's own registry,
+/// never through the peer's bytes. Otherwise say why not. The outcome
+/// goes to the plugin log.
+pub fn adopt_from_peer(manifest: &Path, plugin: &str, hash: &str, peer: &str, theirs: &str) {
+    let path = manifest.to_string_lossy().into_owned();
+    let plan = match Plan::load(&path) {
+        Ok(p) => p,
+        Err(e) => {
+            hostlog::warn(plugin, &format!("{path}: {e}"));
+            return;
+        }
+    };
+    if plan.registry.pinned().is_some() {
+        hostlog::info(
+            plugin,
+            &format!(
+                "{peer} runs {theirs}; {path} pins release {}, not updating",
+                plan.registry.release
+            ),
+        );
+        return;
+    }
+    if !plan.registry_names().iter().any(|n| n == plugin) {
+        return;
+    }
+    let cfg = plan.registry.clone();
+    let plugin = plugin.to_string();
+    let hash = hash.to_string();
+    let peer = peer.to_string();
+    let theirs = theirs.to_string();
     release::resolve_index(
         &cfg.clone(),
         Box::new(move |res| {
             let index = match res {
                 Ok(i) => i,
                 Err(e) => {
-                    done(Err(e));
+                    hostlog::warn(&plugin, &format!("{peer} runs {theirs}; registry: {e}"));
                     return;
                 }
             };
-            let (mut fresh, missing) = Lock::from_index(&cfg, &index, names);
-            let old = plan.lock.clone().unwrap_or_default();
-            let changes = diff_lock(&old, &fresh);
-            let mut text = String::new();
-            if old.registry.tag.is_empty() {
-                let _ = writeln!(text, "release {} of {}", index.tag, cfg.describe());
-            } else if old.registry.tag != index.tag {
-                let _ = writeln!(text, "release {} of {} (lock had {})", index.tag, cfg.describe(), old.registry.tag);
-            } else {
-                let _ = writeln!(text, "release {} of {} (as locked)", index.tag, cfg.describe());
-            }
-            for line in &changes.lines {
-                let _ = writeln!(text, "{line}");
-            }
-            for name in &missing {
-                let _ = writeln!(text, "{name}: not in this release");
-            }
-            if changes.changed == 0 && missing.is_empty() {
-                let _ = writeln!(text, "up to date");
-            }
-            if check_only {
-                if let Some(mut lock) = plan.lock.clone() {
-                    lock.registry.checked = release::now_rfc3339();
-                    let _ = lock.write(&plan.lock_path);
-                }
-                done(Ok(text.trim_end().to_string()));
+            let listed = index
+                .lookup(&plugin)
+                .map(|e| crate::cas::normalize_hash(&e.blake3).unwrap_or_default());
+            if listed.as_deref() != Some(hash.as_str()) {
+                hostlog::warn(
+                    &plugin,
+                    &format!(
+                        "{peer} runs {theirs}, which release {} of {} does not carry; \
+                         a dev build there, or update this side by hand",
+                        index.tag,
+                        cfg.describe()
+                    ),
+                );
                 return;
             }
-            // Keep lock rows for plugins the new release lacks: their
-            // bytes are still what the manifest last resolved to.
-            for name in &missing {
-                if let Some(oe) = old.plugins.get(name) {
-                    fresh.plugins.insert(name.clone(), oe.clone());
+            hostlog::info(
+                &plugin,
+                &format!("{peer} runs {theirs} from release {}; updating {}", index.tag, path),
+            );
+            match finish_update(plan, &index, false) {
+                Ok(report) => {
+                    for line in report.lines() {
+                        hostlog::info("host", line);
+                    }
                 }
-            }
-            if let Err(e) = fresh.write(&plan.lock_path) {
-                done(Err(e));
-                return;
-            }
-            match Plan::load(&manifest) {
-                Ok(plan) => {
-                    let tally = apply(&plan);
-                    let _ = write!(text, "{}", tally.report);
-                    done(Ok(text.trim_end().to_string()));
-                }
-                Err(e) => done(Err(e)),
+                Err(e) => hostlog::error(&plugin, &format!("update from release {}: {e}", index.tag)),
             }
         }),
     );
-    Ok(())
 }
 
 #[cfg(test)]

@@ -15,8 +15,8 @@
 //! keys, because interned ids differ between servers.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
-use std::io::Write as _;
+use std::collections::{HashMap, HashSet};
+
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -42,8 +42,13 @@ pub const COMPRESS_ABOVE: usize = 4096;
 pub const PUSH_GRACE: Duration = Duration::from_secs(10 * 60);
 /// Server option naming the capabilities a pushed plugin may get.
 pub const REMOTE_CAPS_OPTION: &str = "plugin-remote-caps";
-/// Where pushed plugins land: `<data>/tmux/plugin-cache/<peer>/<name>.wasm`.
-const CACHE_DIR: &str = "tmux/plugin-cache";
+/// Server option: may this side fetch a peer's plugin from the url its
+/// hello names instead of asking for a push?
+pub const REMOTE_FETCH_OPTION: &str = "plugin-remote-fetch";
+/// Bridge protocol revision this side speaks. 0 (a hello without the
+/// field) pushes every provider after hello; 1 lists hashes and urls in
+/// hello and pushes only on `Want`.
+pub const BRIDGE_REV: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Kind {
@@ -57,6 +62,7 @@ pub enum Kind {
     Event = 8,
     Ping = 9,
     Pong = 10,
+    Want = 11,
 }
 
 impl Kind {
@@ -72,13 +78,14 @@ impl Kind {
             8 => Kind::Event,
             9 => Kind::Ping,
             10 => Kind::Pong,
+            11 => Kind::Want,
             _ => return None,
         })
     }
 }
 
 /// One provider a host announces in `hello`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HelloPlugin {
     pub name: String,
     pub role: Role,
@@ -88,6 +95,22 @@ pub struct HelloPlugin {
     /// plugin without the export, which every side accepts.
     #[serde(default)]
     pub version: String,
+    /// blake3 of the module, hex; "" from a revision-0 peer.
+    #[serde(default)]
+    pub hash: String,
+    #[serde(default)]
+    pub size: u64,
+    /// Where the peer can fetch the same module itself (a registry or
+    /// url manifest entry on the sender), and its sidecar.
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub sidecar_url: Option<String>,
+    /// serde_json of the LoadDescriptor a push would carry (role forced
+    /// to Provider). Only for plugins the sender would push: its own,
+    /// not ones pushed to it.
+    #[serde(default)]
+    pub descriptor: Option<String>,
 }
 
 /// What this side decided about a peer's copy of one plugin.
@@ -106,6 +129,8 @@ pub enum Frame {
         plugins: Vec<HelloPlugin>,
         /// Capability names the sender grants pushed plugins.
         cap_ceiling: Vec<String>,
+        /// Bridge protocol revision ([`BRIDGE_REV`]); 0 = an old peer.
+        bridge: u32,
     },
     Push {
         /// serde_json of the LoadDescriptor (role forced to Provider,
@@ -124,6 +149,8 @@ pub enum Frame {
     Event { plugin: String, topic: String, seq: u64, payload: Vec<u8> },
     Ping { nonce: u64 },
     Pong { nonce: u64 },
+    /// The receiver of a hello asks for one listed plugin's bytes.
+    Want { name: String, hash: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -133,8 +160,9 @@ pub enum Frame {
 fn body_of(frame: &Frame) -> (Kind, Vec<u8>) {
     let mut w = FieldWriter::new();
     let kind = match frame {
-        Frame::Hello { abi, host, plugins, cap_ceiling } => {
+        Frame::Hello { abi, host, plugins, cap_ceiling, bridge } => {
             w.i64(KeyRef::Name("abi"), i64::from(*abi));
+            w.i64(KeyRef::Name("bridge"), i64::from(*bridge));
             w.str(KeyRef::Name("host"), host);
             w.json(
                 KeyRef::Name("plugins"),
@@ -197,6 +225,11 @@ fn body_of(frame: &Frame) -> (Kind, Vec<u8>) {
         Frame::Pong { nonce } => {
             w.i64(KeyRef::Name("nonce"), *nonce as i64);
             Kind::Pong
+        }
+        Frame::Want { name, hash } => {
+            w.str(KeyRef::Name("plugin"), name);
+            w.str(KeyRef::Name("hash"), hash);
+            Kind::Want
         }
     };
     (kind, w.finish())
@@ -298,6 +331,7 @@ pub fn decode(bytes: &[u8]) -> Result<Frame, String> {
     Ok(match kind {
         Kind::Hello => Frame::Hello {
             abi: f.int("abi")? as i32,
+            bridge: f.int("bridge").unwrap_or(0) as u32,
             host: f.str("host")?,
             plugins: serde_json::from_str(&f.str("plugins").unwrap_or_else(|_| "[]".into()))
                 .unwrap_or_default(),
@@ -339,6 +373,7 @@ pub fn decode(bytes: &[u8]) -> Result<Frame, String> {
         },
         Kind::Ping => Frame::Ping { nonce: f.int("nonce")? as u64 },
         Kind::Pong => Frame::Pong { nonce: f.int("nonce")? as u64 },
+        Kind::Want => Frame::Want { name: f.str("plugin")?, hash: f.str("hash")? },
     })
 }
 
@@ -356,6 +391,8 @@ pub struct Peer {
     /// We made this link (PGH_PEER_LINK); we push plugins to it.
     pub initiator: bool,
     pub hello: Option<(i32, Vec<HelloPlugin>)>,
+    /// The bridge revision the peer's hello announced (0 until then).
+    pub bridge: u32,
     pub down_since: Option<Instant>,
     /// Per plugin name: does this side talk to the peer's copy? Filled
     /// from hello with the semver rule, then refined by the plugin's own
@@ -485,13 +522,15 @@ pub fn plugin_started(plugin: &str) {
         // fresh hello, so the version handshake runs.
         let ups: Vec<u32> =
             PEERS.with(|p| p.borrow().values().filter(|x| x.up).map(|x| x.id).collect());
-        let initiators: Vec<u32> = ups
-            .iter()
-            .copied()
-            .filter(|id| id & PGH_PEER_LINK != 0)
-            .collect();
-        for peer in initiators {
-            push_one(peer, plugin);
+        let legacy: Vec<u32> = PEERS.with(|p| {
+            p.borrow()
+                .values()
+                .filter(|x| x.up && x.initiator && x.bridge == 0)
+                .map(|x| x.id)
+                .collect()
+        });
+        for peer in legacy {
+            push_one(peer, plugin, None);
         }
         if !ups.is_empty() {
             let frame = hello_frame();
@@ -742,11 +781,32 @@ fn hello_frame() -> Frame {
             .plugins
             .values()
             .filter(|d| d.state == PluginState::Running && d.role.provides())
-            .map(|d| HelloPlugin {
-                name: d.name.clone(),
-                role: d.role,
-                service_version: u32::from(providers.contains(&d.name)),
-                version: d.service_version.map(|v| v.to_string()).unwrap_or_default(),
+            .map(|d| {
+                // Only a plugin of our own is offered for the peer to
+                // acquire; one pushed to us is listed for services only.
+                let own = d.pushed_by.is_none();
+                let descriptor = own.then(|| {
+                    serde_json::to_string(&LoadDescriptor {
+                        name: d.name.clone(),
+                        path: String::new(),
+                        scope: d.scope_type,
+                        config: d.config.clone(),
+                        caps: Vec::new(),
+                        role: Role::Provider,
+                    })
+                    .unwrap_or_default()
+                });
+                HelloPlugin {
+                    name: d.name.clone(),
+                    role: d.role,
+                    service_version: u32::from(providers.contains(&d.name)),
+                    version: d.service_version.map(|v| v.to_string()).unwrap_or_default(),
+                    hash: d.hash.to_hex().to_string(),
+                    size: std::fs::metadata(&d.path).map(|m| m.len()).unwrap_or(0),
+                    url: if own { d.source_url.clone() } else { None },
+                    sidecar_url: if own { d.sidecar_url.clone() } else { None },
+                    descriptor,
+                }
             })
             .collect();
         v.sort_by(|a, b| a.name.cmp(&b.name));
@@ -757,6 +817,14 @@ fn hello_frame() -> Frame {
         host: local_hostname(),
         plugins,
         cap_ceiling: remote_caps(),
+        bridge: BRIDGE_REV,
+    }
+}
+
+fn remote_fetch_enabled() -> bool {
+    match crate::dispatch::server_option(REMOTE_FETCH_OPTION) {
+        Some(v) => v.trim() == "on" || v.trim() == "1",
+        None => true,
     }
 }
 
@@ -793,6 +861,7 @@ pub fn state(peer_id: u32, name: Option<String>, up: bool) {
                 up: false,
                 initiator,
                 hello: None,
+                bridge: 0,
                 down_since: None,
                 verdicts: HashMap::new(),
                 menu_client: None,
@@ -838,6 +907,7 @@ pub fn recv(peer_id: u32, bytes: &[u8]) {
             up: false,
             initiator,
             hello: None,
+            bridge: 0,
             down_since: None,
             verdicts: HashMap::new(),
             menu_client: None,
@@ -856,10 +926,11 @@ pub fn recv(peer_id: u32, bytes: &[u8]) {
         }
     };
     match frame {
-        Frame::Hello { abi, host, plugins, cap_ceiling } => {
-            // A peer says hello again after it loaded a pushed plugin, so
-            // its provider list stays current; only the first hello of a
-            // connection starts a push and announces the link.
+        Frame::Hello { abi, host, plugins, cap_ceiling, bridge } => {
+            // A peer says hello again after it loaded a plugin, so its
+            // provider list stays current; only the first hello of a
+            // connection announces the link. Every hello from a peer that
+            // linked to us may list plugins for this side to acquire.
             let (peer, first) = {
                 let r = PEERS.with(|p| {
                     let mut p = p.borrow_mut();
@@ -869,6 +940,7 @@ pub fn recv(peer_id: u32, bytes: &[u8]) {
                         entry.name = host.clone();
                     }
                     entry.hello = Some((abi, plugins.clone()));
+                    entry.bridge = bridge;
                     Some((entry.clone(), first))
                 });
                 let Some(r) = r else { return };
@@ -877,7 +949,7 @@ pub fn recv(peer_id: u32, bytes: &[u8]) {
             hostlog::info(
                 "bridge",
                 &format!(
-                    "hello{} from {} (abi {abi}, {} providers, caps {})",
+                    "hello{} from {} (abi {abi}, bridge {bridge}, {} providers, caps {})",
                     if first { "" } else { " again" },
                     peer.name,
                     plugins.len(),
@@ -886,23 +958,32 @@ pub fn recv(peer_id: u32, bytes: &[u8]) {
             );
             evaluate(peer_id, &plugins);
             peers_handshake(peer_id);
+            if initiator {
+                // A revision-1 peer asks for what it lacks with Want; a
+                // revision-0 peer expects every provider pushed now.
+                if first && bridge == 0 {
+                    if abi >= ABI_VERSION {
+                        push_all(peer_id);
+                    } else {
+                        hostlog::warn(
+                            "bridge",
+                            &format!(
+                                "{}: remote tmux2 is older (abi {abi} < {ABI_VERSION}); run tmux update there",
+                                peer.name
+                            ),
+                        );
+                    }
+                }
+            } else {
+                if first {
+                    if let Err(e) = send(peer_id, &hello_frame()) {
+                        hostlog::debug("bridge", &format!("hello reply: {e}"));
+                    }
+                }
+                acquire_from(peer_id, &plugins);
+            }
             if !first {
                 return;
-            }
-            if initiator {
-                if abi >= ABI_VERSION {
-                    push_all(peer_id);
-                } else {
-                    hostlog::warn(
-                        "bridge",
-                        &format!(
-                            "{}: remote tmux2 is older (abi {abi} < {ABI_VERSION}); run tmux update there",
-                            peer.name
-                        ),
-                    );
-                }
-            } else if let Err(e) = send(peer_id, &hello_frame()) {
-                hostlog::debug("bridge", &format!("hello reply: {e}"));
             }
             services::peer_up(peer_id);
             fire_link_event("link-up", &peer, &plugins);
@@ -911,6 +992,9 @@ pub fn recv(peer_id: u32, bytes: &[u8]) {
             if let Err(e) = accept_push(peer_id, &descriptor, sidecar.as_deref(), &hash, &wasm) {
                 hostlog::error("bridge", &format!("push from {peer_id}: {e}"));
             }
+        }
+        Frame::Want { name, hash } => {
+            push_one(peer_id, &name, Some(&hash));
         }
         Frame::Call { call_id, plugin, method, payload } => {
             services::incoming_call(peer_id, call_id, &plugin, &method, &payload);
@@ -949,10 +1033,10 @@ fn peers_handshake(peer: u32) {
     crate::peers::open_menu(&server, &client);
 }
 
-/// Send every local provider-capable plugin to a peer.
+/// Send every local provider-capable plugin to a revision-0 peer.
 fn push_all(peer: u32) {
     for name in local_pushable() {
-        push_one(peer, &name);
+        push_one(peer, &name, None);
     }
 }
 
@@ -973,14 +1057,18 @@ fn local_pushable() -> Vec<String> {
     })
 }
 
-/// Push one local plugin to a peer.
-fn push_one(peer: u32, name: &str) {
+/// Push one local plugin to a peer. With `want_hash` (a `Want`), the
+/// bytes go only when the local module still has that hash: a stale
+/// request is dropped, and the peer learns the current hash from the
+/// next hello.
+fn push_one(peer: u32, name: &str, want_hash: Option<&str>) {
     let def: Option<(std::path::PathBuf, LoadDescriptor)> = REGISTRY.with(|r| {
         let reg = r.borrow();
         reg.plugins.get(name).filter(|d| {
             d.state == PluginState::Running
                 && d.role.provides()
                 && d.pushed_by.is_none()
+                && want_hash.is_none_or(|h| d.hash.to_hex().as_str() == h)
         }).map(|d| {
             (
                 d.path.clone(),
@@ -995,7 +1083,12 @@ fn push_one(peer: u32, name: &str) {
             )
         })
     });
-    let Some((path, desc)) = def else { return };
+    let Some((path, desc)) = def else {
+        if want_hash.is_some() {
+            hostlog::debug("bridge", &format!("want {name} from peer {peer}: no such module now"));
+        }
+        return;
+    };
     let name = desc.name.clone();
     let wasm = match std::fs::read(&path) {
         Ok(b) => b,
@@ -1017,16 +1110,8 @@ fn push_one(peer: u32, name: &str) {
     }
 }
 
-fn sanitize(name: &str) -> String {
-    let s: String = name
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
-        .collect();
-    if s.is_empty() { "peer".into() } else { s }
-}
-
-/// Write a pushed plugin into the cache and load it as a provider with
-/// the grants `plugin-remote-caps` allows.
+/// A pushed module arrived: check the hash, store it in the cache and
+/// load it as a provider with the grants `plugin-remote-caps` allows.
 fn accept_push(
     peer: u32,
     descriptor: &str,
@@ -1034,6 +1119,19 @@ fn accept_push(
     hash: &str,
     wasm: &[u8],
 ) -> Result<(), String> {
+    let hash = crate::cas::normalize_hash(hash)?;
+    if crate::cas::hash_bytes(wasm) != hash {
+        return Err("wasm hash mismatch".into());
+    }
+    let (_, path) = crate::cas::put(wasm, sidecar)?;
+    load_pushed(peer, descriptor, path, "pushed")
+}
+
+/// Load a peer's plugin from `path` (in the cache) as a provider with the
+/// `plugin-remote-caps` grants. A plugin this server loaded itself stays
+/// as it is: its owner chose its role and grants, and it already answers
+/// the peer's calls, since hello lists it as a provider.
+fn load_pushed(peer: u32, descriptor: &str, path: std::path::PathBuf, how: &str) -> Result<(), String> {
     let mut desc: LoadDescriptor =
         serde_json::from_str(descriptor).map_err(|e| format!("descriptor: {e}"))?;
     if desc.name.is_empty()
@@ -1043,13 +1141,7 @@ fn accept_push(
     {
         return Err(format!("bad plugin name {:?}", desc.name));
     }
-    if blake3::hash(wasm).to_hex().to_string() != hash {
-        return Err(format!("{}: wasm hash mismatch", desc.name));
-    }
     let peer_name = peer_name(peer).unwrap_or_else(|| format!("peer-{peer}"));
-    // A plugin this server loaded itself (manifest or load-plugin) stays
-    // as it is: its owner chose its role and grants. It already answers
-    // the pusher's calls, since hello lists it as a provider.
     let own = REGISTRY.with(|r| {
         let reg = r.borrow();
         reg.plugins
@@ -1058,43 +1150,10 @@ fn accept_push(
             .unwrap_or(false)
     });
     if own {
-        let theirs = peer_version_of(peer, &desc.name).filter(|v| !v.is_empty());
-        let mine = local_version_of(&desc.name);
-        let note = match (&theirs, &mine) {
-            (Some(t), Some(m)) if t != m => format!(" (version {t} there, {m} here)"),
-            _ => String::new(),
-        };
-        hostlog::info(
-            "bridge",
-            &format!("{} from {peer_name}: kept the local plugin{note}", desc.name),
-        );
+        hostlog::info("bridge", &format!("{} from {peer_name}: kept the local plugin", desc.name));
         return Ok(());
     }
-    let dir = crate::fsbox::data_home()?
-        .join(CACHE_DIR)
-        .join(sanitize(&peer_name));
-    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let wasm_path = dir.join(format!("{}.wasm", desc.name));
-    let toml_path = dir.join(format!("{}.toml", desc.name));
-    // Only rewrite what changed: a re-push of the same bytes must not
-    // disturb an unchanged module (the hash is what upsert compares).
-    let same = std::fs::read(&wasm_path).map(|b| b == wasm).unwrap_or(false);
-    if !same {
-        let tmp = dir.join(format!("{}.wasm.tmp", desc.name));
-        let mut f = std::fs::File::create(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
-        f.write_all(wasm).map_err(|e| format!("{}: {e}", tmp.display()))?;
-        drop(f);
-        std::fs::rename(&tmp, &wasm_path).map_err(|e| format!("{}: {e}", wasm_path.display()))?;
-    }
-    match sidecar {
-        Some(text) => {
-            std::fs::write(&toml_path, text).map_err(|e| format!("{}: {e}", toml_path.display()))?;
-        }
-        None => {
-            let _ = std::fs::remove_file(&toml_path);
-        }
-    }
-    desc.path = wasm_path.to_string_lossy().into_owned();
+    desc.path = path.to_string_lossy().into_owned();
     desc.role = Role::Provider;
     desc.caps = remote_caps();
     let name = desc.name.clone();
@@ -1114,10 +1173,130 @@ fn accept_push(
             }
         }
     });
-    hostlog::info("bridge", &format!("{name} from {peer_name}: {outcome}"));
-    // The pusher hears about the new provider when its first instance
+    hostlog::info("bridge", &format!("{name} from {peer_name} ({how}): {outcome}"));
+    // The peer hears about the new provider when its first instance
     // starts (plugin_started), with the version that instance reports.
     Ok(())
+}
+
+thread_local! {
+    /// (plugin, hash) pairs this side already asked its registry about
+    /// because a peer runs them, so a hello storm asks once.
+    static ADOPT_ASKED: RefCell<HashSet<(String, String)>> = RefCell::new(HashSet::new());
+}
+
+/// A peer that linked to us listed its providers: get the ones we lack.
+/// For each, in order: a copy with the same hash already runs (nothing);
+/// the bytes are in the cache (load them); the hello names a url and
+/// `plugin-remote-fetch` is on (fetch, then load); else ask for a push.
+/// An own copy is never replaced; a newer one on the peer may move this
+/// side's own registry lock instead (manifest::adopt_from_peer).
+fn acquire_from(peer: u32, plugins: &[HelloPlugin]) {
+    let peer_name = peer_name(peer).unwrap_or_else(|| format!("peer-{peer}"));
+    for hp in plugins {
+        if !hp.role.provides() || hp.hash.is_empty() {
+            continue; // a revision-0 peer pushes on its own
+        }
+        let Some(descriptor) = hp.descriptor.clone() else { continue };
+        let local = REGISTRY.with(|r| {
+            r.borrow()
+                .plugins
+                .get(&hp.name)
+                .map(|d| (d.pushed_by.is_none(), d.hash.to_hex().to_string(), d.manifest.clone(), d.service_version))
+        });
+        match local {
+            Some((true, mine, manifest, my_version)) => {
+                if mine != hp.hash {
+                    own_copy_differs(&peer_name, hp, manifest, my_version);
+                }
+                continue;
+            }
+            Some((false, mine, _, _)) if mine == hp.hash => {
+                // The same pushed copy runs; the peer may be a new
+                // connection of the same server, so it owns it now (the
+                // sweep unloads a pushed plugin when its peer stays down).
+                REGISTRY.with(|r| {
+                    if let Some(d) = r.borrow_mut().plugins.get_mut(&hp.name) {
+                        d.pushed_by = Some(peer);
+                    }
+                });
+                continue;
+            }
+            _ => {}
+        }
+        let name = hp.name.clone();
+        if crate::cas::has(&hp.hash) {
+            match crate::cas::path_for(&hp.hash) {
+                Ok(path) => {
+                    hostlog::info("bridge", &format!("{name} from {peer_name}: cache hit"));
+                    if let Err(e) = load_pushed(peer, &descriptor, path, "cached") {
+                        hostlog::error("bridge", &format!("{name} from {peer_name}: {e}"));
+                    }
+                }
+                Err(e) => hostlog::error("bridge", &format!("{name}: {e}")),
+            }
+            continue;
+        }
+        if let (Some(url), true) = (&hp.url, remote_fetch_enabled()) {
+            hostlog::info("bridge", &format!("{name} from {peer_name}: fetching {url}"));
+            let hash = hp.hash.clone();
+            let want = Frame::Want { name: name.clone(), hash: hash.clone() };
+            let pn = peer_name.clone();
+            crate::fetch::fetch_module(
+                url,
+                hash,
+                hp.sidecar_url.clone(),
+                Box::new(move |res| match res {
+                    Ok(path) => {
+                        if let Err(e) = load_pushed(peer, &descriptor, path, "fetched") {
+                            hostlog::error("bridge", &format!("{name} from {pn}: {e}"));
+                        }
+                    }
+                    Err(e) => {
+                        hostlog::warn("bridge", &format!("{name} from {pn}: fetch failed ({e}); asking for a push"));
+                        let _ = send(peer, &want);
+                    }
+                }),
+            );
+            continue;
+        }
+        hostlog::info("bridge", &format!("{name} from {peer_name}: want {} bytes", hp.size));
+        if let Err(e) = send(peer, &Frame::Want { name: name.clone(), hash: hp.hash.clone() }) {
+            hostlog::warn("bridge", &format!("want {name}: {e}"));
+        }
+    }
+}
+
+/// The peer runs other bytes of a plugin this side loaded itself. Log
+/// it; when the peer's version is newer and a manifest with a registry
+/// entry manages the own copy, ask that registry once whether it carries
+/// the peer's build, and move the lock if so.
+fn own_copy_differs(
+    peer_name: &str,
+    hp: &HelloPlugin,
+    manifest: Option<std::path::PathBuf>,
+    my_version: Option<Version>,
+) {
+    let theirs = Version::parse(&hp.version);
+    let newer = match (theirs, my_version) {
+        (Some(t), Some(m)) => t > m,
+        _ => false,
+    };
+    let mine = my_version.map(|v| v.to_string()).unwrap_or_else(|| "unknown".into());
+    let theirs_text = if hp.version.is_empty() { "an unversioned build" } else { &hp.version };
+    let Some(manifest) = manifest.filter(|_| newer) else {
+        hostlog::info(
+            &hp.name,
+            &format!("{peer_name} runs {theirs_text} ({}), {mine} here; keeping the local copy", &hp.hash[..8.min(hp.hash.len())]),
+        );
+        return;
+    };
+    let key = (hp.name.clone(), hp.hash.clone());
+    let asked = ADOPT_ASKED.with(|a| !a.borrow_mut().insert(key));
+    if asked {
+        return;
+    }
+    crate::manifest::adopt_from_peer(&manifest, &hp.name, &hp.hash, peer_name, theirs_text);
 }
 
 /// Unload pushed plugins whose peer stayed down past the grace period and
@@ -1210,9 +1389,16 @@ mod tests {
                     role: Role::Both,
                     service_version: 1,
                     version: "0.1.0".into(),
+                    hash: "ab".repeat(32),
+                    size: 1234,
+                    url: Some("https://x/agents.wasm".into()),
+                    sidecar_url: None,
+                    descriptor: Some("{}".into()),
                 }],
                 cap_ceiling: vec!["db".into()],
+                bridge: BRIDGE_REV,
             },
+            Frame::Want { name: "agents".into(), hash: "ab".repeat(32) },
             Frame::Push {
                 descriptor: "{}".into(),
                 sidecar: None,
@@ -1236,6 +1422,33 @@ mod tests {
         for f in frames {
             let bytes = encode(&f);
             assert_eq!(decode(&bytes).unwrap(), f, "{f:?}");
+        }
+    }
+
+    #[test]
+    fn old_hello_reads_as_revision_zero() {
+        // A revision-0 peer sends no `bridge` field and bare plugin
+        // entries; both must decode with the new defaults.
+        let mut w = FieldWriter::new();
+        w.i64(KeyRef::Name("abi"), 1);
+        w.str(KeyRef::Name("host"), "old");
+        w.json(KeyRef::Name("plugins"), r#"[{"name":"agents","role":"both"}]"#);
+        w.json(KeyRef::Name("caps"), "[]");
+        let body = w.finish();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.push(Kind::Hello as u8);
+        bytes.push(0);
+        bytes.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&body);
+        match decode(&bytes).unwrap() {
+            Frame::Hello { bridge, plugins, .. } => {
+                assert_eq!(bridge, 0);
+                assert_eq!(plugins.len(), 1);
+                assert_eq!(plugins[0].hash, "");
+                assert_eq!(plugins[0].descriptor, None);
+            }
+            other => panic!("{other:?}"),
         }
     }
 

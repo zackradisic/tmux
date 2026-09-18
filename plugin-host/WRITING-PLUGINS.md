@@ -374,14 +374,23 @@ its link state, its version of this plugin and whether this side accepts
 it. `plugin-host/examples/services-probe` is the smallest complete
 provider/view pair.
 
-Over a link the local server pushes every plugin with role `both` or
-`provider` to the remote, which loads it as a provider with the grants
-its `plugin-remote-caps` server option allows (everything but
-`run-process`, `fs-write`, `fs-read-any` and `fs-write-any` by default).
+Over a link the local server offers every plugin with role `both` or
+`provider` to the remote, with its hash. The remote loads what it lacks
+as a provider with the grants its `plugin-remote-caps` server option
+allows (everything but `run-process`, `fs-write`, `fs-read-any` and
+`fs-write-any` by default). It takes the bytes from its own plugin cache
+when it has them, fetches them itself when the plugin came from a `url`
+or registry manifest entry on the local side (server option
+`plugin-remote-fetch`, on by default), and asks for a push otherwise. A
+reconnect with the same build on both sides moves nothing.
 A plugin the remote loads itself is never replaced by a push: the remote
-keeps its copy, role and grants, and the pusher talks to that copy. So a
-machine that is both a workstation and a remote keeps its own UI; give
-its own copies `service-serve`, or they cannot forward to the pusher.
+keeps its copy, role and grants, and the pusher talks to that copy. When
+the local copy is newer and a manifest with a registry entry manages the
+remote's copy, the remote asks its own registry once and, if the current
+release carries the local build, moves its lock and reloads; otherwise
+`plugin-log` says which version runs where. So a machine that is both a
+workstation and a remote keeps its own UI; give its own copies
+`service-serve`, or they cannot forward to the pusher.
 Two servers on one machine share a plugin's `store.db` when they share
 `XDG_DATA_HOME`; the regress tests give the second server its own.
 

@@ -62,10 +62,12 @@ wait_for 10 "[ \"\$($AOPT @probe_down_fakehost)\" = 1 ]" || fail "link-down even
 wait_for 10 "[ \"\$($AOPT @probe_err_fakehost)\" = E_UNREACHABLE ]" ||
     fail "fail-fast: $($AOPT @probe_err_fakehost)"
 
-# Link up again: the second hello re-pushes (unchanged), echo answers,
-# the tick subscription is sent again and ticks resume.
-wait_for 15 "[ \"\$($AOPT @probe_up_fakehost)\" = 2 ]" || fail "second link-up"
+# Link up again: B keeps its copy (same hash, nothing moves), the echo
+# at link-up answers, the tick subscription is sent again and ticks
+# resume. Clear the echo before the link returns: with no push in the
+# way the reply lands right after link-up.
 $TMUX set -s @probe_echo_fakehost ""
+wait_for 15 "[ \"\$($AOPT @probe_up_fakehost)\" = 2 ]" || fail "second link-up"
 wait_for 10 "[ \"\$($AOPT @probe_echo_fakehost)\" = provider:ping ]" ||
     fail "echo after reconnect"
 t2=$($AOPT @probe_tick_fakehost)
@@ -73,5 +75,5 @@ wait_for 10 "[ \"\$($AOPT @probe_tick_fakehost)\" -gt $t2 ]" ||
     fail "ticks after reconnect"
 
 # B keeps its own store and cache under its data directory.
-[ -f "$XDG_B/tmux/plugin-cache/"*"/services_probe.wasm" ] || fail "no cached wasm on B"
+ls "$XDG_B/tmux/plugin-cache/cas/"*.wasm >/dev/null 2>&1 || fail "no cached wasm on B"
 exit 0

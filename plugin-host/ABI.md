@@ -526,6 +526,25 @@ it, so the pusher talks to it. Pushed plugins are unloaded ten minutes
 after their peer stays down, so a flapping link does not thrash. Frames
 above 4 KiB are zstd-compressed.
 
+Pushes are pull-driven (bridge revision 1, the `bridge` field of hello).
+Each hello entry of a plugin the sender owns carries its blake3 `hash`,
+`size`, the `descriptor` a push would carry, and, for a plugin that came
+from a manifest `url` or registry entry, the `url` (and `sidecar_url`)
+the same bytes can be fetched from. The receiver decides per plugin: a
+copy with that hash already runs (nothing; a reconnected peer takes
+ownership of it), the bytes are in its content-addressed cache
+(`plugin-cache/cas/<hash>.wasm`; load them), the hello names a url and
+its `plugin-remote-fetch` option is on (fetch with curl, check the hash,
+load), else `Want {plugin, hash}` (kind 11), which the sender answers
+with one `Push` if its module still has that hash. A revision-0 peer
+(no `bridge` field) gets every provider pushed after hello, as before.
+When the receiver owns a copy with other bytes and the peer's version is
+newer, and a manifest with a registry entry manages that copy, the
+receiver asks its own registry once whether the current release carries
+the peer's hash and, if so, moves its lock and syncs
+(`manifest::adopt_from_peer`); bytes for an own copy never come from
+the peer.
+
 Each hello entry carries the plugin's *version*
 (`pgh_service_version`, `major.minor.patch`: the crate version unless the
 plugin overrides it). When a hello names a plugin

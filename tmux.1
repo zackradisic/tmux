@@ -6921,15 +6921,23 @@ or
 .Ql provider .
 When
 .Ic remote-attach
-links a remote server, the local server pushes every plugin with role
+links a remote server, the local server offers every plugin with role
 .Ql both
 or
 .Ql provider
-to it; the remote loads the plugin as a provider with the capabilities its
+to it, with each module's hash; the remote loads what it lacks as a
+provider with the capabilities its
 .Ic plugin-remote-caps
 option allows.
-A plugin the remote loaded itself is kept as it is; the push does not
-replace it.
+It takes the bytes from its own plugin cache when it has them, fetches
+them itself when the local plugin came from a url or registry manifest
+entry and its
+.Ic plugin-remote-fetch
+option is on (the default), and asks the local server for a push
+otherwise.
+A plugin the remote loaded itself is kept as it is; a newer copy on the
+local side may make the remote update through its own manifest's
+registry, never from the pushed bytes.
 Each plugin reports a version (its crate version); two copies of a plugin on linked
 servers talk only when each accepts the other's version, and a call to a
 rejected copy fails with

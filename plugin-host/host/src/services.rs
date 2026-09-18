@@ -330,9 +330,11 @@ pub fn call(
     }
 
     let Some(peer) = bridge::peer_by_name(server) else {
+        crate::hostlog::debug(&caller.plugin, &format!("call {method} on {server}: no such server"));
         return Err(err(ErrorCode::Unreachable, format!("no server {server}")));
     };
     if !bridge::peer_is_up(peer) {
+        crate::hostlog::debug(&caller.plugin, &format!("call {method} on {server}: not connected"));
         return Err(err(
             ErrorCode::Unreachable,
             format!("server {server} is not connected"),
@@ -352,8 +354,10 @@ pub fn call(
             },
         );
     });
+    crate::hostlog::debug(&caller.plugin, &format!("call {plugin}.{method} on {server} (peer {peer}, token {token})"));
     if let Err(e) = bridge::send_call(peer, token, plugin, method, &payload) {
         SERVICES.with(|s| s.borrow_mut().calls.remove(&token));
+        crate::hostlog::debug(&caller.plugin, &format!("call {method} on {server}: send failed: {e}"));
         return Err(err(ErrorCode::Unreachable, e));
     }
     Ok(())
@@ -522,6 +526,7 @@ pub fn incoming_call(
     method: &str,
     payload: &[u8],
 ) {
+    crate::hostlog::debug(plugin, &format!("incoming call {method} from peer {peer} (call {remote_call_id})"));
     if !bridge::peer_accepts(peer, plugin) {
         let _ = bridge::send_reply(
             peer,
@@ -590,11 +595,18 @@ pub fn incoming_call(
 /// A peer answered a call one of our instances made.
 pub fn incoming_reply(peer: u32, token: u64, page: u32, flags: u32, payload: &[u8]) {
     let call = SERVICES.with(|s| s.borrow().calls.get(&token).cloned());
-    let Some(call) = call else { return };
+    let Some(call) = call else {
+        crate::hostlog::debug("services", &format!("reply from peer {peer} for unknown call {token}"));
+        return;
+    };
     match call.callee {
         Callee::Remote { peer: p } if p == peer => {}
-        _ => return,
+        _ => {
+            crate::hostlog::debug("services", &format!("reply from peer {peer} for call {token} made to another peer"));
+            return;
+        }
     }
+    crate::hostlog::debug("services", &format!("reply from peer {peer} for call {token}: flags {flags}, {} bytes", payload.len()));
     let error = flags & service_flags::ERROR != 0;
     let more = !error && flags & service_flags::MORE != 0;
     if error {

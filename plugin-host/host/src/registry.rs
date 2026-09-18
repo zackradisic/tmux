@@ -82,6 +82,12 @@ pub struct PluginDef {
     /// The service version its first instance reported (see abi-types
     /// Version); None for a plugin without the export.
     pub service_version: Option<tmux_plugin_abi::Version>,
+    /// Where a peer can fetch this module itself (a registry or url
+    /// manifest entry), and its sidecar; None for a local file.
+    pub source_url: Option<String>,
+    pub sidecar_url: Option<String>,
+    /// The manifest that manages this plugin, when one does.
+    pub manifest: Option<PathBuf>,
 }
 
 pub struct Instance {
@@ -196,6 +202,9 @@ impl Registry {
                 managed: false,
                 pushed_by: None,
                 service_version: None,
+                source_url: None,
+                sidecar_url: None,
+                manifest: None,
             },
         );
         hostlog::info(
@@ -322,6 +331,13 @@ impl Registry {
                     slot.as_ref().is_some_and(|i| &i.plugin == name)
                 })
                 .count();
+            let pushed = match def.pushed_by {
+                Some(peer) => format!(
+                    "pushed by {}, ",
+                    crate::bridge::peer_name(peer).unwrap_or_else(|| format!("peer {peer}"))
+                ),
+                None => String::new(),
+            };
             let _ = writeln!(
                 out,
                 "{}: version {}, scope {}, role {}, {}, {} instance{}, {}{}path {}",
@@ -334,10 +350,17 @@ impl Registry {
                 ninstances,
                 if ninstances == 1 { "" } else { "s" },
                 if def.managed { "managed, " } else { "" },
-                if def.pushed_by.is_some() { "pushed, " } else { "" },
+                pushed,
                 def.path.display()
             );
             if verbose {
+                let _ = writeln!(out, "  hash: {}", def.hash.to_hex());
+                if let Some(url) = &def.source_url {
+                    let _ = writeln!(out, "  from: {url}");
+                }
+                if let Some(m) = &def.manifest {
+                    let _ = writeln!(out, "  manifest: {}", m.display());
+                }
                 let _ = writeln!(out, "  caps: {}", def.caps.describe());
                 for (_, slot) in self.instances.iter() {
                     let Some(inst) = slot.as_ref() else { continue };

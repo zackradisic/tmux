@@ -531,6 +531,16 @@ const struct options_table_entry options_table[] = {
 		  "update-plugins applies them."
 	},
 
+	{ .name = "plugin-remote-fetch",
+	  .type = OPTIONS_TABLE_FLAG,
+	  .scope = OPTIONS_TABLE_SERVER,
+	  .default_num = 1,
+	  .text = "Whether a plugin a linked server offers may be fetched "
+		  "from the url its hello names (a release or a url manifest "
+		  "entry there) instead of being pushed over the link. The "
+		  "bytes are checked against the announced hash either way."
+	},
+
 	{ .name = "plugin-remote-caps",
 	  .type = OPTIONS_TABLE_STRING,
 	  .scope = OPTIONS_TABLE_SERVER,
