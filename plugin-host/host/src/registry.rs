@@ -318,8 +318,10 @@ impl Registry {
                 .count();
             let _ = writeln!(
                 out,
-                "{}: scope {}, role {}, {}, {} instance{}, {}{}path {}",
+                "{}: version {}, scope {}, role {}, {}, {} instance{}, {}{}path {}",
                 def.name,
+                def.service_version
+                    .map_or_else(|| "unknown".to_string(), |v| v.to_string()),
                 def.scope_type,
                 def.role,
                 state,

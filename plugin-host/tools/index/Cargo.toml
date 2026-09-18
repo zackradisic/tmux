@@ -1,0 +1,15 @@
+[package]
+name = "plugin-index"
+version = "0.1.0"
+edition.workspace = true
+description = "Write the index.toml of a directory of built tmux plugins"
+
+[[bin]]
+name = "plugin-index"
+path = "src/main.rs"
+
+[dependencies]
+blake3 = "1.8.5"
+serde = { version = "1", features = ["derive"] }
+toml = "1.1.2"
+tmux-plugin-abi = { path = "../../abi-types" }

@@ -6930,7 +6930,7 @@ to it; the remote loads the plugin as a provider with the capabilities its
 option allows.
 A plugin the remote loaded itself is kept as it is; the push does not
 replace it.
-Each plugin reports a service version; two copies of a plugin on linked
+Each plugin reports a version (its crate version); two copies of a plugin on linked
 servers talk only when each accepts the other's version, and a call to a
 rejected copy fails with
 .Ql E_VERSION .

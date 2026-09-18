@@ -269,15 +269,21 @@ a plugin that is loaded but has not registered the method yet (its init
 is still queued, as right after a push) waits up to ten seconds; a call
 nobody answers fails after thirty seconds with `E_TIMEOUT`.
 
-### Service versions
+### Plugin versions
 
 The two halves of a plugin can run different builds: a workstation with a
-dev build linked to a host that runs a release. `Plugin::SERVICE_VERSION`
-(default `"0.1.0"`) names the shape of the plugin's methods and topics as
-`major.minor.patch`. Bump it when a request, a reply or a topic payload
-changes in a way an old copy cannot read; a field added with
-`#[serde(default)]` needs no bump. Every bundled plugin sits at `0.1.0`
-while the protocol settles.
+dev build linked to a host that runs a release. A plugin has one version:
+the `version` in its `Cargo.toml`, which `tmux_plugin!` exports as
+`major.minor.patch`. It names the shape of the plugin's methods and
+topics. Bump the minor (while the major is 0) when a request, a reply or
+a topic payload changes in a way an old copy cannot read; a field added
+with `#[serde(default)]` needs no bump. Bump the patch for anything
+else. `show-plugins` prints the version, and so does the release
+`index.toml`. Every bundled plugin sits at `0.1.0` while the protocol
+settles.
+
+`Plugin::SERVICE_VERSION` (default empty) overrides the crate version
+for the wire only; set it when a rewrite keeps the protocol.
 
 Two hooks decide whether copies talk; both default to the semver rule
 (same major, and the same minor while the major is 0):

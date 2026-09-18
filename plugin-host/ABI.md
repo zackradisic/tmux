@@ -226,7 +226,7 @@ Optional:
 | `pgh_snapshot` | `(out_ptr_ptr: i32, out_len_ptr: i32) -> i32` | 0 = wrote {ptr,len}; nonzero = stateless |
 | `pgh_migrate` | `(old_version: i32, ptr: i32, len: i32) -> i32` | nonzero refuses (old code keeps running) |
 | `pgh_on_config_changed` | `(ptr: i32, len: i32) -> i32` | 1 = absorbed, 0 = restart me |
-| `pgh_service_version` | `() -> i64` | the plugin's service version, `major << 32 \| minor << 16 \| patch`; absent = unversioned |
+| `pgh_service_version` | `() -> i64` | the plugin's version (the crate version unless `SERVICE_VERSION` overrides it), `major << 32 \| minor << 16 \| patch`; absent = unversioned |
 | `pgh_service_accept` | `(ptr: i32, len: i32) -> i32` | field block `{server, version, role}` of a peer's copy of this plugin; 1 = talk to it, 0 = reject; absent = the semver rule |
 
 Snapshot/migrate bytes are opaque to the host (the SDK uses JSON there;
@@ -526,8 +526,9 @@ it, so the pusher talks to it. Pushed plugins are unloaded ten minutes
 after their peer stays down, so a flapping link does not thrash. Frames
 above 4 KiB are zstd-compressed.
 
-Each hello entry carries the plugin's *service version*
-(`pgh_service_version`, `major.minor.patch`). When a hello names a plugin
+Each hello entry carries the plugin's *version*
+(`pgh_service_version`, `major.minor.patch`: the crate version unless the
+plugin overrides it). When a hello names a plugin
 this side also runs, the host decides whether the two copies talk: the
 semver rule first (same major, and the same minor while the major is 0),
 then the plugin's own `pgh_service_accept` if it has one. A rejected

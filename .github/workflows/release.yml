@@ -36,26 +36,53 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
+      # The wasm-release profile strips DWARF: agents.wasm goes from 11 MB
+      # to about 0.6 MB. plugin-index writes index.toml (abi, tag, and the
+      # version, blake3 and size of every plugin) so a server can fetch one
+      # plugin and check it, and refuse an index built for another ABI.
       - name: build
         working-directory: plugin-host
         run: |
-          cargo build --release --target wasm32-unknown-unknown \
+          cargo build --profile wasm-release --target wasm32-unknown-unknown \
             -p notify-toast -p resurrect -p session_creator \
             -p git-status -p cron -p agents -p mailbox
+          cargo build --release -p plugin-index
       - name: bundle
+        env:
+          TAG_INPUT: ${{ inputs.tag }}
         run: |
           out=dist/plugins
           mkdir -p "$out"
-          cp plugin-host/target/wasm32-unknown-unknown/release/*.wasm "$out/"
+          cp plugin-host/target/wasm32-unknown-unknown/wasm-release/*.wasm "$out/"
           for f in plugin-host/examples/*/*.toml; do
             case "$f" in *Cargo.toml) ;; *) cp "$f" "$out/";; esac
           done
+          # The same tag rule as the publish job below.
+          if [ "${{ github.event_name }}" = "push" ]; then
+            tag="${GITHUB_REF#refs/tags/}"
+          elif [ -n "$TAG_INPUT" ]; then
+            tag="$TAG_INPUT"
+          else
+            tag="wasm-plugins-$(date -u +%Y%m%d)-${GITHUB_SHA::8}"
+          fi
+          # --version <stem>=<x.y.z> per plugin crate: the wasm file stem is
+          # the crate name with - replaced by _.
+          versions=$(cd plugin-host && cargo metadata --format-version 1 --no-deps |
+            python3 -c 'import json,sys
+          for p in json.load(sys.stdin)["packages"]:
+              if "/examples/" in p["manifest_path"]:
+                  print("--version", p["name"].replace("-", "_") + "=" + p["version"])')
+          # shellcheck disable=SC2086
+          plugin-host/target/release/plugin-index --dir "$out" --tag "$tag" $versions
+          cat "$out/index.toml"
           ls -la "$out"
-          tar -C dist -czf tmux2-plugins.tar.gz plugins
+          tar -C dist -czf dist/tmux2-plugins.tar.gz plugins
+      # dist/ is the common root, so the artifact (and artifacts/ in the
+      # publish job) holds tmux2-plugins.tar.gz next to plugins/.
       - uses: actions/upload-artifact@v4
         with:
           name: tmux2-plugins
-          path: tmux2-plugins.tar.gz
+          path: dist/**
 
   binary:
     name: tmux ${{ matrix.name }}
@@ -138,6 +165,8 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      # Keep this rule identical to the one in the plugins job: index.toml
+      # inside the bundle carries the same tag.
       - name: tag
         id: tag
         run: |
@@ -172,10 +201,13 @@ jobs:
           Runtime deps on Linux: libevent 2.1 and ncurses (tinfo), both present wherever a stock tmux is.
           EOF
           )
-          ls -la artifacts
+          ls -la artifacts artifacts/plugins
+          # The tarballs and the install script, plus every plugin file
+          # and index.toml on their own so a server can fetch one plugin.
           gh release create "$tag" $flags \
             --target "$GITHUB_SHA" \
             --title "tmux2 $tag" \
             --notes "$notes" \
             artifacts/*.tar.gz \
+            artifacts/plugins/* \
             scripts/install-tmux2.sh

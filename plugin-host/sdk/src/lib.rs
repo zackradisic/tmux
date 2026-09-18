@@ -101,24 +101,39 @@ pub mod __internal {
 /// A tmux plugin. One value of the implementing type exists per plugin
 /// instance (per pane/window/session/server, depending on the declared
 /// scope); it is created in `init` and dropped at unload.
-pub trait Plugin: Sized + 'static {
+/// The version of the crate a plugin is built from, as `major.minor.patch`.
+/// `tmux_plugin!` implements this from `CARGO_PKG_VERSION`; it is the
+/// plugin's version unless [`Plugin::SERVICE_VERSION`] overrides it.
+pub trait CrateVersion {
+    const CRATE_VERSION: &'static str;
+}
+
+pub trait Plugin: Sized + 'static + CrateVersion {
     const NAME: &'static str;
 
     /// Bump when the shape returned by [`Plugin::snapshot`] changes;
     /// [`Plugin::restore`] receives the old version on code reload.
     const STATE_VERSION: i32 = 1;
 
-    /// The service version of this plugin's methods and topics, as
-    /// `major.minor.patch`. Bump it when a request, a reply or a topic
-    /// payload changes shape in a way an old copy cannot read. Two
-    /// copies on linked servers talk only when both accept the other's
-    /// version (see [`Plugin::accepts_provider`] and
-    /// [`Plugin::accepts_view`]).
-    const SERVICE_VERSION: &'static str = "0.1.0";
+    /// The version of this plugin's methods and topics, as
+    /// `major.minor.patch`. Empty (the default) means the crate version
+    /// from `Cargo.toml`, which `tmux_plugin!` supplies; set it only to
+    /// decouple the wire version from the crate version. Bump the crate
+    /// version when a request, a reply or a topic payload changes shape
+    /// in a way an old copy cannot read. Two copies on linked servers
+    /// talk only when both accept the other's version (see
+    /// [`Plugin::accepts_provider`] and [`Plugin::accepts_view`]).
+    const SERVICE_VERSION: &'static str = "";
 
-    /// [`Plugin::SERVICE_VERSION`] parsed; a bad string reads as 0.0.0.
+    /// The effective version: [`Plugin::SERVICE_VERSION`], or the crate
+    /// version when that is empty. A bad string reads as 0.0.0.
     fn service_version() -> Version {
-        Version::parse(Self::SERVICE_VERSION).unwrap_or_default()
+        let text = if Self::SERVICE_VERSION.is_empty() {
+            Self::CRATE_VERSION
+        } else {
+            Self::SERVICE_VERSION
+        };
+        Version::parse(text).unwrap_or_default()
     }
 
     /// May the view half here talk to the provider copy of this plugin
@@ -253,6 +268,10 @@ impl Default for Ctx {
 #[macro_export]
 macro_rules! tmux_plugin {
     ($ty:ty) => {
+        impl $crate::CrateVersion for $ty {
+            const CRATE_VERSION: &'static str = env!("CARGO_PKG_VERSION");
+        }
+
         mod __tmux_plugin_glue {
             use super::*;
             use $crate::__internal::{event, executor, runtime, serde_json};

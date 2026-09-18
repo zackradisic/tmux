@@ -28,7 +28,7 @@ instances() {
 	$TMUX show-plugins | sed -n "s/^${1:-ticker}: .*, \([0-9]*\) instance.*/\1/p"
 }
 state() {
-	$TMUX show-plugins | sed -n "s/^${1:-ticker}: scope [a-z]*, role [a-z]*, \([a-z]*\).*/\1/p"
+	$TMUX show-plugins | sed -n "s/^${1:-ticker}: version [^,]*, scope [a-z]*, role [a-z]*, \([a-z]*\).*/\1/p"
 }
 panes() {
 	$TMUX list-panes -a | wc -l | tr -d ' '

@@ -15,6 +15,7 @@ members = [
     "examples/agents",
     "examples/mailbox",
     "examples/services-probe",
+    "tools/index",
 ]
 default-members = ["host"]
 
@@ -31,3 +32,13 @@ debug = true
 # panic=unwind is deliberate: every pgh_* export catches unwinds (ffi_guard!)
 # and poisons the plugin subsystem instead of killing the user's tmux server.
 panic = "unwind"
+
+# Release builds of the wasm plugins: no DWARF, symbols stripped. The
+# workspace release profile keeps debug info for the host staticlib,
+# which would make every plugin several megabytes larger than needed.
+[profile.wasm-release]
+inherits = "release"
+opt-level = "s"
+debug = false
+strip = true
+lto = "fat"
