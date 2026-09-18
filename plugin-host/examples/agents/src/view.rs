@@ -242,7 +242,10 @@ pub async fn fetch_remotes_on_open(
     remotes: Rc<RefCell<Remotes>>,
     history: bool,
 ) {
-    {
+    // Decide under the borrow, act after it. start_spinner takes the
+    // same RefCell, so calling it from inside this block panics with
+    // "already borrowed" - which disabled the plugin after three opens.
+    let outstanding = {
         let mut r = remotes.borrow_mut();
         let now = now_ms();
         // A round outstanding longer than any call the host would still
@@ -250,12 +253,17 @@ pub async fn fetch_remotes_on_open(
         if r.open_round_since
             .is_some_and(|t| now.saturating_sub(t) < FETCH_STALE_MS)
         {
-            // Still show the spinner: the outstanding round owns the
-            // servers this open would have asked for.
-            start_spinner(&picker, &remotes);
-            return;
+            true
+        } else {
+            r.open_round_since = Some(now);
+            false
         }
-        r.open_round_since = Some(now);
+    };
+    if outstanding {
+        // Still show the spinner: the outstanding round owns the
+        // servers this open would have asked for.
+        start_spinner(&picker, &remotes);
+        return;
     }
     fetch_all(Rc::clone(&picker), Rc::clone(&remotes), history, OPEN_FRESH_MS).await;
     remotes.borrow_mut().open_round_since = None;
