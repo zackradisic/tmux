@@ -2669,6 +2669,18 @@ format_cb_remote_host(struct format_tree *ft)
 	return (NULL);
 }
 
+/* Callback for remote_session. */
+static void *
+format_cb_remote_session(struct format_tree *ft)
+{
+	struct remote_link	*rl = format_remote_link(ft);
+	const char		*name;
+
+	if (rl != NULL && (name = remote_link_remote_session(rl)) != NULL)
+		return (xstrdup(name));
+	return (NULL);
+}
+
 /* Callback for remote_connected. */
 static void *
 format_cb_remote_connected(struct format_tree *ft)
@@ -3917,6 +3929,9 @@ static const struct format_table_entry format_table[] = {
 	},
 	{ "remote_host", FORMAT_TABLE_STRING,
 	  format_cb_remote_host
+	},
+	{ "remote_session", FORMAT_TABLE_STRING,
+	  format_cb_remote_session
 	},
 	{ "remote_state", FORMAT_TABLE_STRING,
 	  format_cb_remote_state
