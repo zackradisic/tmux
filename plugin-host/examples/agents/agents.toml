@@ -29,6 +29,11 @@ requests = [
   "service-serve",
   "service-call",
   "claude-notify",
+  # The picker's interrupt key: one C-c into the agent's pane. For a
+  # remote agent the key goes to its shadow pane, whose fd is one end of
+  # the link's socketpair, so it reaches the real agent. Killing a pane
+  # needs nothing extra - that goes through run-command.
+  "send-keys",
 ]
 
 # The services this plugin calls: its own provider on any server, and the

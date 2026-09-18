@@ -128,6 +128,8 @@ struct AgentsConfig {
     pick_close: Option<String>,
     pick_content: Option<String>,
     pick_rename: Option<String>,
+    pick_interrupt: Option<String>,
+    pick_kill: Option<String>,
 }
 
 #[derive(Clone)]
@@ -139,6 +141,10 @@ pub(crate) struct PickKeys {
     pub close: String,
     pub content: String,
     pub rename: String,
+    /// Send an interrupt (C-c) to the agent, leaving the pane alone.
+    pub interrupt: String,
+    /// Kill the agent's pane outright. Asks first.
+    pub kill: String,
 }
 
 impl Default for PickKeys {
@@ -151,6 +157,8 @@ impl Default for PickKeys {
             close: "Escape".into(),
             content: "C-f".into(),
             rename: "r".into(),
+            interrupt: "x".into(),
+            kill: "X".into(),
         }
     }
 }
@@ -205,6 +213,8 @@ impl Config {
                 close: pick(&c.pick_close, d.close),
                 content: pick(&c.pick_content, d.content),
                 rename: pick(&c.pick_rename, d.rename),
+                interrupt: pick(&c.pick_interrupt, d.interrupt),
+                kill: pick(&c.pick_kill, d.kill),
             },
         })
     }

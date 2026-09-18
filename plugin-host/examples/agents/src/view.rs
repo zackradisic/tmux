@@ -486,6 +486,13 @@ pub enum PickAfter {
     Rename(String, String, String),
     /// Send a message to (server, id) through its mailbox.
     Message(String, String, String),
+    /// Interrupt the agent in this local pane: C-c, nothing else. For a
+    /// remote row this is its shadow, whose fd is one end of the link's
+    /// socketpair, so the key travels to the remote like a typed one.
+    Interrupt(u32),
+    /// Kill this local pane. `kill-pane` on a shadow runs on the remote
+    /// server (see tmux.1, REMOTE SESSIONS), so it kills the real pane.
+    KillPane(u32),
 }
 
 /// One rendered line: a server header (only when rows come from more than
@@ -535,6 +542,11 @@ pub struct Picker {
     pub status: Option<String>,
     /// A `g` was pressed and waits for a second `g` (vim `gg` = go top).
     pub pending_g: bool,
+    /// A kill was asked for on this local pane and waits for a second
+    /// press to confirm. Killing a pane cannot be undone, and the row the
+    /// cursor sits on moves under a refresh, so the pane is remembered
+    /// here rather than re-read from the selection on the second press.
+    pub pending_kill: Option<u32>,
     /// A stable display rank per row key, assigned in the recency order
     /// the FIRST time each agent is seen this session. Live refreshes sort
     /// by server, band then this rank, so an activity-time bump never
@@ -838,6 +850,7 @@ pub async fn pick_open(
         keys: cfg.keys.clone(),
         status: None,
         pending_g: false,
+        pending_kill: None,
         order,
         order_next,
         timer: None,
@@ -1082,6 +1095,8 @@ pub fn on_mode_key(
         // keeps it (see the `g` branch).
         let g_pending = p.pending_g;
         p.pending_g = false;
+        // Any key that is not the kill key again cancels a pending kill.
+        let kill_pending = p.pending_kill.take();
         // Arrows and their control aliases move the selection in both
         // modes; they are never text.
         let is_down = matches!(key.as_str(), "Down" | "C-n" | "C-j");
@@ -1209,6 +1224,43 @@ pub fn on_mode_key(
             let n = p.view.len() as i32;
             move_sel(p, n);
             moved = true;
+        } else if key == k.interrupt {
+            // Interrupt, do not kill: send C-c and let the agent decide
+            // what that means. Claude with work in flight answers with its
+            // own "are you sure?", and the live preview shows it, so the
+            // second press is an informed one rather than a guess.
+            match live_pane_of_selection(p) {
+                Some(pane) => {
+                    after = PickAfter::Interrupt(pane);
+                    p.status = Some(format!("interrupt sent to %{pane}"));
+                }
+                None => {
+                    p.status = Some(unreachable_reason(p));
+                }
+            }
+            pick_render(p);
+        } else if key == k.kill {
+            // Killing the pane takes the agent's process and its scrollback
+            // with it, so it asks first. The second press must be on the
+            // same pane the first one named.
+            match live_pane_of_selection(p) {
+                Some(pane) => {
+                    if kill_pending == Some(pane) {
+                        after = PickAfter::KillPane(pane);
+                        p.status = Some(format!("killing %{pane}"));
+                    } else {
+                        p.pending_kill = Some(pane);
+                        p.status = Some(format!(
+                            "kill %{pane}? {} again to confirm",
+                            pretty_key(&k.kill)
+                        ));
+                    }
+                }
+                None => {
+                    p.status = Some(unreachable_reason(p));
+                }
+            }
+            pick_render(p);
         } else if key == k.content {
             toggle_content(p);
         } else if key == k.rename {
@@ -1338,6 +1390,35 @@ pub fn on_mode_key(
                 } else {
                     act_remote(&server, &id, "rename", n).await;
                     fetch_remotes_now(Rc::clone(&picker), Rc::clone(&remotes), false).await;
+                }
+                reload_picker(picker, remotes, false).await;
+            });
+        }
+        PickAfter::Interrupt(pane) => {
+            // Synchronous: one key into the pane. Nothing is reloaded -
+            // the refresh tick repaints the preview, which is where the
+            // agent's answer to the interrupt shows up.
+            if let Err(e) = send_key(PaneId(pane), "C-c") {
+                if let Some(p) = picker.borrow_mut().as_mut() {
+                    p.status = Some(format!("interrupt failed: {}", e.message));
+                    pick_render(p);
+                }
+            }
+        }
+        PickAfter::KillPane(pane) => {
+            let picker = Rc::clone(picker);
+            let remotes = Rc::clone(remotes);
+            ctx.spawn(async move {
+                // On a shadow pane this runs on the remote server, which is
+                // what kills the real agent. The roster follows on its own:
+                // the pane dying retires the row through pane-destroyed.
+                let r = run_command(&format!("kill-pane -t %{pane}")).await;
+                if let Some(p) = picker.borrow_mut().as_mut() {
+                    p.status = Some(match &r {
+                        Ok(_) => format!("killed %{pane}"),
+                        Err(e) => format!("kill failed: {}", e.message),
+                    });
+                    pick_render(p);
                 }
                 reload_picker(picker, remotes, false).await;
             });
@@ -1705,6 +1786,28 @@ fn haystack(a: &Agent) -> String {
         a.reason.as_deref().unwrap_or(""),
         if a.is_local() { "" } else { a.server.as_str() },
     )
+}
+
+/// The local pane the selected agent can be acted on through: its own for
+/// a local row, its shadow for a mirrored remote one. `None` when the row
+/// has no live pane, or is a remote row this server holds no mirror for -
+/// both cases [`unreachable_reason`] explains.
+fn live_pane_of_selection(p: &Picker) -> Option<u32> {
+    let a = p.selected()?;
+    a.pane.filter(|_| a.live())?;
+    p.local_pane_of(a)
+}
+
+/// Why [`live_pane_of_selection`] gave nothing, in the words the jump key
+/// already uses for the same two cases.
+fn unreachable_reason(p: &Picker) -> String {
+    match p.selected() {
+        None => "no agent selected".into(),
+        Some(a) if a.pane.filter(|_| a.live()).is_none() => {
+            "no live pane: this agent is already gone".into()
+        }
+        Some(a) => format!("not mirrored here: remote-attach {}", a.server),
+    }
 }
 
 /// Keep the band order of `p.rows`; the filter only includes or excludes.
@@ -2210,11 +2313,13 @@ pub fn pick_render(p: &mut Picker) {
         format!("type to search · {ctok} · Esc unfocus")
     } else {
         format!(
-            "j/k move · gg/G ends · {} search · {} jump · m msg · {ctok} · {} rename · {} {arch} · q/{} close",
+            "j/k move · gg/G ends · {} search · {} jump · m msg · {ctok} · {} rename · {} {arch} · {} int · {} kill · q/{} close",
             keyname(&k.filter),
             keyname(&k.jump),
             keyname(&k.rename),
             keyname(&k.archive),
+            keyname(&k.interrupt),
+            keyname(&k.kill),
             keyname(&k.close),
         )
     };
