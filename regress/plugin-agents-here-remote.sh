@@ -76,9 +76,16 @@ SHADOW=$($TMUX list-panes -t fakehost/work \
 [ "$SHADOW" != "$BPANE" ] ||
     fail "shadow and remote pane ids coincide ($SHADOW); the test cannot tell them apart"
 
-# Opened from the shadow pane: the border shows, and on the codex row.
+# Opened from the shadow pane: the cursor opens on the codex row (the here
+# row is also the cursor row, so the border is drawn as the cursor glyph),
+# and once the cursor steps off it the border shows as ▎ on that row. The
+# remote roster can land after the popup is up; give the cursor time to
+# follow it.
 open_from "$SHADOW"
 screen | grep -q 'codex' || fail "codex missing from the picker: $(screen)"
+wait_for 5 "$TMUX capture-pane -M -p -t $FORM | grep '▸' | grep -q codex" ||
+    fail "cursor did not open on the remote agent's row: $(screen)"
+$TMUX send-keys -t "$FORM" Up; sleep 0.5
 [ "$(border_count)" -ge 1 ] ||
     fail "no here-border when opened from a shadow pane: $(screen)"
 screen | grep '▎' | grep -q 'codex' ||
@@ -88,9 +95,11 @@ screen | grep '▎' | grep -q 'codex' ||
 # what catches a fix that marks every remote row unconditionally.
 $TMUX send-keys -t "$FORM" q; sleep 0.5
 open_from "$APANE"
-# The local row is also the cursor row, where the here-border is drawn as the
-# cursor glyph; step the cursor off it so the border shows as ▎ and can be
-# told apart from a plain selection.
+# The local row is the cursor row (the picker opens on it), where the
+# here-border is drawn as the cursor glyph; step the cursor off it so the
+# border shows as ▎ and can be told apart from a plain selection.
+screen | grep '▸' | grep -q 'claude' ||
+    fail "cursor did not open on the local agent's row: $(screen)"
 $TMUX send-keys -t "$FORM" Down; sleep 0.5
 [ "$(border_count)" -ge 1 ] ||
     fail "no here-border when opened from the local agent pane: $(screen)"

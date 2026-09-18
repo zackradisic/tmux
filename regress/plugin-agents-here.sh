@@ -71,6 +71,10 @@ $TMUX plugin-command -t "$P2" agents "working"; sleep 0.5
 # cursor row in at least one of them.
 open_from "$P1"
 $TMUX capture-pane -M -p -t "$FORM" | grep -q '2 live' || fail "expected 2 live agents"
+# The cursor opens ON the here row, so right after open the border is drawn
+# as the cursor glyph and no ▎ is on screen at all.
+[ "$(border_count)" -eq 0 ] ||
+    fail "cursor did not open on the here row (▎ count $(border_count))"
 $TMUX send-keys -t "$FORM" g; $TMUX send-keys -t "$FORM" g; sleep 0.4
 top=$(border_count)
 $TMUX send-keys -t "$FORM" G; sleep 0.4

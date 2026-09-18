@@ -556,8 +556,14 @@ pub struct Picker {
     /// The 2s refresh task, cancelled when the picker closes or reopens.
     pub timer: Option<TaskId>,
     /// The pane the picker was opened from. Its row gets a "you are here"
-    /// border, so you can spot the agent you are currently sitting on.
+    /// border, so you can spot the agent you are currently sitting on, and
+    /// the cursor opens on it.
     pub current_pane: Option<u32>,
+    /// The cursor has yet to land on `current_pane`'s row. Set at open;
+    /// cleared once it lands, or once the user moves the cursor
+    /// themselves. While set, each refresh tries again: a remote row's
+    /// roster can land after the picker is already on screen.
+    pub seek_here: bool,
     /// Per server: local clock minus the provider's clock.
     pub skew: HashMap<String, i64>,
     /// Per server: when its link went down (local clock), while it is.
@@ -660,6 +666,24 @@ impl Picker {
         {
             self.top -= 1;
         }
+    }
+
+    /// Put the cursor on the row for the pane the picker was opened from,
+    /// if that row is on screen and the cursor has not been moved since
+    /// open. Returns whether it landed.
+    fn select_here(&mut self) -> bool {
+        if !self.seek_here || self.current_pane.is_none() {
+            return false;
+        }
+        let pos = self
+            .view
+            .iter()
+            .position(|&i| self.local_pane_of(&self.rows[i]) == self.current_pane);
+        let Some(pos) = pos else { return false };
+        self.sel = pos;
+        self.seek_here = false;
+        self.scroll_to_selection();
+        true
     }
 
     /// The highlighted row.
@@ -855,6 +879,7 @@ pub async fn pick_open(
         order_next,
         timer: None,
         current_pane: here,
+        seek_here: here.is_some(),
         skew,
         down,
         mismatch,
@@ -867,6 +892,8 @@ pub async fn pick_open(
         multi,
     };
     pick_refilter(&mut p);
+    // Open on the agent you are sitting in, when it has a row.
+    p.select_here();
     pick_render(&mut p);
     *picker.borrow_mut() = Some(p);
     // Keep times and file-sourced status fresh while the picker is open,
@@ -922,6 +949,9 @@ pub async fn reload_picker(
         // A refresh keeps the scroll where it is (only filter typing snaps
         // back to the top).
         pick_refilter_keep(p, keep, false);
+        // The here row may only now have arrived (a remote roster landing
+        // after open); land on it unless the cursor has been moved since.
+        p.select_here();
         pick_render(p);
     }
     drop(b);
@@ -1586,6 +1616,8 @@ fn move_sel(p: &mut Picker, delta: i32) {
     }
     let last = (p.view.len() - 1) as i32;
     p.sel = (p.sel as i32 + delta).clamp(0, last) as usize;
+    // The user took the cursor: stop pulling it back to the here row.
+    p.seek_here = false;
     p.scroll_to_selection();
     pick_render(p);
 }
