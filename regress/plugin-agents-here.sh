@@ -59,14 +59,24 @@ $TMUX load-plugin -s server -o trust_env=1 -c capture-pane -c run-command -c mod
     -c db -c env-read -c pane-fds "$WASM" || fail "load-plugin"
 sleep 1.5
 
-# Bump P2 so it sorts to the top; P1 then sits on a non-cursor row, so its
-# "here" border is the ▎ glyph (the cursor row would use ▸).
 $TMUX plugin-command -t "$P2" agents "working"; sleep 0.5
 
 # Opened from P1: its row shows the here border.
+#
+# On the row the cursor is on, the border is drawn as the cursor glyph
+# rather than ▎, so ▎ only appears while the cursor is elsewhere - and
+# which of the two rows P1 sorted into is not something this test can pin
+# down (both are fresh, both are `working`). So look from both ends: gg
+# parks the cursor on the first row, G on the last, and P1 is not the
+# cursor row in at least one of them.
 open_from "$P1"
 $TMUX capture-pane -M -p -t "$FORM" | grep -q '2 live' || fail "expected 2 live agents"
-[ "$(border_count)" -ge 1 ] || fail "no here-border when opened from an agent pane"
+$TMUX send-keys -t "$FORM" g; $TMUX send-keys -t "$FORM" g; sleep 0.4
+top=$(border_count)
+$TMUX send-keys -t "$FORM" G; sleep 0.4
+bot=$(border_count)
+[ "$top" -ge 1 ] || [ "$bot" -ge 1 ] ||
+    fail "no here-border when opened from an agent pane (gg $top, G $bot)"
 
 # Opened from the non-agent pane P3: no row matches, no border.
 $TMUX send-keys -t "$FORM" q; sleep 0.4
