@@ -20,6 +20,12 @@ status=$1
 shift
 sock=${TMUX%%,*}
 
+# A hook's PATH does not always have the fork on it - it inherits the
+# agent's, which is whatever the shell had when the agent started. Name
+# the binary if `tmux` here is the wrong one, or nothing:
+#   TMUXBIN=$HOME/.local/share/tmux2/bin/tmux
+TMUXBIN=${TMUXBIN:-tmux}
+
 text=$*
 # Only for `needs_input`: no other hook carries a message, and PreToolUse
 # runs on every single tool call - not a place to read and parse stdin.
@@ -37,5 +43,5 @@ fi
 # list apart. (The plugin flattens it too - this keeps the wire tidy.)
 text=$(printf '%s' "$text" | tr '\n\r\t' '   ')
 
-tmux -S "$sock" plugin-command -t "$TMUX_PANE" agents "$status $text" 2>/dev/null
+"$TMUXBIN" -S "$sock" plugin-command -t "$TMUX_PANE" agents "$status $text" 2>/dev/null
 exit 0
