@@ -1205,7 +1205,7 @@ Kill the
 server and clients and destroy all sessions.
 .It Xo Ic update
 .Op Fl ny
-.Op Ar version
+.Op Ar version | Cm canary
 .Xc
 Update a
 .Nm
@@ -1219,7 +1219,10 @@ with the installed tag in
 .Pa <home>/VERSION .
 Without
 .Ar version ,
-the latest release is used.
+the release GitHub marks as latest is used, which is never a prerelease.
+.Cm canary
+takes the newest release of any kind instead, prereleases included, which
+is where the dated builds from a branch are published.
 The command reports the installed and the available tag, then asks on
 the client's standard input before it downloads anything; it cannot ask
 on an attached client.

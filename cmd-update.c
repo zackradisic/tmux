@@ -33,7 +33,8 @@
  *
  * The running binary must be <home>/bin/tmux as laid out by
  * install-tmux2.sh, with the installed tag in <home>/VERSION. The command
- * resolves the latest release (or takes a tag), asks on the client's stdin
+ * resolves the latest release (or takes a tag, or "canary" for the newest
+ * release of any kind, prereleases included), asks on the client's stdin
  * unless -y is given, runs the release's install-tmux2.sh into <home>, and
  * hands the server off to the new binary.
  */
@@ -47,7 +48,7 @@ const struct cmd_entry cmd_update_entry = {
 	.alias = NULL,
 
 	.args = { "ny", 0, 1, NULL },
-	.usage = "[-ny] [version]",
+	.usage = "[-ny] [version|canary]",
 
 	.flags = CMD_CLIENT_CANFAIL,
 	.exec = cmd_update_exec
@@ -64,6 +65,7 @@ struct cmd_update_data {
 
 	int			 yes;
 	int			 check_only;
+	int			 canary;
 
 	char			*repo;
 	char			*home;
@@ -240,6 +242,10 @@ cmd_update_exec(struct cmd *self, struct cmdq_item *item)
 	}
 
 	want = args_string(args, 0);
+	if (want != NULL && strcmp(want, "canary") == 0) {
+		cdata->canary = 1;
+		want = NULL;
+	}
 	if (want != NULL && *want != '\0') {
 		cdata->wanted = xstrdup(want);
 		cdata->target = xstrdup(want);
@@ -250,11 +256,26 @@ cmd_update_exec(struct cmd *self, struct cmdq_item *item)
 		return (CMD_RETURN_WAIT);
 	}
 
-	/* Ask GitHub which release is the latest. */
-	xasprintf(&cmd, "curl -fsSL "
-	    "https://api.github.com/repos/%s/releases/latest | "
-	    "sed -n 's/.*\"tag_name\": *\"\\([^\"]*\\)\".*/\\1/p' | head -1",
-	    cdata->repo);
+	/*
+	 * Ask GitHub which release is the latest. What GitHub marks latest is
+	 * never a prerelease; the canary channel takes the most recently
+	 * published release of any kind, which is where the dated builds from
+	 * a branch land. The list is not in publish order (a release's
+	 * created_at is its commit's date), so pick by published_at.
+	 */
+	if (cdata->canary) {
+		xasprintf(&cmd, "curl -fsSL "
+		    "'https://api.github.com/repos/%s/releases?per_page=30' | "
+		    "sed -n -e 's/.*\"tag_name\": *\"\\([^\"]*\\)\".*/tag \\1/p' "
+		    "-e 's/.*\"published_at\": *\"\\([^\"]*\\)\".*/pub \\1/p' | "
+		    "awk '$1==\"tag\"{t=$2} $1==\"pub\" && $2>best{best=$2; tag=t} "
+		    "END{if (tag != \"\") print tag}'", cdata->repo);
+	} else {
+		xasprintf(&cmd, "curl -fsSL "
+		    "https://api.github.com/repos/%s/releases/latest | "
+		    "sed -n 's/.*\"tag_name\": *\"\\([^\"]*\\)\".*/\\1/p' | head -1",
+		    cdata->repo);
+	}
 	cdata->refs++;
 	if (job_run(cmd, 0, NULL, NULL, NULL, NULL, NULL,
 	    cmd_update_resolve_callback, NULL, cdata, 0, -1, -1) == NULL) {
@@ -289,8 +310,9 @@ cmd_update_resolve_callback(struct job *job)
 	if (cmd_update_job_status(job) != 0 || line == NULL ||
 	    *line == '\0') {
 		free(line);
-		cmd_update_fail(cdata, "cannot resolve the latest release of "
-		    "%s (is curl installed and the network up?)", cdata->repo);
+		cmd_update_fail(cdata, "cannot resolve the %s release of "
+		    "%s (is curl installed and the network up?)",
+		    cdata->canary ? "newest" : "latest", cdata->repo);
 		cmd_update_unref(cdata);
 		return;
 	}
