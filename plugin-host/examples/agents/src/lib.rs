@@ -13,6 +13,17 @@
 //! query. `k` at the top row stays at the top - only `/` reaches the box.
 //! `J`/`K` (shift) mark rows into a selection; `a` then archives the whole
 //! selection at once (and un-archives when every marked row is archived).
+//! `Space` opens an action menu on the selected row - every action the
+//! picker has, with the ones that do not apply to that row dimmed. Its
+//! items send their own key back into the picker, so the menu is a view
+//! of the keymap rather than a second copy of it.
+//! `c` copies the agent's durable id - the harness's own session id, with
+//! the roster's `kind:` prefix off - to the clipboard of the client that
+//! pressed it, so `claude --resume <id>` is a paste away.
+//! `w` moves the row out of the "needs input" band into `waiting` when
+//! the roster flagged something you have already dealt with, and raises a
+//! `waiting` row into the band when you know it needs you and no hook
+//! said so. It takes a marked selection too.
 //! Esc clears the selection before it closes the picker. `+`/`-` grow and
 //! shrink the popup; the size is remembered across opens. The popup opens
 //! at a fraction of the window by default. `r` renames the selected agent
@@ -127,6 +138,9 @@ struct AgentsConfig {
     pick_jump: Option<String>,
     pick_filter: Option<String>,
     pick_archive: Option<String>,
+    pick_attention: Option<String>,
+    pick_copy: Option<String>,
+    pick_menu: Option<String>,
     pick_history: Option<String>,
     pick_close: Option<String>,
     pick_content: Option<String>,
@@ -140,6 +154,12 @@ pub(crate) struct PickKeys {
     pub jump: String,
     pub filter: String,
     pub archive: String,
+    /// Move the row between the attention band and `waiting` by hand.
+    pub attention: String,
+    /// Copy the agent's durable id to the clipboard.
+    pub copy: String,
+    /// Open the action menu on the selected row.
+    pub menu: String,
     pub history: String,
     pub close: String,
     pub content: String,
@@ -156,6 +176,9 @@ impl Default for PickKeys {
             jump: "Enter".into(),
             filter: "/".into(),
             archive: "a".into(),
+            attention: "w".into(),
+            copy: "c".into(),
+            menu: "Space".into(),
             history: "h".into(),
             close: "Escape".into(),
             content: "C-f".into(),
@@ -212,6 +235,9 @@ impl Config {
                 jump: pick(&c.pick_jump, d.jump),
                 filter: pick(&c.pick_filter, d.filter),
                 archive: pick(&c.pick_archive, d.archive),
+                attention: pick(&c.pick_attention, d.attention),
+                copy: pick(&c.pick_copy, d.copy),
+                menu: pick(&c.pick_menu, d.menu),
                 history: pick(&c.pick_history, d.history),
                 close: pick(&c.pick_close, d.close),
                 content: pick(&c.pick_content, d.content),
@@ -446,6 +472,24 @@ impl Agents {
             let client = event.scope.client.map(u64::from);
             let here = event.scope.pane;
             ctx.spawn(view::pick_open(picker, cfg, remotes, client, here));
+            return;
+        }
+        if verb == "menu-key" {
+            // "menu-key <key>": an item of the action menu, handing its
+            // key back to the picker. The menu is drawn by tmux, so this
+            // is the only way back in.
+            if !self.role.views() {
+                return;
+            }
+            let Some(key) = text.split_whitespace().nth(1) else { return };
+            view::on_menu_key(
+                &self.picker,
+                &self.busy,
+                &self.remotes,
+                ctx,
+                key.to_string(),
+                event.scope.client.map(u64::from),
+            );
             return;
         }
         if verb == "message" {

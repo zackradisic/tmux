@@ -511,14 +511,38 @@ pub async fn report(pane: u32, status: String, task: Option<String>, cfg: Rc<Con
         }
         let _ = store::finish_by_pane(pane as i64, now).await;
     } else {
-        let n = store::set_status(pane as i64, &status, task.as_deref(), now)
-            .await
-            .unwrap_or(0);
+        // The trailing text of a report means different things either
+        // side of `needs_input`. On a working/waiting report it is the
+        // task - what the agent is doing. On `needs_input` it is the
+        // harness's own reason for wanting the user (the Claude
+        // `Notification` message, a permission prompt's subject), which
+        // belongs on the row only while the agent is blocked, so it goes
+        // to `note` and the next report clears it.
+        let (task, note) = if status == "needs_input" {
+            (None, task)
+        } else {
+            (task, None)
+        };
+        let n = store::set_status(
+            pane as i64,
+            &status,
+            task.as_deref(),
+            note.as_deref(),
+            now,
+        )
+        .await
+        .unwrap_or(0);
         if n == 0 {
             // The shim beat classify to it; discover the pane, then retry.
             classify(pane, Rc::clone(&cfg)).await;
-            let _ =
-                store::set_status(pane as i64, &status, task.as_deref(), now).await;
+            let _ = store::set_status(
+                pane as i64,
+                &status,
+                task.as_deref(),
+                note.as_deref(),
+                now,
+            )
+            .await;
         }
         // A `working` report is a new turn - the user messaged the agent -
         // so bring an archived row back into the roster.
@@ -743,6 +767,16 @@ pub async fn handle(req: ServiceRequest, cfg: Rc<Config>) {
                     let n = q.name.as_deref().filter(|s| !s.is_empty());
                     store::rename_by_user(&q.id, n, now).await.is_ok()
                 }
+                // The view moved a row between the attention band and
+                // `waiting` by hand. Only those two: a view has no
+                // business declaring an agent to be mid-turn or finished,
+                // which the pane and the shims say.
+                "status" => match q.name.as_deref() {
+                    Some(v @ ("needs_input" | "waiting")) => {
+                        store::set_status_by_id(&q.id, v, now).await.is_ok()
+                    }
+                    _ => false,
+                },
                 _ => false,
             };
             if ok {

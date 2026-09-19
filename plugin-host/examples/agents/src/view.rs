@@ -455,7 +455,9 @@ pub fn follow(server: &str) {
 
 /// Ask a remote provider to act on one of its rows. The reply is a plain
 /// "ok", so this is a byte call, not a JSON one.
-async fn act_remote(server: &str, id: &str, verb: &str, name: Option<&str>) {
+/// Returns whether the provider took it. Most callers reload afterwards
+/// and so see the answer anyway; the ones that count rows do not.
+async fn act_remote(server: &str, id: &str, verb: &str, name: Option<&str>) -> bool {
     let target = format!("@{server}");
     let req = provider::ActReq {
         id: id.to_string(),
@@ -463,8 +465,12 @@ async fn act_remote(server: &str, id: &str, verb: &str, name: Option<&str>) {
         name: name.map(str::to_string),
     };
     let bytes = serde_json::to_vec(&req).unwrap_or_default();
-    if let Err(e) = service::call(&target, "act", &bytes).await {
-        log(&format!("agents: {verb} on {server}: {}", e.message));
+    match service::call(&target, "act", &bytes).await {
+        Ok(_) => true,
+        Err(e) => {
+            log(&format!("agents: {verb} on {server}: {}", e.message));
+            false
+        }
     }
 }
 
@@ -480,6 +486,12 @@ pub enum PickAfter {
     Jump(u32, ModeId),
     /// Set the life of these (server, id) rows.
     Life(Vec<(String, String)>, String),
+    /// Set the turn status of these (server, id) rows by hand.
+    Status(Vec<(String, String)>, String),
+    /// Put this text on the pressing client's clipboard.
+    Copy(String),
+    /// Open the action menu on the pressing client.
+    Menu,
     Reload,
     Resize(ModeId, u32, u32),
     /// Rename (server, id) to the name.
@@ -1064,6 +1076,160 @@ pub async fn apply_life(
     reload_picker(picker, remotes, false).await;
 }
 
+/// Move rows between the attention band and `waiting` by hand, wherever
+/// they live. A remote row's status belongs to its own provider, so the
+/// change goes over the `act` RPC rather than into this server's store.
+pub async fn apply_status(
+    picker: Rc<RefCell<Option<Picker>>>,
+    remotes: Rc<RefCell<Remotes>>,
+    ids: Vec<(String, String)>,
+    status: String,
+) {
+    let now = now_ms() as i64;
+    let mut moved = 0usize;
+    for (server, id) in &ids {
+        let ok = if server == LOCAL {
+            store::set_status_by_id(id, &status, now).await.is_ok()
+        } else {
+            act_remote(server, id, "status", Some(&status)).await
+        };
+        moved += usize::from(ok);
+    }
+    {
+        let mut b = picker.borrow_mut();
+        if let Some(p) = b.as_mut() {
+            let verb = if status == "waiting" { "moved to waiting" } else { "flagged" };
+            p.status = Some(if moved == 1 {
+                verb.to_string()
+            } else {
+                format!("{moved} {verb}")
+            });
+            p.marked.clear();
+        }
+    }
+    fetch_remotes_now(Rc::clone(&picker), Rc::clone(&remotes), false).await;
+    reload_picker(picker, remotes, false).await;
+}
+
+/// Text that is safe to drop into a tmux command string as a
+/// single-quoted argument. tmux's single quotes take no escapes, so a
+/// quote inside one cannot be escaped - it can only be removed. `#` goes
+/// too: a menu name is format-expanded, and `#{...}` from an agent's own
+/// title is not something to hand to the format parser.
+fn menu_safe(s: &str, max: usize) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .filter(|c| !matches!(c, '\'' | '"' | '#' | '\\' | ';' | '$'))
+        .collect();
+    clip(cleaned.trim(), max)
+}
+
+/// One row of the action menu: a label, the picker key it stands for,
+/// and whether it applies to the selected agent right now. A name
+/// starting with `-` is what tmux draws dimmed and refuses to select, so
+/// an action that does not apply is still SHOWN - the menu is the place
+/// you go to find out what you can do, and a silently missing line
+/// answers nothing.
+fn menu_item(label: &str, key: &str, enabled: bool) -> String {
+    let name = if enabled {
+        label.to_string()
+    } else {
+        format!("-{label}")
+    };
+    format!(" '{}' '{}' \"plugin-command agents 'menu-key {}'\"", name, key, key)
+}
+
+/// The action menu for the selected row: every picker action, with the
+/// ones that do not apply dimmed, opened on the client that asked for it.
+///
+/// The items do not DO anything themselves - each one sends its key back
+/// into the picker through `menu-key`. That is the whole design: the menu
+/// is a view of the keymap, so an action can never behave one way from a
+/// key and another from the menu, and a new key costs one line here.
+async fn open_menu(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>) {
+    let Some((title, items)) = ({
+        let b = picker.borrow();
+        b.as_ref().and_then(|p| {
+            let a = p.selected()?;
+            let k = &p.keys;
+            let live = live_pane_of_selection(p).is_some();
+            let flagged = a.status == "needs_input";
+            let movable =
+                a.live() && matches!(a.status.as_str(), "needs_input" | "waiting");
+            let mut items = String::new();
+            items.push_str(&menu_item("jump to pane", &k.jump, live));
+            items.push_str(&menu_item("message", "m", true));
+            items.push_str(&menu_item("copy id", &k.copy, durable_id(a).is_some()));
+            items.push_str(&menu_item("rename", &k.rename, true));
+            items.push_str(" ''");
+            let band = if flagged { "move to waiting" } else { "flag: needs input" };
+            items.push_str(&menu_item(band, &k.attention, movable));
+            let arch = if a.life == "archived" { "un-archive" } else { "archive" };
+            items.push_str(&menu_item(arch, &k.archive, true));
+            items.push_str(" ''");
+            items.push_str(&menu_item("interrupt (C-c)", &k.interrupt, live));
+            items.push_str(&menu_item("kill pane", &k.kill, live));
+            Some((menu_safe(&display_name(a), 30), items))
+        })
+    }) else {
+        return;
+    };
+    let target = client
+        .and_then(|cid| {
+            list_clients().ok()?.into_iter().find(|c| u64::from(c.id) == cid)
+        })
+        .map(|c| c.name)
+        .filter(|n| {
+            n.chars().all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c))
+        })
+        .map(|n| format!(" -c '{n}'"))
+        .unwrap_or_default();
+    // No -x/-y: display-menu then centres on the client's window, which
+    // is where the picker floats. Anchoring it to the float itself would
+    // need the mode's pane id, which the host does not hand out.
+    let cmd = format!("display-menu{target} -T ' {title} '{items}");
+    if let Err(e) = run_command(&cmd).await {
+        if let Some(p) = picker.borrow_mut().as_mut() {
+            p.status = Some(format!("menu failed: {}", e.message));
+            pick_render(p);
+        }
+    }
+}
+
+/// Put text on the clipboard of the client that pressed the key.
+///
+/// `set-buffer -w` does both halves: a tmux paste buffer (for
+/// `paste-buffer` in another pane) and the terminal's own clipboard over
+/// OSC 52, which is the one that reaches the browser or editor. The `-t`
+/// names the client, because "the current client" from a plugin command
+/// is whichever one tmux guesses is best - fine when one client is
+/// attached, wrong the moment two are.
+async fn copy_to_clipboard(
+    picker: Rc<RefCell<Option<Picker>>>,
+    text: String,
+    client: Option<u64>,
+) {
+    let name = client
+        .and_then(|cid| {
+            list_clients().ok()?.into_iter().find(|c| u64::from(c.id) == cid)
+        })
+        .map(|c| c.name)
+        .filter(|n| {
+            n.chars().all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c))
+        });
+    let target = name.map(|n| format!(" -t '{n}'")).unwrap_or_default();
+    let cmd = format!("set-buffer -w{target} -- '{text}'");
+    let msg = match run_command(&cmd).await {
+        Ok(_) => format!("copied {text}"),
+        Err(e) => format!("copy failed: {}", e.message),
+    };
+    if let Some(p) = picker.borrow_mut().as_mut() {
+        p.status = Some(msg);
+        pick_render(p);
+    }
+}
+
 /// Acknowledge (mark read) a row, wherever it lives.
 async fn acknowledge(server: String, id: String) {
     if server == LOCAL {
@@ -1103,6 +1269,42 @@ pub fn on_mode_key(
 ) {
     let mode_id = event.get_i64("mode");
     let key = event.get_str("key").unwrap_or("").to_string();
+    // The client whose key this was. A clipboard belongs to a terminal,
+    // not to the server, so a copy has to name it - and so does a menu.
+    let client = event.get_i64("client").map(|v| v as u64);
+    dispatch_key(picker, busy, remotes, ctx, mode_id, key, client);
+}
+
+/// A key the action menu sent back in. The menu's items are the picker's
+/// own keys, re-entered here, so the two can never disagree about what a
+/// key does - the menu is a way to SEE the keys, not a second
+/// implementation of them.
+pub fn on_menu_key(
+    picker: &Rc<RefCell<Option<Picker>>>,
+    busy: &Rc<Cell<bool>>,
+    remotes: &Rc<RefCell<Remotes>>,
+    ctx: &Ctx,
+    key: String,
+    client: Option<u64>,
+) {
+    let mode_id = picker.borrow().as_ref().map(|p| p.mode.0 as i64);
+    // No picker: the menu outlived it (its window went away, or someone
+    // ran the command by hand). Nothing to act on.
+    if mode_id.is_none() {
+        return;
+    }
+    dispatch_key(picker, busy, remotes, ctx, mode_id, key, client);
+}
+
+fn dispatch_key(
+    picker: &Rc<RefCell<Option<Picker>>>,
+    busy: &Rc<Cell<bool>>,
+    remotes: &Rc<RefCell<Remotes>>,
+    ctx: &Ctx,
+    mode_id: Option<i64>,
+    key: String,
+    client: Option<u64>,
+) {
     let mut after = PickAfter::None;
     // A row to acknowledge (mark read) after the borrow drops: the cursor
     // landed on an unread waiting row, or the user jumped to it.
@@ -1333,6 +1535,26 @@ pub fn on_mode_key(
             }
         } else if key == k.archive {
             after = archive_after(p);
+        } else if key == k.menu {
+            if p.selected().is_some() {
+                after = PickAfter::Menu;
+            }
+        } else if key == k.copy {
+            match copy_after(p) {
+                Ok(a) => after = a,
+                Err(why) => {
+                    p.status = Some(why);
+                    pick_render(p);
+                }
+            }
+        } else if key == k.attention {
+            match attention_after(p) {
+                Ok(a) => after = a,
+                Err(why) => {
+                    p.status = Some(why);
+                    pick_render(p);
+                }
+            }
         } else if key == k.history {
             p.show_history = !p.show_history;
             after = PickAfter::Reload;
@@ -1392,6 +1614,23 @@ pub fn on_mode_key(
         }
         PickAfter::Life(ids, life) => {
             ctx.spawn(apply_life(Rc::clone(picker), Rc::clone(remotes), ids, life));
+        }
+        PickAfter::Menu => {
+            let picker = Rc::clone(picker);
+            ctx.spawn(async move {
+                open_menu(picker, client).await;
+            });
+        }
+        PickAfter::Copy(text) => {
+            ctx.spawn(copy_to_clipboard(Rc::clone(picker), text, client));
+        }
+        PickAfter::Status(ids, status) => {
+            ctx.spawn(apply_status(
+                Rc::clone(picker),
+                Rc::clone(remotes),
+                ids,
+                status,
+            ));
         }
         PickAfter::Reload => {
             let picker = Rc::clone(picker);
@@ -1650,24 +1889,104 @@ fn toggle_content(p: &mut Picker) {
     pick_render(p);
 }
 
+/// The harness's own id for a row, with the roster's `kind:` prefix
+/// taken off - what you paste into `claude --resume`, or grep a log for.
+/// `None` while the row is still provisional: the roster has seen the
+/// pane but no resolver has bound it to a durable id yet, and a made-up
+/// `prov-claude-3` on the clipboard is worse than a refusal.
+fn durable_id(a: &Agent) -> Option<&str> {
+    if a.id.starts_with("prov-") {
+        return None;
+    }
+    Some(a.id.strip_prefix(&format!("{}:", a.kind)).unwrap_or(&a.id))
+}
+
+/// The copy key takes the row under the cursor only - a clipboard holds
+/// one thing, so a marked selection has no sensible answer here.
+fn copy_after(p: &Picker) -> Result<PickAfter, String> {
+    let Some(a) = p.selected() else {
+        return Ok(PickAfter::None);
+    };
+    let Some(id) = durable_id(a) else {
+        return Err(format!("{} has no id yet", display_name(a)));
+    };
+    if !id.chars().all(|c| c.is_ascii_alphanumeric() || "-_.:@+/".contains(c)) {
+        // The id reaches the clipboard through a tmux command string,
+        // and tmux's single quotes take no escapes, so there is no way
+        // to quote a hostile one safely. No id a harness mints looks
+        // like this; refuse rather than build the command anyway.
+        return Err("that id has characters I will not paste".into());
+    }
+    Ok(PickAfter::Copy(id.to_string()))
+}
+
+/// What a bulk key acts on: the marked rows if there are any, else the
+/// row under the cursor.
+fn action_targets(p: &Picker) -> Vec<&Agent> {
+    let marked: Vec<&Agent> = p
+        .view
+        .iter()
+        .filter_map(|&i| p.rows.get(i))
+        .filter(|a| p.marked.contains(&a.key()))
+        .collect();
+    if marked.is_empty() {
+        p.selected().into_iter().collect()
+    } else {
+        marked
+    }
+}
+
+/// The attention key moves a row between the top band and `waiting` by
+/// hand. It toggles on what the targets already are: anything still in
+/// `needs_input` drops to `waiting` (the common direction - the roster
+/// flagged it, the user has judged it and wants it out of the way), and
+/// a selection that is entirely `waiting` is raised into the attention
+/// band (the user knows it needs them even though no hook said so).
+///
+/// A row that is mid-turn or finished has no say in this: `working` is
+/// the pane's own business and a dead agent needs nothing. Rather than
+/// silently ignoring the key there, it says why - the band a row sits in
+/// is the whole point of the picker, and a key that does nothing on the
+/// row under the cursor looks like the picker is wedged.
+fn attention_after(p: &Picker) -> Result<PickAfter, String> {
+    let targets = action_targets(p);
+    if targets.is_empty() {
+        return Ok(PickAfter::None);
+    }
+    let movable: Vec<&Agent> = targets
+        .iter()
+        .copied()
+        .filter(|a| a.live() && matches!(a.status.as_str(), "needs_input" | "waiting"))
+        .collect();
+    if movable.is_empty() {
+        let a = targets[0];
+        return Err(if !a.live() {
+            "that agent is done".into()
+        } else {
+            format!("{} is mid-turn; nothing is waiting on you", display_name(a))
+        });
+    }
+    // Any flagged row in the selection means the key clears; only an
+    // all-waiting selection raises.
+    let to = if movable.iter().any(|a| a.status == "needs_input") {
+        "waiting"
+    } else {
+        "needs_input"
+    };
+    let ids: Vec<(String, String)> = movable
+        .iter()
+        .filter(|a| a.status != to)
+        .map(|a| (a.server.clone(), a.id.clone()))
+        .collect();
+    Ok(PickAfter::Status(ids, to.to_string()))
+}
+
 /// The archive key toggles: it archives its targets, or un-archives them
 /// when they are all already archived (an archived row shows in the
 /// history view). Targets are the marked selection, else the highlighted
 /// row.
 fn archive_after(p: &Picker) -> PickAfter {
-    let targets: Vec<&Agent> = {
-        let marked: Vec<&Agent> = p
-            .view
-            .iter()
-            .filter_map(|&i| p.rows.get(i))
-            .filter(|a| p.marked.contains(&a.key()))
-            .collect();
-        if !marked.is_empty() {
-            marked
-        } else {
-            p.selected().into_iter().collect()
-        }
-    };
+    let targets = action_targets(p);
     if targets.is_empty() {
         return PickAfter::None;
     }
@@ -1807,7 +2126,7 @@ fn rank(hay: &str, needle: &str) -> Option<u8> {
 
 fn haystack(a: &Agent) -> String {
     format!(
-        "{} {} {} {} {} {} {} {} {}",
+        "{} {} {} {} {} {} {} {} {} {}",
         display_name(a),
         a.kind,
         a.status,
@@ -1815,6 +2134,7 @@ fn haystack(a: &Agent) -> String {
         a.session.as_deref().unwrap_or(""),
         a.window.as_deref().unwrap_or(""),
         a.task.as_deref().unwrap_or(""),
+        a.note.as_deref().unwrap_or(""),
         a.reason.as_deref().unwrap_or(""),
         if a.is_local() { "" } else { a.server.as_str() },
     )
@@ -2022,6 +2342,27 @@ fn clip(s: &str, max: usize) -> String {
         let head: String = s.chars().take(max.saturating_sub(1)).collect();
         format!("{head}…")
     }
+}
+
+/// Flatten text that came from outside onto one line. A harness writes
+/// its own words into a note (the Claude `Notification` message is a
+/// sentence, sometimes two), and a newline or a stray control character
+/// inside a row would tear the list apart.
+fn one_line(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut gap = false;
+    for c in s.chars() {
+        if c.is_control() {
+            gap = !out.is_empty();
+        } else {
+            if gap {
+                out.push(' ');
+                gap = false;
+            }
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn keyname(k: &str) -> &str {
@@ -2249,14 +2590,17 @@ pub fn pick_render(p: &mut Picker) {
                         .pane
                         .and_then(|pn| p.content_hits.get(&(a.server.clone(), pn as u32)))
                         .filter(|_| p.content_search);
+                    // The note wins over the task: it is the reason this
+                    // row is at the top of the list, and it only exists
+                    // while the agent is blocked on the user.
+                    let note = a.note.as_deref().filter(|s| !s.is_empty());
+                    let task = a.task.as_deref().filter(|s| !s.is_empty());
                     if a.life == "archived" {
                         label = format!("{label}  ·  archived");
                     } else if let Some(sn) = snip {
                         label = format!("{label}  ·  {}", sn.trim());
-                    } else if let Some(t) =
-                        a.task.as_deref().filter(|s| !s.is_empty())
-                    {
-                        label = format!("{label}  ·  {t}");
+                    } else if let Some(t) = note.or(task) {
+                        label = format!("{label}  ·  {}", one_line(t));
                     }
                     let label = clip(&label, label_w);
                     // The badge carries its own colour codes; keep it out
@@ -2334,9 +2678,6 @@ pub fn pick_render(p: &mut Picker) {
     } else {
         format!("{} contents", pretty_key(&k.content))
     };
-    // The archive key un-archives when the highlighted row is archived.
-    let cursor_archived = p.selected().is_some_and(|a| a.life == "archived");
-    let arch = if cursor_archived { "unarch" } else { "arch" };
     let footer = if p.composing {
         "type a message · Enter send · Esc cancel".to_string()
     } else if p.renaming {
@@ -2344,14 +2685,16 @@ pub fn pick_render(p: &mut Picker) {
     } else if p.filtering {
         format!("type to search · {ctok} · Esc unfocus")
     } else {
+        // Six hints, not twelve. Everything else - archive, rename,
+        // copy, the band, interrupt, kill - lives in the action menu,
+        // which names each one in full and says which apply to the row
+        // under the cursor. A footer that lists every key fits none of
+        // them at a usable width.
         format!(
-            "j/k move · gg/G ends · {} search · {} jump · m msg · {ctok} · {} rename · {} {arch} · {} int · {} kill · q/{} close",
-            keyname(&k.filter),
+            "j/k move · gg/G ends · {} jump · {} actions · {} search · {ctok} · q/{} close",
             keyname(&k.jump),
-            keyname(&k.rename),
-            keyname(&k.archive),
-            keyname(&k.interrupt),
-            keyname(&k.kill),
+            keyname(&k.menu),
+            keyname(&k.filter),
             keyname(&k.close),
         )
     };

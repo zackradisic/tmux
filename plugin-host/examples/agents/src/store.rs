@@ -20,7 +20,7 @@
 use serde::{Deserialize, Serialize};
 use tmux_plugin_sdk::prelude::*;
 
-pub const USER_VERSION: i64 = 7;
+pub const USER_VERSION: i64 = 8;
 
 /// The server a row belongs to. A provider only ever writes rows for its
 /// own server, so every stored row says "local"; the view stamps the link
@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS agents (
   session TEXT,
   window TEXT,
   task TEXT,
+  note TEXT,
   name TEXT,
   name_ms INTEGER,
   user_name TEXT,
@@ -68,7 +69,7 @@ CREATE TABLE IF NOT EXISTS captures (
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT);
-PRAGMA user_version = 7;";
+PRAGMA user_version = 8;";
 
 /// The v1 -> v2 upgrade: the resolved columns did not exist in v1.
 const MIGRATE_V2: &str = "
@@ -136,9 +137,21 @@ DROP TABLE captures;
 ALTER TABLE captures_v7 RENAME TO captures;
 PRAGMA user_version = 7;";
 
-const COLS: &str = "id, kind, status, life, pane, session, window, task, name, \
-                    name_ms, user_name, user_name_ms, waiting_ms, acked_ms, \
-                    first_seen_ms, \
+/// The v7 -> v8 upgrade: `note` - why an agent wants the user. A shim
+/// reporting `needs_input` may carry the harness's own words with it (the
+/// Claude `Notification` message, a permission prompt's subject), and the
+/// roster shows them on the row so the band says what each agent is
+/// blocked on without a jump. It is deliberately NOT `task`: a task
+/// describes what the agent is doing and outlives the turn, while a note
+/// is only true while the agent is in `needs_input` and is cleared by the
+/// next status report.
+const MIGRATE_V8: &str = "
+ALTER TABLE agents ADD COLUMN note TEXT;
+PRAGMA user_version = 8;";
+
+const COLS: &str = "id, kind, status, life, pane, session, window, task, \
+                    note, name, name_ms, user_name, user_name_ms, \
+                    waiting_ms, acked_ms, first_seen_ms, \
                     last_status_ms, started_ms, last_active_ms, source_path, \
                     ended_ms, reason, server";
 
@@ -158,6 +171,11 @@ pub struct Agent {
     pub session: Option<String>,
     pub window: Option<String>,
     pub task: Option<String>,
+    /// Why the agent wants the user, in the harness's own words. Set by a
+    /// `needs_input` report that carries text; cleared by any later
+    /// status. See [`MIGRATE_V8`].
+    #[serde(default)]
+    pub note: Option<String>,
     pub name: Option<String>,
     pub name_ms: Option<i64>,
     pub user_name: Option<String>,
@@ -238,6 +256,7 @@ fn agents_from(rows: &Rows) -> Vec<Agent> {
             session: s(row.get_named("session")),
             window: s(row.get_named("window")),
             task: s(row.get_named("task")),
+            note: s(row.get_named("note")),
             name: s(row.get_named("name")),
             name_ms: i(row.get_named("name_ms")),
             user_name: s(row.get_named("user_name")),
@@ -296,6 +315,10 @@ pub fn migrate_sync() -> Result<(), String> {
         }
         if version <= 6 {
             db_exec_sync(MIGRATE_V7, params![])
+                .map_err(|e| format!("db: {e}"))?;
+        }
+        if version <= 7 {
+            db_exec_sync(MIGRATE_V8, params![])
                 .map_err(|e| format!("db: {e}"))?;
         }
     }
@@ -496,31 +519,71 @@ pub async fn rename_by_user(
 }
 
 /// Update the turn status (and task, when the report carries one).
+///
+/// `note` is written on every report, not only when it is `Some`: it says
+/// why the agent wants the user *now*, so a report that carries none
+/// clears the one the last report left. Without that, the reason an agent
+/// was blocked five turns ago would stay on the row forever.
 pub async fn set_status(
     pane: i64,
     status: &str,
     task: Option<&str>,
+    note: Option<&str>,
     now_ms: i64,
 ) -> Result<u64, HostError> {
     let r = if task.is_some() {
         db_exec(
-            "UPDATE agents SET status = ?2, task = ?3, last_status_ms = ?4, \
+            "UPDATE agents SET status = ?2, task = ?3, note = ?4, \
+             last_status_ms = ?5, \
              waiting_ms = CASE WHEN status <> 'waiting' AND ?2 = 'waiting' \
-                               THEN ?4 ELSE waiting_ms END \
+                               THEN ?5 ELSE waiting_ms END \
              WHERE pane = ?1 AND ended_ms IS NULL",
-            params![pane, status, task, now_ms],
+            params![pane, status, task, note, now_ms],
         )
         .await?
     } else {
         db_exec(
-            "UPDATE agents SET status = ?2, last_status_ms = ?3, \
+            "UPDATE agents SET status = ?2, note = ?3, last_status_ms = ?4, \
              waiting_ms = CASE WHEN status <> 'waiting' AND ?2 = 'waiting' \
-                               THEN ?3 ELSE waiting_ms END \
+                               THEN ?4 ELSE waiting_ms END \
              WHERE pane = ?1 AND ended_ms IS NULL",
-            params![pane, status, now_ms],
+            params![pane, status, note, now_ms],
         )
         .await?
     };
+    Ok(r.changes as u64)
+}
+
+/// Set the turn status by hand, from the picker - the user moving a row
+/// between the attention band and `waiting`. Addressed by id, not pane,
+/// so it reaches a row whose pane this server does not own (a remote row
+/// acts through its provider) and one whose pane has gone.
+///
+/// Three differences from a shim's [`set_status`]:
+///
+///   * the note goes: whatever the agent said it was blocked on, the user
+///     has now judged the row, and a stale reason under a hand-set status
+///     reads as if the agent still wants something;
+///   * `last_status_ms` is stamped, which is what makes the choice stick -
+///     `keeps_status` and the enrichers both compare against it, so the
+///     next render will not flatten a hand-set status back;
+///   * entering `waiting` acknowledges the row as well as stamping the
+///     episode. The user is looking straight at it, so leaving it unread
+///     (a bright `envelope`) would be a notification for something they
+///     just did.
+pub async fn set_status_by_id(
+    id: &str,
+    status: &str,
+    now_ms: i64,
+) -> Result<u64, HostError> {
+    let r = db_exec(
+        "UPDATE agents SET status = ?2, note = NULL, last_status_ms = ?3, \
+         waiting_ms = CASE WHEN ?2 = 'waiting' THEN ?3 ELSE waiting_ms END, \
+         acked_ms = CASE WHEN ?2 = 'waiting' THEN ?3 ELSE acked_ms END \
+         WHERE id = ?1 AND ended_ms IS NULL",
+        params![id, status, now_ms],
+    )
+    .await?;
     Ok(r.changes as u64)
 }
 

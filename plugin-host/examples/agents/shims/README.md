@@ -75,3 +75,22 @@ in-process extensions) and the status words below.
 
 `done` is best taken from pane liveness, not a hook: a killed or crashed
 CLI never fires its exit hook, but the pane always dies.
+
+## Why an agent wants you
+
+A `needs_input` report may carry text after the status word, and the
+roster shows it on the row - so the "needs input" band says what each
+agent is blocked on without jumping to the pane. It is cleared by the
+next report, because it is only true while the agent is blocked.
+
+`agent-status.sh` fills it in on its own: the Claude `Notification` hook
+puts its own words in the payload's `message` field ("Claude needs your
+permission to use Bash"), and the shim passes them on. Only for
+`needs_input` - `PreToolUse` runs on every tool call and has no message
+to read. Pass your own text instead by putting it after the status:
+
+    ~/.config/agents/agent-status.sh needs_input waiting on the deploy
+
+The user can also move a row out of the band by hand (`w` in the
+picker), so a report that turns out not to need them is one key to
+clear, not something to wait out.
