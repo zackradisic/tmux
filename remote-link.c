@@ -867,8 +867,17 @@ remote_link_restore_floats(struct window *w, struct remote_float *floats,
 			continue;
 		layout_assign_pane(lc, wp, 1);
 	}
-	for (i = n; i > 0; i--)
-		TAILQ_INSERT_HEAD(&w->z_index, floats[i - 1].wp, zentry);
+	for (i = n; i > 0; i--) {
+		wp = floats[i - 1].wp;
+		/* Still linked in means the list was not rebuilt: move it. */
+		TAILQ_FOREACH(loop, &w->z_index, zentry) {
+			if (loop == wp) {
+				TAILQ_REMOVE(&w->z_index, wp, zentry);
+				break;
+			}
+		}
+		TAILQ_INSERT_HEAD(&w->z_index, wp, zentry);
+	}
 }
 
 /*
@@ -933,7 +942,16 @@ remote_link_apply_layout(struct remote_link *rl, struct remote_window *rw,
 	if (layout_parse(w, stripped, &cause) != 0) {
 		log_debug("%s: %s: @%u: %s", __func__, rl->host, w->id, cause);
 		free(cause);
+
+		/*
+		 * layout_parse() only rebuilds the z-order when it succeeds.
+		 * Empty it the same way here, or the floats would be put back
+		 * on top of themselves below and the list would loop.
+		 */
+		while ((wp = TAILQ_FIRST(&w->z_index)) != NULL)
+			TAILQ_REMOVE(&w->z_index, wp, zentry);
 		layout_by_splitting(w);
+		layout_fix_zindexes(w, w->layout_root);
 	}
 	remote_link_restore_floats(w, floats, nfloats);
 	free(floats);
