@@ -455,9 +455,17 @@ pub fn follow(server: &str) {
 
 /// Ask a remote provider to act on one of its rows. The reply is a plain
 /// "ok", so this is a byte call, not a JSON one.
-/// Returns whether the provider took it. Most callers reload afterwards
-/// and so see the answer anyway; the ones that count rows do not.
-async fn act_remote(server: &str, id: &str, verb: &str, name: Option<&str>) -> bool {
+/// The provider's answer, or its refusal as text a status line can
+/// show. A refusal has one common cause worth naming: the provider on
+/// that server is an older agents build that does not know the verb. Its
+/// `act` falls through to "act: <verb> failed", which read on this side
+/// as nothing happening - the row stayed put and the log alone said why.
+async fn act_remote(
+    server: &str,
+    id: &str,
+    verb: &str,
+    name: Option<&str>,
+) -> Result<(), String> {
     let target = format!("@{server}");
     let req = provider::ActReq {
         id: id.to_string(),
@@ -466,10 +474,15 @@ async fn act_remote(server: &str, id: &str, verb: &str, name: Option<&str>) -> b
     };
     let bytes = serde_json::to_vec(&req).unwrap_or_default();
     match service::call(&target, "act", &bytes).await {
-        Ok(_) => true,
+        Ok(_) => Ok(()),
         Err(e) => {
             log(&format!("agents: {verb} on {server}: {}", e.message));
-            false
+            let why = if e.message.contains("failed") {
+                format!("{server} refused {verb}: its agents plugin is older - update it")
+            } else {
+                format!("{server}: {}", e.message)
+            };
+            Err(why)
         }
     }
 }
@@ -1056,7 +1069,7 @@ pub async fn apply_life(
             let _ = store::set_life(id, &life).await;
         } else {
             let verb = if life == "active" { "unarchive" } else { "archive" };
-            act_remote(server, id, verb, None).await;
+            let _ = act_remote(server, id, verb, None).await;
         }
     }
     {
@@ -1087,22 +1100,37 @@ pub async fn apply_status(
 ) {
     let now = now_ms() as i64;
     let mut moved = 0usize;
+    // The first refusal, verbatim. A row that does not move must say
+    // why on the status line, because "0 moved" against a remote row
+    // looks exactly like a wedged picker.
+    let mut refused: Option<String> = None;
     for (server, id) in &ids {
-        let ok = if server == LOCAL {
-            store::set_status_by_id(id, &status, now).await.is_ok()
+        let r = if server == LOCAL {
+            store::set_status_by_id(id, &status, now)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.message)
         } else {
             act_remote(server, id, "status", Some(&status)).await
         };
-        moved += usize::from(ok);
+        match r {
+            Ok(()) => moved += 1,
+            Err(why) => {
+                if refused.is_none() {
+                    refused = Some(why);
+                }
+            }
+        }
     }
     {
         let mut b = picker.borrow_mut();
         if let Some(p) = b.as_mut() {
             let verb = if status == "waiting" { "moved to waiting" } else { "flagged" };
-            p.status = Some(if moved == 1 {
-                verb.to_string()
-            } else {
-                format!("{moved} {verb}")
+            p.status = Some(match (moved, refused) {
+                (1, None) => verb.to_string(),
+                (n, None) => format!("{n} {verb}"),
+                (0, Some(why)) => why,
+                (n, Some(why)) => format!("{n} {verb}; {why}"),
             });
             p.marked.clear();
         }
@@ -1235,7 +1263,7 @@ async fn acknowledge(server: String, id: String) {
     if server == LOCAL {
         let _ = store::acknowledge(&id, now_ms() as i64).await;
     } else {
-        act_remote(&server, &id, "ack", None).await;
+        let _ = act_remote(&server, &id, "ack", None).await;
     }
 }
 
@@ -1657,7 +1685,7 @@ fn dispatch_key(
                 if server == LOCAL {
                     let _ = store::rename_by_user(&id, n, now_ms() as i64).await;
                 } else {
-                    act_remote(&server, &id, "rename", n).await;
+                    let _ = act_remote(&server, &id, "rename", n).await;
                     fetch_remotes_now(Rc::clone(&picker), Rc::clone(&remotes), false).await;
                 }
                 reload_picker(picker, remotes, false).await;
