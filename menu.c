@@ -283,6 +283,24 @@ menu_destroy(struct window *w)
 	w->menu = NULL;
 }
 
+/*
+ * A pane is going away. A menu keeps the target it was opened against in
+ * md->fs, as raw pointers, and menu_reapply_styles dereferences fs.wp on
+ * every redraw - so a menu left open over a pane that dies is a
+ * use-after-free waiting for the next draw. window_destroy already calls
+ * menu_destroy before its panes go; this is the same care for one pane.
+ *
+ * The menu goes rather than just losing its target: its items were built
+ * for that pane (display-menu -t), so running one afterwards would act
+ * on whatever the target resolved to instead.
+ */
+void
+menu_pane_destroyed(struct window *w, struct window_pane *wp)
+{
+	if (w->menu != NULL && w->menu->fs.wp == wp)
+		menu_close(w);
+}
+
 void
 menu_get_cursor(struct menu_data *md, u_int *cx, u_int *cy)
 {

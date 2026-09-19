@@ -1120,6 +1120,8 @@ window_remove_pane(struct window *w, struct window_pane *wp)
 {
 	int	pop = (wp == w->modal);
 
+	/* A menu holding this pane as its target must not outlive it. */
+	menu_pane_destroyed(w, wp);
 	window_lost_pane(w, wp);
 	TAILQ_REMOVE(&w->panes, wp, entry);
 	TAILQ_REMOVE(&w->z_index, wp, zentry);

@@ -4259,6 +4259,7 @@ int		 menu_display(struct menu *, int, int, struct cmdq_item *,
 		    menu_choice_cb, void *);
 void		 menu_close(struct window *);
 void		 menu_destroy(struct window *);
+void		 menu_pane_destroyed(struct window *, struct window_pane *);
 void		 menu_update(struct menu_data *);
 struct screen	*menu_screen(struct menu_data *);
 u_int		 menu_width(struct menu_data *);
