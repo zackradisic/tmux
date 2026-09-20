@@ -160,6 +160,10 @@ cmd_select_pane_exec(struct cmd *self, struct cmdq_item *item)
 	char			*title;
 	const char		*style;
 	struct options_entry	*o;
+#ifdef ENABLE_PLUGINS
+	struct window_mode_entry *wme;
+	const char		*dir = NULL;
+#endif
 
 	if (entry == &cmd_last_pane_entry || args_has(args, 'l')) {
 		/*
@@ -215,6 +219,28 @@ cmd_select_pane_exec(struct cmd *self, struct cmdq_item *item)
 		cmdq_print(item, "%s", options_get_string(oo, "window-style"));
 		return (CMD_RETURN_NORMAL);
 	}
+
+#ifdef ENABLE_PLUGINS
+	/*
+	 * A direction from a pane held by a plugin mode goes to the plugin
+	 * (see window_plugin_mode_nav): its panel has sides of its own, and
+	 * this is the only way a key binding reaches it while the panel is
+	 * forwarding every plain key elsewhere.
+	 */
+	if (args_has(args, 'L'))
+		dir = "left";
+	else if (args_has(args, 'R'))
+		dir = "right";
+	else if (args_has(args, 'U'))
+		dir = "up";
+	else if (args_has(args, 'D'))
+		dir = "down";
+	wme = TAILQ_FIRST(&wp->modes);
+	if (dir != NULL && wme != NULL && wme->mode == &window_plugin_mode) {
+		window_plugin_mode_nav(wme, dir);
+		return (CMD_RETURN_NORMAL);
+	}
+#endif
 
 	if (args_has(args, 'L')) {
 		window_push_zoom(w, 0, 1);

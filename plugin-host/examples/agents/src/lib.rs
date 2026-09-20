@@ -5,7 +5,20 @@
 //! waiting, working, done) and, inside each group, most recently active
 //! first. A live preview of the highlighted pane sits to the right.
 //! `j`/`k` move, `gg`/`G` jump to the ends, Enter jumps to the pane, `a`
-//! archives, `h` folds in the finished ones. `q` or Esc closes the picker.
+//! archives, `.` folds in the finished ones. `q` or Esc closes the picker.
+//! `l` (or Right, or a click on the preview) hands the keyboard to the
+//! preview: every key then goes to the agent's pane, so a prompt can be
+//! typed and sent without leaving the picker, and the preview shows the
+//! echo. `C-]` takes the keyboard back; so does a click on the list, and
+//! so does a directional `select-pane` on the float - tmux hands the
+//! picker the direction as a `mode-nav` event, so whatever `prefix h` /
+//! `prefix l` / `prefix j` / `prefix k` already do for panes, they do
+//! inside the picker: left is the list, right is the preview, up and
+//! down move the highlight even while the preview has the keyboard. The
+//! prefix table runs before the mode sees a key, which is what makes
+//! this reachable when every plain key is the agent's. The mouse works
+//! on the list too: a click selects a row, a double click jumps to it,
+//! the wheel scrolls, a click on the search line focuses it.
 //! The cursor opens on the agent whose pane the picker was opened from
 //! (the "you are here" row); it lands there even when that row's roster
 //! arrives after the popup is up, unless the cursor has been moved since.
@@ -148,6 +161,8 @@ struct AgentsConfig {
     pick_rename: Option<String>,
     pick_interrupt: Option<String>,
     pick_kill: Option<String>,
+    pick_focus: Option<String>,
+    pick_unfocus: Option<String>,
 }
 
 #[derive(Clone)]
@@ -171,6 +186,13 @@ pub(crate) struct PickKeys {
     pub interrupt: String,
     /// Kill the agent's pane outright. Asks first.
     pub kill: String,
+    /// Hand the keyboard to the preview: keys then go to the agent's
+    /// pane. Right and a click on the preview do the same.
+    pub focus: String,
+    /// Take the keyboard back from the preview. The one key that never
+    /// reaches the pane while typing, so it must be one no agent wants:
+    /// telnet's escape character by default.
+    pub unfocus: String,
 }
 
 impl Default for PickKeys {
@@ -182,13 +204,17 @@ impl Default for PickKeys {
             attention: "w".into(),
             copy: "c".into(),
             menu: "Space".into(),
-            history: "h".into(),
+            // `.` shows hidden things in nnn and yazi; here it shows the
+            // finished rows. `h` used to, but `h`/`l` are left/right now.
+            history: ".".into(),
             archived: "A".into(),
             close: "Escape".into(),
             content: "C-f".into(),
             rename: "r".into(),
             interrupt: "x".into(),
             kill: "X".into(),
+            focus: "l".into(),
+            unfocus: "C-]".into(),
         }
     }
 }
@@ -249,6 +275,8 @@ impl Config {
                 rename: pick(&c.pick_rename, d.rename),
                 interrupt: pick(&c.pick_interrupt, d.interrupt),
                 kill: pick(&c.pick_kill, d.kill),
+                focus: pick(&c.pick_focus, d.focus),
+                unfocus: pick(&c.pick_unfocus, d.unfocus),
             },
         })
     }
@@ -281,7 +309,14 @@ impl Plugin for Agents {
             "pane-command-changed",
         ];
         if role.views() {
-            events.extend(["mode-key", "mode-resize", "mode-closed", "link-up", "link-down"]);
+            events.extend([
+                "mode-key",
+                "mode-nav",
+                "mode-resize",
+                "mode-closed",
+                "link-up",
+                "link-down",
+            ]);
         }
         ctx.subscribe(&events).map_err(|e| e.message.clone())?;
         store::migrate_sync()?;
@@ -385,6 +420,7 @@ impl Plugin for Agents {
             "mode-key" => {
                 view::on_mode_key(&self.picker, &self.busy, &self.remotes, ctx, &event)
             }
+            "mode-nav" => view::on_mode_nav(&self.picker, &self.busy, ctx, &event),
             "mode-resize" => {
                 let mut b = self.picker.borrow_mut();
                 let Some(p) = b.as_mut() else { return };
@@ -481,19 +517,30 @@ impl Agents {
             return;
         }
         if verb == "menu-key" {
-            // "menu-key <key>": an item of the action menu, handing its
-            // key back to the picker. The menu is drawn by tmux, so this
-            // is the only way back in.
+            // "menu-key <key> [x y]": an item of the action menu, handing
+            // its key back to the picker. The menu is drawn by tmux, so
+            // this is the only way back in. The optional cell makes a
+            // mouse key whole (a click needs somewhere to land), which is
+            // how a script - or a test - clicks the picker.
             if !self.role.views() {
                 return;
             }
-            let Some(key) = text.split_whitespace().nth(1) else { return };
+            let mut words = text.split_whitespace().skip(1);
+            let Some(key) = words.next() else { return };
+            let mouse = match (
+                words.next().and_then(|v| v.parse::<u32>().ok()),
+                words.next().and_then(|v| v.parse::<u32>().ok()),
+            ) {
+                (Some(x), Some(y)) => Some((x, y)),
+                _ => None,
+            };
             view::on_menu_key(
                 &self.picker,
                 &self.busy,
                 &self.remotes,
                 ctx,
                 key.to_string(),
+                mouse,
                 event.scope.client.map(u64::from),
             );
             return;

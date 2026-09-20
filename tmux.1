@@ -4182,6 +4182,11 @@ or
 .Fl U
 is used, respectively the pane below, to the left, to the right, or above the
 target pane is used.
+When the target pane is held by a plugin mode (see
+.Ic load\-plugin ) ,
+a direction is handed to that plugin instead, so a binding such as
+.Ql prefix h
+moves inside the plugin's panel rather than off it.
 .Fl Z
 keeps the window zoomed if it was zoomed.
 .Fl l

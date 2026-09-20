@@ -265,6 +265,29 @@ window_plugin_refresh_callback(__unused int fd, __unused short events,
 		evtimer_add(&data->refresh, &tv);
 }
 
+/*
+ * A directional select-pane (-L/-R/-U/-D) on the pane this mode holds.
+ * The panel is a modal UI with sides of its own, so the direction is the
+ * plugin's to interpret (which half has the keyboard, which row is
+ * highlighted) rather than a step across the layout underneath. Delivered
+ * as a mode-nav event with dir "left", "right", "up" or "down"; a plugin
+ * that does not know the event ignores it, as it would an unknown key.
+ * This is what a prefix binding can reach while every ordinary key is
+ * being forwarded to another pane: the prefix table runs before the mode
+ * sees a key.
+ */
+void
+window_plugin_mode_nav(struct window_mode_entry *wme, const char *dir)
+{
+	struct window_plugin_mode_data	*data = wme->data;
+	struct plugin_buf		*pb;
+
+	pb = plugin_event_create("mode-nav");
+	plugin_event_i64(pb, "mode", data->mode_id);
+	plugin_event_str(pb, "dir", dir);
+	plugin_event_send_mode(pb, data->mode_id);
+}
+
 /* Accessors for plugin-mode.c (registry validation and vtable calls). */
 
 uint64_t

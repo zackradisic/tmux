@@ -4386,6 +4386,7 @@ void	 plugin_bridge_link_state(struct remote_link *, int);
 
 /* window-plugin-mode.c */
 extern const struct window_mode window_plugin_mode;
+void	 window_plugin_mode_nav(struct window_mode_entry *, const char *);
 #endif
 
 #endif /* TMUX_H */

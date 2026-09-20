@@ -1,6 +1,6 @@
 #!/bin/sh
 # Un-archive an agent from the picker. Archiving hides a row from the live
-# roster; the history view (h) shows it again, tagged "archived", and the
+# roster; the history view (.) shows it again, tagged "archived", and the
 # archive key (a) on an archived row un-archives it - the row returns to
 # the live roster. Check:
 #
@@ -72,7 +72,7 @@ $TMUX send-keys -t "$FORM" a; sleep 0.6
 screen | grep -q '0 live' || fail "archiving did not drop the agent"
 
 # Show history: the archived agent reappears, tagged "archived".
-$TMUX send-keys -t "$FORM" h; sleep 0.6
+$TMUX send-keys -t "$FORM" .; sleep 0.6
 screen | grep -q 'archived' || fail "history view did not show the archived tag"
 screen | grep -q 'claude' || fail "the archived agent is missing from history"
 

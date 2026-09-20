@@ -808,6 +808,11 @@ the `mode` field (`event.get_i64("mode")`):
   "Down", "MouseDown1Pane", ...); mouse keys add `mouse_x`/`mouse_y`/
   `mouse_b` fields
   with pane-relative cell coordinates.
+- `mode-nav`: `get_str("dir")` is `"left"`, `"right"`, `"up"` or `"down"`:
+  someone ran a directional `select-pane` on your panel (typically a
+  prefix binding like `prefix h`). Move focus between your panel's parts
+  if it has any; otherwise ignore it. Nothing else reaches you from a key
+  binding while the panel is forwarding plain keys to another pane.
 - `mode-resize`: `get_i64("width")`/`get_i64("height")` — redraw.
 - `mode-closed`: terminal, with `get_str("reason")` `"closed"` (your
   `mode_close`) or `"killed"` (user killed the pane, reload, window

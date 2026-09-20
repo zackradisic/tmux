@@ -33,6 +33,8 @@ fail() { echo "FAIL: $*" >&2; echo "--- screen:" >&2; screen >&2; cleanup; exit 
 screen() { $TMUX capture-pane -M -p -t "$FORM" | sed '/^ *$/d'; }
 # The screen line the cursor marker sits on.
 curline() { $TMUX capture-pane -M -p -t "$FORM" | grep -n '▸' | head -1 | cut -d: -f1; }
+# The screen line of the first row: every row carries the ● badge.
+firstrow() { $TMUX capture-pane -M -p -t "$FORM" | grep -n '●' | head -1 | cut -d: -f1; }
 keys() { $TMUX send-keys -t "$FORM" "$@"; sleep 0.4; }
 open_picker() {
 	[ -n "$CTL" ] && kill $CTL 2>/dev/null
@@ -70,8 +72,11 @@ sleep 1.5
 
 open_picker
 screen | grep -q '3 live' || fail "expected 3 live agents"
-TOP=$(curline)
-[ -n "$TOP" ] || fail "no cursor marker at open"
+# The top row, not the cursor's: the picker opens on the agent you are
+# sitting in, which need not be the first row.
+TOP=$(firstrow)
+[ -n "$TOP" ] || fail "no rows at open"
+[ -n "$(curline)" ] || fail "no cursor marker at open"
 
 # G goes to the bottom: the marker moves to a later screen line.
 keys G

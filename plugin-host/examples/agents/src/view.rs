@@ -514,6 +514,9 @@ pub enum PickAfter {
     /// Kill this local pane. `kill-pane` on a shadow runs on the remote
     /// server (see tmux.1, REMOTE SESSIONS), so it kills the real pane.
     KillPane(u32),
+    /// Type this key into the local pane the preview shows: the keyboard
+    /// is the preview's. Same route as `Interrupt`, one key per press.
+    Type(u32, String),
 }
 
 /// One rendered line: a server header (only when rows come from more than
@@ -618,9 +621,37 @@ pub struct Picker {
     pub remote_capture: Option<(String, Vec<String>)>,
     /// Rows come from more than one server: show server headers.
     pub multi: bool,
+    /// The keyboard belongs to the preview: every key goes to the
+    /// highlighted agent's pane (see `PickAfter::Type`), except the one
+    /// that takes it back. The list still refreshes underneath, but no
+    /// key moves the cursor - a selection that moved under your prompt
+    /// would send the rest of it to another agent.
+    pub preview_focus: bool,
 }
 
 impl Picker {
+    /// The width of the list column; the preview takes the rest. 60% of
+    /// the width, but never let the clamp's min exceed its max: a narrow
+    /// mode (a split pane) would panic `clamp(30, <30)` and trap the
+    /// guest. Below ~50 cols give the list almost everything and skip the
+    /// side preview.
+    fn list_w(&self) -> usize {
+        let w = self.width as usize;
+        if w <= 50 {
+            w.saturating_sub(2).max(1)
+        } else {
+            (w * 6 / 10).clamp(30, w - 20)
+        }
+    }
+
+    /// The preview cannot keep the keyboard without a pane to type into:
+    /// the agent may have finished, or a refresh replaced the rows and
+    /// the highlighted one is a remote row with no mirror here.
+    fn sync_focus(&mut self) {
+        if self.preview_focus && live_pane_of_selection(self).is_none() {
+            self.preview_focus = false;
+        }
+    }
     /// What to ask the store and every provider for beyond the live rows.
     pub fn list_req(&self) -> ListReq {
         ListReq { history: self.show_history, archived: self.archived_only }
@@ -960,6 +991,7 @@ pub async fn pick_open(
         mirrors: if multi { find_mirrors() } else { HashMap::new() },
         remote_capture: None,
         multi,
+        preview_focus: false,
     };
     pick_refilter(&mut p);
     // Open on the agent you are sitting in, when it has a row.
@@ -1239,6 +1271,7 @@ async fn open_menu(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>) {
                 a.live() && matches!(a.status.as_str(), "needs_input" | "waiting");
             let mut items = String::new();
             items.push_str(&menu_item("jump to pane", &k.jump, live));
+            items.push_str(&menu_item("type into pane", &k.focus, live));
             items.push_str(&menu_item("message", "m", true));
             items.push_str(&menu_item("copy id", &k.copy, durable_id(a).is_some()));
             items.push_str(&menu_item("rename", &k.rename, true));
@@ -1250,6 +1283,15 @@ async fn open_menu(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>) {
             items.push_str(" ''");
             items.push_str(&menu_item("interrupt (C-c)", &k.interrupt, live));
             items.push_str(&menu_item("kill pane", &k.kill, live));
+            // The one view toggle in a menu of row actions: a key that
+            // is not in the footer has to be findable somewhere.
+            items.push_str(" ''");
+            let hist = if p.show_history {
+                "hide finished (history)"
+            } else {
+                "show finished (history)"
+            };
+            items.push_str(&menu_item(hist, &k.history, true));
             Some((menu_safe(&display_name(a), 30), items))
         })
     }) else {
@@ -1352,7 +1394,73 @@ pub fn on_mode_key(
     // The client whose key this was. A clipboard belongs to a terminal,
     // not to the server, so a copy has to name it - and so does a menu.
     let client = event.get_i64("client").map(|v| v as u64);
-    dispatch_key(picker, busy, remotes, ctx, mode_id, key, client);
+    // A mouse key lands on a cell of the mode screen (0-based).
+    let mouse = match (event.get_i64("mouse_x"), event.get_i64("mouse_y")) {
+        (Some(x), Some(y)) if x >= 0 && y >= 0 => Some((x as u32, y as u32)),
+        _ => None,
+    };
+    dispatch_key(picker, busy, remotes, ctx, mode_id, key, mouse, client);
+}
+
+/// A directional `select-pane` on the float: a prefix binding, most
+/// likely (`prefix h` is `select-pane -L` in the common config). The
+/// picker has two sides, so left is the list and right is the preview;
+/// up and down move the highlight whichever side has the keyboard - a
+/// prefix key can never be text, so this is the one way to switch the
+/// agent you are typing into, or to leave the preview, without spending
+/// a key of the agent's own.
+pub fn on_mode_nav(
+    picker: &Rc<RefCell<Option<Picker>>>,
+    busy: &Rc<Cell<bool>>,
+    ctx: &Ctx,
+    event: &Event,
+) {
+    let dir = event.get_str("dir").unwrap_or("").to_string();
+    let mut ack: Option<(String, String)> = None;
+    {
+        let mut b = picker.borrow_mut();
+        let Some(p) = b.as_mut() else { return };
+        if event.get_i64("mode") != Some(p.mode.0 as i64) {
+            return;
+        }
+        if busy.get() {
+            return;
+        }
+        p.status = None;
+        match dir.as_str() {
+            "left" => {
+                p.preview_focus = false;
+                pick_render(p);
+            }
+            "right" => {
+                ack = focus_preview(p);
+            }
+            "up" | "down" => {
+                let typing = p.preview_focus;
+                move_sel(p, if dir == "up" { -1 } else { 1 });
+                // Landing on an unread row acknowledges it, as a key does.
+                if let Some(&i) = p.view.get(p.sel) {
+                    if p.rows[i].unread() {
+                        p.rows[i].acked_ms = Some(p.now_ms as i64);
+                        ack = Some((p.rows[i].server.clone(), p.rows[i].id.clone()));
+                    }
+                }
+                // The keyboard stays with the preview, which now shows
+                // another agent - unless that row has no pane to type
+                // into, in which case the focus drops and the footer says
+                // so (rendered again, since move_sel drew the old state).
+                p.sync_focus();
+                if typing {
+                    pick_render(p);
+                }
+            }
+            _ => return,
+        }
+    }
+    if let Some((server, id)) = ack {
+        ctx.spawn(acknowledge(server, id));
+    }
+    request_capture(picker);
 }
 
 /// A key the action menu sent back in. The menu's items are the picker's
@@ -1365,6 +1473,7 @@ pub fn on_menu_key(
     remotes: &Rc<RefCell<Remotes>>,
     ctx: &Ctx,
     key: String,
+    mouse: Option<(u32, u32)>,
     client: Option<u64>,
 ) {
     let mode_id = picker.borrow().as_ref().map(|p| p.mode.0 as i64);
@@ -1373,9 +1482,18 @@ pub fn on_menu_key(
     if mode_id.is_none() {
         return;
     }
-    dispatch_key(picker, busy, remotes, ctx, mode_id, key, client);
+    dispatch_key(picker, busy, remotes, ctx, mode_id, key, mouse, client);
 }
 
+/// A mouse key, by name: a click, a release, a drag, a wheel notch, with
+/// or without a modifier prefix. Never text, and never forwarded to a
+/// pane - `send_key` would take the name, but a mouse key without its
+/// event is a key the pane cannot make sense of.
+fn is_mouse_key(key: &str) -> bool {
+    key.contains("Mouse") || key.contains("Wheel") || key.contains("Click")
+}
+
+#[allow(clippy::too_many_arguments)]
 fn dispatch_key(
     picker: &Rc<RefCell<Option<Picker>>>,
     busy: &Rc<Cell<bool>>,
@@ -1383,6 +1501,7 @@ fn dispatch_key(
     ctx: &Ctx,
     mode_id: Option<i64>,
     key: String,
+    mouse: Option<(u32, u32)>,
     client: Option<u64>,
 ) {
     let mut after = PickAfter::None;
@@ -1400,7 +1519,6 @@ fn dispatch_key(
         }
         p.status = None;
         let k = &p.keys.clone();
-        let sel = p.view.get(p.sel).copied();
         // True when this key moved the selection: drives read-ack.
         let mut moved = false;
         // A pending `g` is consumed by this key; only a second `g`
@@ -1413,7 +1531,32 @@ fn dispatch_key(
         // modes; they are never text.
         let is_down = matches!(key.as_str(), "Down" | "C-n" | "C-j");
         let is_up = matches!(key.as_str(), "Up" | "C-p" | "C-k");
-        if p.composing {
+        if is_mouse_key(&key) {
+            // The mouse means the same thing whatever has the keyboard:
+            // a click lands where it lands. Without a cell (a mouse key
+            // typed by name) there is nowhere for it to land.
+            if let Some((x, y)) = mouse {
+                moved = mouse_key(p, &key, x, y, &mut after, &mut ack);
+            }
+        } else if p.preview_focus {
+            // The preview has the keyboard: every key goes to the pane
+            // it shows, except the one that takes the keyboard back.
+            if key == k.unfocus {
+                p.preview_focus = false;
+                pick_render(p);
+            } else {
+                match live_pane_of_selection(p) {
+                    Some(pane) => after = PickAfter::Type(pane, key.clone()),
+                    None => {
+                        // The pane went away under the prompt: say so,
+                        // rather than typing into nothing.
+                        p.preview_focus = false;
+                        p.status = Some(unreachable_reason(p));
+                        pick_render(p);
+                    }
+                }
+            }
+        } else if p.composing {
             // Compose mode: keys are text, except accept / cancel.
             if key == k.close {
                 p.composing = false;
@@ -1590,29 +1733,13 @@ fn dispatch_key(
                 pick_render(p);
             }
         } else if key == k.jump {
-            if let Some(i) = sel {
-                let a = &p.rows[i];
-                let live_pane = a.pane.filter(|_| a.live()).map(|x| x as u32);
-                match (live_pane, p.local_pane_of(a)) {
-                    (Some(_), Some(local)) => {
-                        // Jumping to the pane acknowledges the agent.
-                        p.rows[i].acked_ms = Some(p.now_ms as i64);
-                        ack = Some((p.rows[i].server.clone(), p.rows[i].id.clone()));
-                        after = PickAfter::Jump(local, p.mode);
-                    }
-                    (Some(_), None) => {
-                        p.status = Some(format!(
-                            "not mirrored here: remote-attach {}",
-                            a.server
-                        ));
-                        pick_render(p);
-                    }
-                    (None, _) => {
-                        p.status = Some("no live pane to jump to".into());
-                        pick_render(p);
-                    }
-                }
-            }
+            after = jump_after(p, &mut ack);
+        } else if key == k.focus || key == "Right" {
+            // Right, into the preview: the keyboard goes with it.
+            ack = focus_preview(p);
+        } else if key == "h" || key == "Left" {
+            // Left of the list is nothing; the key is spent so that it
+            // is never mistaken for text. (`h` used to fold in history.)
         } else if key == k.archive {
             after = archive_after(p);
         } else if key == k.menu {
@@ -1704,6 +1831,21 @@ fn dispatch_key(
     request_capture(picker);
     match after {
         PickAfter::None => {}
+        PickAfter::Type(pane, key) => {
+            // Synchronous, like the interrupt: one key into the pane.
+            // Then hurry the preview along - the host re-blits it every
+            // 500ms, which is fine for watching and too slow for typing.
+            match send_key(PaneId(pane), &key) {
+                Ok(()) => poke_preview(picker),
+                Err(e) => {
+                    if let Some(p) = picker.borrow_mut().as_mut() {
+                        p.preview_focus = false;
+                        p.status = Some(format!("typing failed: {}", e.message));
+                        pick_render(p);
+                    }
+                }
+            }
+        }
         PickAfter::Close(mode) => {
             let _ = mode_close(mode);
         }
@@ -1948,6 +2090,171 @@ struct MailboxCount {
     #[allow(dead_code)]
     #[serde(default)]
     total: i64,
+}
+
+/// The jump key: to the highlighted row's pane, or the reason it cannot.
+/// Jumping acknowledges the agent (`ack`), like landing the cursor on it.
+fn jump_after(p: &mut Picker, ack: &mut Option<(String, String)>) -> PickAfter {
+    let Some(i) = p.view.get(p.sel).copied() else {
+        return PickAfter::None;
+    };
+    let a = &p.rows[i];
+    let live_pane = a.pane.filter(|_| a.live()).map(|x| x as u32);
+    match (live_pane, p.local_pane_of(a)) {
+        (Some(_), Some(local)) => {
+            p.rows[i].acked_ms = Some(p.now_ms as i64);
+            *ack = Some((p.rows[i].server.clone(), p.rows[i].id.clone()));
+            PickAfter::Jump(local, p.mode)
+        }
+        (Some(_), None) => {
+            p.status = Some(format!("not mirrored here: remote-attach {}", a.server));
+            pick_render(p);
+            PickAfter::None
+        }
+        (None, _) => {
+            p.status = Some("no live pane to jump to".into());
+            pick_render(p);
+            PickAfter::None
+        }
+    }
+}
+
+/// Hand the keyboard to the preview. Only a row with a pane on this
+/// server can take it (its own, or the shadow of a remote one); for any
+/// other row the status line says why, in the jump key's words. Taking
+/// the keyboard acknowledges an unread row, as jumping to it would: you
+/// are about to talk to it. Returns the row to acknowledge.
+fn focus_preview(p: &mut Picker) -> Option<(String, String)> {
+    if live_pane_of_selection(p).is_none() {
+        p.status = Some(unreachable_reason(p));
+        pick_render(p);
+        return None;
+    }
+    // Whatever was being typed into the picker itself is abandoned; the
+    // keyboard cannot be in two places.
+    p.filtering = false;
+    p.composing = false;
+    p.msg_buf.clear();
+    p.renaming = false;
+    p.rename_buf.clear();
+    p.preview_focus = true;
+    let mut ack = None;
+    if let Some(&i) = p.view.get(p.sel) {
+        if p.rows[i].unread() {
+            p.rows[i].acked_ms = Some(p.now_ms as i64);
+            ack = Some((p.rows[i].server.clone(), p.rows[i].id.clone()));
+        }
+    }
+    pick_render(p);
+    ack
+}
+
+/// A mouse key at cell (x, y) of the mode screen, 0-based. The screen is
+/// the list on the left (its rows from screen row 3, scrolled by `top`),
+/// the separator column at `list_w`, the preview to the right. Returns
+/// whether the selection moved. A click takes the keyboard to the side it
+/// lands on: on the preview it starts typing, on the list it stops.
+fn mouse_key(
+    p: &mut Picker,
+    key: &str,
+    x: u32,
+    y: u32,
+    after: &mut PickAfter,
+    ack: &mut Option<(String, String)>,
+) -> bool {
+    let list_w = p.list_w();
+    let (x, y) = (x as usize, y as usize);
+    // A modifier prefix does not change where a click lands.
+    let base = key.rsplit('-').next().unwrap_or(key);
+    let in_list = x < list_w;
+    match base {
+        "MouseDown1Pane" | "DoubleClick1Pane" => {
+            if !in_list {
+                if x > list_w {
+                    *ack = focus_preview(p);
+                }
+                return false;
+            }
+            if p.preview_focus {
+                p.preview_focus = false;
+            }
+            // The search line: a click there focuses the box, as `/`.
+            if y == 1 {
+                p.filtering = true;
+                pick_render(p);
+                return false;
+            }
+            let Some(off) = y.checked_sub(3) else {
+                pick_render(p);
+                return false;
+            };
+            if off >= p.list_h() {
+                pick_render(p);
+                return false;
+            }
+            let Some(Line::Item(v)) = p.lines.get(p.top + off).cloned() else {
+                pick_render(p);
+                return false;
+            };
+            let was = p.sel;
+            p.sel = v;
+            // The user took the cursor: stop pulling it back to the
+            // here row.
+            p.seek_here = false;
+            p.scroll_to_selection();
+            if base == "DoubleClick1Pane" {
+                *after = jump_after(p, ack);
+            }
+            pick_render(p);
+            v != was
+        }
+        "WheelUpPane" | "WheelDownPane" if in_list => {
+            // The wheel moves the cursor, so it must take the keyboard
+            // back first: a cursor that moves while the preview types
+            // would send the rest of the prompt to another agent.
+            p.preview_focus = false;
+            move_sel(p, if base == "WheelUpPane" { -1 } else { 1 });
+            true
+        }
+        _ => false,
+    }
+}
+
+/// How soon after a typed key the preview is re-blitted, twice: once for
+/// a pane that echoes at once, once more for one that redraws its prompt
+/// a beat later (an agent's TUI does). The host's own 500ms refresh
+/// carries on regardless; these only bring the next frame forward.
+const POKE_MS: [u64; 2] = [40, 160];
+
+/// Bring the preview's next frame forward (see [`POKE_MS`]). Setting the
+/// rect again is what redraws it now: the host blits on set, then keeps
+/// its own cadence. Fire-and-forget, one task per key: a blit is a grid
+/// copy, cheap enough that overlapping pokes cost nothing worth tracking.
+fn poke_preview(picker: &Rc<RefCell<Option<Picker>>>) {
+    let (mode, rect) = {
+        let b = picker.borrow();
+        let Some(p) = b.as_ref() else { return };
+        (p.mode, preview_rect(p, p.list_w()))
+    };
+    let Some(rect) = rect else { return };
+    let picker = Rc::clone(picker);
+    spawn(async move {
+        for ms in POKE_MS {
+            if sleep_ms(ms).await.is_err() {
+                return;
+            }
+            // Still the same picker, still typing into the same pane.
+            let same = picker.borrow().as_ref().is_some_and(|p| {
+                p.mode.0 == mode.0
+                    && p.preview_focus
+                    && live_pane_of_selection(p) == Some(rect.pane.0)
+            });
+            if !same {
+                return;
+            }
+            let _ = mode_preview(mode, Some(&rect));
+        }
+    });
 }
 
 /// Move the selection by `delta` rows, clamped, then scroll and redraw.
@@ -2357,6 +2664,7 @@ fn pick_refilter_keep(
         p.top = p.lines.len().saturating_sub(1);
     }
     p.scroll_to_selection();
+    p.sync_focus();
 }
 
 /// Whether a row is in the view: it belongs to the view's set (every row,
@@ -2522,15 +2830,7 @@ fn badge(a: &Agent) -> String {
 pub fn pick_render(p: &mut Picker) {
     let w = p.width as usize;
     let h = p.height as usize;
-    // 60% of the width for the list, but never let the clamp's min exceed
-    // its max: a narrow mode (a split pane) would panic `clamp(30, <30)`
-    // and trap the guest. Below ~50 cols give the list almost everything
-    // and skip the side preview.
-    let list_w = if w <= 50 {
-        w.saturating_sub(2).max(1)
-    } else {
-        (w * 6 / 10).clamp(30, w - 20)
-    };
+    let list_w = p.list_w();
     let mut out = String::from("\x1b[2J\x1b[H");
 
     let live = p.rows.iter().filter(|a| a.live()).count();
@@ -2737,8 +3037,11 @@ pub fn pick_render(p: &mut Picker) {
                     let stale = p.down.contains_key(&a.server);
                     if cur {
                         // The cursor row: reverse video across the width.
+                        // Dimmed while the preview has the keyboard, so
+                        // the bright thing on screen is where keys go.
+                        let sgr = if p.preview_focus { "2;7" } else { "7" };
                         out.push_str(&format!(
-                            "\x1b[{row};1H\x1b[7m{:<pad$}\x1b[0m",
+                            "\x1b[{row};1H\x1b[{sgr}m{:<pad$}\x1b[0m",
                             strip_sgr(&shown),
                         ));
                     } else if marked {
@@ -2778,9 +3081,12 @@ pub fn pick_render(p: &mut Picker) {
         }
     }
 
-    // Vertical separator between the list and the preview.
+    // Vertical separator between the list and the preview. It lights up
+    // while the preview has the keyboard: the one mark on screen that
+    // says which side your keys are going to.
+    let sep = if p.preview_focus { "\x1b[1;36m┃" } else { "\x1b[2m│" };
     for r in 1..=h {
-        out.push_str(&format!("\x1b[{r};{c}H\x1b[2m│\x1b[0m", c = list_w + 1));
+        out.push_str(&format!("\x1b[{r};{c}H{sep}\x1b[0m", c = list_w + 1));
     }
 
     if let Some(s) = &p.status {
@@ -2796,7 +3102,20 @@ pub fn pick_render(p: &mut Picker) {
     } else {
         format!("{} contents", pretty_key(&k.content))
     };
-    let footer = if p.composing {
+    let footer = if p.preview_focus {
+        // Every key goes to the pane, so the footer can promise only one
+        // thing about the keyboard: how to get it back.
+        // The prefix route is named too, since it is the one that costs
+        // the agent nothing: tmux hands a directional select-pane on the
+        // float to the picker (mode-nav), and `prefix h` is select-pane
+        // -L in the common config.
+        let to = p.selected().map(display_name).unwrap_or_default();
+        format!(
+            "typing into {} · keys go to its pane · {} back to list (or select-pane -L)",
+            clip(&to, 16),
+            pretty_key(&k.unfocus)
+        )
+    } else if p.composing {
         "type a message · Enter send · Esc cancel".to_string()
     } else if p.renaming {
         "type a name · Enter accept · Esc cancel".to_string()
@@ -2809,10 +3128,12 @@ pub fn pick_render(p: &mut Picker) {
         // under the cursor. A footer that lists every key fits none of
         // them at a usable width.
         format!(
-            "j/k move · gg/G ends · {} jump · {} actions · {} search · {ctok} · q/{} close",
+            "j/k move · {} type · {} jump · {} actions · {} search · {ctok} · {} history · q/{} close",
+            keyname(&k.focus),
             keyname(&k.jump),
             keyname(&k.menu),
             keyname(&k.filter),
+            keyname(&k.history),
             keyname(&k.close),
         )
     };

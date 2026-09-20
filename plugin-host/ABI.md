@@ -470,6 +470,15 @@ is not offered; the design for it is in [MODE-ATTACH.md](MODE-ATTACH.md).)
     "Escape", "MouseDown1Pane", ...), `client` (the pressing client),
     and for mouse keys `mouse_x`, `mouse_y`, `mouse_b` (pane-relative
     cell coordinates).
+  - `mode-nav` — fields `mode`, `dir` (`"left"`, `"right"`, `"up"`,
+    `"down"`): a directional `select-pane` (`-L`/`-R`/`-U`/`-D`) was run
+    on the float while the mode held it. The panel is a modal UI with
+    sides of its own, so the direction is the plugin's to interpret
+    (which half has the keyboard, which row is highlighted) and the
+    layout underneath is not stepped across. This is the one route a
+    prefix key binding has into a panel that is forwarding every plain
+    key elsewhere: the prefix table runs before the mode sees a key.
+    Ignore it if the panel has no sides.
   - `mode-resize` — fields `mode`, `width`, `height`; the float was
     resized, redraw.
   - `mode-closed` — fields `mode`, `reason`; terminal. `reason` is
