@@ -525,6 +525,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
+name = "formkit"
+version = "0.1.0"
+dependencies = [
+ "tmux-plugin-sdk",
+]
+
+[[package]]
 name = "fs-probe"
 version = "0.1.0"
 dependencies = [
@@ -1080,6 +1087,7 @@ dependencies = [
 name = "session_creator"
 version = "0.1.0"
 dependencies = [
+ "formkit",
  "serde",
  "serde_json",
  "tmux-plugin-sdk",

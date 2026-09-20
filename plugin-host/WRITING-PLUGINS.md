@@ -853,6 +853,33 @@ then cannot read each other's answer, and the option dies with its
 object. notify-toast uses this for `#{pane_current_command}` and
 `#{pane_title}`.
 
+### Forms and completion: the `formkit` crate
+
+A panel that asks for a path, a name and a branch does not have to draw
+its own fields or scan its own directories. `plugin-host/formkit` is the
+session creator's form machinery as a library, in three layers a plugin
+can take separately:
+
+- `formkit::complete`: a completion list for one field. Sources are the
+  directories under a base, only the repos among them, a repo's
+  worktrees, its branches, or a fixed word list. One `fs_list` plus one
+  shell job per scan; the expensive git questions run afterwards, for the
+  rows on screen only.
+- `formkit::form`: labelled fields, focus, the list keys (`C-j` steps in,
+  `Tab` completes, `Esc` hides then closes), the touched/mirror rule, the
+  render and the `mode_resize` handshake. What the fields mean comes from
+  your `Model` impl: which field completes from where, which follows
+  which, what the tag says.
+- `formkit::git`: resolve a repo root, make sure a folder exists (asking
+  first), add a worktree.
+
+It is compile-time only: your plugin runs the scans, so it needs the
+capabilities in `formkit::complete::CAPS` (`run-process`, `fs-list`,
+`fs-read-any`) granted to its own binary. A denied one is rendered as a
+hint in the list rule, never as a silent empty list. `session_creator`
+is the reference consumer; `regress/plugin-session-creator.sh` is what
+a change to the crate must keep green.
+
 ## Debugging checklist
 
 - `tmux plugin-log [-n N] myplugin` — your `log()` lines, panics with

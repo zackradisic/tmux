@@ -4,6 +4,7 @@ members = [
     "host",
     "abi-types",
     "sdk",
+    "formkit",
     "examples/fs-probe",
     "examples/hello-raw",
     "examples/ticker",
