@@ -418,6 +418,9 @@ Ideas, roughly in order of how much they change:
 1. **Make the archive cheap to come back from** (§A2) and the pressure
    mostly goes away — I would archive the lingering half without
    flinching. Half of this problem is really a findability problem.
+   *Done first: `A` is now the archive as its own list, searchable
+   (§A2, "Fixed").* Whether that is enough on its own, or (2)/(3) is
+   still wanted, is a question of living with it for a while.
 2. **A third life between `active` and `archived`.** `life` is already
    `active | stale | archived` (`store.rs:36`), so this is a fourth
    value, not a new axis: still in the roster, still previewable, but in
@@ -441,7 +444,8 @@ one. Worth picking one and not shipping both.
 ### A2. The archive is where agents go to become unfindable
 
 The friction is not archiving, it is everything after. Four separate
-things make the archive feel like a write-only sink:
+things made the archive feel like a write-only sink. The first three are
+fixed (see the end of this section); the fourth is open.
 
 **It is not a list of archived agents.** `h` folds in `store::history()`
 (`store.rs:612`), which is `ended_ms IS NOT NULL OR life = 'archived'`,
@@ -496,6 +500,26 @@ in the list and a real position to scroll to; and be scrollable without
 touching the agent's TUI. The cost is writing a renderer per harness and
 keeping it honest about what the transcript does not contain (raw
 terminal output, anything the agent printed outside the protocol).
+
+**Fixed, kept for the record.** `A` in the picker (`pick_archived`) is
+the archive as a list of its own: only archived rows, every one of them
+rather than whatever survives `HISTORY_MAX`, from every server (the
+`list` request gained `archived`; an older provider answers with capped
+history, and the view still filters it). Entering it turns history on;
+leaving it puts history back the way it was, and `h` off leaves it too.
+The header says `archive`, an empty one says `(nothing archived)`. The
+search box filters inside that set, and `^F` reaches it: a live archived
+row is grepped in its grid as before, an ended one in its saved capture
+(`store::archived_captures`, over the same `search` RPC for a remote
+row, which gained `archived`). To make that capture exist, archiving a
+live agent now saves one (`provider::capture_on_archive`), on both the
+local `a` path and the remote `act archive`; `sweep_gone` also covers
+archived rows now, so a lost pane ends the row and the capture takes
+over. Content hits key on the row (`Agent::key`) rather than the pane,
+which is what let a pane-less row carry a snippet at all; the snippet
+now wins over the `archived` tag on the row. Captures are grepped in
+Rust (substring, then subsequence), so a *regex* query only ever hits a
+grid, never a capture. `regress/plugin-agents-archived.sh` covers it.
 
 ## Sessions and windows
 

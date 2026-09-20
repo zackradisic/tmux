@@ -6,9 +6,9 @@
 //! crosses a link, so the provider runs on every server (pushed there by a
 //! `remote-attach` link) and a view anywhere asks it through services:
 //!
-//!   list    { history }              -> Snapshot (enriched rows + clock)
+//!   list    { history, archived }    -> Snapshot (enriched rows + clock)
 //!   capture { id }                   -> the pane's text, or the saved one
-//!   search  { needle, mode, lines }  -> SearchReply (hits per agent id)
+//!   search  { needle, archived }     -> SearchReply (hits per agent id)
 //!   act     { id, verb, name? }      -> "ok" (ack | archive | unarchive | rename)
 //!
 //! and follows the `changed` topic, which carries a fresh Snapshot after
@@ -52,10 +52,17 @@ pub struct Snapshot {
     pub agents: Vec<Agent>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// What a view wants beyond the live rows. `history` adds the recent
+/// finished and archived rows (capped); `archived` adds every archived
+/// row instead, uncapped, for the archive-only view. An older provider
+/// that does not know `archived` answers with history: the view still
+/// filters to archived rows, only capped ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ListReq {
     #[serde(default)]
     pub history: bool,
+    #[serde(default)]
+    pub archived: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +73,10 @@ pub struct CaptureReq {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchReq {
     pub needle: String,
+    /// Also grep the saved captures of archived agents whose pane is
+    /// gone, for the archive-only view.
+    #[serde(default)]
+    pub archived: bool,
 }
 
 /// Content-search hits, by agent id, with the matcher that found them.
@@ -574,7 +585,7 @@ pub async fn reconcile(cfg: Rc<Config>) {
 /// timer; see `SWEEP_MS`.
 pub async fn sweep_gone() -> usize {
     let panes = list_panes().unwrap_or_default();
-    let live = store::live_agents().await.unwrap_or_default();
+    let live = store::unended().await.unwrap_or_default();
     let now = now_ms() as i64;
     let mut gone = 0;
     for a in live {
@@ -636,48 +647,104 @@ fn mode_from_label(s: &str) -> SearchMode {
     }
 }
 
-/// Run content search over the live panes: auto-detect the matcher, and
-/// fall back to fuzzy when it finds nothing (an unmatched query, or a
-/// half-typed regex that will not compile). Returns the mode that
-/// actually produced the hits and the snippet per matching pane.
+/// Run content search over the live panes and the saved captures:
+/// auto-detect the matcher, and fall back to fuzzy when it finds nothing
+/// anywhere (an unmatched query, or a half-typed regex that will not
+/// compile). Returns the mode that actually produced the hits, the
+/// snippet per matching pane, and the snippet per matching capture (by
+/// whatever the captures were keyed with).
+///
+/// The grids are grepped in tmux (`panes_search`); a capture is text this
+/// side already holds, so it is grepped here, by [`text_search`] - which
+/// has no regex matcher, so a regex query only ever hits a grid.
 pub fn run_content_search(
     panes: &[PaneId],
+    captures: &[(String, String)],
     needle: &str,
-) -> (SearchMode, HashMap<u32, String>) {
-    let collect = |hits: Vec<SearchHit>| -> HashMap<u32, String> {
-        hits.into_iter().map(|h| (h.pane.0, h.snippet)).collect()
+) -> (SearchMode, HashMap<u32, String>, HashMap<String, String>) {
+    let grid = |mode: SearchMode| -> HashMap<u32, String> {
+        panes_search(panes, needle, mode, false, SEARCH_LINES)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|h: SearchHit| (h.pane.0, h.snippet))
+            .collect()
+    };
+    let text = |fuzzy: bool| -> HashMap<String, String> {
+        captures
+            .iter()
+            .filter_map(|(k, t)| text_search(t, needle, fuzzy).map(|s| (k.clone(), s)))
+            .collect()
     };
     let mode = detect_mode(needle);
-    let hits = panes_search(panes, needle, mode, false, SEARCH_LINES)
-        .unwrap_or_default();
-    if !hits.is_empty() {
-        return (mode, collect(hits));
+    let (g, t) = (grid(mode), text(false));
+    if !g.is_empty() || !t.is_empty() {
+        return (mode, g, t);
     }
-    let fz = panes_search(panes, needle, SearchMode::Fuzzy, false, SEARCH_LINES)
-        .unwrap_or_default();
-    if !fz.is_empty() {
-        return (SearchMode::Fuzzy, collect(fz));
+    let (g, t) = (grid(SearchMode::Fuzzy), text(true));
+    if !g.is_empty() || !t.is_empty() {
+        return (SearchMode::Fuzzy, g, t);
     }
-    (mode, HashMap::new())
+    (mode, HashMap::new(), HashMap::new())
 }
 
-/// Content search over this server's live agents, keyed by agent id, for
-/// a view elsewhere.
-async fn search_local(needle: &str) -> SearchReply {
+/// Grep a saved capture the way the grid search does, minus regex: a
+/// case-insensitive substring, or with `fuzzy` an in-order subsequence.
+/// The first matching line is the snippet.
+pub fn text_search(text: &str, needle: &str, fuzzy: bool) -> Option<String> {
+    let n = needle.to_lowercase();
+    if n.is_empty() {
+        return None;
+    }
+    let hit = |line: &str| {
+        let l = line.to_lowercase();
+        if fuzzy {
+            let mut it = l.chars();
+            n.chars().all(|c| it.any(|h| h == c))
+        } else {
+            l.contains(&n)
+        }
+    };
+    text.lines()
+        .find(|l| !l.trim().is_empty() && hit(l))
+        .map(|l| l.trim_end().to_string())
+}
+
+/// Content search over this server's agents, keyed by agent id, for a
+/// view elsewhere: the live grids, plus (when asked) the saved captures
+/// of archived agents whose pane is gone.
+async fn search_local(req: &SearchReq) -> SearchReply {
     let rows = store::live_agents().await.unwrap_or_default();
     let panes: Vec<PaneId> = rows
         .iter()
         .filter_map(|a| a.pane.map(|p| PaneId(p as u32)))
         .collect();
-    let (mode, by_pane) = run_content_search(&panes, needle);
-    let hits = rows
+    let captures = if req.archived {
+        store::archived_captures().await.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let (mode, by_pane, by_id) = run_content_search(&panes, &captures, &req.needle);
+    let mut hits: HashMap<String, String> = rows
         .into_iter()
         .filter_map(|a| {
             let pane = a.pane? as u32;
             by_pane.get(&pane).map(|s| (a.id, s.clone()))
         })
         .collect();
+    hits.extend(by_id);
     SearchReply { mode: mode_label(mode).to_string(), hits }
+}
+
+/// Save the pane's text before an archive, so the archived agent keeps a
+/// preview and a searchable body once its pane is gone. `done` saves one
+/// too; this covers a pane that is later killed or lost without ever
+/// reporting. A row with no live pane is left as it is.
+pub async fn capture_on_archive(id: &str) {
+    let Ok(Some(a)) = store::by_id(id).await else { return };
+    let Some(pane) = a.pane.filter(|_| a.live()) else { return };
+    if let Some(text) = capture_tail(pane as u32) {
+        let _ = store::save_capture(&a.id, &text).await;
+    }
 }
 
 /// [`SearchReply::mode`] back into a [`SearchMode`].
@@ -700,11 +767,16 @@ pub fn register_services() {
     }
 }
 
-/// The current roster, enriched from the session files.
-pub async fn snapshot(history: bool) -> Snapshot {
+/// The current roster, enriched from the session files, plus what
+/// `req` asks for beyond it.
+pub async fn snapshot(req: ListReq) -> Snapshot {
     let mut rows = store::live_agents().await.unwrap_or_default();
     enrich_live(&mut rows).await;
-    if history {
+    if req.archived {
+        // Every archived row, including the live ones (which the live
+        // set above already holds, minus the archived - see the store).
+        rows.extend(store::archived().await.unwrap_or_default());
+    } else if req.history {
         rows.extend(store::history(crate::HISTORY_MAX).await.unwrap_or_default());
     }
     Snapshot { now_ms: now_ms() as i64, agents: rows }
@@ -723,7 +795,7 @@ pub async fn handle(req: ServiceRequest, cfg: Rc<Config>) {
     match req.method.as_str() {
         "list" => {
             let q: ListReq = req.json().unwrap_or_default();
-            let snap = snapshot(q.history).await;
+            let snap = snapshot(q).await;
             let _ = req.reply_json(&snap);
         }
         "capture" => {
@@ -750,7 +822,7 @@ pub async fn handle(req: ServiceRequest, cfg: Rc<Config>) {
                 let _ = req.fail("search: bad request");
                 return;
             };
-            let reply = search_local(&q.needle).await;
+            let reply = search_local(&q).await;
             let _ = req.reply_json(&reply);
         }
         "act" => {
@@ -761,7 +833,10 @@ pub async fn handle(req: ServiceRequest, cfg: Rc<Config>) {
             let now = now_ms() as i64;
             let ok = match q.verb.as_str() {
                 "ack" => store::acknowledge(&q.id, now).await.is_ok(),
-                "archive" => store::set_life(&q.id, "archived").await.is_ok(),
+                "archive" => {
+                    capture_on_archive(&q.id).await;
+                    store::set_life(&q.id, "archived").await.is_ok()
+                }
                 "unarchive" => store::set_life(&q.id, "active").await.is_ok(),
                 "rename" => {
                     let n = q.name.as_deref().filter(|s| !s.is_empty());

@@ -20,7 +20,7 @@ use std::task::{Context, Poll};
 use tmux_plugin_sdk::abi::ErrorCode;
 use tmux_plugin_sdk::prelude::*;
 
-use crate::provider::{self, mode_label, run_content_search, Snapshot};
+use crate::provider::{self, mode_label, run_content_search, ListReq, Snapshot};
 use crate::store::{self, Agent, LOCAL};
 use crate::{Config, PickKeys, HISTORY_MAX};
 
@@ -203,8 +203,8 @@ impl Remotes {
     }
 }
 
-/// Fetch the roster of every connected remote server. `history` asks for
-/// the finished rows too.
+/// Fetch the roster of every connected remote server. `req` says what to
+/// ask for beyond the live rows (history, the archive).
 ///
 /// The calls run TOGETHER, not one after another: these are expensive
 /// hops (a ProxyCommand, a Tailscale link, a box in a cloud region), so
@@ -215,9 +215,9 @@ impl Remotes {
 pub async fn fetch_remotes(
     picker: Rc<RefCell<Option<Picker>>>,
     remotes: Rc<RefCell<Remotes>>,
-    history: bool,
+    req: ListReq,
 ) {
-    fetch_all(picker, remotes, history, FETCH_DEBOUNCE_MS).await
+    fetch_all(picker, remotes, req, FETCH_DEBOUNCE_MS).await
 }
 
 /// [`fetch_remotes`] without the debounce: after acting on a remote row
@@ -227,9 +227,9 @@ pub async fn fetch_remotes(
 pub async fn fetch_remotes_now(
     picker: Rc<RefCell<Option<Picker>>>,
     remotes: Rc<RefCell<Remotes>>,
-    history: bool,
+    req: ListReq,
 ) {
-    fetch_all(picker, remotes, history, 0).await
+    fetch_all(picker, remotes, req, 0).await
 }
 
 /// The fetch a picker-open starts. Opening the picker is a key press, so
@@ -240,7 +240,7 @@ pub async fn fetch_remotes_now(
 pub async fn fetch_remotes_on_open(
     picker: Rc<RefCell<Option<Picker>>>,
     remotes: Rc<RefCell<Remotes>>,
-    history: bool,
+    req: ListReq,
 ) {
     // Decide under the borrow, act after it. start_spinner takes the
     // same RefCell, so calling it from inside this block panics with
@@ -265,7 +265,7 @@ pub async fn fetch_remotes_on_open(
         start_spinner(&picker, &remotes);
         return;
     }
-    fetch_all(Rc::clone(&picker), Rc::clone(&remotes), history, OPEN_FRESH_MS).await;
+    fetch_all(Rc::clone(&picker), Rc::clone(&remotes), req, OPEN_FRESH_MS).await;
     remotes.borrow_mut().open_round_since = None;
 }
 
@@ -276,7 +276,7 @@ pub async fn fetch_remotes_on_open(
 async fn fetch_all(
     picker: Rc<RefCell<Option<Picker>>>,
     remotes: Rc<RefCell<Remotes>>,
-    history: bool,
+    req: ListReq,
     min_age_ms: u64,
 ) {
     let list = service::servers().unwrap_or_default();
@@ -322,7 +322,7 @@ async fn fetch_all(
                 Rc::clone(&picker),
                 Rc::clone(&remotes),
                 Rc::clone(&queue),
-                history,
+                req,
             )) as Pin<Box<dyn Future<Output = ()>>>
         })
         .collect();
@@ -335,12 +335,12 @@ async fn fetch_worker(
     picker: Rc<RefCell<Option<Picker>>>,
     remotes: Rc<RefCell<Remotes>>,
     queue: Rc<RefCell<Vec<String>>>,
-    history: bool,
+    req: ListReq,
 ) {
     loop {
         let next = queue.borrow_mut().pop();
         let Some(server) = next else { return };
-        fetch_one(Rc::clone(&picker), Rc::clone(&remotes), server, history).await;
+        fetch_one(Rc::clone(&picker), Rc::clone(&remotes), server, req).await;
     }
 }
 
@@ -349,15 +349,11 @@ async fn fetch_one(
     picker: Rc<RefCell<Option<Picker>>>,
     remotes: Rc<RefCell<Remotes>>,
     server: String,
-    history: bool,
+    req: ListReq,
 ) {
     remotes.borrow_mut().start_fetch(&server);
     let target = format!("@{server}");
-    let res = service::call_json::<_, Snapshot>(
-        &target,
-        "list",
-        &provider::ListReq { history },
-    )
+    let res = service::call_json::<_, Snapshot>(&target, "list", &req)
     .await;
     {
         let mut r = remotes.borrow_mut();
@@ -552,9 +548,13 @@ pub struct Picker {
     /// each live agent's pane is grep'd for the query, in tmux, through
     /// `panes_search` (locally) or the provider's `search` (remotely).
     pub content_search: bool,
-    /// The matching snippet per (server, pane), from the last content
-    /// search. Drives the row's snippet and the OR in the filter.
-    pub content_hits: HashMap<(String, u32), String>,
+    /// The matching snippet per row key ([`Agent::key`]), from the last
+    /// content search. Drives the row's snippet and the OR in the filter.
+    pub content_hits: HashMap<String, String>,
+    /// The saved captures of the local archived rows whose pane is gone,
+    /// by row key; loaded with the rows in the archive-only view, so a
+    /// content search can grep what those rows no longer show anywhere.
+    pub captures: Vec<(String, String)>,
     /// The matcher the last content search actually used (auto-detected,
     /// with a fuzzy fallback). Shown in the footer/header.
     pub content_mode: SearchMode,
@@ -563,6 +563,13 @@ pub struct Picker {
     pub content_query: String,
     pub now_ms: u64,
     pub show_history: bool,
+    /// Only the archived rows: the archive as a list of its own, rather
+    /// than a dozen set-aside agents mixed into a hundred finished ones.
+    /// Implies `show_history`.
+    pub archived_only: bool,
+    /// Whether history was on before the archive view was entered, so
+    /// leaving it puts the roster back the way it was.
+    pub history_before_archive: bool,
     pub keys: PickKeys,
     pub status: Option<String>,
     /// A `g` was pressed and waits for a second `g` (vim `gg` = go top).
@@ -614,6 +621,11 @@ pub struct Picker {
 }
 
 impl Picker {
+    /// What to ask the store and every provider for beyond the live rows.
+    pub fn list_req(&self) -> ListReq {
+        ListReq { history: self.show_history, archived: self.archived_only }
+    }
+
     /// Rebuild the display lines from `view`, inserting a server header
     /// whenever the server changes (multi-server only) and a band header
     /// whenever the band changes.
@@ -767,24 +779,41 @@ fn find_mirrors() -> HashMap<(String, u32), u32> {
     out
 }
 
+/// What [`gather_rows`] hands back: the rows plus the per-server state
+/// the picker renders with.
+struct Gathered {
+    rows: Vec<Agent>,
+    /// The saved captures of the local archived rows whose pane is gone,
+    /// by row key. Only loaded for the archive-only view.
+    captures: Vec<(String, String)>,
+    skew: HashMap<String, i64>,
+    down: HashMap<String, u64>,
+    mismatch: HashMap<String, String>,
+    fetching: HashMap<String, u64>,
+}
+
 /// Local rows (from the store) plus every remote row, with the per-server
-/// clock skew and link state the picker renders with.
+/// clock skew and link state the picker renders with. `req` is what the
+/// view wants beyond the live rows, the same request the providers get.
 async fn gather_rows(
     remotes: &Rc<RefCell<Remotes>>,
-    show_history: bool,
+    req: ListReq,
     enrich: bool,
-) -> (
-    Vec<Agent>,
-    HashMap<String, i64>,
-    HashMap<String, u64>,
-    HashMap<String, String>,
-    HashMap<String, u64>,
-) {
+) -> Gathered {
     let mut rows = store::live_agents().await.unwrap_or_default();
     if enrich {
         provider::enrich_live(&mut rows).await;
     }
-    if show_history {
+    let mut captures = Vec::new();
+    if req.archived {
+        rows.extend(store::archived().await.unwrap_or_default());
+        captures = store::archived_captures()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(id, text)| (store::row_key(LOCAL, &id), text))
+            .collect();
+    } else if req.history {
         rows.extend(store::history(HISTORY_MAX).await.unwrap_or_default());
     }
     let r = remotes.borrow();
@@ -795,7 +824,20 @@ async fn gather_rows(
         .iter()
         .filter_map(|(k, v)| v.down_since.map(|t| (k.clone(), t)))
         .collect();
-    (rows, skew, down, r.mismatch.clone(), r.fetching())
+    Gathered {
+        rows,
+        captures,
+        skew,
+        down,
+        mismatch: r.mismatch.clone(),
+        fetching: r.fetching(),
+    }
+}
+
+/// The open picker's [`Picker::list_req`], or the plain live roster when
+/// no picker is open.
+pub fn list_req_of(picker: &Rc<RefCell<Option<Picker>>>) -> ListReq {
+    picker.borrow().as_ref().map(Picker::list_req).unwrap_or_default()
 }
 
 /// Server headers are worth the lines once rows come from more than this
@@ -870,8 +912,8 @@ pub async fn pick_open(
             return;
         }
     };
-    let (mut rows, skew, down, mismatch, fetching) =
-        gather_rows(&remotes, false, true).await;
+    let Gathered { mut rows, captures, skew, down, mismatch, fetching } =
+        gather_rows(&remotes, ListReq::default(), true).await;
     let mut order: HashMap<String, u64> = HashMap::new();
     let mut order_next: u64 = 0;
     stable_sort(&mut order, &mut order_next, &mut rows);
@@ -892,10 +934,13 @@ pub async fn pick_open(
         rename_buf: String::new(),
         content_search: false,
         content_hits: HashMap::new(),
+        captures,
         content_mode: SearchMode::Plain,
         content_query: String::new(),
         now_ms: now_ms(),
         show_history: false,
+        archived_only: false,
+        history_before_archive: false,
         keys: cfg.keys.clone(),
         status: None,
         pending_g: false,
@@ -933,7 +978,7 @@ pub async fn pick_open(
     // refresh_if_open as it lands, and the servers still outstanding
     // spin in their headers meanwhile. Reopening in a hurry does not
     // stack up rounds of ssh - see fetch_remotes_on_open.
-    spawn(fetch_remotes_on_open(Rc::clone(&picker), Rc::clone(&remotes), false));
+    spawn(fetch_remotes_on_open(Rc::clone(&picker), Rc::clone(&remotes), ListReq::default()));
     fetch_unread(Rc::clone(&picker));
     request_capture(&picker);
 }
@@ -947,10 +992,9 @@ pub async fn reload_picker(
     remotes: Rc<RefCell<Remotes>>,
     enrich: bool,
 ) {
-    let show_history =
-        picker.borrow().as_ref().map(|p| p.show_history).unwrap_or(false);
-    let (mut rows, skew, down, mismatch, fetching) =
-        gather_rows(&remotes, show_history, enrich).await;
+    let req = list_req_of(&picker);
+    let Gathered { mut rows, captures, skew, down, mismatch, fetching } =
+        gather_rows(&remotes, req, enrich).await;
     let multi = is_multi(&rows, &fetching, now_ms());
     let mirrors = if multi { find_mirrors() } else { HashMap::new() };
     let mut b = picker.borrow_mut();
@@ -964,6 +1008,7 @@ pub async fn reload_picker(
         // reshuffles rows under the cursor.
         stable_sort(&mut p.order, &mut p.order_next, &mut rows);
         p.rows = rows;
+        p.captures = captures;
         p.now_ms = now_ms();
         p.skew = skew;
         p.down = down;
@@ -1007,17 +1052,17 @@ async fn refresh_timer(
         if sleep_ms(REFRESH_MS).await.is_err() {
             return;
         }
-        let (live, history) = {
+        let (live, req) = {
             let b = picker.borrow();
             match b.as_ref() {
-                Some(p) if p.mode.0 == mode.0 => (true, p.show_history),
-                _ => (false, false),
+                Some(p) if p.mode.0 == mode.0 => (true, p.list_req()),
+                _ => (false, ListReq::default()),
             }
         };
         if !live {
             return;
         }
-        fetch_remotes(Rc::clone(&picker), Rc::clone(&remotes), history).await;
+        fetch_remotes(Rc::clone(&picker), Rc::clone(&remotes), req).await;
         reload_picker(Rc::clone(&picker), Rc::clone(&remotes), true).await;
     }
 }
@@ -1066,6 +1111,9 @@ pub async fn apply_life(
 ) {
     for (server, id) in &ids {
         if server == LOCAL {
+            if life == "archived" {
+                provider::capture_on_archive(id).await;
+            }
             let _ = store::set_life(id, &life).await;
         } else {
             let verb = if life == "active" { "unarchive" } else { "archive" };
@@ -1085,7 +1133,10 @@ pub async fn apply_life(
             p.marked.clear();
         }
     }
-    fetch_remotes_now(Rc::clone(&picker), Rc::clone(&remotes), false).await;
+    // The same request the view is showing: an archive from the history
+    // view must not empty the remote half of it until the next tick.
+    let req = list_req_of(&picker);
+    fetch_remotes_now(Rc::clone(&picker), Rc::clone(&remotes), req).await;
     reload_picker(picker, remotes, false).await;
 }
 
@@ -1135,7 +1186,8 @@ pub async fn apply_status(
             p.marked.clear();
         }
     }
-    fetch_remotes_now(Rc::clone(&picker), Rc::clone(&remotes), false).await;
+    let req = list_req_of(&picker);
+    fetch_remotes_now(Rc::clone(&picker), Rc::clone(&remotes), req).await;
     reload_picker(picker, remotes, false).await;
 }
 
@@ -1585,6 +1637,27 @@ fn dispatch_key(
             }
         } else if key == k.history {
             p.show_history = !p.show_history;
+            // Leaving history leaves the archive view too: it lives there.
+            if !p.show_history {
+                p.archived_only = false;
+            }
+            after = PickAfter::Reload;
+        } else if key == k.archived {
+            // The archive as a list of its own. It is a history view, so
+            // entering it turns history on; leaving it puts history back
+            // the way it was before.
+            p.archived_only = !p.archived_only;
+            if p.archived_only {
+                p.history_before_archive = p.show_history;
+                p.show_history = true;
+            } else {
+                p.show_history = p.history_before_archive;
+            }
+            p.status = Some(if p.archived_only {
+                "archive only: on".into()
+            } else {
+                "archive only: off".into()
+            });
             after = PickAfter::Reload;
         } else if key == "J" {
             mark_and_move(p, 1);
@@ -1664,8 +1737,8 @@ fn dispatch_key(
             let picker = Rc::clone(picker);
             let remotes = Rc::clone(remotes);
             ctx.spawn(async move {
-                let history = picker.borrow().as_ref().is_some_and(|p| p.show_history);
-                fetch_remotes_now(Rc::clone(&picker), Rc::clone(&remotes), history).await;
+                let req = list_req_of(&picker);
+                fetch_remotes_now(Rc::clone(&picker), Rc::clone(&remotes), req).await;
                 reload_picker(picker, remotes, false).await;
             });
         }
@@ -1686,7 +1759,8 @@ fn dispatch_key(
                     let _ = store::rename_by_user(&id, n, now_ms() as i64).await;
                 } else {
                     let _ = act_remote(&server, &id, "rename", n).await;
-                    fetch_remotes_now(Rc::clone(&picker), Rc::clone(&remotes), false).await;
+                    let req = list_req_of(&picker);
+                    fetch_remotes_now(Rc::clone(&picker), Rc::clone(&remotes), req).await;
                 }
                 reload_picker(picker, remotes, false).await;
             });
@@ -2215,13 +2289,18 @@ fn pick_refilter_keep(
     // keystroke. Remote grids are asked through each provider's `search`,
     // whose replies land later (see `remote_search`).
     if p.content_search && !needle.is_empty() {
-        let panes: Vec<PaneId> = p
+        // The live local grids, plus (in the archive view) the saved
+        // captures of the local archived rows whose pane is gone.
+        let local: HashMap<u32, String> = p
             .rows
             .iter()
             .filter(|a| a.live() && a.is_local())
-            .filter_map(|a| a.pane.map(|x| PaneId(x as u32)))
+            .filter_map(|a| a.pane.map(|x| (x as u32, a.key())))
             .collect();
-        let (mode, hits) = run_content_search(&panes, &needle);
+        let panes: Vec<PaneId> = local.keys().map(|&x| PaneId(x)).collect();
+        let captures: &[(String, String)] =
+            if p.archived_only { &p.captures } else { &[] };
+        let (mode, grid, text) = run_content_search(&panes, captures, &needle);
         p.content_mode = mode;
         // Keep remote hits for the same query; local ones are fresh.
         if p.content_query != needle {
@@ -2229,11 +2308,15 @@ fn pick_refilter_keep(
             p.content_query = needle.clone();
             remote_search(p, &needle);
         } else {
-            p.content_hits.retain(|(s, _), _| s != LOCAL);
+            let local_prefix = store::row_key(LOCAL, "");
+            p.content_hits.retain(|k, _| !k.starts_with(&local_prefix));
         }
-        for (pane, snip) in hits {
-            p.content_hits.insert((LOCAL.to_string(), pane), snip);
+        for (pane, snip) in grid {
+            if let Some(key) = local.get(&pane) {
+                p.content_hits.insert(key.clone(), snip);
+            }
         }
+        p.content_hits.extend(text);
     } else {
         p.content_hits = HashMap::new();
         p.content_query.clear();
@@ -2242,12 +2325,7 @@ fn pick_refilter_keep(
         .rows
         .iter()
         .enumerate()
-        .filter(|(_, a)| {
-            rank(&haystack(a), &needle).is_some()
-                || a.pane
-                    .map(|pn| p.content_hits.contains_key(&(a.server.clone(), pn as u32)))
-                    .unwrap_or(false)
-        })
+        .filter(|(_, a)| row_shown(p, a, &needle))
         .map(|(i, _)| i)
         .collect();
     p.sel = keep
@@ -2281,15 +2359,27 @@ fn pick_refilter_keep(
     p.scroll_to_selection();
 }
 
-/// Ask every remote server with live rows to grep its panes for `needle`;
-/// the replies fold into `content_hits` when they arrive. The picker is
-/// found again through the shared cell, so a reply for a closed picker or
-/// an outdated query is dropped.
+/// Whether a row is in the view: it belongs to the view's set (every row,
+/// or only the archived ones), and the filter matches its metadata or a
+/// content hit landed on it.
+fn row_shown(p: &Picker, a: &Agent, needle: &str) -> bool {
+    if p.archived_only && a.life != "archived" {
+        return false;
+    }
+    rank(&haystack(a), needle).is_some() || p.content_hits.contains_key(&a.key())
+}
+
+/// Ask every remote server with rows to search to grep them for `needle`:
+/// the live panes, and in the archive view the saved captures too. The
+/// replies fold into `content_hits` when they arrive. The picker is found
+/// again through the shared cell, so a reply for a closed picker or an
+/// outdated query is dropped.
 fn remote_search(p: &mut Picker, needle: &str) {
+    let archived = p.archived_only;
     let servers: HashSet<String> = p
         .rows
         .iter()
-        .filter(|a| a.live() && !a.is_local())
+        .filter(|a| !a.is_local() && (a.live() || (archived && a.life == "archived")))
         .map(|a| a.server.clone())
         .collect();
     if servers.is_empty() {
@@ -2301,7 +2391,7 @@ fn remote_search(p: &mut Picker, needle: &str) {
         let needle = needle.clone();
         spawn(async move {
             let target = format!("@{server}");
-            let req = provider::SearchReq { needle: needle.clone() };
+            let req = provider::SearchReq { needle: needle.clone(), archived };
             let Ok(reply) =
                 service::call_json::<_, provider::SearchReply>(&target, "search", &req).await
             else {
@@ -2314,17 +2404,8 @@ fn remote_search(p: &mut Picker, needle: &str) {
                 if p.mode.0 != mode.0 || p.content_query != needle || !p.content_search {
                     return;
                 }
-                // Map ids back to panes: hits key on (server, pane).
-                let by_id: HashMap<&str, u32> = p
-                    .rows
-                    .iter()
-                    .filter(|a| a.server == server)
-                    .filter_map(|a| a.pane.map(|pn| (a.id.as_str(), pn as u32)))
-                    .collect();
                 for (id, snip) in &reply.hits {
-                    if let Some(&pane) = by_id.get(id.as_str()) {
-                        p.content_hits.insert((server.clone(), pane), snip.clone());
-                    }
+                    p.content_hits.insert(store::row_key(&server, id), snip.clone());
                 }
                 if !reply.hits.is_empty() {
                     p.content_mode = provider::reply_mode(&reply);
@@ -2333,18 +2414,14 @@ fn remote_search(p: &mut Picker, needle: &str) {
                 // Rebuild the view with the new hits, without re-running
                 // the search (the query is unchanged).
                 let q = p.content_query.clone();
-                p.view = p
+                let view: Vec<usize> = p
                     .rows
                     .iter()
                     .enumerate()
-                    .filter(|(_, a)| {
-                        rank(&haystack(a), &q).is_some()
-                            || a.pane
-                                .map(|pn| p.content_hits.contains_key(&(a.server.clone(), pn as u32)))
-                                .unwrap_or(false)
-                    })
+                    .filter(|(_, a)| row_shown(p, a, &q))
                     .map(|(i, _)| i)
                     .collect();
+                p.view = view;
                 p.sel = keep
                     .and_then(|(key, _, _)| p.view.iter().position(|&i| p.rows[i].key() == key))
                     .unwrap_or(0);
@@ -2486,7 +2563,13 @@ pub fn pick_render(p: &mut Picker) {
     };
     out.push_str(&format!(
         "\x1b[1;1H\x1b[1m agents\x1b[0m \x1b[2m({live} live{}{unread_tag}{servers_tag}{content_tag}{selected})\x1b[0m",
-        if p.show_history { ", +history" } else { "" },
+        if p.archived_only {
+            ", archive"
+        } else if p.show_history {
+            ", +history"
+        } else {
+            ""
+        },
     ));
     if p.composing {
         // Compose mode takes over the prompt line, with a block cursor.
@@ -2527,7 +2610,14 @@ pub fn pick_render(p: &mut Picker) {
 
     let list_h = p.list_h();
     if p.view.is_empty() {
-        out.push_str("\x1b[4;1H  \x1b[2m(no agents)\x1b[0m");
+        // An empty archive says so; an empty search result does not
+        // change its words for the view it ran in.
+        let what = if p.archived_only && p.filter.trim().is_empty() {
+            "(nothing archived)"
+        } else {
+            "(no agents)"
+        };
+        out.push_str(&format!("\x1b[4;1H  \x1b[2m{what}\x1b[0m"));
     } else {
         for (line_i, li) in
             (p.top..(p.top + list_h).min(p.lines.len())).enumerate()
@@ -2610,23 +2700,23 @@ pub fn pick_render(p: &mut Picker) {
                     } else {
                         display_name(a)
                     };
-                    // An archived row (only in the history view) says so,
-                    // so the `a` un-archive is obvious. Otherwise a
-                    // content-search hit shows the matching line, else the
-                    // reported task.
-                    let snip = a
-                        .pane
-                        .and_then(|pn| p.content_hits.get(&(a.server.clone(), pn as u32)))
+                    // A content-search hit shows the matching line: it is
+                    // why the row is here. Otherwise an archived row (only
+                    // in the history views) says so, so the `a` un-archive
+                    // is obvious; else the reported task.
+                    let snip = p
+                        .content_hits
+                        .get(&a.key())
                         .filter(|_| p.content_search);
                     // The note wins over the task: it is the reason this
                     // row is at the top of the list, and it only exists
                     // while the agent is blocked on the user.
                     let note = a.note.as_deref().filter(|s| !s.is_empty());
                     let task = a.task.as_deref().filter(|s| !s.is_empty());
-                    if a.life == "archived" {
-                        label = format!("{label}  ·  archived");
-                    } else if let Some(sn) = snip {
+                    if let Some(sn) = snip {
                         label = format!("{label}  ·  {}", sn.trim());
+                    } else if a.life == "archived" {
+                        label = format!("{label}  ·  archived");
                     } else if let Some(t) = note.or(task) {
                         label = format!("{label}  ·  {}", one_line(t));
                     }

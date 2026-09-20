@@ -142,6 +142,7 @@ struct AgentsConfig {
     pick_copy: Option<String>,
     pick_menu: Option<String>,
     pick_history: Option<String>,
+    pick_archived: Option<String>,
     pick_close: Option<String>,
     pick_content: Option<String>,
     pick_rename: Option<String>,
@@ -161,6 +162,8 @@ pub(crate) struct PickKeys {
     /// Open the action menu on the selected row.
     pub menu: String,
     pub history: String,
+    /// Show only the archived rows (turns the history view on).
+    pub archived: String,
     pub close: String,
     pub content: String,
     pub rename: String,
@@ -180,6 +183,7 @@ impl Default for PickKeys {
             copy: "c".into(),
             menu: "Space".into(),
             history: "h".into(),
+            archived: "A".into(),
             close: "Escape".into(),
             content: "C-f".into(),
             rename: "r".into(),
@@ -239,6 +243,7 @@ impl Config {
                 copy: pick(&c.pick_copy, d.copy),
                 menu: pick(&c.pick_menu, d.menu),
                 history: pick(&c.pick_history, d.history),
+                archived: pick(&c.pick_archived, d.archived),
                 close: pick(&c.pick_close, d.close),
                 content: pick(&c.pick_content, d.content),
                 rename: pick(&c.pick_rename, d.rename),
@@ -360,7 +365,8 @@ impl Plugin for Agents {
                 let remotes = Rc::clone(&self.remotes);
                 ctx.spawn(async move {
                     // fetch_remotes repaints per server as it lands.
-                    view::fetch_remotes(Rc::clone(&picker), Rc::clone(&remotes), false)
+                    let req = view::list_req_of(&picker);
+                    view::fetch_remotes(Rc::clone(&picker), Rc::clone(&remotes), req)
                         .await;
                     view::refresh_if_open(&picker, &remotes).await;
                 });

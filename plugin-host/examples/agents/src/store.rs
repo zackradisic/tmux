@@ -195,6 +195,12 @@ fn default_server() -> String {
     LOCAL.to_string()
 }
 
+/// [`Agent::key`] for a row named by server and id alone (a search hit
+/// that came back from a remote provider, say).
+pub fn row_key(server: &str, id: &str) -> String {
+    format!("{server}\u{1}{id}")
+}
+
 impl Agent {
     pub fn live(&self) -> bool {
         self.ended_ms.is_none()
@@ -208,7 +214,7 @@ impl Agent {
     /// The key a view uses for marks and ranks: an id is unique per
     /// server only.
     pub fn key(&self) -> String {
-        format!("{}\u{1}{}", self.server, self.id)
+        row_key(&self.server, &self.id)
     }
 
     /// When the agent was last active: the resolved harness time, else the
@@ -672,6 +678,19 @@ pub async fn live_agents() -> Result<Vec<Agent>, HostError> {
     Ok(agents_from(&rows))
 }
 
+/// Every agent whose pane is still meant to exist, archived or not: the
+/// set a sweep for vanished panes has to cover. [`live_agents`] leaves
+/// the archived ones out, and an archived agent whose pane dies must
+/// still be ended, or its saved capture never stands in for the pane.
+pub async fn unended() -> Result<Vec<Agent>, HostError> {
+    let rows = db_query(
+        &format!("SELECT {COLS} FROM agents WHERE ended_ms IS NULL"),
+        params![],
+    )
+    .await?;
+    Ok(agents_from(&rows))
+}
+
 /// Ended or archived agents, most recent first, capped.
 pub async fn history(limit: i64) -> Result<Vec<Agent>, HostError> {
     let rows = db_query(
@@ -685,6 +704,38 @@ pub async fn history(limit: i64) -> Result<Vec<Agent>, HostError> {
     )
     .await?;
     Ok(agents_from(&rows))
+}
+
+/// Every archived agent, most recent first. Not capped: the archive is
+/// the set the user set aside on purpose, and a row must not drop out of
+/// it behind a hundred agents that merely finished (which is what
+/// [`history`]'s cap does to it).
+pub async fn archived() -> Result<Vec<Agent>, HostError> {
+    let rows = db_query(
+        &format!(
+            "SELECT {COLS} FROM agents WHERE life = 'archived' \
+             ORDER BY COALESCE(ended_ms, last_active_ms, last_status_ms) DESC"
+        ),
+        params![],
+    )
+    .await?;
+    Ok(agents_from(&rows))
+}
+
+/// The saved capture of every archived agent whose pane is gone, by id.
+/// Content search greps these for the rows that have no grid left.
+pub async fn archived_captures() -> Result<Vec<(String, String)>, HostError> {
+    let rows = db_query(
+        "SELECT c.id AS id, c.text AS text FROM captures c \
+         JOIN agents a ON a.id = c.id \
+         WHERE a.life = 'archived' AND a.ended_ms IS NOT NULL",
+        params![],
+    )
+    .await?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| Some((s(r.get_named("id"))?, s(r.get_named("text"))?)))
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
