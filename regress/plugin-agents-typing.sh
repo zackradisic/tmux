@@ -80,6 +80,9 @@ open_picker
 screen | grep -q '2 live' || fail "expected 2 live agents"
 screen | grep -q 'l type' || fail "the footer does not offer typing"
 screen | grep -q '\. history' || fail "the footer does not name the history key"
+# Start from the top row: the picker opens on the "you are here" row,
+# which is whichever of the two agents sorted second.
+keys g; keys g
 TOP=$(curline)
 
 # --- l hands the keyboard to the preview ----------------------------------
