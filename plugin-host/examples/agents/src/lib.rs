@@ -19,6 +19,10 @@
 //! this reachable when every plain key is the agent's. The mouse works
 //! on the list too: a click selects a row, a double click jumps to it,
 //! the wheel scrolls, a click on the search line focuses it.
+//! `n` starts another agent: a form over the picker (see `newagent`),
+//! prefilled from the highlighted row - its session, its pane's folder,
+//! its harness - that makes a window in that session running the
+//! harness; `C-t` cycles to a new session or a git worktree instead.
 //! The cursor opens on the agent whose pane the picker was opened from
 //! (the "you are here" row); it lands there even when that row's roster
 //! arrives after the popup is up, unless the cursor has been moved since.
@@ -109,8 +113,12 @@
 //!   scope = "server"
 //!   caps = ["capture-pane", "run-command", "mode", "db", "env-read",
 //!           "pane-fds", "fs-read", "fs-list", "service-serve",
-//!           "service-call"]
+//!           "service-call", "send-keys", "run-process", "fs-read-any"]
 //!   config = { keep_days = 14 }
+//!
+//! `send-keys` is the picker's interrupt and its typing into the preview;
+//! `run-process` and `fs-read-any` are the new-agent form's completion
+//! (`formkit::complete::CAPS`, with `fs-list`).
 //!
 //! The scoped lists (the variables env-read may read, the directories
 //! fs-read may reach) do not live in plugins.toml. They come from the
@@ -127,6 +135,7 @@ use std::rc::Rc;
 use serde::Deserialize;
 use tmux_plugin_sdk::prelude::*;
 
+mod newagent;
 mod provider;
 mod push;
 mod resolve;
@@ -163,6 +172,7 @@ struct AgentsConfig {
     pick_kill: Option<String>,
     pick_focus: Option<String>,
     pick_unfocus: Option<String>,
+    pick_new: Option<String>,
 }
 
 #[derive(Clone)]
@@ -193,6 +203,8 @@ pub(crate) struct PickKeys {
     /// reaches the pane while typing, so it must be one no agent wants:
     /// telnet's escape character by default.
     pub unfocus: String,
+    /// Open the new-agent form, prefilled from the highlighted row.
+    pub new: String,
 }
 
 impl Default for PickKeys {
@@ -215,6 +227,7 @@ impl Default for PickKeys {
             kill: "X".into(),
             focus: "l".into(),
             unfocus: "C-]".into(),
+            new: "n".into(),
         }
     }
 }
@@ -277,6 +290,7 @@ impl Config {
                 kill: pick(&c.pick_kill, d.kill),
                 focus: pick(&c.pick_focus, d.focus),
                 unfocus: pick(&c.pick_unfocus, d.unfocus),
+                new: pick(&c.pick_new, d.new),
             },
         })
     }
@@ -417,6 +431,12 @@ impl Plugin for Agents {
                     view::refresh_if_open(&picker, &remotes).await;
                 });
             }
+            // The new-agent form is a second float of this instance; its
+            // events are told apart from the picker's by mode id.
+            "mode-key" if newagent::owns(event.get_i64("mode")) => newagent::on_key(ctx, &event),
+            "mode-nav" if newagent::owns(event.get_i64("mode")) => {}
+            "mode-resize" if newagent::owns(event.get_i64("mode")) => newagent::on_resize(&event),
+            "mode-closed" if newagent::owns(event.get_i64("mode")) => newagent::on_closed(),
             "mode-key" => {
                 view::on_mode_key(&self.picker, &self.busy, &self.remotes, ctx, &event)
             }

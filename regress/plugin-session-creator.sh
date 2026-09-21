@@ -36,7 +36,7 @@ cleanup() {
 fail() { echo "FAIL: $*" >&2; echo "--- screen:" >&2; screen >&2; cleanup; exit 1; }
 screen() { $TMUX capture-pane -M -p -t "$FORM" | sed '/^ *$/d'; }
 keys() { $TMUX send-keys -t "$FORM" "$@"; sleep 0.5; }
-type_text() { $TMUX send-keys -t "$FORM" -l "$1"; sleep 0.7; }
+type_text() { $TMUX send-keys -t "$FORM" -l -- "$1"; sleep 0.7; }
 form_pane() {
 	$TMUX list-panes -a -F '#{pane_id} #{pane_mode}' |
 	    awk '/plugin-mode/ { print $1 }' | head -1

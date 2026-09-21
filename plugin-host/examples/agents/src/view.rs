@@ -517,6 +517,9 @@ pub enum PickAfter {
     /// Type this key into the local pane the preview shows: the keyboard
     /// is the preview's. Same route as `Interrupt`, one key per press.
     Type(u32, String),
+    /// Open the new-agent form over the picker, prefilled from the
+    /// highlighted row (see `newagent`).
+    NewAgent,
 }
 
 /// One rendered line: a server header (only when rows come from more than
@@ -574,6 +577,9 @@ pub struct Picker {
     /// leaving it puts the roster back the way it was.
     pub history_before_archive: bool,
     pub keys: PickKeys,
+    /// The harness commands the roster detects, for the new-agent form's
+    /// command field.
+    pub commands: Vec<String>,
     pub status: Option<String>,
     /// A `g` was pressed and waits for a second `g` (vim `gg` = go top).
     pub pending_g: bool,
@@ -755,13 +761,13 @@ impl Picker {
     }
 
     /// The highlighted row.
-    fn selected(&self) -> Option<&Agent> {
+    pub fn selected(&self) -> Option<&Agent> {
         self.rows.get(*self.view.get(self.sel)?)
     }
 
     /// The local pane a row's pane shows in: the pane itself for a local
     /// row, the shadow pane for a mirrored remote row.
-    fn local_pane_of(&self, a: &Agent) -> Option<u32> {
+    pub fn local_pane_of(&self, a: &Agent) -> Option<u32> {
         let pane = a.pane.filter(|_| a.live())? as u32;
         if a.is_local() {
             return Some(pane);
@@ -973,6 +979,7 @@ pub async fn pick_open(
         archived_only: false,
         history_before_archive: false,
         keys: cfg.keys.clone(),
+        commands: cfg.commands.clone(),
         status: None,
         pending_g: false,
         pending_kill: None,
@@ -1272,6 +1279,7 @@ async fn open_menu(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>) {
             let mut items = String::new();
             items.push_str(&menu_item("jump to pane", &k.jump, live));
             items.push_str(&menu_item("type into pane", &k.focus, live));
+            items.push_str(&menu_item("new agent here", &k.new, true));
             items.push_str(&menu_item("message", "m", true));
             items.push_str(&menu_item("copy id", &k.copy, durable_id(a).is_some()));
             items.push_str(&menu_item("rename", &k.rename, true));
@@ -1746,6 +1754,11 @@ fn dispatch_key(
             if p.selected().is_some() {
                 after = PickAfter::Menu;
             }
+        } else if key == k.new {
+            // Start another agent: the form prefills from the row under
+            // the cursor, or from the pressing client's pane when the
+            // list is empty.
+            after = PickAfter::NewAgent;
         } else if key == k.copy {
             match copy_after(p) {
                 Ok(a) => after = a,
@@ -1863,6 +1876,9 @@ fn dispatch_key(
             ctx.spawn(async move {
                 open_menu(picker, client).await;
             });
+        }
+        PickAfter::NewAgent => {
+            ctx.spawn(crate::newagent::open(Rc::clone(picker), client));
         }
         PickAfter::Copy(text) => {
             ctx.spawn(copy_to_clipboard(Rc::clone(picker), text, client));
@@ -3128,9 +3144,10 @@ pub fn pick_render(p: &mut Picker) {
         // under the cursor. A footer that lists every key fits none of
         // them at a usable width.
         format!(
-            "j/k move · {} type · {} jump · {} actions · {} search · {ctok} · {} history · q/{} close",
+            "j/k move · {} type · {} jump · {} new · {} actions · {} search · {ctok} · {} history · q/{} close",
             keyname(&k.focus),
             keyname(&k.jump),
+            keyname(&k.new),
             keyname(&k.menu),
             keyname(&k.filter),
             keyname(&k.history),

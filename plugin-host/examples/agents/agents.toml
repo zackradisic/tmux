@@ -34,6 +34,12 @@ requests = [
   # the link's socketpair, so it reaches the real agent. Killing a pane
   # needs nothing extra - that goes through run-command.
   "send-keys",
+  # The new-agent form (n in the picker) completes folders, repos and
+  # branches like the session creator does, through formkit: one
+  # directory listing and one shell job per scan, git for the rows on
+  # screen, mkdir and git worktree add on Enter. fs-list is above.
+  "run-process",
+  "fs-read-any",
 ]
 
 # The services this plugin calls: its own provider on any server, and the
