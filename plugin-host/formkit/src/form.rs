@@ -8,6 +8,13 @@
 //! render, the resize handshake with the host, and the async plumbing
 //! that runs scans and probes without letting a stale result land.
 //!
+//! The keys follow a shell, not a menu: `C-j`/`C-k` (and the arrows)
+//! always move between fields and never into the list. The list shows
+//! itself when you type into a field, or on `Tab`; `Tab` and `S-Tab`
+//! then cycle through the candidates, writing each into the field as you
+//! go, and `Esc` puts the list away. A field is scanned when it takes
+//! the focus, quietly, so the first `Tab` or keystroke has rows ready.
+//!
 //! The form lives in a shared cell ([`Shared`]) because scans and probes
 //! outlive the callback that started them; every one of them checks the
 //! form is still the same one (by mode id and generation) before it
@@ -135,8 +142,9 @@ pub type Shared<M> = Rc<RefCell<Option<Form<M>>>>;
 pub enum Action {
     None,
     /// The focused field or its value changed: start (or refilter) its
-    /// completion list. See [`start_scan`].
-    Rescan,
+    /// completion list, shown when `reveal` (an edit, a Tab) and kept
+    /// out of sight otherwise (a focus move). See [`start_scan`].
+    Rescan { reveal: bool },
     /// The rows on screen changed: ask git about the new ones. See
     /// [`kick_probe`].
     Probe,
@@ -288,6 +296,34 @@ impl<M: Model> Form<M> {
         self.list.as_ref().is_some_and(|p| p.shown())
     }
 
+    /// Whether the focused field has a completion source at all.
+    pub fn completes(&self) -> bool {
+        self.model.source(&self.fields, self.focused).is_some()
+    }
+
+    /// Tab / S-Tab: cycle the list and write the candidate into the
+    /// field. From the text the first press takes the first (or last)
+    /// row; past either end it wraps. Returns false when there is no
+    /// shown list to cycle.
+    fn cycle(&mut self, forward: bool) -> bool {
+        let Some(p) = self.list.as_mut() else { return false };
+        if !p.shown() || p.view.is_empty() {
+            return false;
+        }
+        let last = p.view.len() - 1;
+        p.sel = Some(match (p.sel, forward) {
+            (None, true) => 0,
+            (None, false) => last,
+            (Some(i), true) => if i >= last { 0 } else { i + 1 },
+            (Some(i), false) => if i == 0 { last } else { i - 1 },
+        });
+        p.scroll_to_selection();
+        // The candidate goes into the field as you land on it, so Enter
+        // takes what you see. A disabled row leaves its reason instead.
+        self.accept();
+        true
+    }
+
     /// One key. `toggle_key` is the caller's kind-swap key, if any
     /// ("C-t"); everything else is the form's own.
     pub fn key(&mut self, key: &str, toggle_key: Option<&str>) -> Action {
@@ -300,8 +336,7 @@ impl<M: Model> Form<M> {
         let n = self.fields.len();
         match key {
             "Escape" => {
-                // The list first, the form second. Hiding the list frees
-                // C-j/C-k to move between fields.
+                // The list first, the form second.
                 if self.listed() {
                     if let Some(p) = self.list.as_mut() {
                         p.sel = None;
@@ -315,57 +350,40 @@ impl<M: Model> Form<M> {
                 }
             }
             "Enter" => Action::Submit,
-            "Down" | "C-n" | "C-j" => {
-                let listed = self.list.as_ref().is_some_and(|p| p.shown() && !p.view.is_empty());
-                if listed {
-                    self.list.as_mut().unwrap().step(1);
+            // Fields, always. A list never captures these.
+            "Down" | "C-j" => {
+                self.focused = (self.focused + 1) % n;
+                Action::Rescan { reveal: false }
+            }
+            "Up" | "C-k" => {
+                self.focused = (self.focused + n - 1) % n;
+                Action::Rescan { reveal: false }
+            }
+            // The list: show it, then cycle it.
+            "Tab" | "C-n" => {
+                if self.cycle(true) {
                     self.error = None;
                     render(self);
                     Action::Probe
+                } else if self.completes() {
+                    Action::Rescan { reveal: true }
                 } else {
-                    // No list to step into: the key keeps its old
-                    // meaning rather than going dead.
+                    // Nothing to complete: Tab moves on, as in any form.
                     self.focused = (self.focused + 1) % n;
-                    Action::Rescan
+                    Action::Rescan { reveal: false }
                 }
             }
-            "Up" | "C-p" | "C-k" => {
-                // Leaving the top row puts the cursor back in the text; a
-                // second Up then moves to the field above.
-                if self.in_list() {
-                    self.list.as_mut().unwrap().step(-1);
+            "BTab" | "C-p" => {
+                if self.cycle(false) {
                     self.error = None;
                     render(self);
                     Action::Probe
+                } else if self.completes() {
+                    Action::Rescan { reveal: true }
                 } else {
                     self.focused = (self.focused + n - 1) % n;
-                    Action::Rescan
+                    Action::Rescan { reveal: false }
                 }
-            }
-            "Tab" => {
-                // Complete like a shell: take the highlighted row, or the
-                // first row when none is highlighted, and stay in the
-                // field with the cursor at the end. The list re-filters
-                // on the completed value.
-                let listed = self.list.as_ref().is_some_and(|p| p.shown() && !p.view.is_empty());
-                if !listed {
-                    return Action::None;
-                }
-                let p = self.list.as_mut().unwrap();
-                if p.sel.is_none() {
-                    p.sel = Some(0);
-                }
-                if self.accept() {
-                    self.list.as_mut().unwrap().sel = None;
-                    Action::Rescan
-                } else {
-                    render(self);
-                    Action::None
-                }
-            }
-            "BTab" => {
-                self.focused = (self.focused + n - 1) % n;
-                Action::Rescan
             }
             "BSpace" => {
                 let i = self.focused;
@@ -373,7 +391,7 @@ impl<M: Model> Form<M> {
                 // Erasing to empty resumes the mirror.
                 let touched = !self.fields[i].value.is_empty() && self.fields[i].touched;
                 self.edited(touched);
-                Action::Rescan
+                Action::Rescan { reveal: true }
             }
             "C-u" => {
                 // Clear to type fresh: touched keeps the mirror from
@@ -381,17 +399,17 @@ impl<M: Model> Form<M> {
                 // resume-the-mirror gesture).
                 self.fields[self.focused].value.clear();
                 self.edited(true);
-                Action::Rescan
+                Action::Rescan { reveal: true }
             }
             "Space" => {
                 self.fields[self.focused].value.push(' ');
                 self.edited(true);
-                Action::Rescan
+                Action::Rescan { reveal: true }
             }
             k if k.chars().count() == 1 && !k.chars().next().unwrap().is_control() => {
                 self.fields[self.focused].value.push_str(k);
                 self.edited(true);
-                Action::Rescan
+                Action::Rescan { reveal: true }
             }
             _ => Action::None,
         }
@@ -449,20 +467,10 @@ pub fn render<M: Model>(form: &mut Form<M>) {
         let mark = form.model.mark(&form.fields, i).map(|m| format!(" {m}")).unwrap_or_default();
         let val = clip(&f.value, w.saturating_sub(labelw + 13));
         if focused {
-            // The cursor block sits in the text only while the list has
-            // no selection; once you are in the list the field is quiet.
-            let in_list = form.list.as_ref().is_some_and(|p| p.field == i && p.sel.is_some());
-            if in_list {
-                out.push_str(&format!(
-                    "  \x1b[1m{:<labelw$}\x1b[0m \x1b[4m{val}\x1b[0m{mark}\r\n",
-                    f.label
-                ));
-            } else {
-                out.push_str(&format!(
-                    "  \x1b[1m{:<labelw$}\x1b[0m \x1b[7m{val}\x1b[27m\x1b[7m \x1b[0m{mark}\r\n",
-                    f.label
-                ));
-            }
+            out.push_str(&format!(
+                "  \x1b[1m{:<labelw$}\x1b[0m \x1b[7m{val}\x1b[27m\x1b[7m \x1b[0m{mark}\r\n",
+                f.label
+            ));
         } else {
             out.push_str(&format!("  {:<labelw$} {val}{mark}\r\n", f.label));
         }
@@ -482,10 +490,10 @@ pub fn render<M: Model>(form: &mut Form<M>) {
     }
     let verb = form.model.submit_label();
     let toggle = form.model.toggle_hint().map(|t| format!("C-t {t} · ")).unwrap_or_default();
-    let hint = if form.in_list() {
-        format!("Tab accept · C-j/C-k move · Enter {verb} · Esc hide list")
-    } else if form.listed() {
-        format!("{toggle}C-j list · Tab accept · Enter {verb} · Esc hide list")
+    let hint = if form.listed() {
+        format!("Tab/S-Tab cycle · C-j/C-k field · Enter {verb} · Esc hide list")
+    } else if form.completes() {
+        format!("{toggle}Tab complete · C-j/C-k field · Enter {verb} · Esc cancel")
     } else {
         format!("{toggle}C-j/C-k field · Enter {verb} · Esc cancel")
     };
@@ -495,8 +503,9 @@ pub fn render<M: Model>(form: &mut Form<M>) {
 
 /// Start (or reuse) the completion list for the focused field. Same
 /// source key, same rows: only the filter runs. A new key cancels the
-/// scan in flight and starts another.
-pub fn start_scan<M: Model>(state: &Shared<M>, mode: ModeId) {
+/// scan in flight and starts another. `reveal` shows the list (an edit,
+/// a Tab); a plain focus move scans quietly so the rows are ready.
+pub fn start_scan<M: Model>(state: &Shared<M>, mode: ModeId, reveal: bool) {
     let (generation, field, source) = {
         let mut st = state.borrow_mut();
         let Some(form) = st.as_mut().filter(|f| f.mode.0 == mode.0) else { return };
@@ -512,7 +521,8 @@ pub fn start_scan<M: Model>(state: &Shared<M>, mode: ModeId) {
         if let Some(p) = form.list.as_mut() {
             if p.key == key {
                 p.field = field;
-                p.hidden = false;
+                p.hidden = !reveal;
+                p.sel = None;
                 p.refilter(&frag);
                 render(form);
                 drop(st);
@@ -526,7 +536,9 @@ pub fn start_scan<M: Model>(state: &Shared<M>, mode: ModeId) {
         if let Some(old) = form.scan_task.take() {
             cancel_task(old);
         }
-        form.list = Some(Completion::pending(field, key, generation));
+        let mut pending = Completion::pending(field, key, generation);
+        pending.hidden = !reveal;
+        form.list = Some(pending);
         render(form);
         (generation, field, source)
     };

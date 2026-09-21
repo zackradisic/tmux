@@ -130,9 +130,17 @@ ftype "-two"
 fscreen | grep -q 'name *proj-a-two' || fail "typing did not reach name"
 fkeys C-j
 sleep 0.8
-fscreen | grep -q 'harnesses' || fail "the command field did not list the harnesses"
-# The list filters on the field's value: "claude" matches one of four.
+# Moving to the field does not pop its list; Tab does, filtered on the
+# field's value: "claude" matches one of four.
+fscreen | grep -q 'harnesses' && fail "moving to the command field popped the list"
+fkeys Tab
+sleep 0.8
+fscreen | grep -q 'harnesses' || fail "Tab did not show the harness list"
 fscreen | grep -q '1 of 4' || fail "the harness list was not filtered by the value"
+# C-j from a shown list still moves to the next field, and back.
+fkeys C-j
+fscreen | grep -q 'harnesses' && fail "C-j went into the list instead of the next field"
+fkeys C-k
 fkeys C-u
 fscreen | grep -q 'codex' || fail "codex is missing from the harness list"
 ftype "$AGENT"

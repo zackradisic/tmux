@@ -415,7 +415,7 @@ pub async fn open(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>) {
         .unwrap_or_else(|| form.idx("name"));
     form::render(&mut form);
     *state().borrow_mut() = Some(form);
-    form::start_scan(&state(), mode);
+    form::start_scan(&state(), mode, false);
 }
 
 /// Repo detection after a swap into the worktree kind; applies only if
@@ -451,7 +451,7 @@ pub fn on_key(ctx: &Ctx, event: &Event) {
         if action == Action::Toggle {
             detect = toggle(form);
             form::render(form);
-            action = Action::Rescan;
+            action = Action::Rescan { reveal: false };
         }
         (mode, action, detect)
     };
@@ -460,7 +460,7 @@ pub fn on_key(ctx: &Ctx, event: &Event) {
     }
     match action {
         Action::None | Action::Toggle => {}
-        Action::Rescan => form::start_scan(&st, mode),
+        Action::Rescan { reveal } => form::start_scan(&st, mode, reveal),
         Action::Probe => form::kick_probe(&st, mode),
         Action::Submit => {
             ctx.spawn(submit());

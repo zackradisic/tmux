@@ -90,11 +90,15 @@ screen | grep -q "folder *$WORK/proj-a" || fail "folder was not prefilled from t
 screen | grep -q 'name *proj-a' || fail "name did not mirror the folder basename"
 
 # --- completion on the folder field ---------------------------------------
-# Focus opens on name (folder is prefilled); Up moves to folder, whose list
-# scans $WORK filtered by the fragment "proj-a": only proj-a matches.
+# Focus opens on name (folder is prefilled); Up moves to folder. Moving
+# there does NOT pop the list - a field move never lands in a dropdown.
 keys Up
 sleep 0.8
-screen | grep -q "in $WORK" || fail "the folder list did not scan $WORK"
+screen | grep -q "in $WORK" && fail "moving to the folder field popped the list"
+# Tab shows it, filtered by the fragment "proj-a": only proj-a matches.
+keys Tab
+sleep 0.8
+screen | grep -q "in $WORK" || fail "Tab did not show the folder list"
 screen | grep -q 'proj-b' && fail "the fragment proj-a let proj-b through"
 # Backspace to "proj-": all three show.
 keys BSpace
