@@ -2511,8 +2511,8 @@ fn sort_rows(rows: &mut [Agent]) {
 /// winning. Falls back to the pane title (also in `name`), else
 /// `kind · session`.
 pub fn display_name(a: &Agent) -> String {
-    let user = a.user_name.as_deref().filter(|s| !s.is_empty());
-    let harness = a.name.as_deref().filter(|s| !s.is_empty());
+    let user = a.user_name.as_deref().map(unadorned).filter(|s| !s.is_empty());
+    let harness = a.name.as_deref().map(unadorned).filter(|s| !s.is_empty());
     match (user, harness) {
         (Some(u), Some(h)) => {
             if a.user_name_ms.unwrap_or(0) >= a.name_ms.unwrap_or(0) {
@@ -2527,6 +2527,30 @@ pub fn display_name(a: &Agent) -> String {
             Some(s) if !s.is_empty() => format!("{} · {}", a.kind, s),
             _ => a.kind.clone(),
         },
+    }
+}
+
+/// A name without the decoration a harness puts in front of it. Claude
+/// Code titles its pane "✳ <topic>" - a spinner glyph (✳ ✻ ✶ ✽ ✢ · ∗ ⁕,
+/// it rotates) and a space - and the glyph says nothing in a list of
+/// names. Any run of leading symbol characters followed by a space goes;
+/// a bracket, a quote or a path character is kept, since those can be the
+/// name. The stored name stays as written; this is display only.
+fn unadorned(s: &str) -> &str {
+    let s = s.trim_start();
+    let keep = |c: char| {
+        c.is_alphanumeric() || "[({<\"'`_~/.$@#-".contains(c) || c.is_whitespace()
+    };
+    let glyphs = s.chars().take_while(|&c| !keep(c)).count();
+    if glyphs == 0 {
+        return s;
+    }
+    let rest: &str = &s[s.char_indices().nth(glyphs).map(|(i, _)| i).unwrap_or(s.len())..];
+    // Only a glyph that stands apart from the name is decoration.
+    if rest.starts_with(char::is_whitespace) && !rest.trim_start().is_empty() {
+        rest.trim_start()
+    } else {
+        s
     }
 }
 
@@ -2835,8 +2859,10 @@ fn badge(a: &Agent) -> String {
     match a.status.as_str() {
         "needs_input" => "\x1b[1;33m!\x1b[0m".into(),
         "working" => "\x1b[32m●\x1b[0m".into(),
-        // Unread waiting: bright, bold, filled. Read waiting: hollow.
-        "waiting" if a.unread() => "\x1b[1;96m◉\x1b[0m".into(),
+        // Unread waiting: a filled badge on a bright cyan block, the one
+        // coloured background in the list, so it cannot be missed at a
+        // glance. Read waiting: hollow, no block.
+        "waiting" if a.unread() => "\x1b[1;30;106m◉\x1b[0m".into(),
         "waiting" => "\x1b[36m◍\x1b[0m".into(),
         "done" => "\x1b[2m·\x1b[0m".into(),
         _ => "?".into(),
@@ -3074,6 +3100,15 @@ pub fn pick_render(p: &mut Picker) {
                             "\x1b[{row};1H\x1b[2m{}\x1b[0m",
                             strip_sgr(&shown)
                         ));
+                    } else if a.unread() {
+                        // An unread row's name is bold too: the badge is
+                        // one cell, the name is what the eye reads.
+                        let bold = shown.replacen(
+                            label.as_str(),
+                            &format!("\x1b[1m{label}\x1b[0m"),
+                            1,
+                        );
+                        out.push_str(&format!("\x1b[{row};1H{bold}"));
                     } else {
                         out.push_str(&format!("\x1b[{row};1H{shown}"));
                     }
