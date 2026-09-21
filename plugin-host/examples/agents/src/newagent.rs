@@ -56,14 +56,6 @@ impl Kind {
         }
     }
 
-    fn tag(self) -> &'static str {
-        match self {
-            Kind::Window => "[window]",
-            Kind::Session => "[session]",
-            Kind::Worktree => "[worktree]",
-        }
-    }
-
     fn word(self) -> &'static str {
         match self {
             Kind::Window => "window",
@@ -180,8 +172,17 @@ impl Model for NewAgent {
         self.reuse = false;
     }
 
-    fn tag(&self) -> String {
-        self.kind.tag().into()
+    fn title(&self) -> String {
+        "New Agent".into()
+    }
+
+    fn kinds(&self) -> Option<(Vec<&'static str>, usize)> {
+        let active = match self.kind {
+            Kind::Window => 0,
+            Kind::Session => 1,
+            Kind::Worktree => 2,
+        };
+        Some((vec!["window", "session", "worktree"], active))
     }
 
     fn toggle_hint(&self) -> Option<String> {

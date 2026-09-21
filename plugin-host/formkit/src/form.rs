@@ -52,8 +52,15 @@ pub trait Model: 'static {
     /// Field `i` was edited by hand (typed, erased, cleared).
     fn edited(&mut self, _fields: &[Field], _i: usize) {}
 
-    /// The tag in the top right corner, e.g. `[plain]`.
-    fn tag(&self) -> String;
+    /// The form's name, drawn bold on the title line: "New Agent".
+    fn title(&self) -> String;
+
+    /// The kinds the toggle key cycles through and which one is up, drawn
+    /// as tabs on the title line: `[window]  session  worktree`. `None`
+    /// for a form of one kind.
+    fn kinds(&self) -> Option<(Vec<&'static str>, usize)> {
+        None
+    }
 
     /// The word for what the toggle key swaps to (`worktree`), or `None`
     /// when the form has one kind only. Shown in the hint line.
@@ -402,14 +409,39 @@ pub fn render<M: Model>(form: &mut Form<M>) {
 
     let w = form.width as usize;
     let mut out = String::from("\x1b[2J\x1b[H");
+    // Title line: the name on the left, the kinds as tabs on the right
+    // with the one that is up in brackets. Then a rule.
+    let title = form.model.title();
+    let (tabs, tabs_w) = match form.model.kinds() {
+        Some((names, active)) => {
+            let mut plain = 0usize;
+            let mut s = String::new();
+            for (i, n) in names.iter().enumerate() {
+                if i == active {
+                    s.push_str(&format!("\x1b[0;1m[{n}]\x1b[0;2m"));
+                    plain += n.chars().count() + 2;
+                } else {
+                    s.push_str(n);
+                    plain += n.chars().count();
+                }
+                if i + 1 < names.len() {
+                    s.push_str("  ");
+                    plain += 2;
+                }
+            }
+            (s, plain)
+        }
+        None => (String::new(), 0),
+    };
+    let gap = w.saturating_sub(2 + title.chars().count() + tabs_w + 2);
     out.push_str(&format!(
-        "\x1b[2m{:>width$}\x1b[0m\r\n",
-        form.model.tag(),
-        width = w.saturating_sub(2)
+        "  \x1b[1m{title}\x1b[0m{}\x1b[2m{tabs}\x1b[0m\r\n",
+        " ".repeat(gap)
     ));
+    out.push_str(&format!("  \x1b[2m{}\x1b[0m\r\n", "─".repeat(w.saturating_sub(4))));
     match form.model.banner(&form.fields) {
-        Some(b) => out.push_str(&format!("  \x1b[33m{}\x1b[0m\r\n\r\n", clip(&b, w - 4))),
-        None => out.push_str("\r\n\r\n"),
+        Some(b) => out.push_str(&format!("  \x1b[33m{}\x1b[0m\r\n", clip(&b, w - 4))),
+        None => out.push_str("\r\n"),
     }
     let labelw = form.fields.iter().map(|f| f.label.chars().count()).max().unwrap_or(0).max(7);
     for (i, f) in form.fields.iter().enumerate() {

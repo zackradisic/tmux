@@ -153,12 +153,16 @@ impl Model for Creator {
         self.reuse = false;
     }
 
-    fn tag(&self) -> String {
-        match self.kind {
-            Kind::Plain => "[plain]",
-            Kind::Worktree => "[worktree]",
-        }
-        .into()
+    fn title(&self) -> String {
+        "New Session".into()
+    }
+
+    fn kinds(&self) -> Option<(Vec<&'static str>, usize)> {
+        let active = match self.kind {
+            Kind::Plain => 0,
+            Kind::Worktree => 1,
+        };
+        Some((vec!["plain", "worktree"], active))
     }
 
     fn toggle_hint(&self) -> Option<String> {
