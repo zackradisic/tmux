@@ -114,7 +114,11 @@
 //!   caps = ["capture-pane", "run-command", "mode", "db", "env-read",
 //!           "pane-fds", "fs-read", "fs-list", "service-serve",
 //!           "service-call", "send-keys", "run-process", "fs-read-any"]
-//!   config = { keep_days = 14 }
+//!
+//!   # A table, not `config = { ... }`: an inline table cannot take the
+//!   # launch section below.
+//!   [plugins.agents.config]
+//!   keep_days = 14
 //!
 //!   # Named launchers for the new-agent form's command field. The name
 //!   # is what you type; the line is what runs (through the default
