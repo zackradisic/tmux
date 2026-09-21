@@ -577,9 +577,9 @@ pub struct Picker {
     /// leaving it puts the roster back the way it was.
     pub history_before_archive: bool,
     pub keys: PickKeys,
-    /// The harness commands the roster detects, for the new-agent form's
-    /// command field.
-    pub commands: Vec<String>,
+    /// The new-agent form's launchers (name, shell line): the configured
+    /// ones, then the detected harness commands, see `Config::launchers`.
+    pub launchers: Vec<(String, String)>,
     pub status: Option<String>,
     /// A `g` was pressed and waits for a second `g` (vim `gg` = go top).
     pub pending_g: bool,
@@ -979,7 +979,7 @@ pub async fn pick_open(
         archived_only: false,
         history_before_archive: false,
         keys: cfg.keys.clone(),
-        commands: cfg.commands.clone(),
+        launchers: cfg.launchers.clone(),
         status: None,
         pending_g: false,
         pending_kill: None,

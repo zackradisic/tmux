@@ -106,7 +106,10 @@ sleep 0.5
 $TMUX -f/dev/null new-session -d -s alpha -x 200 -y 50 -c "$WORK/proj-a" "$AGENT" \
     || fail "new-session"
 sleep 0.5
-$TMUX load-plugin -s server -o trust_env=1 -c capture-pane -c run-command -c mode \
+# One launcher, "fake", standing for the fake agent: the command field
+# completes it and Enter expands it.
+$TMUX load-plugin -s server -o trust_env=1 -o "launch=fake = $AGENT" \
+    -c capture-pane -c run-command -c mode \
     -c db -c env-read -c pane-fds -c send-keys -c run-process -c fs-list -c fs-read-any \
     "$DEPLOY/agents.wasm" || fail "load-plugin"
 sleep 1.5
@@ -132,25 +135,26 @@ fkeys C-j
 sleep 0.8
 # Moving to the field does not pop its list; Tab does, filtered on the
 # field's value: "claude" matches one of four.
-fscreen | grep -q 'harnesses' && fail "moving to the command field popped the list"
+fscreen | grep -q 'launchers' && fail "moving to the command field popped the list"
 fkeys Tab
 sleep 0.8
-fscreen | grep -q 'harnesses' || fail "Tab did not show the harness list"
-fscreen | grep -q '1 of 4' || fail "the harness list was not filtered by the value"
+fscreen | grep -q 'launchers' || fail "Tab did not show the launcher list"
+fscreen | grep -q '1 of 5' || fail "the launcher list was not filtered by the value"
 fscreen | grep -q 'Enter take' || fail "the hint does not say Enter takes the row"
 # Enter on the highlighted row takes it and closes the list; the form
 # stays up.
 fkeys Enter
-fscreen | grep -q 'harnesses' && fail "Enter did not close the list"
+fscreen | grep -q 'launchers' && fail "Enter did not close the list"
 [ -n "$(modes | grep -v "^$FORM\$")" ] || fail "Enter on a highlighted row submitted the form"
 fscreen | grep -q 'command *claude' || fail "the taken row is not in the field"
 # C-j from a shown list still moves to the next field, and back.
 fkeys Tab
 fkeys C-j
-fscreen | grep -q 'harnesses' && fail "C-j went into the list instead of the next field"
+fscreen | grep -q 'launchers' && fail "C-j went into the list instead of the next field"
 fkeys C-k
 fkeys C-u
-fscreen | grep -q 'codex' || fail "codex is missing from the harness list"
+fscreen | grep -q 'codex' || fail "codex is missing from the launcher list"
+fscreen | grep -q "fake *sh -c" || fail "the launcher is not listed with its line"
 ftype "$AGENT"
 
 # --- Enter: a window in the session, running the command -------------------
@@ -162,8 +166,14 @@ $TMUX list-windows -t alpha -F '#{window_name}' | grep -qx 'proj-a-two' ||
     fail "the new window is not rooted in the folder"
 [ "$($TMUX display-message -p -t alpha:proj-a-two '#{pane_current_command}')" = "cat" ] ||
     fail "the new window is not running the command"
-sleep 1.5
 open_picker
+# The new pane is classified asynchronously (env, fds, session files):
+# give the roster a moment to show it.
+i=0
+while [ "$i" -lt 20 ]; do
+	screen | grep -q '2 live' && break
+	sleep 0.4; i=$((i + 1))
+done
 screen | grep -q '2 live' || fail "the roster did not pick up the new agent"
 
 # --- C-t cycles the kinds, carrying command and remembering the session ----
@@ -183,8 +193,12 @@ fkeys C-t
 fscreen | grep -q '\[window\]' || fail "C-t did not come back to window"
 
 # --- the session kind: a new session rooted in the folder -----------------
+# This one runs the launcher by name: the status says what it expands to.
 fkeys C-t
 fscreen | grep -q '\[session\]' || fail "C-t did not reach session again"
+fkeys C-u
+ftype "fake"
+fscreen | grep -q "runs: sh -c" || fail "the launcher expansion is not shown: $(fscreen)"
 # The focus followed the command field through the swaps; name is the
 # field above it.
 fkeys C-k
@@ -196,6 +210,8 @@ wait_closed
 $TMUX list-sessions -F '#{session_name}' | grep -qx 'beta' || fail "session beta was not created"
 [ "$($TMUX display-message -p -t beta: '#{pane_current_path}')" = "$WORK/proj-a" ] ||
     fail "session beta is not rooted in the folder"
+[ "$($TMUX display-message -p -t beta: '#{pane_current_command}')" = "cat" ] ||
+    fail "the launcher did not expand to the fake agent"
 
 # --- the worktree kind: add the tree, window in the session ---------------
 sleep 1

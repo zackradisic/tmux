@@ -116,6 +116,16 @@
 //!           "service-call", "send-keys", "run-process", "fs-read-any"]
 //!   config = { keep_days = 14 }
 //!
+//!   # Named launchers for the new-agent form's command field. The name
+//!   # is what you type; the line is what runs (through the default
+//!   # shell, non-interactive - so spell the flags out, no aliases). A
+//!   # launcher named like a harness (claude) is what a new agent from
+//!   # one of that harness's rows runs by default. The first word of the
+//!   # command is expanded, so `claude-opus --resume <id>` works.
+//!   [plugins.agents.config.launch]
+//!   claude = "IS_SANDBOX=1 claude --dangerously-skip-permissions"
+//!   claude-opus = "claude --dangerously-skip-permissions --model opus"
+//!
 //! `send-keys` is the picker's interrupt and its typing into the preview;
 //! `run-process` and `fs-read-any` are the new-agent form's completion
 //! (`formkit::complete::CAPS`, with `fs-list`).
@@ -156,6 +166,9 @@ pub(crate) const HISTORY_MAX: i64 = 100;
 struct AgentsConfig {
     keep_days: Option<serde_json::Value>,
     commands: Option<Vec<String>>,
+    /// Named launchers for the new-agent form: a table of `name = "shell
+    /// line"`, or one string of such lines (the `-o` form).
+    launch: Option<serde_json::Value>,
     trust_env: Option<String>,
     pick_jump: Option<String>,
     pick_filter: Option<String>,
@@ -235,6 +248,10 @@ impl Default for PickKeys {
 pub(crate) struct Config {
     pub keep_days: i64,
     pub commands: Vec<String>,
+    /// The new-agent form's command field completes from these: the
+    /// launchers by name (each with the line it runs), then every
+    /// detected harness command that no launcher shadows.
+    pub launchers: Vec<(String, String)>,
     /// An `AI_AGENT` marker alone makes a claude row (no session file
     /// needed). Off by default; the regress tests turn it on.
     pub trust_env: bool,
@@ -258,6 +275,28 @@ impl Config {
             Some(v) if !v.is_empty() => v.clone(),
             _ => DEFAULT_COMMANDS.iter().map(|s| s.to_string()).collect(),
         };
+        // Launchers: a TOML table (`[plugins.agents.config.launch]`,
+        // name = "line") or one string of `name = line` rows, which is
+        // what `-o launch=...` can carry. Names sort; a harness command
+        // with no launcher of its own follows, running as itself.
+        let mut launchers: Vec<(String, String)> = match &c.launch {
+            Some(serde_json::Value::Object(m)) => m
+                .iter()
+                .filter_map(|(k, v)| {
+                    let line = v.as_str().map(str::trim).unwrap_or("");
+                    (!line.is_empty()).then(|| (k.trim().to_string(), line.to_string()))
+                })
+                .collect(),
+            Some(serde_json::Value::String(s)) => parse_launch_lines(s),
+            Some(other) => return Err(format!("bad launch {other}: a table or a string")),
+            None => Vec::new(),
+        };
+        launchers.sort();
+        for cmd in &commands {
+            if !launchers.iter().any(|(n, _)| n == cmd) {
+                launchers.push((cmd.clone(), cmd.clone()));
+            }
+        }
         let d = PickKeys::default();
         let pick = |v: &Option<String>, def: String| {
             v.as_ref()
@@ -273,6 +312,7 @@ impl Config {
         Ok(Config {
             keep_days,
             commands,
+            launchers,
             trust_env,
             keys: PickKeys {
                 jump: pick(&c.pick_jump, d.jump),
@@ -294,6 +334,20 @@ impl Config {
             },
         })
     }
+}
+
+/// `name = shell line` rows, one per line; blank lines and `#` comments
+/// are skipped, and so is a row with no `=` or an empty side.
+fn parse_launch_lines(s: &str) -> Vec<(String, String)> {
+    s.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| {
+            let (name, line) = l.split_once('=')?;
+            let (name, line) = (name.trim(), line.trim());
+            (!name.is_empty() && !line.is_empty()).then(|| (name.to_string(), line.to_string()))
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

@@ -68,8 +68,10 @@ impl Kind {
 /// What the new-agent form knows about its fields.
 pub struct NewAgent {
     kind: Kind,
-    /// The harness commands the `command` field completes from.
-    commands: Vec<String>,
+    /// What the `command` field completes from: (name, shell line). A
+    /// configured launcher's line is what its name runs; a bare harness
+    /// runs as itself. See `Config::launchers`.
+    launchers: Vec<(String, String)>,
     /// The session the selected row lives in (a link's local name for a
     /// remote row), kept across the session kind, which has no field
     /// for it, so cycling back does not lose it.
@@ -128,8 +130,17 @@ impl Model for NewAgent {
                     .collect(),
             }),
             "command" => Some(Source::Words {
-                title: "harnesses".into(),
-                words: self.commands.iter().map(|c| (c.clone(), "harness".into())).collect(),
+                title: "launchers".into(),
+                words: self
+                    .launchers
+                    .iter()
+                    .map(|(n, line)| {
+                        // The second column is the line a name runs; a
+                        // harness that runs as itself says so.
+                        let meta = if n == line { "harness".to_string() } else { line.clone() };
+                        (n.clone(), meta)
+                    })
+                    .collect(),
             }),
             _ => None,
         }
@@ -230,6 +241,13 @@ impl Model for NewAgent {
         if self.confirm_create {
             return Some("folder does not exist — Enter again to create it".into());
         }
+        // A command that starts with a launcher's name says what it
+        // really runs, so there is no surprise on Enter.
+        let command = value_of(fields, "command");
+        let expanded = expand_command(&self.launchers, &command);
+        if !command.is_empty() && expanded != command {
+            return Some(format!("runs: {expanded}"));
+        }
         None
     }
 
@@ -277,6 +295,24 @@ fn fields_for(kind: Kind, session: &str, folder: &str, name: Field, command: Fie
     }
 }
 
+/// The shell line a command field runs: its first word, when it names a
+/// launcher, is replaced by that launcher's line and the rest follows -
+/// so `claude-opus --resume <id>` is the opus launcher with a flag. Any
+/// other command runs as typed. A harness with no launcher of its own
+/// is listed as itself, so this is the identity for it.
+pub fn expand_command(launchers: &[(String, String)], command: &str) -> String {
+    let command = command.trim();
+    let (head, rest) = match command.split_once(char::is_whitespace) {
+        Some((h, r)) => (h, r.trim_start()),
+        None => (command, ""),
+    };
+    match launchers.iter().find(|(n, _)| n == head) {
+        Some((_, line)) if rest.is_empty() => line.clone(),
+        Some((_, line)) => format!("{line} {rest}"),
+        None => command.to_string(),
+    }
+}
+
 /// tmux session names may not contain '.' or ':'; spaces are legal but
 /// unpleasant in targets.
 fn session_name(name: &str) -> String {
@@ -321,7 +357,7 @@ pub async fn open(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>) {
         return;
     }
     // What the row gives us, read under one borrow.
-    let (picker_mode, commands, session, remote, local_pane, harness) = {
+    let (picker_mode, launchers, session, remote, local_pane, harness) = {
         let b = picker.borrow();
         let Some(p) = b.as_ref() else { return };
         let row = p.selected();
@@ -338,7 +374,7 @@ pub async fn open(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>) {
             .filter(|s| session_exists(s))
             .unwrap_or_default();
         let harness = row.map(|a| a.kind.clone()).unwrap_or_default();
-        (p.mode, p.commands.clone(), session, remote, local_pane, harness)
+        (p.mode, p.launchers.clone(), session, remote, local_pane, harness)
     };
     // The folder: the row's pane cwd (a shadow's is the remote's cached
     // path), else the pressing client's pane, like `prefix S`.
@@ -382,8 +418,10 @@ pub async fn open(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>) {
             return;
         }
     };
+    // The row's harness by name: a launcher of that name (the user's
+    // own flags for it) or the bare harness. No row: the first launcher.
     let command = if harness.is_empty() {
-        commands.first().cloned().unwrap_or_default()
+        launchers.first().map(|(n, _)| n.clone()).unwrap_or_default()
     } else {
         harness
     };
@@ -396,7 +434,7 @@ pub async fn open(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>) {
     );
     let model = NewAgent {
         kind: Kind::Window,
-        commands,
+        launchers,
         session,
         remote,
         detected: None,
@@ -592,7 +630,8 @@ async fn submit() {
 
     // The window in the session, or a session of its own.
     let name = get("name");
-    let command = get("command");
+    let launchers = st.borrow().as_ref().map(|f| f.model.launchers.clone()).unwrap_or_default();
+    let command = expand_command(&launchers, &get("command"));
     let session = get("session");
     let (cmd, target) = if !session.is_empty() {
         (
