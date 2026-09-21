@@ -12,7 +12,8 @@
 //! always move between fields and never into the list. The list shows
 //! itself when you type into a field, or on `Tab`; `Tab` and `S-Tab`
 //! then cycle through the candidates, writing each into the field as you
-//! go, and `Esc` puts the list away. A field is scanned when it takes
+//! go; `Enter` on a highlighted row takes it and closes the list, and
+//! `Esc` puts the list away. A field is scanned when it takes
 //! the focus, quietly, so the first `Tab` or keystroke has rows ready.
 //!
 //! The form lives in a shared cell ([`Shared`]) because scans and probes
@@ -131,6 +132,9 @@ pub struct Form<M: Model> {
     /// The home directory, read once when the form opens, so a `~` in a
     /// path field completes like any other directory.
     pub home: Option<String>,
+    /// Tab was pressed before the list had rows: take the first row the
+    /// moment they land, so one Tab always means "the first candidate".
+    pub take_first: bool,
     pub model: M,
 }
 
@@ -181,6 +185,7 @@ impl<M: Model> Form<M> {
             probing: false,
             // Synchronous, so `~` is expandable before the first scan.
             home: home_dir().ok().filter(|h| !h.is_empty()),
+            take_first: false,
             model,
         };
         form.model.mirror(&mut form.fields);
@@ -305,11 +310,13 @@ impl<M: Model> Form<M> {
     /// field. From the text the first press takes the first (or last)
     /// row; past either end it wraps. Returns false when there is no
     /// shown list to cycle.
-    fn cycle(&mut self, forward: bool) -> bool {
+    pub(crate) fn cycle(&mut self, forward: bool) -> bool {
         let Some(p) = self.list.as_mut() else { return false };
-        if !p.shown() || p.view.is_empty() {
+        if p.loading || p.view.is_empty() {
             return false;
         }
+        // A list scanned quietly on focus is shown by its first Tab.
+        p.hidden = false;
         let last = p.view.len() - 1;
         p.sel = Some(match (p.sel, forward) {
             (None, true) => 0,
@@ -333,6 +340,8 @@ impl<M: Model> Form<M> {
         if Some(key) == toggle_key {
             return Action::Toggle;
         }
+        // Only a Tab that could not cycle yet leaves this set.
+        self.take_first = false;
         let n = self.fields.len();
         match key {
             "Escape" => {
@@ -349,7 +358,23 @@ impl<M: Model> Form<M> {
                     Action::Close
                 }
             }
-            "Enter" => Action::Submit,
+            "Enter" => {
+                // A highlighted suggestion is taken, and the list closes:
+                // Enter means "this one" while you are choosing. With no
+                // row highlighted the list is only showing what matches
+                // what you typed, and Enter means the form.
+                if self.in_list() {
+                    if let Some(p) = self.list.as_mut() {
+                        p.sel = None;
+                        p.hidden = true;
+                    }
+                    self.error = None;
+                    render(self);
+                    Action::None
+                } else {
+                    Action::Submit
+                }
+            }
             // Fields, always. A list never captures these.
             "Down" | "C-j" => {
                 self.focused = (self.focused + 1) % n;
@@ -366,6 +391,9 @@ impl<M: Model> Form<M> {
                     render(self);
                     Action::Probe
                 } else if self.completes() {
+                    // No rows yet: show the list, and take the first row
+                    // when the scan lands.
+                    self.take_first = true;
                     Action::Rescan { reveal: true }
                 } else {
                     // Nothing to complete: Tab moves on, as in any form.
@@ -379,6 +407,7 @@ impl<M: Model> Form<M> {
                     render(self);
                     Action::Probe
                 } else if self.completes() {
+                    self.take_first = true;
                     Action::Rescan { reveal: true }
                 } else {
                     self.focused = (self.focused + n - 1) % n;
@@ -491,7 +520,11 @@ pub fn render<M: Model>(form: &mut Form<M>) {
     let verb = form.model.submit_label();
     let toggle = form.model.toggle_hint().map(|t| format!("C-t {t} · ")).unwrap_or_default();
     let hint = if form.listed() {
-        format!("Tab/S-Tab cycle · C-j/C-k field · Enter {verb} · Esc hide list")
+        if form.in_list() {
+            "Tab/S-Tab cycle · Enter take · C-j/C-k field · Esc hide list".to_string()
+        } else {
+            format!("Tab/S-Tab cycle · C-j/C-k field · Enter {verb} · Esc hide list")
+        }
     } else if form.completes() {
         format!("{toggle}Tab complete · C-j/C-k field · Enter {verb} · Esc cancel")
     } else {
@@ -524,6 +557,10 @@ pub fn start_scan<M: Model>(state: &Shared<M>, mode: ModeId, reveal: bool) {
                 p.hidden = !reveal;
                 p.sel = None;
                 p.refilter(&frag);
+                if form.take_first {
+                    form.take_first = false;
+                    form.cycle(true);
+                }
                 render(form);
                 drop(st);
                 kick_probe(state, mode);
@@ -583,6 +620,10 @@ async fn scan_into<M: Model>(
     let Some(p) = form.list.as_mut() else { return };
     p.install(scanned);
     p.refilter(&frag);
+    if form.take_first {
+        form.take_first = false;
+        form.cycle(true);
+    }
     render(form);
     drop(st);
 

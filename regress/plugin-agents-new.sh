@@ -137,7 +137,15 @@ fkeys Tab
 sleep 0.8
 fscreen | grep -q 'harnesses' || fail "Tab did not show the harness list"
 fscreen | grep -q '1 of 4' || fail "the harness list was not filtered by the value"
+fscreen | grep -q 'Enter take' || fail "the hint does not say Enter takes the row"
+# Enter on the highlighted row takes it and closes the list; the form
+# stays up.
+fkeys Enter
+fscreen | grep -q 'harnesses' && fail "Enter did not close the list"
+[ -n "$(modes | grep -v "^$FORM\$")" ] || fail "Enter on a highlighted row submitted the form"
+fscreen | grep -q 'command *claude' || fail "the taken row is not in the field"
 # C-j from a shown list still moves to the next field, and back.
+fkeys Tab
 fkeys C-j
 fscreen | grep -q 'harnesses' && fail "C-j went into the list instead of the next field"
 fkeys C-k
