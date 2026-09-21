@@ -7,10 +7,11 @@
       { "hooks": [ { "type": "command", "command": "~/.config/agents/agent-status.sh working" } ] }
     ],
     "Notification": [
-      { "hooks": [ { "type": "command", "command": "~/.config/agents/agent-status.sh needs_input" } ] }
+      { "matcher": "permission_prompt|elicitation_dialog",
+        "hooks": [ { "type": "command", "command": "~/.config/agents/agent-status.sh needs_input" } ] }
     ],
     "Stop": [
-      { "hooks": [ { "type": "command", "command": "~/.config/agents/agent-status.sh waiting" } ] }
+      { "hooks": [ { "type": "command", "command": "~/.config/agents/agent-status.sh needs_input" } ] }
     ],
     "SessionEnd": [
       { "hooks": [ { "type": "command", "command": "~/.config/agents/agent-status.sh done" } ] }

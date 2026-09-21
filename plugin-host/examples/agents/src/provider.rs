@@ -833,6 +833,7 @@ pub async fn handle(req: ServiceRequest, cfg: Rc<Config>) {
             let now = now_ms() as i64;
             let ok = match q.verb.as_str() {
                 "ack" => store::acknowledge(&q.id, now).await.is_ok(),
+                "unack" => store::unacknowledge(&q.id, now).await.is_ok(),
                 "archive" => {
                     capture_on_archive(&q.id).await;
                     store::set_life(&q.id, "archived").await.is_ok()

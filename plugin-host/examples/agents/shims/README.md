@@ -69,9 +69,17 @@ in-process extensions) and the status words below.
 |--------------|-------------------|-------------------|-----------------|-----------------------|
 | working      | UserPromptSubmit  | UserPromptSubmit  | agent_start     | session.status busy   |
 |              | PreToolUse        | PreToolUse        | turn_start      |                       |
-| needs_input  | Notification      | PermissionRequest | ui_prompt_start | permission/question   |
-| waiting      | Stop              | Stop              | agent_settled   | session.status idle   |
+| needs_input  | Stop, Notification¹| PermissionRequest | ui_prompt_start | permission/question   |
+| waiting      | (by hand: `w`)    | Stop              | agent_settled   | session.status idle   |
 | done         | (pane close)      | (pane close)      | session_shutdown| session.deleted       |
+
+¹ Claude's `Stop` reports `needs_input`, not `waiting`: under
+`--dangerously-skip-permissions` there are no permission prompts, so "it
+stopped" is the signal that it wants you, and the picker's `w` is how a
+row you have judged leaves the band. The `Notification` hook carries a
+matcher for `permission_prompt|elicitation_dialog` only; Claude's
+`idle_prompt` (fired a minute into an idle prompt) is not used, since
+the Stop already said it.
 
 `done` is best taken from pane liveness, not a hook: a killed or crashed
 CLI never fires its exit hook, but the pane always dies.

@@ -520,6 +520,8 @@ pub enum PickAfter {
     /// Open the new-agent form over the picker, prefilled from the
     /// highlighted row (see `newagent`).
     NewAgent,
+    /// Mark these (server, id) rows read (true) or unread (false).
+    Read(Vec<(String, String)>, bool),
 }
 
 /// One rendered line: a server header (only when rows come from more than
@@ -1179,6 +1181,55 @@ pub async fn apply_life(
     reload_picker(picker, remotes, false).await;
 }
 
+/// Mark rows read or unread by hand, wherever they live. A remote row's
+/// ack belongs to its own provider, over the `act` RPC (`ack`/`unack`).
+pub async fn apply_read(
+    picker: Rc<RefCell<Option<Picker>>>,
+    remotes: Rc<RefCell<Remotes>>,
+    ids: Vec<(String, String)>,
+    read: bool,
+) {
+    let now = now_ms() as i64;
+    let mut done = 0usize;
+    let mut refused: Option<String> = None;
+    for (server, id) in &ids {
+        let r = if server == LOCAL {
+            let r = if read {
+                store::acknowledge(id, now).await
+            } else {
+                store::unacknowledge(id, now).await
+            };
+            r.map(|_| ()).map_err(|e| e.message)
+        } else {
+            act_remote(server, id, if read { "ack" } else { "unack" }, None).await
+        };
+        match r {
+            Ok(()) => done += 1,
+            Err(why) => {
+                if refused.is_none() {
+                    refused = Some(why);
+                }
+            }
+        }
+    }
+    {
+        let mut b = picker.borrow_mut();
+        if let Some(p) = b.as_mut() {
+            let verb = if read { "marked read" } else { "marked unread" };
+            p.status = Some(match (done, refused) {
+                (1, None) => verb.to_string(),
+                (n, None) => format!("{n} {verb}"),
+                (0, Some(why)) => why,
+                (n, Some(why)) => format!("{n} {verb}; {why}"),
+            });
+            p.marked.clear();
+        }
+    }
+    let req = list_req_of(&picker);
+    fetch_remotes_now(Rc::clone(&picker), Rc::clone(&remotes), req).await;
+    reload_picker(picker, remotes, false).await;
+}
+
 /// Move rows between the attention band and `waiting` by hand, wherever
 /// they live. A remote row's status belongs to its own provider, so the
 /// change goes over the `act` RPC rather than into this server's store.
@@ -1281,6 +1332,10 @@ async fn open_menu(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>) {
             items.push_str(&menu_item("type into pane", &k.focus, live));
             items.push_str(&menu_item("new agent here", &k.new, true));
             items.push_str(&menu_item("message", "m", true));
+            let stopped =
+                a.live() && matches!(a.status.as_str(), "needs_input" | "waiting");
+            items.push_str(&menu_item("mark read", &k.read, stopped && a.unread()));
+            items.push_str(&menu_item("mark unread", &k.unread, stopped && !a.unread()));
             items.push_str(&menu_item("copy id", &k.copy, durable_id(a).is_some()));
             items.push_str(&menu_item("rename", &k.rename, true));
             items.push_str(" ''");
@@ -1446,13 +1501,6 @@ pub fn on_mode_nav(
             "up" | "down" => {
                 let typing = p.preview_focus;
                 move_sel(p, if dir == "up" { -1 } else { 1 });
-                // Landing on an unread row acknowledges it, as a key does.
-                if let Some(&i) = p.view.get(p.sel) {
-                    if p.rows[i].unread() {
-                        p.rows[i].acked_ms = Some(p.now_ms as i64);
-                        ack = Some((p.rows[i].server.clone(), p.rows[i].id.clone()));
-                    }
-                }
                 // The keyboard stays with the preview, which now shows
                 // another agent - unless that row has no pane to type
                 // into, in which case the focus drops and the footer says
@@ -1527,8 +1575,6 @@ fn dispatch_key(
         }
         p.status = None;
         let k = &p.keys.clone();
-        // True when this key moved the selection: drives read-ack.
-        let mut moved = false;
         // A pending `g` is consumed by this key; only a second `g`
         // keeps it (see the `g` branch).
         let g_pending = p.pending_g;
@@ -1544,7 +1590,7 @@ fn dispatch_key(
             // a click lands where it lands. Without a cell (a mouse key
             // typed by name) there is nowhere for it to land.
             if let Some((x, y)) = mouse {
-                moved = mouse_key(p, &key, x, y, &mut after, &mut ack);
+                mouse_key(p, &key, x, y, &mut after, &mut ack);
             }
         } else if p.preview_focus {
             // The preview has the keyboard: every key goes to the pane
@@ -1634,10 +1680,8 @@ fn dispatch_key(
                 pick_render(p);
             } else if is_down {
                 move_sel(p, 1);
-                moved = true;
             } else if is_up {
                 move_sel(p, -1);
-                moved = true;
             } else if key == "BSpace" {
                 p.filter.pop();
                 pick_refilter(p);
@@ -1678,7 +1722,6 @@ fn dispatch_key(
             if g_pending {
                 let n = p.view.len() as i32;
                 move_sel(p, -n);
-                moved = true;
             } else {
                 p.pending_g = true;
             }
@@ -1686,7 +1729,6 @@ fn dispatch_key(
             // Vim `G`: go to the bottom.
             let n = p.view.len() as i32;
             move_sel(p, n);
-            moved = true;
         } else if key == k.interrupt {
             // Interrupt, do not kill: send C-c and let the agent decide
             // what that means. Claude with work in flight answers with its
@@ -1801,10 +1843,24 @@ fn dispatch_key(
             after = PickAfter::Reload;
         } else if key == "J" {
             mark_and_move(p, 1);
-            moved = true;
         } else if key == "K" {
             mark_and_move(p, -1);
-            moved = true;
+        } else if key == k.read || key == k.unread {
+            // Read and unread by hand: the cursor passing over a row is
+            // not reading it, so these are the way to say you have (or
+            // have not) dealt with what it stopped for.
+            let read = key == k.read;
+            let ids: Vec<(String, String)> = action_targets(p)
+                .iter()
+                .filter(|a| a.live())
+                .map(|a| (a.server.clone(), a.id.clone()))
+                .collect();
+            if ids.is_empty() {
+                p.status = Some("no live agent to mark".into());
+                pick_render(p);
+            } else {
+                after = PickAfter::Read(ids, read);
+            }
         } else if key == "+" || key == "=" {
             let w = (p.width + RESIZE_STEP_W).min(MAX_WIDTH);
             let h = (p.height + RESIZE_STEP_H).min(MAX_HEIGHT);
@@ -1821,22 +1877,12 @@ fn dispatch_key(
             after = PickAfter::Resize(p.mode, w, h);
         } else if is_down || key == "j" {
             move_sel(p, 1);
-            moved = true;
         } else if is_up || key == "k" {
             move_sel(p, -1);
-            moved = true;
         }
-        // Landing the cursor on an unread waiting row acknowledges it
-        // (only real navigation acks; opening the picker does not).
-        if moved && ack.is_none() {
-            if let Some(&i) = p.view.get(p.sel) {
-                if p.rows[i].unread() {
-                    p.rows[i].acked_ms = Some(p.now_ms as i64);
-                    ack = Some((p.rows[i].server.clone(), p.rows[i].id.clone()));
-                    pick_render(p);
-                }
-            }
-        }
+        // The cursor landing on a row does not acknowledge it: scrolling
+        // past an unread agent is not reading it. Jumping to it, typing
+        // into it, or the read key are.
     }
     if let Some((server, id)) = ack {
         ctx.spawn(acknowledge(server, id));
@@ -1879,6 +1925,9 @@ fn dispatch_key(
         }
         PickAfter::NewAgent => {
             ctx.spawn(crate::newagent::open(Rc::clone(picker), client));
+        }
+        PickAfter::Read(ids, read) => {
+            ctx.spawn(apply_read(Rc::clone(picker), Rc::clone(remotes), ids, read));
         }
         PickAfter::Copy(text) => {
             ctx.spawn(copy_to_clipboard(Rc::clone(picker), text, client));
@@ -2212,7 +2261,6 @@ fn mouse_key(
                 pick_render(p);
                 return false;
             };
-            let was = p.sel;
             p.sel = v;
             // The user took the cursor: stop pulling it back to the
             // here row.
@@ -2222,7 +2270,7 @@ fn mouse_key(
                 *after = jump_after(p, ack);
             }
             pick_render(p);
-            v != was
+            true
         }
         "WheelUpPane" | "WheelDownPane" if in_list => {
             // The wheel moves the cursor, so it must take the keyboard
@@ -2857,6 +2905,9 @@ fn badge(a: &Agent) -> String {
         return "\x1b[2m·\x1b[0m".into();
     }
     match a.status.as_str() {
+        // Unread needs-input: the bang on a bright yellow block; read: the
+        // bang alone.
+        "needs_input" if a.unread() => "\x1b[1;30;103m!\x1b[0m".into(),
         "needs_input" => "\x1b[1;33m!\x1b[0m".into(),
         "working" => "\x1b[32m●\x1b[0m".into(),
         // Unread waiting: a filled badge on a bright cyan block, the one

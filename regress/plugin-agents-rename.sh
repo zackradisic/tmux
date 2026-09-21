@@ -91,9 +91,9 @@ $TMUX load-plugin -s server -o trust_env=1 -c capture-pane -c run-command -c mod
     || fail "load-plugin"
 sleep 1.0
 
-# Nameless agent: rename it via r; it shows and persists.
+# Nameless agent: rename it via R; it shows and persists.
 open_picker
-$TMUX send-keys -t "$FORM" r; sleep 0.4
+$TMUX send-keys -t "$FORM" R; sleep 0.4
 $TMUX send-keys -t "$FORM" USERPICK; sleep 0.4
 $TMUX send-keys -t "$FORM" Enter; sleep 0.6
 screen | grep -q 'USERPICK' || fail "rename did not take"

@@ -43,7 +43,7 @@
 //! said so. It takes a marked selection too.
 //! Esc clears the selection before it closes the picker. `+`/`-` grow and
 //! shrink the popup; the size is remembered across opens. The popup opens
-//! at a fraction of the window by default. `r` renames the selected agent
+//! at a fraction of the window by default. `R` renames the selected agent
 //! (Enter accepts, Esc cancels, empty reverts to the harness name); your
 //! name and the harness name compete by recency (see `display_name`).
 //! `C-f` toggles content search: the filter then also greps each live
@@ -55,11 +55,19 @@
 //! substring), and falls back to fuzzy when it finds nothing; the active
 //! mode shows in the header and footer.
 //!
-//! A waiting agent you have not gotten to yet is UNREAD: it entered
-//! `waiting` more recently than your last acknowledgement. Jumping to its
-//! pane or landing the cursor on its row acknowledges it. Unread rows sort
-//! to the top of the waiting band, show a bright filled badge, and count
-//! in the header.
+//! An agent that stopped for you and you have not gotten to yet is
+//! UNREAD: it entered `needs_input` or `waiting` more recently than your
+//! last acknowledgement. Jumping to its pane or typing into it
+//! acknowledges it, and so does `r`; `u` makes it unread again. Moving
+//! the cursor over a row does NOT: scrolling past is not reading. Unread
+//! rows sort to the top of their band, show their badge on a coloured
+//! block with the name in bold, and count in the header.
+//!
+//! With the Claude shim installed, an agent that stops goes straight to
+//! `needs_input`: under `--dangerously-skip-permissions` there are no
+//! permission prompts, so "it stopped" IS the signal that it wants you.
+//! `waiting` is the band you move a row to by hand (`w`) once you have
+//! judged it; Claude's `idle_prompt` notification is not used.
 //!
 //! Three signals drive it, each from its own trusted source:
 //!
@@ -190,6 +198,8 @@ struct AgentsConfig {
     pick_focus: Option<String>,
     pick_unfocus: Option<String>,
     pick_new: Option<String>,
+    pick_read: Option<String>,
+    pick_unread: Option<String>,
 }
 
 #[derive(Clone)]
@@ -222,6 +232,10 @@ pub(crate) struct PickKeys {
     pub unfocus: String,
     /// Open the new-agent form, prefilled from the highlighted row.
     pub new: String,
+    /// Mark the row (or the marked selection) read.
+    pub read: String,
+    /// Mark it unread again.
+    pub unread: String,
 }
 
 impl Default for PickKeys {
@@ -239,12 +253,15 @@ impl Default for PickKeys {
             archived: "A".into(),
             close: "Escape".into(),
             content: "C-f".into(),
-            rename: "r".into(),
+            // `r`/`u` read and unread; rename moved to `R`.
+            rename: "R".into(),
             interrupt: "x".into(),
             kill: "X".into(),
             focus: "l".into(),
             unfocus: "C-]".into(),
             new: "n".into(),
+            read: "r".into(),
+            unread: "u".into(),
         }
     }
 }
@@ -335,6 +352,8 @@ impl Config {
                 focus: pick(&c.pick_focus, d.focus),
                 unfocus: pick(&c.pick_unfocus, d.unfocus),
                 new: pick(&c.pick_new, d.new),
+                read: pick(&c.pick_read, d.read),
+                unread: pick(&c.pick_unread, d.unread),
             },
         })
     }

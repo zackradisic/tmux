@@ -63,7 +63,7 @@ $TMUX capture-pane -M -p -t "$FORM" | grep -q '3 live' || fail "expected 3 live"
 
 # Select the middle row and pin it with a distinctive name.
 $TMUX send-keys -t "$FORM" j; sleep 0.4
-$TMUX send-keys -t "$FORM" r; sleep 0.3
+$TMUX send-keys -t "$FORM" R; sleep 0.3
 $TMUX send-keys -t "$FORM" PINME; sleep 0.3
 $TMUX send-keys -t "$FORM" Enter; sleep 0.6
 selname | grep -q PINME || fail "cursor not on PINME after rename"

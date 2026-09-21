@@ -228,11 +228,13 @@ impl Agent {
         self.started_ms.unwrap_or(self.first_seen_ms)
     }
 
-    /// A waiting agent the user has not gotten to yet: it entered `waiting`
-    /// more recently than the last acknowledgement (a jump, or the picker
-    /// cursor landing on it). A live waiting row with no ack is unread.
+    /// An agent that stopped for the user and has not been gotten to yet:
+    /// it entered `waiting` or `needs_input` more recently than the last
+    /// acknowledgement (a jump to its pane, typing into it, or `r`). A
+    /// live stopped row with no ack is unread. The cursor landing on a
+    /// row is not an acknowledgement: scrolling past is not reading.
     pub fn unread(&self) -> bool {
-        if !self.live() || self.status != "waiting" {
+        if !self.live() || !matches!(self.status.as_str(), "waiting" | "needs_input") {
             return false;
         }
         match self.waiting_ms {
@@ -541,7 +543,7 @@ pub async fn set_status(
         db_exec(
             "UPDATE agents SET status = ?2, task = ?3, note = ?4, \
              last_status_ms = ?5, \
-             waiting_ms = CASE WHEN status <> 'waiting' AND ?2 = 'waiting' \
+             waiting_ms = CASE WHEN status <> ?2 AND ?2 IN ('waiting', 'needs_input') \
                                THEN ?5 ELSE waiting_ms END \
              WHERE pane = ?1 AND ended_ms IS NULL",
             params![pane, status, task, note, now_ms],
@@ -550,7 +552,7 @@ pub async fn set_status(
     } else {
         db_exec(
             "UPDATE agents SET status = ?2, note = ?3, last_status_ms = ?4, \
-             waiting_ms = CASE WHEN status <> 'waiting' AND ?2 = 'waiting' \
+             waiting_ms = CASE WHEN status <> ?2 AND ?2 IN ('waiting', 'needs_input') \
                                THEN ?4 ELSE waiting_ms END \
              WHERE pane = ?1 AND ended_ms IS NULL",
             params![pane, status, note, now_ms],
@@ -594,11 +596,24 @@ pub async fn set_status_by_id(
 }
 
 /// Mark an agent acknowledged as of `now_ms`: the user got to it (a jump
-/// to its pane, or the picker cursor landing on its row). This clears the
-/// unread flag for the current waiting episode.
+/// to its pane, typing into it, or the read key). This clears the unread
+/// flag for the current episode.
 pub async fn acknowledge(id: &str, now_ms: i64) -> Result<u64, HostError> {
     let r = db_exec(
         "UPDATE agents SET acked_ms = ?2 WHERE id = ?1",
+        params![id, now_ms],
+    )
+    .await?;
+    Ok(r.changes as u64)
+}
+
+/// The opposite: the user wants the row back on the unread pile (the
+/// unread key). The ack goes; a row that was never stamped as stopped
+/// gets stamped now, so it reads as unread whatever its history.
+pub async fn unacknowledge(id: &str, now_ms: i64) -> Result<u64, HostError> {
+    let r = db_exec(
+        "UPDATE agents SET acked_ms = NULL, waiting_ms = COALESCE(waiting_ms, ?2) \
+         WHERE id = ?1",
         params![id, now_ms],
     )
     .await?;

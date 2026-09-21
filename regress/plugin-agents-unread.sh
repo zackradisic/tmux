@@ -1,5 +1,5 @@
 #!/bin/sh
-# Unread waiting agents. A live agent that enters `waiting` is unread until
+# Unread agents. A live agent that enters `waiting` (or `needs_input`) is unread until
 # the user gets to it. Acknowledging happens two ways: the picker cursor
 # lands on the row (real navigation, not the auto-selection at open), or the
 # user jumps to the pane. Unread rows sort to the top of the waiting band
@@ -102,27 +102,45 @@ screen | grep -q '2 unread' || fail "header does not show 2 unread"
 screen | grep -q '◉' || fail "no unread badge on screen"
 [ "$(q "$UNREAD_SQL")" = "2" ] || fail "opening the picker acked a row"
 
-# Navigate down onto the second row: that acknowledges it, not the first.
-$TMUX send-keys -t "$FORM" j; sleep 0.6
+# Moving the cursor onto the second row does NOT acknowledge it: scrolling
+# past an agent is not reading it.
+$TMUX send-keys -t "$FORM" j; sleep 0.8
+[ "$(q "$UNREAD_SQL")" = "2" ] ||
+    fail "moving the cursor onto a row acked it (got $(q "$UNREAD_SQL"))"
+screen | grep -q '2 unread' || fail "header changed on a cursor move"
+
+# r marks the row under the cursor read.
+$TMUX send-keys -t "$FORM" r; sleep 0.6
 i=0
 while [ "$i" -lt 10 ]; do
 	[ "$(q "$UNREAD_SQL")" = "1" ] && break
 	sleep 1; i=$((i + 1))
 done
 [ "$(q "$UNREAD_SQL")" = "1" ] ||
-    fail "navigating onto a row did not ack exactly one (got $(q "$UNREAD_SQL"))"
+    fail "r did not ack exactly one (got $(q "$UNREAD_SQL"))"
 screen | grep -q '1 unread' || fail "header did not drop to 1 unread"
+screen | grep -q 'marked read' || fail "the status line did not say marked read"
 
-# Jump (Enter) to the remaining unread agent's pane: that acks it too.
-$TMUX send-keys -t "$FORM" k; sleep 0.4
+# u makes it unread again.
+$TMUX send-keys -t "$FORM" u; sleep 0.6
+i=0
+while [ "$i" -lt 10 ]; do
+	[ "$(q "$UNREAD_SQL")" = "2" ] && break
+	sleep 1; i=$((i + 1))
+done
+[ "$(q "$UNREAD_SQL")" = "2" ] ||
+    fail "u did not make the row unread again (got $(q "$UNREAD_SQL"))"
+screen | grep -q '2 unread' || fail "header did not go back to 2 unread"
+
+# Jump (Enter) to an unread agent's pane: that acks it.
 $TMUX send-keys -t "$FORM" Enter; sleep 0.8
 i=0
 while [ "$i" -lt 10 ]; do
-	[ "$(q "$UNREAD_SQL")" = "0" ] && break
+	[ "$(q "$UNREAD_SQL")" = "1" ] && break
 	sleep 1; i=$((i + 1))
 done
-[ "$(q "$UNREAD_SQL")" = "0" ] ||
-    fail "jump/select did not clear the last unread (got $(q "$UNREAD_SQL"))"
+[ "$(q "$UNREAD_SQL")" = "1" ] ||
+    fail "jump did not clear the unread it jumped to (got $(q "$UNREAD_SQL"))"
 
 cleanup
 exit 0
