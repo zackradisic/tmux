@@ -127,9 +127,12 @@ fscreen | grep -q 'name *proj-a' || fail "name did not follow the folder"
 fscreen | grep -q 'command *claude' || fail "command was not prefilled from the harness"
 fscreen | grep -q 'Enter start' || fail "the hint does not say start"
 
-# name has the focus (everything else is prefilled); a suffix, then the
-# command field, whose list is the harness list.
-ftype "-two"
+# name has the focus (everything else is prefilled). Clearing it leaves
+# it empty: the default shows dim as a placeholder, it does not come back.
+fkeys C-u
+$TMUX capture-pane -M -p -e -t "$NEWF" | grep -qE "\[[0-9;]*2mproj-a" ||
+    fail "an emptied name did not show its default as a dim placeholder"
+ftype "proj-a-two"
 fscreen | grep -q 'name *proj-a-two' || fail "typing did not reach name"
 fkeys C-j
 sleep 0.8

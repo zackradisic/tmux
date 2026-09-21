@@ -135,6 +135,11 @@ $TMUX list-sessions -F '#{session_name}' | grep -qx 'proj-a' || fail "session pr
 
 # --- a duplicate name is refused; a missing folder is created on the second Enter
 open_form new
+# Clearing name leaves it empty with the default as a dim placeholder;
+# Enter uses that default, which is the session that already exists.
+keys C-u
+$TMUX capture-pane -M -p -e -t "$FORM" | grep -qE "\[[0-9;]*2mproj-a" ||
+    fail "an emptied name did not show its default as a dim placeholder"
 keys Enter
 sleep 0.5
 screen | grep -q "already exists" || fail "a duplicate name was not refused"

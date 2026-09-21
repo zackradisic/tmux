@@ -368,7 +368,7 @@ async fn detect_repo(state: State, mode: ModeId, folder: String) {
     }
     form.fields[ri].value = root.clone();
     form.model.detected = Some(root);
-    form.model.mirror(&mut form.fields);
+    form.run_mirror();
     form::render(form);
 }
 
@@ -415,7 +415,7 @@ async fn submit(state: State) {
             return;
         }
         let values: Vec<String> =
-            form.fields.iter().map(|f| f.value.trim().to_string()).collect();
+            form.fields.iter().map(|f| f.effective().trim().to_string()).collect();
         let confirmed = form.model.confirm_create;
         let reuse = form.model.reuse;
         form.busy = true;

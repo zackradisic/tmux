@@ -8,6 +8,12 @@
 //! render, the resize handshake with the host, and the async plumbing
 //! that runs scans and probes without letting a stale result land.
 //!
+//! A field follows another (`name` follows the folder's basename) until
+//! you edit it. An edited field that you empty stays empty: what the
+//! mirror would have put there shows as a dim placeholder, and submit
+//! uses it if you leave the field blank. Nothing you erase comes back
+//! under your cursor.
+//!
 //! The keys follow a shell, not a menu: `C-j`/`C-k` (and the arrows)
 //! always move between fields and never into the list. The list shows
 //! itself when you type into a field, or on `Tab`; `Tab` and `S-Tab`
@@ -36,12 +42,28 @@ pub struct Field {
     pub label: &'static str,
     pub value: String,
     /// Once the user edits a field it stops mirroring its source (see
-    /// [`Model::mirror`]). Emptying it with BSpace resumes the mirror.
+    /// [`Model::mirror`]). Erasing it to empty does not resume the
+    /// mirror: the mirror's value becomes the [`placeholder`](Self::placeholder).
     pub touched: bool,
+    /// What the mirror would have put in an edited, empty field. Drawn
+    /// dim in its place, and what [`Field::effective`] answers with.
+    pub placeholder: Option<String>,
 }
 
 pub fn field(label: &'static str, value: String) -> Field {
-    Field { label, value, touched: false }
+    Field { label, value, touched: false, placeholder: None }
+}
+
+impl Field {
+    /// The value the form acts on: what was typed, or the placeholder
+    /// when the field was left empty.
+    pub fn effective(&self) -> &str {
+        if self.value.trim().is_empty() {
+            self.placeholder.as_deref().unwrap_or("")
+        } else {
+            &self.value
+        }
+    }
 }
 
 /// What the caller knows about its fields.
@@ -188,7 +210,7 @@ impl<M: Model> Form<M> {
             take_first: false,
             model,
         };
-        form.model.mirror(&mut form.fields);
+        form.run_mirror();
         form
     }
 
@@ -196,9 +218,41 @@ impl<M: Model> Form<M> {
         self.fields.iter().position(|f| f.label == label).unwrap()
     }
 
-    /// A field's value, trimmed.
+    /// A field's effective value, trimmed: what was typed, or the
+    /// placeholder when the field was left empty.
     pub fn value(&self, label: &str) -> String {
-        self.fields[self.idx(label)].value.trim().to_string()
+        self.fields[self.idx(label)].effective().trim().to_string()
+    }
+
+    /// Run the model's mirror rule. An edited field that is empty takes
+    /// part as if untouched, so the mirror fills it and the dependents
+    /// see the filled value; what it wrote is then moved into the
+    /// placeholder and the field is empty again. A touched field that no
+    /// rule writes has no placeholder.
+    pub fn run_mirror(&mut self) {
+        let blank: Vec<usize> = self
+            .fields
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.touched && f.value.trim().is_empty())
+            .map(|(i, _)| i)
+            .collect();
+        for &i in &blank {
+            self.fields[i].touched = false;
+            self.fields[i].value.clear();
+            self.fields[i].placeholder = None;
+        }
+        self.model.mirror(&mut self.fields);
+        for &i in &blank {
+            let f = &mut self.fields[i];
+            let filled = std::mem::take(&mut f.value);
+            f.placeholder = (!filled.trim().is_empty()).then_some(filled);
+            f.touched = true;
+        }
+        // An untouched field is shown as its value; it has no placeholder.
+        for f in self.fields.iter_mut().filter(|f| !f.touched) {
+            f.placeholder = None;
+        }
     }
 
     /// Replace the field set (a kind swap). The field with the focused
@@ -213,7 +267,7 @@ impl<M: Model> Form<M> {
             .unwrap_or_else(|| self.idx(fallback));
         self.error = None;
         self.list = None;
-        self.model.mirror(&mut self.fields);
+        self.run_mirror();
     }
 
     /// The fragment the list filters on: the last path component for a
@@ -259,14 +313,14 @@ impl<M: Model> Form<M> {
         self.sized = (self.width, self.height);
     }
 
-    /// An edit of the focused field by hand, with the touched rule and
-    /// the mirrors that follow.
-    fn edited(&mut self, touched: bool) {
+    /// An edit of the focused field by hand: it is touched from now on,
+    /// and the mirrors that follow it run.
+    fn edited(&mut self) {
         let i = self.focused;
-        self.fields[i].touched = touched;
+        self.fields[i].touched = true;
         self.error = None;
         self.model.edited(&self.fields, i);
-        self.model.mirror(&mut self.fields);
+        self.run_mirror();
     }
 
     /// Take the highlighted row into its field. False when nothing was
@@ -280,7 +334,7 @@ impl<M: Model> Form<M> {
                 self.fields[field].touched = true;
                 self.error = None;
                 self.model.accepted(&self.fields, field, kind);
-                self.model.mirror(&mut self.fields);
+                self.run_mirror();
                 true
             }
             Ok(None) => false,
@@ -415,29 +469,25 @@ impl<M: Model> Form<M> {
                 }
             }
             "BSpace" => {
-                let i = self.focused;
-                self.fields[i].value.pop();
-                // Erasing to empty resumes the mirror.
-                let touched = !self.fields[i].value.is_empty() && self.fields[i].touched;
-                self.edited(touched);
+                // Erasing to empty leaves the field empty; the mirror's
+                // value shows as a placeholder instead of coming back.
+                self.fields[self.focused].value.pop();
+                self.edited();
                 Action::Rescan { reveal: true }
             }
             "C-u" => {
-                // Clear to type fresh: touched keeps the mirror from
-                // instantly refilling the field (BSpace past empty is the
-                // resume-the-mirror gesture).
                 self.fields[self.focused].value.clear();
-                self.edited(true);
+                self.edited();
                 Action::Rescan { reveal: true }
             }
             "Space" => {
                 self.fields[self.focused].value.push(' ');
-                self.edited(true);
+                self.edited();
                 Action::Rescan { reveal: true }
             }
             k if k.chars().count() == 1 && !k.chars().next().unwrap().is_control() => {
                 self.fields[self.focused].value.push_str(k);
-                self.edited(true);
+                self.edited();
                 Action::Rescan { reveal: true }
             }
             _ => Action::None,
@@ -494,14 +544,31 @@ pub fn render<M: Model>(form: &mut Form<M>) {
     for (i, f) in form.fields.iter().enumerate() {
         let focused = i == form.focused && !form.busy;
         let mark = form.model.mark(&form.fields, i).map(|m| format!(" {m}")).unwrap_or_default();
-        let val = clip(&f.value, w.saturating_sub(labelw + 13));
-        if focused {
-            out.push_str(&format!(
+        let maxw = w.saturating_sub(labelw + 13);
+        // An emptied field shows what submit would use, dim, behind the
+        // cursor - it is not text you typed.
+        let placeholder = f.value.is_empty() && f.placeholder.is_some();
+        let val = if placeholder {
+            clip(f.placeholder.as_deref().unwrap_or(""), maxw)
+        } else {
+            clip(&f.value, maxw)
+        };
+        match (focused, placeholder) {
+            (true, false) => out.push_str(&format!(
                 "  \x1b[1m{:<labelw$}\x1b[0m \x1b[7m{val}\x1b[27m\x1b[7m \x1b[0m{mark}\r\n",
                 f.label
-            ));
-        } else {
-            out.push_str(&format!("  {:<labelw$} {val}{mark}\r\n", f.label));
+            )),
+            (true, true) => out.push_str(&format!(
+                "  \x1b[1m{:<labelw$}\x1b[0m \x1b[7m \x1b[0m\x1b[2m{val}\x1b[0m{mark}\r\n",
+                f.label
+            )),
+            (false, true) => out.push_str(&format!(
+                "  {:<labelw$} \x1b[2m{val}\x1b[0m{mark}\r\n",
+                f.label
+            )),
+            (false, false) => {
+                out.push_str(&format!("  {:<labelw$} {val}{mark}\r\n", f.label))
+            }
         }
     }
 
