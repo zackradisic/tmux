@@ -1292,7 +1292,7 @@ pub async fn apply_life(
     for (server, id) in &ids {
         if server == LOCAL {
             if life == "archived" {
-                provider::capture_on_archive(id).await;
+                provider::on_archive(id).await;
             }
             let _ = store::set_life(id, &life).await;
         } else {

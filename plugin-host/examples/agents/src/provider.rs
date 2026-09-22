@@ -557,7 +557,7 @@ pub async fn report(pane: u32, status: String, task: Option<String>, cfg: Rc<Con
         // The agent is done: read the rest of its transcript, then
         // snapshot the index.
         if let Some(a) = live {
-            transcript::ingest_later(a.id, true);
+            transcript::request(a.id, true);
         }
     } else {
         // The trailing text of a report means different things either
@@ -600,7 +600,7 @@ pub async fn report(pane: u32, status: String, task: Option<String>, cfg: Rc<Con
         } else {
             // The turn is over (`waiting`, `needs_input`): the transcript
             // holds all of it. Read what is new, off this handler.
-            spawn(transcript::ingest_pane(pane));
+            spawn(transcript::request_pane(pane));
         }
     }
 }
@@ -613,7 +613,7 @@ async fn end_pane(pane: u32, now: i64, reason: &str) {
     let _ = store::end_by_pane(pane as i64, now, reason).await;
     if let Some(a) = live {
         if a.transcript_path.is_some() {
-            transcript::ingest_later(a.id, true);
+            transcript::request(a.id, true);
         }
     }
 }
@@ -660,7 +660,7 @@ pub async fn sweep_gone() -> usize {
             if !panes.iter().any(|p| p.id as i64 == pane) {
                 let _ = store::end_by_pane(pane, now, "gone").await;
                 if a.transcript_path.is_some() {
-                    transcript::ingest_later(a.id.clone(), true);
+                    transcript::request(a.id.clone(), true);
                 }
                 gone += 1;
             }
@@ -812,15 +812,22 @@ async fn search_local(req: &SearchReq) -> SearchReply {
     SearchReply { mode: mode_label(mode).to_string(), hits, transcript: transcript_hits, agents }
 }
 
-/// Save the pane's text before an archive, so the archived agent keeps a
-/// preview and a searchable body once its pane is gone. `done` saves one
-/// too; this covers a pane that is later killed or lost without ever
-/// reporting. A row with no live pane is left as it is.
-pub async fn capture_on_archive(id: &str) {
+/// An agent is being archived: save the pane's text, so the archived
+/// agent keeps a preview and a searchable body once its pane is gone
+/// (`done` saves one too; this covers a pane later killed or lost
+/// without ever reporting), and read its transcript, so what it talked
+/// about is searchable from the moment it is set aside. Both on the
+/// local `a` path and the remote `act archive`.
+pub async fn on_archive(id: &str) {
     let Ok(Some(a)) = store::by_id(id).await else { return };
-    let Some(pane) = a.pane.filter(|_| a.live()) else { return };
-    if let Some(text) = capture_tail(pane as u32) {
-        let _ = store::save_capture(&a.id, &text).await;
+    if let Some(pane) = a.pane.filter(|_| a.live()) {
+        if let Some(text) = capture_tail(pane as u32) {
+            let _ = store::save_capture(&a.id, &text).await;
+        }
+    }
+    if a.transcript_path.is_some() {
+        let ended = !a.live();
+        transcript::request(a.id, ended);
     }
 }
 
@@ -921,7 +928,7 @@ pub async fn handle(req: ServiceRequest, cfg: Rc<Config>) {
                 "ack" => store::acknowledge(&q.id, now).await.is_ok(),
                 "unack" => store::unacknowledge(&q.id, now).await.is_ok(),
                 "archive" => {
-                    capture_on_archive(&q.id).await;
+                    on_archive(&q.id).await;
                     store::set_life(&q.id, "archived").await.is_ok()
                 }
                 "unarchive" => store::set_life(&q.id, "active").await.is_ok(),

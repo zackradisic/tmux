@@ -61,8 +61,9 @@
 //! is on, best match first, each row showing the line that matched, and
 //! the preview opens on the matching turn. The conversation comes from
 //! the harness's own transcript file (Claude's `~/.claude/projects/...`
-//! jsonl, Codex's rollout), read when a turn ends and when the agent
-//! ends, condensed to prompts, replies and one line per tool call, and
+//! jsonl, Codex's rollout), read from a saved cursor when a turn ends,
+//! when the agent is archived and when it ends (debounced per agent),
+//! condensed to prompts, replies and one line per tool call, and
 //! kept in the store for `history_days` - past the harness's own cleanup
 //! of the file. It is searched through an inverted index held in memory,
 //! so the answer is inside the keystroke. See `transcript.rs`,

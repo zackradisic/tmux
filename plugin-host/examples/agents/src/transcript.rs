@@ -7,8 +7,15 @@
 //!     transcript holds all of it);
 //!   * the agent ending - its pane dying, or a `done` report - which is
 //!     what makes a killed agent searchable: the file outlives the pane;
+//!   * the agent being archived (set aside is when you want it findable);
 //!   * `init`, for every agent whose transcript may have grown while the
 //!     server was down.
+//!
+//! Every trigger goes through [`request`], which debounces per agent: a
+//! burst (Stop and Notification hooks firing together, a pane dying as
+//! its `done` lands, a sweep finding what an event already found) is one
+//! read, `DEBOUNCE_MS` after the last request. A request that arrives
+//! while a read is running queues exactly one more.
 //!
 //! Each run reads the transcript from the saved cursor in 128 KiB chunks
 //! (`fs_read`, straight into guest memory from the fs worker), hands the
@@ -62,6 +69,12 @@ pub const HITS_MAX: usize = 50;
 pub const DOC_WINDOW: i64 = 64;
 /// Snippet width, in characters.
 const SNIPPET_W: usize = 100;
+/// A read starts this long after the last request for the agent, so a
+/// burst of triggers is one read.
+pub const DEBOUNCE_MS: u64 = 500;
+/// A read slower than this is logged with its size, so lag can be
+/// attributed to a specific transcript.
+const SLOW_MS: u64 = 50;
 
 thread_local! {
     static INDEX: RefCell<Option<Index>> = const { RefCell::new(None) };
@@ -71,6 +84,12 @@ thread_local! {
     static PENDING: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
     /// Documents added since the last snapshot.
     static SINCE_SNAPSHOT: RefCell<usize> = const { RefCell::new(0) };
+    /// Per agent: the serial of the latest request, and whether any
+    /// request in the burst said the agent ended. The task that wakes
+    /// with the latest serial does the read; the others do nothing.
+    static REQUESTS: RefCell<std::collections::HashMap<String, (u64, bool)>> =
+        RefCell::new(std::collections::HashMap::new());
+    static SERIAL: RefCell<u64> = const { RefCell::new(0) };
 }
 
 /// A transcript hit as it travels to a view: the agent, the turn to open
@@ -260,10 +279,47 @@ impl Grouper {
 // ingest
 // ---------------------------------------------------------------------------
 
-/// Ingest the transcript of the live agent on `pane`, if it has one.
-pub async fn ingest_pane(pane: u32) {
+/// Ask for the agent's transcript to be read, debounced: the read starts
+/// `DEBOUNCE_MS` after the last request for it. `ended` is remembered
+/// across the burst, so a pane-gone and a `done` a moment apart end in
+/// one read that snapshots the index.
+pub fn request(id: String, ended: bool) {
+    let serial = SERIAL.with(|s| {
+        let mut s = s.borrow_mut();
+        *s += 1;
+        *s
+    });
+    REQUESTS.with(|r| {
+        let mut r = r.borrow_mut();
+        let e = r.entry(id.clone()).or_insert((serial, ended));
+        *e = (serial, e.1 || ended);
+    });
+    spawn(async move {
+        if sleep_ms(DEBOUNCE_MS).await.is_err() {
+            return;
+        }
+        let mine = REQUESTS.with(|r| {
+            let mut r = r.borrow_mut();
+            match r.get(&id) {
+                Some(&(s, ended)) if s == serial => {
+                    r.remove(&id);
+                    Some(ended)
+                }
+                _ => None,
+            }
+        });
+        if let Some(ended) = mine {
+            ingest(&id, ended).await;
+        }
+    });
+}
+
+/// [`request`] for the live agent on `pane`, if it has a transcript.
+pub async fn request_pane(pane: u32) {
     if let Ok(Some(a)) = store::live_by_pane(pane as i64).await {
-        ingest(&a.id, false).await;
+        if a.transcript_path.is_some() {
+            request(a.id, false);
+        }
     }
 }
 
@@ -310,7 +366,10 @@ async fn ingest_once(id: &str) -> Result<(), ()> {
     let Ok(Some(a)) = store::by_id(id).await else { return Err(()) };
     let Some(mut ex) = extract::for_kind(&a.kind) else { return Err(()) };
     let Some(mut path) = a.transcript_path.clone() else { return Err(()) };
-    let mut base = a.transcript_cursor.max(0) as u64;
+    let started = now_ms();
+    let start_cursor = a.transcript_cursor.max(0) as u64;
+    let (mut chunks, mut turns_stored) = (0u32, 0usize);
+    let mut base = start_cursor;
     let mut seq = store::next_seq(id).await.map_err(|_| ())?;
     let mut carry: Vec<u8> = Vec::new();
     let mut skipping = false;
@@ -344,6 +403,7 @@ async fn ingest_once(id: &str) -> Result<(), ()> {
         if bytes.is_empty() {
             break;
         }
+        chunks += 1;
         pos += bytes.len() as u64;
         let chunk: &[u8] = if skipping {
             // Drop the rest of the over-long line; resume after it.
@@ -396,6 +456,7 @@ async fn ingest_once(id: &str) -> Result<(), ()> {
                         });
                         SINCE_SNAPSHOT.with(|c| *c.borrow_mut() += added);
                         seq += n as i64;
+                        turns_stored += n;
                     }
                     Err(e) => {
                         log(&format!("agents: transcript {id}: store: {}", e.message));
@@ -422,6 +483,13 @@ async fn ingest_once(id: &str) -> Result<(), ()> {
     }
     let added = with_index(|ix| grouper.flush(ix));
     SINCE_SNAPSHOT.with(|c| *c.borrow_mut() += added);
+    let took = now_ms().saturating_sub(started);
+    if took >= SLOW_MS || chunks > 8 {
+        log(&format!(
+            "agents: transcript {id}: {} KB in {chunks} chunks, {turns_stored} turns, {took} ms",
+            pos.saturating_sub(start_cursor) / 1024
+        ));
+    }
     Ok(())
 }
 
@@ -455,14 +523,6 @@ pub fn claude_transcript_path(home: &str, cwd: &str, sid: &str) -> String {
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
     format!("{home}/.claude/projects/{slug}/{sid}.jsonl")
-}
-
-/// Ingest in the background. For call sites that must not wait on a file
-/// read (a status report, a pane closing).
-pub fn ingest_later(id: String, ended: bool) {
-    spawn(async move {
-        ingest(&id, ended).await;
-    });
 }
 
 #[cfg(test)]
