@@ -1032,16 +1032,6 @@ fn register_imports(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
         }))
     })?;
 
-    linker.func_wrap(m, im::MODE_PREVIEW_SCROLL, |mut c: Caller<'_, StoreData>, mode: i64, back: i32| -> i32 {
-        match with_mem(&mut c, |mem| dispatch::mode_preview_scroll(mem, mode, back)) {
-            Ok(n) => n,
-            Err(e) => {
-                set_last_error(&e.message);
-                -e.code.as_num()
-            }
-        }
-    })?;
-
     linker.func_wrap(m, im::MODE_MOVE, |mut c: Caller<'_, StoreData>, mode: i64, window: i32, x: i32, y: i32| -> i32 {
         ret_i32(with_mem(&mut c, |mem| dispatch::mode_move(mem, mode, window, x, y)))
     })?;

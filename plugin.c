@@ -84,7 +84,6 @@ plugin_init(void)
 	vt.mode_open = plugin_vtable_mode_open;
 	vt.mode_write = plugin_vtable_mode_write;
 	vt.mode_preview = plugin_vtable_mode_preview;
-	vt.mode_preview_scroll = plugin_vtable_mode_preview_scroll;
 	vt.mode_close = plugin_vtable_mode_close;
 	vt.mode_move = plugin_vtable_mode_move;
 	vt.mode_resize = plugin_vtable_mode_resize;

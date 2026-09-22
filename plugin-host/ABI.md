@@ -346,7 +346,6 @@ an inbound peer's calls are always allowed).
 | `mode_open` | `(window /* -1 = default */, width, height, x, y, title Str?) -> i64` (mode id) | mode |
 | `mode_write` | `(mode: i64, data Bytes) -> i32` (≤256 KiB; raw ANSI, zero-copy) | mode |
 | `mode_preview` | `(mode: i64, pane: i64 /* -1 = clear */, x, y, w, h) -> i32` | mode |
-| `mode_preview_scroll` | `(mode: i64, back: i32) -> i32` — scroll the retained preview `back` lines into the source pane's history (0 = live); returns the offset in effect after clamping | mode |
 | `mode_move` | `(mode: i64, window /* -1 = default */, x, y) -> i32` | mode |
 | `mode_resize` | `(mode: i64, width, height) -> i32` (content cells, clamped) | mode |
 | `mode_close` | `(mode: i64) -> i32` | mode |
@@ -536,11 +535,6 @@ is not offered; the design for it is in [MODE-ATTACH.md](MODE-ATTACH.md).)
   reparsing), refreshed ~every 500 ms until cleared (pane -1), the
   source pane dies, or the mode closes. The rect must fit the mode
   screen; scope-implied pane targeting applies as for `capture_pane`.
-  `mode_preview_scroll(mode, back)` shows the rect `back` lines above
-  the live bottom instead (history plus screen, no cursor), clamped to
-  the history the pane has; it returns the offset in effect. The offset
-  survives re-setting the same rect (a redraw) and resets when the rect
-  moves to another pane or `back` is 0.
 - **Events** (delivered only to the owning instance, no subscription
   needed; the mode id arrives in the `mode` field):
   - `mode-key` — fields `mode`, `key` (a tmux key name: "q", "Enter",

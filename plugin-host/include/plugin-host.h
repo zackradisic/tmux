@@ -26,13 +26,6 @@
  */
 #define COMPRESS_ABOVE 4096
 
-/**
- * Bridge protocol revision this side speaks. 0 (a hello without the
- * field) pushes every provider after hello; 1 lists hashes and urls in
- * hello and pushes only on `Want`.
- */
-#define BRIDGE_REV 1
-
 #define READ_STATE (1 << 0)
 
 #define WRITE_OPTIONS (1 << 1)
@@ -237,23 +230,6 @@
 #define LIST_DIRS_ONLY (1 << 1)
 
 /**
- * The 16-byte header at the start of the out buffer:
- * `u64 cursor | u32 need | u8 eof | u8[3] pad`, little-endian.
- */
-#define LINES_HEADER 16
-
-/**
- * Each kept line: `u64 offset | u32 len | u8 line[len]` (newline included).
- */
-#define LINES_REC_HEADER 12
-
-/**
- * Bytes consumed per call at most (at a line boundary): bounds one
- * worker task, and lets the guest see progress on a huge file.
- */
-#define LINES_SCAN_MAX ((8 * 1024) * 1024)
-
-/**
  * Failures within [`FAILURE_WINDOW`] before a plugin is disabled until an
  * explicit reload. A window rather than a consecutive count: a trapped
  * instance is restarted, and its init is a clean callback, so a plugin
@@ -274,24 +250,6 @@
 #define ASYNC_STATEMENT_MS 30000
 
 #define SYNC_STATEMENT_MS 500
-
-/**
- * How many bytes of a record the prefilter looks at. The needles are
- * fields near the start of every record shape seen so far.
- */
-#define HEAD 1024
-
-/**
- * A candidate record longer than this is skipped unparsed, whatever
- * its head said: nothing conversational is that long.
- */
-#define MAX_LINE ((4 * 1024) * 1024)
-
-/**
- * A call's block stops growing past this (soft: a line's turns are
- * never split, and the first line always fits).
- */
-#define BLOCK_MAX (1024 * 1024)
 
 /**
  * Sink used wherever bytes cross the FFI from callee to caller: the
@@ -433,13 +391,6 @@ typedef struct {
    * -2 rect does not fit the mode screen.
    */
   int (*mode_preview)(uint64_t mode, int64_t pane, uint32_t x, uint32_t y, uint32_t w, uint32_t h);
-  /**
-   * Scroll a mode's retained preview `back` lines into its source
-   * pane's history (0 = live). Returns the offset in effect after
-   * clamping to the history the pane has, -1 no such mode, -3 no
-   * preview set.
-   */
-  int (*mode_preview_scroll)(uint64_t mode, uint32_t back);
   /**
    * Close a mode: the floating pane is torn down at the next safe
    * point (never synchronously inside this call), which delivers
@@ -774,7 +725,7 @@ int pgh_peers_revoke(const char *server, const char *plugin);
 void pgh_peers_menu(const char *server, const char *client);
 
 #ifdef __cplusplus
-} // extern "C"
-#endif // __cplusplus
+}  // extern "C"
+#endif  // __cplusplus
 
-#endif /* PLUGIN_HOST_H */
+#endif  /* PLUGIN_HOST_H */

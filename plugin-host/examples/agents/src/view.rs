@@ -629,12 +629,6 @@ pub struct Picker {
     /// The captured text of the highlighted remote row that has no local
     /// mirror, by row key, once the provider answered.
     pub remote_capture: Option<(String, Vec<String>)>,
-    /// The live preview, scrolled `preview_back` lines into the pane's
-    /// history (0 = live, following the cursor). The host keeps the same
-    /// count as long as the rect stays on `preview_pane`; a new pane, a
-    /// typed key or a wheel back down to 0 return to live.
-    pub preview_back: u32,
-    pub preview_pane: Option<u32>,
     /// Rows come from more than one server: show server headers.
     pub multi: bool,
     /// The keyboard belongs to the preview: every key goes to the
@@ -1071,8 +1065,6 @@ pub async fn pick_open(
         unread: HashMap::new(),
         mirrors: if multi { find_mirrors() } else { HashMap::new() },
         remote_capture: None,
-        preview_back: 0,
-        preview_pane: None,
         multi,
         preview_focus: false,
         transcript_query: String::new(),
@@ -1845,15 +1837,7 @@ fn dispatch_key(
                 pick_render(p);
             } else {
                 match live_pane_of_selection(p) {
-                    Some(pane) => {
-                        // A key to the pane wants its live bottom, as a
-                        // terminal snaps out of its scrollback on input.
-                        if p.preview_back > 0 {
-                            p.preview_back = 0;
-                            let _ = mode_preview_scroll(p.mode, 0);
-                        }
-                        after = PickAfter::Type(pane, key.clone());
-                    }
+                    Some(pane) => after = PickAfter::Type(pane, key.clone()),
                     None => {
                         // The pane went away under the prompt: say so,
                         // rather than typing into nothing.
@@ -2602,32 +2586,8 @@ fn mouse_key(
             pick_render(p);
             false
         }
-        "WheelUpPane" | "WheelDownPane" if !p.show_info => {
-            // Over the live pane: scroll its history in the blit.
-            scroll_preview(p, if base == "WheelUpPane" { 3 } else { -3 });
-            false
-        }
         _ => false,
     }
-}
-
-/// Scroll the live preview `delta` lines further into the pane's history
-/// (negative: back toward live). The host clamps to the history the pane
-/// has and answers with the offset in effect, which is what the footer
-/// shows; without a rect (no live pane under the cursor) nothing moves.
-fn scroll_preview(p: &mut Picker, delta: i32) {
-    if live_pane_of_selection(p).is_none() || preview_rect(p, p.list_w()).is_none() {
-        return;
-    }
-    let want = p.preview_back.saturating_add_signed(delta);
-    if want == p.preview_back {
-        return;
-    }
-    match mode_preview_scroll(p.mode, want) {
-        Ok(now) => p.preview_back = now,
-        Err(_) => p.preview_back = 0,
-    }
-    pick_render(p);
 }
 
 /// How soon after a typed key the preview is re-blitted, twice: once for
@@ -3769,20 +3729,6 @@ pub fn pick_render(p: &mut Picker) {
     // row's conversation (a finished agent, or a live one with Tab); else
     // the provider's captured text for a remote row with no mirror here.
     let rect = preview_rect(p, list_w);
-    let rect_pane = rect.as_ref().map(|r| r.pane.0);
-    if rect_pane != p.preview_pane {
-        // The rect moved to another pane (or went away): the host starts
-        // that one live, and so does the footer.
-        p.preview_pane = rect_pane;
-        p.preview_back = 0;
-    }
-    if rect.is_some() && p.preview_back > 0 {
-        // The row under the preview, which the blit leaves free.
-        let x = list_w + 2;
-        let pw = w.saturating_sub(list_w + 2);
-        let note = format!("↑ {} lines back · wheel down for live", p.preview_back);
-        out.push_str(&format!("\x1b[{h};{x}H\x1b[2;33m{}\x1b[0m", clip(&note, pw)));
-    }
     if rect.is_none() {
         let x = list_w + 2;
         let pw = w.saturating_sub(list_w + 2);

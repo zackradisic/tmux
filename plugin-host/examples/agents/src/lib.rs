@@ -18,11 +18,7 @@
 //! prefix table runs before the mode sees a key, which is what makes
 //! this reachable when every plain key is the agent's. The mouse works
 //! on the list too: a click selects a row, a double click jumps to it,
-//! the wheel scrolls, a click on the search line focuses it. Over the
-//! preview the wheel scrolls the pane's own history (the blit is moved
-//! back through it by the host, `mode_preview_scroll`); the row under
-//! the preview says how far back it is, wheel down returns to live, and
-//! so does any key typed into the pane.
+//! the wheel scrolls, a click on the search line focuses it.
 //! `n` starts another agent: a form over the picker (see `newagent`),
 //! prefilled from the highlighted row - its session, its pane's folder,
 //! its harness - that makes a window in that session running the
