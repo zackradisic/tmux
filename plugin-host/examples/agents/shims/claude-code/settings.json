@@ -4,11 +4,7 @@
       { "hooks": [ { "type": "command", "command": "~/.config/agents/agent-status.sh working" } ] }
     ],
     "PreToolUse": [
-      { "hooks": [ { "type": "command", "command": "~/.config/agents/agent-status.sh working" } ] }
-    ],
-    "Notification": [
-      { "matcher": "permission_prompt|elicitation_dialog",
-        "hooks": [ { "type": "command", "command": "~/.config/agents/agent-status.sh needs_input" } ] }
+      { "hooks": [ { "type": "command", "command": "~/.config/agents/agent-status.sh pretool" } ] }
     ],
     "Stop": [
       { "hooks": [ { "type": "command", "command": "~/.config/agents/agent-status.sh needs_input" } ] }

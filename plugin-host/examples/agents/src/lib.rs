@@ -66,8 +66,11 @@
 //! With the Claude shim installed, an agent that stops goes straight to
 //! `needs_input`: under `--dangerously-skip-permissions` there are no
 //! permission prompts, so "it stopped" IS the signal that it wants you.
+//! Mid-turn, a question dialog (`AskUserQuestion`) or a plan waiting for
+//! approval (`ExitPlanMode`) is the exact signal: the shim's PreToolUse
+//! hook reports `needs_input` with the question as the row's note.
 //! `waiting` is the band you move a row to by hand (`w`) once you have
-//! judged it; Claude's `idle_prompt` notification is not used.
+//! judged it; Claude's Notification hook is not used.
 //!
 //! Three signals drive it, each from its own trusted source:
 //!

@@ -368,16 +368,17 @@ pub async fn enrich_live(rows: &mut [Agent]) {
 }
 
 /// Must a resolved status yield to the one the row already carries? A
-/// shim reports `needs_input` - an idle turn that is waiting on the USER -
-/// and no session file can say that much: the most a harness writes is
-/// `idle`, which reads here as plain `waiting`. Flattening one into the
-/// other on every render is what made a row flip between the two bands, so
-/// a resolved `waiting` never overrides a `needs_input` report; only
-/// activity in the file dated after that report - a new turn - does.
-fn keeps_status(a: &Agent, resolved: &str, last_active_ms: Option<i64>) -> bool {
-    a.status == "needs_input"
-        && resolved == "waiting"
-        && last_active_ms.unwrap_or(0) <= a.last_status_ms
+/// shim reports `needs_input` - the agent is waiting on the USER - and no
+/// session file can say that much: the most a harness writes is `idle`
+/// (plain `waiting` here) or `busy` (`working`). A question dialog is
+/// open mid-turn, so the file says `busy` while the agent is in fact
+/// blocked on you; an idle prompt says `idle`. Flattening either over the
+/// report on every render is what made rows flip between bands, so a
+/// resolved status never overrides a `needs_input` report; only activity
+/// in the file dated after that report - the user answered, a new turn -
+/// does.
+fn keeps_status(a: &Agent, _resolved: &str, last_active_ms: Option<i64>) -> bool {
+    a.status == "needs_input" && last_active_ms.unwrap_or(0) <= a.last_status_ms
 }
 
 /// Fold one resolver result onto a row: migrate the id first (so enrich
