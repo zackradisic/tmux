@@ -93,6 +93,39 @@ by it. The host consumes at most 8 MiB per call, at a line boundary, so
 one worker task stays short and a caller reading a 200 MB file sees
 progress; loop on `cursor` until `eof`.
 
+## Transcript extraction
+
+`transcript_extract` is the agents plugin's reader for a harness's
+transcript, in the host for the same reason `fs_read_lines` is - the
+work scales with the file, not with what the plugin needs from it - and
+one step further: the parse too. The plugin's side is decoding a few KB
+of finished turns. `claude_notify` set the precedent for a harness-aware
+import; the formats live in `host/src/transcript.rs` (Claude Code's
+`~/.claude/projects/<slug>/<id>.jsonl`, Codex's rollout).
+
+The worker scans from `offset` with the harness's needles (the
+`fs_read_lines` scan), parses each record that passes - a typed,
+borrowing parse; a tool's `input` stays raw JSON and its line counts are
+read off the escapes - and condenses it: a prompt, a reply, or one line
+per tool call (the tool and what it touched, an edit's line counts;
+never file content or a tool's output). The completion carries:
+
+```
+v0:   cursor - the offset after the last record consumed, kept or skipped
+v1:   eof
+data: u16 version_len | u8 version[]            (the harness's, or 0)
+      per turn: u8 kind | i64 ts_ms | u64 offset | u32 len |
+                u32 text_len | u8 text[] | u16 path_len | u8 path[]
+      kind: 0 user, 1 assistant, 2 tool;  ts_ms: i64::MIN = none
+```
+
+`offset`/`len` are the record's byte range in the transcript, so a
+preview can seek back to it for what was not kept. A record's turns are
+all in the block or none. The block stops growing past 1 MiB, the scan
+past 8 MiB consumed, both at a record boundary; a trailing record with
+no newline is not consumed. Loop on `cursor` until `eof`. An unknown
+harness name fails at once with `E_UNSUPPORTED`.
+
 ## Directory listing
 
 `fs_list` runs on the fs executor and writes packed records straight
@@ -356,6 +389,7 @@ guest frees (the error message bytes when `err != 0`; empty = none).
 | `fs_write` | `(path, data, append) -> i64` | v0 = bytes written | fs-write |
 | `fs_read` | `(path, offset: i64, out_ptr, out_cap) -> i64` | v0 = bytes read, v1 = eof | fs-read |
 | `fs_read_lines` | `(path, offset: i64, needles Bytes, head, max_line, out_ptr, out_cap) -> i64` — the lines from `offset` whose first `head` bytes hold a keep needle and no reject needle; see **Filtered line read** | v0 = bytes written, v1 = lines kept | fs-read |
+| `transcript_extract` | `(path, offset: i64, harness Str) -> i64` — the conversation in an agent harness's transcript ("claude" \| "codex") from `offset`, condensed to turns; see **Transcript extraction** | v0 = cursor, v1 = eof, data = the turns block | fs-read |
 | `fs_list` | `(path Str, out_ptr, out_cap) -> i64` (async; v0 = bytes, v1 = entries) | fs-list |
 | `fs_rename` | `(from Str, to Str, flags) -> i64` | nothing | fs-write |
 | `fs_remove` | `(path Str) -> i64` (async) | nothing | fs-write |

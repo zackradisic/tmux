@@ -105,6 +105,18 @@ pub enum FsJob {
         max_line: usize,
         out: GuestSliceMut,
     },
+    /// The conversation in an agent harness's transcript from `offset`,
+    /// as a block of turns in the completion's data. See
+    /// [`do_extract`] and `transcript.rs`.
+    Extract {
+        token: u64,
+        key: InstKey,
+        root: Arc<Root>,
+        rel: String,
+        offset: u64,
+        reach: Reach,
+        harness: crate::transcript::Harness,
+    },
     /// List a directory, packing the entries straight into the guest's
     /// pinned buffer. See [`do_list`] for the record format.
     List {
@@ -126,6 +138,7 @@ pub fn submit(job: FsJob) -> Result<(), String> {
         FsJob::Write { key, .. }
         | FsJob::Read { key, .. }
         | FsJob::ReadLines { key, .. }
+        | FsJob::Extract { key, .. }
         | FsJob::List { key, .. }
         | FsJob::Rename { key, .. }
         | FsJob::Remove { key, .. } => key.clone(),
@@ -155,6 +168,9 @@ async fn run_job(job: FsJob) -> Completion {
         }
         FsJob::ReadLines { token, key: _, root, rel, offset, reach, needles, head, max_line, out } => {
             do_read_lines(token, &root, &rel, offset, reach, &needles, head, max_line, &out)
+        }
+        FsJob::Extract { token, key: _, root, rel, offset, reach, harness } => {
+            do_extract(token, &root, &rel, offset, reach, harness)
         }
         FsJob::List { token, key: _, root, rel, reach, flags, out } => {
             do_list(token, &root, &rel, reach, flags, out).await
@@ -793,6 +809,58 @@ fn do_read_lines(
     dst[12] = u8::from(end.eof);
     dst[13..16].copy_from_slice(&[0, 0, 0]);
     Completion { token, err: 0, v0: used as i64, v1: i64::from(count), data: Vec::new() }
+}
+
+/// `transcript_extract`: scan the transcript from `offset` with the
+/// harness's needles, parse the records that pass, and return their
+/// turns as one block (see `transcript.rs` for the format). v0 = the
+/// cursor to resume from, v1 = eof. A line's turns are all in or all
+/// out; the block stops growing past `BLOCK_MAX`, except that the first
+/// line always fits, so a huge record cannot stall the cursor.
+fn do_extract(
+    token: u64,
+    root: &Root,
+    rel: &str,
+    offset: u64,
+    reach: Reach,
+    harness: crate::transcript::Harness,
+) -> Completion {
+    use crate::transcript as tx;
+    let mut file = match crate::fsbox::open_read(root, rel, reach) {
+        Ok(f) => f,
+        Err(e) => return open_failed(token, e),
+    };
+    if let Err(e) = file.seek(std::io::SeekFrom::Start(offset)) {
+        return err_completion(token, ErrorCode::Host, format!("{rel}: {e}"));
+    }
+    let needles = harness.needles();
+    let mut body: Vec<u8> = Vec::new();
+    let mut version: Option<String> = None;
+    let mut lines_kept = 0usize;
+    let mut sink = |off: u64, line: &[u8]| -> bool {
+        let mut fed = tx::Fed::default();
+        tx::extract_line(harness, line, off, &mut fed);
+        if version.is_none() {
+            version = fed.version.take();
+        }
+        let size: usize = fed.turns.iter().map(tx::turn_size).sum();
+        if lines_kept > 0 && body.len() + size > tx::BLOCK_MAX {
+            return false;
+        }
+        for t in &fed.turns {
+            tx::put_turn(&mut body, t);
+        }
+        lines_kept += 1;
+        true
+    };
+    let end = match scan_lines(&mut file, offset, &needles, tx::HEAD, tx::MAX_LINE, &mut sink) {
+        Ok(e) => e,
+        Err(e) => return err_completion(token, ErrorCode::Host, format!("{rel}: {e}")),
+    };
+    let mut data = Vec::with_capacity(body.len() + 64);
+    tx::block_header(&mut data, version.as_deref());
+    data.extend_from_slice(&body);
+    Completion { token, err: 0, v0: end.cursor as i64, v1: i64::from(end.eof), data }
 }
 
 #[cfg(test)]

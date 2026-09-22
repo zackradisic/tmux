@@ -213,6 +213,10 @@ pub mod db;
 ///                       // first `head` bytes hold a keep-needle and no
 ///                       // reject-needle, packed with their offsets after a
 ///                       // 16-byte header; v0 = bytes, v1 = lines. See ABI.md
+/// transcript_extract(path_ptr, path_len, offset: i64, harness_ptr, harness_len) -> i64
+///                       // async; the conversation in an agent harness's
+///                       // transcript ("claude" | "codex") from `offset`, as
+///                       // turns in `data`; v0 = cursor, v1 = eof. See ABI.md
 /// fs_list(path_ptr, path_len, flags, out_ptr, out_cap) -> i64
 ///                       // async; out PINNED; v0 = bytes, v1 = entries found
 ///                       // flags: 1 = mtime, 2 = directories only
@@ -318,6 +322,7 @@ pub mod imports {
     pub const FS_WRITE: &str = "fs_write";
     pub const FS_READ: &str = "fs_read";
     pub const FS_READ_LINES: &str = "fs_read_lines";
+    pub const TRANSCRIPT_EXTRACT: &str = "transcript_extract";
     pub const FS_LIST: &str = "fs_list";
     pub const FS_WRITE_SYNC: &str = "fs_write_sync";
     pub const CLAUDE_NOTIFY: &str = "claude_notify";

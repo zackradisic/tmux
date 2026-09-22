@@ -578,6 +578,9 @@ fs_read_lines(path, offset, &needles, head, max_line, cap).await -> Lines
                                                         // only the lines whose head
                                                         // holds a needle; the scan
                                                         // runs in the host (ABI.md)
+transcript_extract(path, offset, "claude").await -> Extracted
+                                                        // an agent transcript's turns;
+                                                        // scan + parse in the host
 fs_list(path) -> Listing                                // dir entries + d_type;
                                                         // names borrow the buffer
 fs_rename(from, to, RenameFlag).await                   // atomic in the sandbox;

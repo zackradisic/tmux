@@ -895,6 +895,112 @@ pub async fn fs_read_lines(
     }
 }
 
+/// One turn of an agent's conversation, from [`transcript_extract`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptTurn {
+    pub kind: TranscriptKind,
+    /// A prompt, a reply, or a condensed tool call (`Edit view.rs +12 −3`).
+    pub text: String,
+    /// The file a tool call touched, when it touched one.
+    pub path: Option<String>,
+    /// The record's own timestamp, epoch ms, when it carries one.
+    pub ts_ms: Option<i64>,
+    /// The record's byte range in the transcript, newline included.
+    pub offset: u64,
+    pub len: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptKind {
+    User,
+    Assistant,
+    Tool,
+}
+
+impl TranscriptKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TranscriptKind::User => "user",
+            TranscriptKind::Assistant => "assistant",
+            TranscriptKind::Tool => "tool",
+        }
+    }
+}
+
+/// What one [`transcript_extract`] call returned.
+#[derive(Debug, Default)]
+pub struct Extracted {
+    pub turns: Vec<TranscriptTurn>,
+    /// The harness version the records named, when they did.
+    pub version: Option<String>,
+    /// The file offset to resume from: after the last record consumed,
+    /// kept or skipped. A trailing record with no newline is not consumed.
+    pub cursor: u64,
+    /// The scan reached the end of the file.
+    pub eof: bool,
+}
+
+/// The conversation in an agent harness's transcript (`harness` is
+/// "claude" or "codex"), from `offset`: prompts, replies and one line
+/// per tool call, each with the byte range of the record it came from.
+/// The scan and the parse run on the host's fs worker; only the turns
+/// cross into the guest. One call consumes a few MiB at most; loop on
+/// `cursor` until `eof`. An unknown harness fails with `Unsupported`.
+pub async fn transcript_extract(
+    path: &str,
+    offset: u64,
+    harness: &str,
+) -> Result<Extracted, HostError> {
+    let token = unsafe {
+        raw::transcript_extract(
+            path.as_ptr() as i32,
+            path.len() as i32,
+            offset as i64,
+            harness.as_ptr() as i32,
+            harness.len() as i32,
+        )
+    };
+    let c = start_async(token)?.await?;
+    let mut out = Extracted { cursor: c.v0.max(0) as u64, eof: c.v1 != 0, ..Default::default() };
+    let d = &c.data;
+    let short = || HostError { code: ErrorCode::Host, message: "transcript_extract: short block".into() };
+    let mut pos = 0usize;
+    let take = |pos: &mut usize, n: usize| -> Result<&[u8], HostError> {
+        let s = d.get(*pos..*pos + n).ok_or_else(short)?;
+        *pos += n;
+        Ok(s)
+    };
+    let vlen = u16::from_le_bytes(take(&mut pos, 2)?.try_into().unwrap()) as usize;
+    let v = take(&mut pos, vlen)?;
+    if vlen > 0 {
+        out.version = Some(String::from_utf8_lossy(v).into_owned());
+    }
+    while pos < d.len() {
+        let kind = match take(&mut pos, 1)?[0] {
+            0 => TranscriptKind::User,
+            1 => TranscriptKind::Assistant,
+            _ => TranscriptKind::Tool,
+        };
+        let ts = i64::from_le_bytes(take(&mut pos, 8)?.try_into().unwrap());
+        let offset = u64::from_le_bytes(take(&mut pos, 8)?.try_into().unwrap());
+        let len = u32::from_le_bytes(take(&mut pos, 4)?.try_into().unwrap());
+        let tlen = u32::from_le_bytes(take(&mut pos, 4)?.try_into().unwrap()) as usize;
+        let text = String::from_utf8_lossy(take(&mut pos, tlen)?).into_owned();
+        let plen = u16::from_le_bytes(take(&mut pos, 2)?.try_into().unwrap()) as usize;
+        let path = take(&mut pos, plen)?;
+        let path = (plen > 0).then(|| String::from_utf8_lossy(path).into_owned());
+        out.turns.push(TranscriptTurn {
+            kind,
+            text,
+            path,
+            ts_ms: (ts != i64::MIN).then_some(ts),
+            offset,
+            len,
+        });
+    }
+    Ok(out)
+}
+
 /// What a directory entry is, from `d_type`. `Unknown` means the
 /// filesystem did not say and no `stat` was made.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

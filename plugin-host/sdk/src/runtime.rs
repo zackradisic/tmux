@@ -87,6 +87,10 @@ pub(crate) mod raw {
             needles_ptr: i32, needles_len: i32, head: i32, max_line: i32,
             out_ptr: i32, out_cap: i32,
         ) -> i64;
+        pub fn transcript_extract(
+            path_ptr: i32, path_len: i32, offset: i64,
+            harness_ptr: i32, harness_len: i32,
+        ) -> i64;
         pub fn fs_list(
             path_ptr: i32, path_len: i32, flags: i32,
             out_ptr: i32, out_cap: i32,
@@ -181,6 +185,7 @@ pub(crate) mod raw {
     pub unsafe fn claude_notify(path_ptr: i32, path_len: i32, text_ptr: i32, text_len: i32) -> i64 { -7 }
     pub unsafe fn fs_read(path_ptr: i32, path_len: i32, offset: i64, out_ptr: i32, out_cap: i32) -> i64 { -7 }
     pub unsafe fn fs_read_lines(path_ptr: i32, path_len: i32, offset: i64, needles_ptr: i32, needles_len: i32, head: i32, max_line: i32, out_ptr: i32, out_cap: i32) -> i64 { -7 }
+    pub unsafe fn transcript_extract(path_ptr: i32, path_len: i32, offset: i64, harness_ptr: i32, harness_len: i32) -> i64 { -7 }
     pub unsafe fn fs_list(path_ptr: i32, path_len: i32, flags: i32, out_ptr: i32, out_cap: i32) -> i64 { -7 }
     pub unsafe fn fs_write_sync(path_ptr: i32, path_len: i32, data_ptr: i32, data_len: i32, append: i32) -> i64 { -7 }
     pub unsafe fn fs_read_sync(path_ptr: i32, path_len: i32, offset: i64, out: i32, cap: i32, len_out: i32, eof_out: i32) -> i32 { -7 }

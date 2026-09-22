@@ -17,24 +17,22 @@
 //! read, `DEBOUNCE_MS` after the last request. A request that arrives
 //! while a read is running queues exactly one more.
 //!
-//! Each run asks the host for the transcript's lines from the saved
-//! cursor (`fs_read_lines`): the host scans the file on the fs worker,
-//! keeps only the records whose head holds one of the extractor's
-//! needles, and lands those - about one per cent of the bytes - in guest
-//! memory with their offsets. The guest parses them and stores the turns
-//! and the new cursor in one transaction. Only complete lines count: the
-//! tail of a record still being written is re-read next time. Tool
-//! output that runs to megabytes on one line never reaches the guest.
+//! Each run asks the host for the transcript's conversation from the
+//! saved cursor (`transcript_extract`): the host scans the file on the fs
+//! worker, parses the records that are conversation, condenses them, and
+//! hands back finished turns - a few KB per call. This side stores them
+//! and the new cursor in one transaction. Only complete records count:
+//! the tail of one still being written is re-read next time. No transcript
+//! byte is parsed on the main thread; the formats live in the host
+//! (`host/src/transcript.rs`).
 //!
 //! The index (see `index.rs`) is fed as turns are stored, one document
 //! per user turn. It is snapshotted to the store when an agent ends and
 //! every so many documents, and loaded at start with a catch-up over the
 //! turns stored since the snapshot.
 //!
-//! Cost: the scan is the host's, at native memchr speed off the main
-//! thread; the guest pays for parsing the records it was handed, about
-//! 2 µs per 128 KiB of transcript scanned, and a typical turn-end ingest
-//! is one call and one small batch of turns.
+//! Cost on the main thread: decoding the turn block and encoding the
+//! store batch, microseconds per call; a turn-end read is one call.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -42,20 +40,41 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use tmux_plugin_sdk::prelude::*;
 
-use crate::extract::{self, TurnKind};
 use crate::index::{self, Index};
 use crate::store::{self, NewTurn, TurnRow};
 
-/// The buffer `fs_read_lines` fills per call: the records that passed
-/// the host's prefilter (5-60% of a Claude transcript's bytes - the
-/// assistant records carry the tool inputs). One call is one wake of the
-/// guest, and the typed parse runs at roughly 0.5-1 GB/s, so 64 KiB
-/// bounds a wake to about 0.1 ms. The SDK grows the buffer for a record
-/// that does not fit, up to `MAX_LINE`.
-pub const LINES_BUF: usize = 64 * 1024;
-/// A candidate record longer than this is skipped by the host unparsed,
-/// whatever its head said: nothing conversational is that long.
-pub const MAX_LINE: usize = 4 * 1024 * 1024;
+/// The harnesses the host can extract a transcript for (see
+/// `transcript_extract` in the ABI). Any other kind has rows and
+/// captures as before, no turns.
+pub const HARNESSES: &[&str] = &["claude", "codex"];
+
+/// What a turn is. Mirrors the store's `kind` column and the ABI's kind
+/// byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnKind {
+    User,
+    Assistant,
+    Tool,
+}
+
+impl TurnKind {
+    pub fn parse(s: &str) -> Option<TurnKind> {
+        match s {
+            "user" => Some(TurnKind::User),
+            "assistant" => Some(TurnKind::Assistant),
+            "tool" => Some(TurnKind::Tool),
+            _ => None,
+        }
+    }
+
+    fn from_abi(k: TranscriptKind) -> TurnKind {
+        match k {
+            TranscriptKind::User => TurnKind::User,
+            TranscriptKind::Assistant => TurnKind::Assistant,
+            TranscriptKind::Tool => TurnKind::Tool,
+        }
+    }
+}
 /// An agent that ended within this long may still have unread tail (the
 /// server was down when it died); older ones stopped writing long ago.
 pub const RECENT_MS: i64 = 24 * 3600 * 1000;
@@ -422,12 +441,14 @@ pub async fn ingest(id: &str, ended: bool) {
 }
 
 /// One pass over the transcript from the cursor to EOF. The host does
-/// the scan (`fs_read_lines`): only the records whose head holds one of
-/// the extractor's needles come back, with their offsets, and the
-/// cursor the host consumed to - kept or skipped - is what is stored.
+/// the reading, the scan and the parse (`transcript_extract`); what
+/// comes back is finished turns and the cursor the host consumed to -
+/// kept or skipped - which is what is stored.
 async fn ingest_once(id: &str) -> Result<(), ()> {
     let Ok(Some(a)) = store::by_id(id).await else { return Err(()) };
-    let Some(mut ex) = extract::for_kind(&a.kind) else { return Err(()) };
+    if !HARNESSES.contains(&a.kind.as_str()) {
+        return Err(());
+    }
     let Some(mut path) = a.transcript_path.clone() else { return Err(()) };
     let started = now_ms();
     let start_cursor = a.transcript_cursor.max(0) as u64;
@@ -436,15 +457,9 @@ async fn ingest_once(id: &str) -> Result<(), ()> {
     let mut seq = store::next_seq(id).await.map_err(|_| ())?;
     let mut grouper = Grouper::default();
     let mut first_read = true;
-    let needles: Vec<LineNeedle<'static>> = ex
-        .needles()
-        .into_iter()
-        .map(|(bytes, reject)| LineNeedle { bytes, reject })
-        .collect();
     loop {
-        let lines = match fs_read_lines(&path, cursor, &needles, extract::HEAD, MAX_LINE, LINES_BUF).await
-        {
-            Ok(l) => l,
+        let got = match transcript_extract(&path, cursor, &a.kind).await {
+            Ok(g) => g,
             Err(e) => {
                 // A derived path that does not exist yet (or a wrong
                 // guess): for a fresh Claude transcript, look for the
@@ -467,17 +482,13 @@ async fn ingest_once(id: &str) -> Result<(), ()> {
         };
         first_read = false;
         calls += 1;
-        if lines.cursor <= cursor {
+        if got.cursor <= cursor {
             // Nothing consumed: a partial record at the end, or nothing new.
             break;
         }
-        let mut fed = extract::Fed::default();
-        for (off, record) in lines.iter() {
-            ex.feed_line(record, off, &mut fed);
-        }
-        let n = fed.turns.len();
+        let n = got.turns.len();
         let mut rows: Vec<NewTurn<'_>> = Vec::with_capacity(n);
-        for (i, t) in fed.turns.iter().enumerate() {
+        for (i, t) in got.turns.iter().enumerate() {
             rows.push(NewTurn {
                 seq: seq + i as i64,
                 kind: t.kind.as_str(),
@@ -488,12 +499,19 @@ async fn ingest_once(id: &str) -> Result<(), ()> {
                 len: t.len as i64,
             });
         }
-        match store::insert_turns(id, &rows, lines.cursor as i64, fed.version.as_deref()).await {
+        match store::insert_turns(id, &rows, got.cursor as i64, got.version.as_deref()).await {
             Ok(max_rowid) => {
                 let added = with_index(|ix| {
                     let mut added = 0;
-                    for (i, t) in fed.turns.iter().enumerate() {
-                        added += grouper.push(ix, id, seq + i as i64, t.kind, &t.text, t.path.as_deref());
+                    for (i, t) in got.turns.iter().enumerate() {
+                        added += grouper.push(
+                            ix,
+                            id,
+                            seq + i as i64,
+                            TurnKind::from_abi(t.kind),
+                            &t.text,
+                            t.path.as_deref(),
+                        );
                     }
                     if max_rowid > ix.max_rowid {
                         ix.max_rowid = max_rowid;
@@ -509,8 +527,8 @@ async fn ingest_once(id: &str) -> Result<(), ()> {
                 return Err(());
             }
         }
-        cursor = lines.cursor;
-        if lines.eof {
+        cursor = got.cursor;
+        if got.eof {
             break;
         }
     }

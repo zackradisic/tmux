@@ -177,7 +177,6 @@ use std::rc::Rc;
 use serde::Deserialize;
 use tmux_plugin_sdk::prelude::*;
 
-mod extract;
 mod index;
 mod newagent;
 mod provider;

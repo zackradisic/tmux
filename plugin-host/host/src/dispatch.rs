@@ -1194,6 +1194,50 @@ pub fn fs_read_lines_async(
     Ok(token as i64)
 }
 
+/// The conversation in an agent harness's transcript, from `offset`, as
+/// a block of turns in the completion's data (`v0` = cursor, `v1` =
+/// eof). The scan and the parse both run on the fs worker; see
+/// `transcript.rs`. `harness` names the format: "claude" or "codex".
+/// Gated like `fs_read`.
+pub fn transcript_extract_async(
+    mem: &mut GuestMem<'_, '_>,
+    path_ptr: i32,
+    path_len: i32,
+    offset: i64,
+    harness_ptr: i32,
+    harness_len: i32,
+) -> Result<i64, HostError> {
+    check_cap(mem, crate::caps::FS_READ)?;
+    if offset < 0 {
+        return Err(err(ErrorCode::BadRequest, "negative offset"));
+    }
+    let name = mem.read(harness_ptr, harness_len)?;
+    let name = String::from_utf8(name).map_err(|_| err(ErrorCode::BadRequest, "harness: not UTF-8"))?;
+    let Some(harness) = crate::transcript::Harness::from_name(&name) else {
+        return Err(err(ErrorCode::Unsupported, format!("transcript_extract: unknown harness {name:?}")));
+    };
+    let root = fs_root_of(mem)?;
+    let rel = fs_rel(mem, path_ptr, path_len)?;
+    let reach = read_reach(mem, &root, &rel)?;
+    let data = mem.data();
+    let key = (data.plugin.clone(), data.scope, data.generation);
+    let token = alloc_token(mem);
+    let job = crate::fsworker::FsJob::Extract {
+        token,
+        key,
+        root,
+        rel,
+        offset: offset as u64,
+        reach,
+        harness,
+    };
+    if let Err(e) = crate::fsworker::submit(job) {
+        crate::tokens::discard(token);
+        return Err(err(ErrorCode::Host, e));
+    }
+    Ok(token as i64)
+}
+
 fn parse_needles(block: &[u8]) -> Result<Vec<crate::fsworker::Needle>, HostError> {
     let bad = || err(ErrorCode::BadRequest, "fs_read_lines: bad needles block");
     if block.len() < 2 {

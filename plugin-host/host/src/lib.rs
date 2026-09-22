@@ -29,6 +29,7 @@ mod services;
 mod sqlite;
 mod state;
 mod tokens;
+mod transcript;
 mod worker;
 
 pub use ffi::*;
