@@ -969,6 +969,12 @@ fn register_imports(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
         }))
     })?;
 
+    linker.func_wrap(m, im::PANE_MOUSE, |mut c: Caller<'_, StoreData>, pane: i32, key_ptr: i32, key_len: i32, x: i32, y: i32, client: i64| -> i32 {
+        ret_i32(with_mem(&mut c, |mem| {
+            dispatch::pane_mouse(mem, pane, key_ptr, key_len, x, y, client)
+        }))
+    })?;
+
     linker.func_wrap(m, im::SEND_KEYS, |mut c: Caller<'_, StoreData>, pane: i32, keys_ptr: i32, keys_len: i32, literal: i32| -> i32 {
         ret_i32(with_mem(&mut c, |mem| {
             dispatch::send_keys(mem, pane, keys_ptr, keys_len, literal)

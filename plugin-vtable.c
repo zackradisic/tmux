@@ -380,6 +380,107 @@ plugin_vtable_send_keys(u_int pane_id, const char *keys, int literal)
 }
 
 /*
+ * Deliver a mouse key to a pane as if the pointer were at cell (x, y) of
+ * that pane: the same path a real wheel notch over the pane takes. The
+ * mouse event names the pane, so `-t=` and `send-keys -M` in the user's
+ * bindings resolve to it; the key table is the pane's mode table when it
+ * is in one (copy mode's wheel bindings), else root; a key no table binds
+ * goes to the pane itself, which hands it to the application when that
+ * asked for mouse input. With the session's `mouse` option off the key
+ * goes straight to the pane, as tmux does. `client` is the pressing
+ * client (or -1), for bindings that act on one. Returns 0, -1 no such
+ * pane, -2 not a wheel key.
+ */
+int
+plugin_vtable_pane_mouse(u_int pane_id, const char *name, u_int x, u_int y,
+    int64_t client_id)
+{
+	struct window_pane		*wp;
+	struct winlink			*wl;
+	struct session			*s;
+	struct client			*c = NULL, *loop;
+	struct window_mode_entry	*wme;
+	struct key_table		*table;
+	struct key_binding		*bd;
+	struct key_event		 event;
+	struct mouse_event		*m = &event.m;
+	struct cmd_find_state		 fs;
+	key_code			 key;
+
+	wp = window_pane_find_by_id(pane_id);
+	if (wp == NULL || (wp->flags & PANE_DESTROYED))
+		return (-1);
+	wl = TAILQ_FIRST(&wp->window->winlinks);
+	if (wl == NULL)
+		return (-1);
+	s = wl->session;
+
+	key = key_string_lookup_string(name);
+	if (key == KEYC_NONE || key == KEYC_UNKNOWN)
+		return (-2);
+	memset(&event, 0, sizeof event);
+	event.key = key;
+	switch (key & KEYC_MASK_KEY) {
+	case KEYC_WHEELUP_PANE:
+		m->b = MOUSE_WHEEL_UP;
+		break;
+	case KEYC_WHEELDOWN_PANE:
+		m->b = MOUSE_WHEEL_DOWN;
+		break;
+	default:
+		return (-2);
+	}
+	if (client_id >= 0) {
+		TAILQ_FOREACH(loop, &clients, entry) {
+			if (loop->id == (u_int)client_id &&
+			    (~loop->flags & CLIENT_DEAD)) {
+				c = loop;
+				break;
+			}
+		}
+	}
+
+	if (x >= wp->sx)
+		x = wp->sx - 1;
+	if (y >= wp->sy)
+		y = wp->sy - 1;
+	m->valid = 1;
+	m->key = key;
+	m->statusat = -1;
+	m->x = m->lx = wp->xoff + x;
+	m->y = m->ly = wp->yoff + y;
+	m->lb = m->b;
+	m->s = s->id;
+	m->w = wp->window->id;
+	m->wp = wp->id;
+
+	if (!options_get_number(s->options, "mouse")) {
+		window_pane_key(wp, c, s, wl, key, m);
+		return (0);
+	}
+
+	wme = TAILQ_FIRST(&wp->modes);
+	if (wme != NULL && wme->mode->key_table != NULL)
+		table = key_bindings_get_table(wme->mode->key_table(wme), 1);
+	else
+		table = key_bindings_get_table("root", 1);
+	bd = key_bindings_get(table, key & ~KEYC_MASK_FLAGS);
+	if (bd == NULL && strcmp(table->name, "root") != 0) {
+		table = key_bindings_get_table("root", 1);
+		bd = key_bindings_get(table, key & ~KEYC_MASK_FLAGS);
+	}
+	if (bd == NULL) {
+		window_pane_key(wp, c, s, wl, key, m);
+		return (0);
+	}
+	cmd_find_from_winlink_pane(&fs, wl, wp, 0);
+	table->references++;
+	key_bindings_dispatch(bd, NULL, c, &event, &fs);
+	key_bindings_unref_table(table);
+	return (0);
+}
+
+/*
  * Capture pane contents as text into the sink, one line per row.
  * start/end are grid rows relative to the top of the visible screen
  * (negative reaches into history), end inclusive; escapes != 0 includes

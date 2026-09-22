@@ -244,7 +244,11 @@ window_plugin_draw_preview(struct window_mode_entry *wme)
 
 	screen_write_start(&ctx, s);
 	screen_write_cursormove(&ctx, data->preview.px, data->preview.py, 0);
-	screen_write_preview(&ctx, &src->base, nx, ny);
+	/*
+	 * The pane's active screen, not its base grid: a pane in copy mode
+	 * (a wheel forwarded to it, or the user's own) shows copy mode.
+	 */
+	screen_write_preview(&ctx, src->screen, nx, ny);
 	screen_write_stop(&ctx);
 	wme->wp->flags |= PANE_REDRAW;
 }

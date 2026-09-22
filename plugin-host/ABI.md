@@ -337,6 +337,7 @@ an inbound peer's calls are always allowed).
 | `set_option` | `(kind, id, name Str, value Str) -> i32` (@-options only) | write-options |
 | `format_expand` | `(kind, id, fmt Str, out, cap, len_out) -> i32` — `#{...}` against the scope; `#()` disabled | read-state |
 | `send_keys` | `(pane, keys Str, literal) -> i32` | send-keys |
+| `pane_mouse` | `(pane, key Str, x, y, client: i64 /* -1 = none */) -> i32` — a wheel key into the pane as if the pointer were at its cell (x, y): the pane's bindings (root, or its mode table), else its application | send-keys |
 | `capture_pane` | `(pane, start, end, escapes, out, cap, len_out) -> i32` (≤2000 lines/call) | capture-pane |
 | `pane_env` | `(pane, name Str, out, cap, len_out) -> i32` — one env var of the pane's foreground process; -2 = unset | env-read |
 | `pane_fds` | `(pane, out, cap, len_out) -> i32` — the open-file paths of the pane's foreground process, one per line; -2 = none | pane-fds |

@@ -185,6 +185,7 @@ pub mod db;
 /// format_expand(kind, id, fmt_ptr, fmt_len, out, cap, len_out) -> i32
 ///                                                  // #{...} against the scope; #() disabled
 /// send_keys(pane, keys_ptr, keys_len, literal) -> i32
+/// pane_mouse(pane, key_ptr, key_len, x, y, client: i64 /* -1 = none */) -> i32
 /// capture_pane(pane, start, end, escapes, out, cap, len_out) -> i32
 /// display_message(client /* -1 = all */, msg_ptr, msg_len) -> i32
 /// timer_cancel(token: i64) -> i32
@@ -282,6 +283,7 @@ pub mod imports {
     pub const SET_OPTION: &str = "set_option";
     pub const FORMAT_EXPAND: &str = "format_expand";
     pub const SEND_KEYS: &str = "send_keys";
+    pub const PANE_MOUSE: &str = "pane_mouse";
     pub const CAPTURE_PANE: &str = "capture_pane";
     /// pane_env(pane, name_ptr, name_len, out, cap, len_out) -> i32
     ///                       // read one env var from the pane's

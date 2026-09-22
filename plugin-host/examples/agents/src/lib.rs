@@ -18,7 +18,11 @@
 //! prefix table runs before the mode sees a key, which is what makes
 //! this reachable when every plain key is the agent's. The mouse works
 //! on the list too: a click selects a row, a double click jumps to it,
-//! the wheel scrolls, a click on the search line focuses it.
+//! the wheel scrolls, a click on the search line focuses it. Over the
+//! preview the wheel goes to the pane it shows, as if the pointer were
+//! there (`pane_mouse`): the pane's own bindings run - copy mode, or the
+//! application's scrolling when it takes the mouse - and the preview
+//! blits whatever the pane shows, copy mode included.
 //! `n` starts another agent: a form over the picker (see `newagent`),
 //! prefilled from the highlighted row - its session, its pane's folder,
 //! its harness - that makes a window in that session running the

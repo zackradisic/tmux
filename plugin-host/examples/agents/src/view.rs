@@ -501,6 +501,9 @@ pub enum PickAfter {
     Status(Vec<(String, String)>, String),
     /// Put this text on the pressing client's clipboard.
     Copy(String),
+    /// A wheel notch over the live preview: into the pane it shows, at
+    /// that pane's cell (x, y), as if the pointer were there.
+    Wheel(u32, String, u32, u32),
     /// Open the action menu on the pressing client.
     Menu,
     Reload,
@@ -2186,11 +2189,24 @@ fn dispatch_key(
             // Then hurry the preview along - the host re-blits it every
             // 500ms, which is fine for watching and too slow for typing.
             match send_key(PaneId(pane), &key) {
-                Ok(()) => poke_preview(picker),
+                Ok(()) => poke_preview(picker, true),
                 Err(e) => {
                     if let Some(p) = picker.borrow_mut().as_mut() {
                         p.preview_focus = false;
                         p.status = Some(format!("typing failed: {}", e.message));
+                        pick_render(p);
+                    }
+                }
+            }
+        }
+        PickAfter::Wheel(pane, key, x, y) => {
+            // Into the pane as a mouse key at its cell, then hurry the
+            // blit along so copy mode (or the app's scroll) shows now.
+            match pane_mouse(PaneId(pane), &key, x, y, client) {
+                Ok(()) => poke_preview(picker, false),
+                Err(e) => {
+                    if let Some(p) = picker.borrow_mut().as_mut() {
+                        p.status = Some(format!("wheel: {}", e.message));
                         pick_render(p);
                     }
                 }
@@ -2586,6 +2602,21 @@ fn mouse_key(
             pick_render(p);
             false
         }
+        "WheelUpPane" | "WheelDownPane" if !p.show_info => {
+            // Over the live pane: the notch goes to that pane, as if the
+            // pointer were over it. Its own bindings decide what a wheel
+            // does there - copy mode, or the application's scrolling when
+            // it takes the mouse - and the blit shows the result. The
+            // picture itself is never scrolled.
+            if let (Some(pane), Some(rect)) =
+                (live_pane_of_selection(p), preview_rect(p, list_w))
+            {
+                let rx = (x as u32).saturating_sub(rect.x);
+                let ry = (y as u32).saturating_sub(rect.y);
+                *after = PickAfter::Wheel(pane, base.to_string(), rx, ry);
+            }
+            false
+        }
         _ => false,
     }
 }
@@ -2600,7 +2631,7 @@ const POKE_MS: [u64; 2] = [40, 160];
 /// rect again is what redraws it now: the host blits on set, then keeps
 /// its own cadence. Fire-and-forget, one task per key: a blit is a grid
 /// copy, cheap enough that overlapping pokes cost nothing worth tracking.
-fn poke_preview(picker: &Rc<RefCell<Option<Picker>>>) {
+fn poke_preview(picker: &Rc<RefCell<Option<Picker>>>, typing: bool) {
     let (mode, rect) = {
         let b = picker.borrow();
         let Some(p) = b.as_ref() else { return };
@@ -2613,10 +2644,11 @@ fn poke_preview(picker: &Rc<RefCell<Option<Picker>>>) {
             if sleep_ms(ms).await.is_err() {
                 return;
             }
-            // Still the same picker, still typing into the same pane.
+            // Still the same picker, same pane in the preview (and, for
+            // a typed key, still typing into it).
             let same = picker.borrow().as_ref().is_some_and(|p| {
                 p.mode.0 == mode.0
-                    && p.preview_focus
+                    && (!typing || p.preview_focus)
                     && live_pane_of_selection(p) == Some(rect.pane.0)
             });
             if !same {

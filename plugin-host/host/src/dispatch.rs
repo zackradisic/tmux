@@ -432,6 +432,32 @@ pub fn send_keys(
     }
 }
 
+/// A wheel key into a pane as if the pointer were at cell (x, y) of it:
+/// the pane's own bindings run (copy mode's when it is in one), or the
+/// application gets the event when it asked for mouse input. Same cap as
+/// typing into the pane, which is what it amounts to.
+pub fn pane_mouse(
+    mem: &mut GuestMem<'_, '_>,
+    pane: i32,
+    key_ptr: i32,
+    key_len: i32,
+    x: i32,
+    y: i32,
+    client: i64,
+) -> Result<(), HostError> {
+    check_cap(mem, crate::caps::SEND_KEYS)?;
+    let pane = pane_id(pane)?;
+    check_pane_target(mem, pane)?;
+    let vt = vtable()?;
+    let key = mem.c_str(key_ptr, key_len)?;
+    let rc = unsafe { (vt.pane_mouse)(pane, key, x.max(0) as u32, y.max(0) as u32, client) };
+    match rc {
+        0 => Ok(()),
+        -2 => Err(err(ErrorCode::BadRequest, "not a wheel key")),
+        _ => Err(err(ErrorCode::NoSuchObject, format!("no such pane %{pane}"))),
+    }
+}
+
 pub fn pane_env(
     mem: &mut GuestMem<'_, '_>,
     pane: i32,

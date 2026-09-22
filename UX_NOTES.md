@@ -626,6 +626,18 @@ transcript.sh`.
   read, and the `claude --resume` line. `y` copies the cwd; Esc or `i`
   puts the card away. Schema v10 (`cwd`, `git_branch`, `model`); remote
   rows get their totals from the provider's `stats`.
+- **The wheel over the live preview goes to the pane.** A first cut
+  scrolled the blit itself through the pane's history (a host offset on
+  the preview rect); that was wrong for a Claude Code pane, where the
+  wheel should do what it does in the pane. Now a notch over the preview
+  is delivered to the pane as a mouse key at the matching cell
+  (`pane_mouse`): the mouse event names the pane, so the user's own
+  root/copy-mode wheel bindings run against it (`copy-mode -e`, `send -M`
+  to an app that takes the mouse, scroll-speed plugins), and the blit
+  now copies the pane's active screen, so copy mode shows in the preview
+  and wheeling back down leaves it as it would in the pane. Only wheel
+  keys are forwarded. Remote rows without a mirrored pane show captured
+  text, which the wheel does nothing to. `regress/plugin-agents-preview-scroll.sh`.
 
 ## Sessions and windows
 

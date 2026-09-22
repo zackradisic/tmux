@@ -280,6 +280,26 @@ pub fn send_key(pane: PaneId, key: impl AsTmuxStr) -> Result<(), HostError> {
     check(unsafe { raw::send_keys(pane.0 as i32, p, l, 0) })
 }
 
+/// Deliver a wheel key (`WheelUpPane` / `WheelDownPane`) to a pane as if
+/// the pointer were at cell (x, y) of it. Exactly what a real notch over
+/// the pane does: the user's binding for that pane runs (root, or the
+/// mode table when the pane is in copy mode), and a key no table binds
+/// goes to the pane's application when it asked for mouse input. Pass
+/// the pressing client so bindings that act on one have it. Needs
+/// `send-keys`.
+pub fn pane_mouse(
+    pane: PaneId,
+    key: impl AsTmuxStr,
+    x: u32,
+    y: u32,
+    client: Option<u64>,
+) -> Result<(), HostError> {
+    let key = key.to_tmux();
+    let (p, l) = key.parts();
+    let client = client.map_or(-1, |c| c as i64);
+    check(unsafe { raw::pane_mouse(pane.0 as i32, p, l, x as i32, y as i32, client) })
+}
+
 /// Capture pane text into a reusable buffer (cleared first). Rows are
 /// relative to the visible top (negative reaches history), `end`
 /// inclusive; `escapes` includes SGR/OSC sequences. At most 2000 lines

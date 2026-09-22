@@ -88,6 +88,17 @@ pub struct pgh_host_vtable {
     /// otherwise `keys` is one tmux key name. 0 ok, -1 dead pane, -2 bad key.
     pub send_keys:
         unsafe extern "C" fn(pane_id: u32, keys: *const c_char, literal: c_int) -> c_int,
+    /// Deliver a wheel key to a pane as if the pointer were at cell
+    /// (x, y) of it: the user's bindings for that pane (root or its
+    /// mode's table), else the pane's application. `client` is the
+    /// pressing client or -1. 0 ok, -1 dead pane, -2 not a wheel key.
+    pub pane_mouse: unsafe extern "C" fn(
+        pane_id: u32,
+        key: *const c_char,
+        x: u32,
+        y: u32,
+        client: i64,
+    ) -> c_int,
     /// Capture pane text into the sink (one line per row, trailing \n).
     /// start/end rows relative to the visible top (negative = history),
     /// end inclusive. 0 ok, -1 dead pane.
