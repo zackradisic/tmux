@@ -585,6 +585,16 @@ transcript.sh`.
   all on a copy of the live store. The cost of the host knowing the
   formats: a Claude format change means a tmux update, not a plugin
   update - though both ship through the same release.
+- **The preview renders Markdown and takes the keyboard.** Headings,
+  emphasis, inline and fenced code, lists, quotes, rules and links, to
+  styled cells that wrap and highlight without the markup fighting the
+  width. `l`, Right or a click on the conversation focuses it (the
+  separator lights up as it does for typing into a pane); `j`/`k`,
+  Space/`b`, `g`/`G` move, `n`/`N` step through the query's matches with
+  the count in the header, Esc returns. A live row's conversation is
+  refetched on the refresh cadence and keeps the scroll and match
+  position across the refetch. Not done: tables stay as typed, and a
+  match inside a wrapped word is highlighted only on the line it starts.
 
 ## Sessions and windows
 

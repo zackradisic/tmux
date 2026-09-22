@@ -9,7 +9,9 @@
 #     store (a prompt, a reply, a condensed Edit);
 #   the search box finds the agent by a word only its conversation holds,
 #     and the row shows the matching line;
-#   Tab shows the conversation in the preview in place of the live pane;
+#   Tab shows the conversation in the preview in place of the live pane,
+#     with its Markdown rendered; l gives it the keyboard, n steps to the
+#     next match;
 #   after the agent's pane is killed, the same search still finds it with
 #     history off, and its preview shows the conversation.
 #
@@ -116,7 +118,7 @@ mkdir -p "$HOME/.claude/projects/$SLUG"
 T="$HOME/.claude/projects/$SLUG/$SID.jsonl"
 cat >"$T" <<'EOF'
 {"type":"user","message":{"role":"user","content":"please measure the dflash2 acceptance length on the bench box"},"timestamp":"2026-09-16T08:20:43.045Z","version":"2.1.273","sessionId":"x"}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Running the drafter benchmark now."},{"type":"tool_use","name":"Edit","input":{"file_path":"/x/bench/run.py","old_string":"k=4","new_string":"k=8\nverbose=True"}}]},"timestamp":"2026-09-16T08:20:50.000Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Running the drafter benchmark now.\n\n## Plan\n\n- warm up the **acceptance** counter\n- read `run.py`\n\n```python\nk = 8\n```"},{"type":"tool_use","name":"Edit","input":{"file_path":"/x/bench/run.py","old_string":"k=4","new_string":"k=8\nverbose=True"}}]},"timestamp":"2026-09-16T08:20:50.000Z"}
 {"type":"user","message":{"role":"user","content":[{"tool_use_id":"t1","type":"tool_result","content":"a very long tool result that must never be stored"}]},"timestamp":"2026-09-16T08:20:51.000Z"}
 EOF
 
@@ -133,7 +135,7 @@ screen | grep -q 'hyperyaml-91' || fail "resolved name missing"
 # The turn ends: a `waiting` report ingests the transcript.
 $TMUX plugin-command -t "$PANE" agents waiting || fail "report"
 sleep 1.5
-n=$(turns | wc -l | tr -d ' ')
+n=$(sqlite3 "$XDG_DATA_HOME/tmux/plugins/agents/store.db" "SELECT COUNT(*) FROM turns" 2>/dev/null)
 [ "$n" = "3" ] || fail "expected 3 turns, got $n"
 turns | grep -q '^0|user|please measure the dflash2' || fail "the prompt is not turn 0"
 turns | grep -q '^1|assistant|Running the drafter benchmark' || fail "the reply is not turn 1"
@@ -165,6 +167,23 @@ shot "Tab: conversation of a live agent"
 screen | grep -q 'conversation · 3 turns' || fail "Tab did not show the conversation"
 screen | grep -q 'please measure the' || fail "the prompt is not in the preview"
 screen | grep -q 'Edit bench/run.py' || fail "the tool line is not in the preview"
+# Markdown: the heading without its hashes, bullets, a fenced block.
+screen | grep -q '│Plan' || fail "the heading was not rendered"
+screen | grep -q '• warm up the acceptance counter' || fail "the list was not rendered"
+screen | grep -q '┌─ python' || fail "the code fence was not rendered"
+screen | grep -q '│ k = 8' || fail "the code line was not rendered"
+# The query has two matches (the prompt and the bullet); the preview
+# opened on the first. l: the conversation takes the keyboard, and n
+# steps between them.
+screen | grep -q 'match 1/2' || fail "the preview did not open on the first match"
+keys l
+screen | grep -q 'Esc back to list' || fail "the footer does not say how to leave"
+keys n
+screen | grep -q 'match 2/2' || fail "n did not step to the second match"
+keys n
+screen | grep -q 'match 1/2' || fail "n did not wrap to the first match"
+keys Escape
+screen | grep -q 'Esc back to list' && fail "Esc did not give the keyboard back"
 close_picker
 
 # The agent dies. Its pane goes, the row ends, the rest of the transcript

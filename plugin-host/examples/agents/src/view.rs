@@ -658,6 +658,9 @@ pub struct Picker {
     pub transcript: Option<TranscriptView>,
     /// Show the highlighted live row's conversation instead of its pane.
     pub show_transcript: bool,
+    /// The keyboard belongs to the conversation in the preview: keys
+    /// scroll it and step through its matches (see `dispatch_key`).
+    pub transcript_focus: bool,
 }
 
 /// A conversation rendered for the preview.
@@ -675,6 +678,10 @@ pub struct TranscriptView {
     /// The width the lines were rendered for.
     pub width: usize,
     pub lines: Vec<String>,
+    /// The rendered lines that hold a match of the query, in order, and
+    /// which of them `n`/`N` last landed on.
+    pub matches: Vec<usize>,
+    pub match_idx: Option<usize>,
     /// The saved capture that stands in when there are no turns.
     pub capture: Vec<String>,
 }
@@ -1049,6 +1056,7 @@ pub async fn pick_open(
         roster_len: 0,
         transcript: None,
         show_transcript: false,
+        transcript_focus: false,
     };
     p.roster_len = p.rows.len();
     pick_refilter(&mut p);
@@ -1218,30 +1226,31 @@ fn request_transcript(picker: &Rc<RefCell<Option<Picker>>>) {
         if p.mode.0 != mode.0 || p.selected().map(|a| a.key()) != Some(key.clone()) {
             return;
         }
-        // A refetch of the same conversation keeps the scroll position.
-        let top = match p.transcript.as_ref() {
-            Some(tv) if tv.key == key && tv.open_seq == open_seq && !tv.lines.is_empty() => {
-                Some(tv.top)
-            }
-            _ => None,
-        };
+        // A refetch of the same conversation (a live row, on the refresh
+        // cadence) keeps where the user is: the scroll position and the
+        // match they stepped to. Rendering would reset both.
+        let keep = p
+            .transcript
+            .as_ref()
+            .filter(|tv| tv.key == key && tv.open_seq == open_seq && !tv.lines.is_empty())
+            .map(|tv| (tv.top, tv.match_idx));
         p.transcript = Some(TranscriptView {
             key,
             fetched_ms: now_ms(),
             turns,
             open_seq,
-            top: top.unwrap_or(0),
+            top: 0,
             width: 0,
             lines: Vec::new(),
+            matches: Vec::new(),
+            match_idx: None,
             capture,
         });
-        if let Some(t) = top {
-            // Rendering resets `top` to the opening turn; keep the user's.
-            let pw = (p.width as usize).saturating_sub(p.list_w() + 2);
-            let (terms, _) = index::query_terms(&p.transcript_query);
+        if let Some((top, match_idx)) = keep {
+            ensure_transcript_rendered(p);
             if let Some(tv) = p.transcript.as_mut() {
-                render_transcript(tv, pw, &terms);
-                tv.top = t;
+                tv.top = top;
+                tv.match_idx = match_idx.filter(|&i| i < tv.matches.len());
             }
         }
         pick_render(p);
@@ -1632,10 +1641,17 @@ pub fn on_mode_nav(
         match dir.as_str() {
             "left" => {
                 p.preview_focus = false;
+                p.transcript_focus = false;
                 pick_render(p);
             }
             "right" => {
-                ack = focus_preview(p);
+                if transcript_shown(p) {
+                    p.transcript_focus = true;
+                    ensure_transcript_rendered(p);
+                    pick_render(p);
+                } else {
+                    ack = focus_preview(p);
+                }
             }
             "up" | "down" => {
                 let typing = p.preview_focus;
@@ -1749,6 +1765,10 @@ fn dispatch_key(
                     }
                 }
             }
+        } else if p.transcript_focus {
+            // The conversation has the keyboard: scroll it, step through
+            // its matches, or hand the keyboard back.
+            transcript_key(p, &key, is_up, is_down);
         } else if p.composing {
             // Compose mode: keys are text, except accept / cancel.
             if key == k.close {
@@ -1946,10 +1966,16 @@ fn dispatch_key(
         } else if key == k.jump {
             after = jump_after(p, &mut ack);
         } else if key == k.focus || key == "Right" {
-            // Right, into the preview: the keyboard goes with it, and the
-            // pane comes back if the conversation was showing.
-            p.show_transcript = false;
-            ack = focus_preview(p);
+            // Right, into the preview: the keyboard goes with it. To the
+            // conversation when that is what the preview shows (a finished
+            // agent, or Tab on a live one); else to the pane.
+            if transcript_shown(p) {
+                p.transcript_focus = true;
+                ensure_transcript_rendered(p);
+                pick_render(p);
+            } else {
+                ack = focus_preview(p);
+            }
         } else if key == "h" || key == "Left" {
             // Left of the list is nothing; the key is spent so that it
             // is never mistaken for text. (`h` used to fold in history.)
@@ -2399,13 +2425,20 @@ fn mouse_key(
         "MouseDown1Pane" | "DoubleClick1Pane" => {
             if !in_list {
                 if x > list_w {
-                    *ack = focus_preview(p);
+                    if transcript_shown(p) {
+                        p.transcript_focus = true;
+                        ensure_transcript_rendered(p);
+                        pick_render(p);
+                    } else {
+                        *ack = focus_preview(p);
+                    }
                 }
                 return false;
             }
             if p.preview_focus {
                 p.preview_focus = false;
             }
+            p.transcript_focus = false;
             // The search line: a click there focuses the box, as `/`.
             if y == 1 {
                 p.filtering = true;
@@ -2440,8 +2473,16 @@ fn mouse_key(
             // back first: a cursor that moves while the preview types
             // would send the rest of the prompt to another agent.
             p.preview_focus = false;
+            p.transcript_focus = false;
             move_sel(p, if base == "WheelUpPane" { -1 } else { 1 });
             true
+        }
+        "WheelUpPane" | "WheelDownPane" if transcript_shown(p) => {
+            // Over the conversation: scroll it.
+            ensure_transcript_rendered(p);
+            scroll_transcript(p, if base == "WheelUpPane" { -3 } else { 3 });
+            pick_render(p);
+            false
         }
         _ => false,
     }
@@ -3515,7 +3556,7 @@ pub fn pick_render(p: &mut Picker) {
     // Vertical separator between the list and the preview. It lights up
     // while the preview has the keyboard: the one mark on screen that
     // says which side your keys are going to.
-    let sep = if p.preview_focus { "\x1b[1;36m┃" } else { "\x1b[2m│" };
+    let sep = if p.preview_focus || p.transcript_focus { "\x1b[1;36m┃" } else { "\x1b[2m│" };
     for r in 1..=h {
         out.push_str(&format!("\x1b[{r};{c}H{sep}\x1b[0m", c = list_w + 1));
     }
@@ -3533,7 +3574,9 @@ pub fn pick_render(p: &mut Picker) {
     } else {
         format!("{} contents", pretty_key(&k.content))
     };
-    let footer = if p.preview_focus {
+    let footer = if p.transcript_focus {
+        "j/k scroll · n/N match · g/G top/end · Space/b page · Tab pane · Esc back to list".to_string()
+    } else if p.preview_focus {
         // Every key goes to the pane, so the footer can promise only one
         // thing about the keyboard: how to get it back.
         // The prefix route is named too, since it is the one that costs
@@ -3615,12 +3658,10 @@ fn transcript_shown(p: &Picker) -> bool {
 /// Draw the conversation into the preview area: a header line, then the
 /// rendered turns from the scroll position.
 fn draw_transcript(p: &mut Picker, out: &mut String, x: usize, pw: usize, ph: usize) {
-    let (terms, _) = index::query_terms(&p.transcript_query);
     let live = live_pane_of_selection(p).is_some();
+    let focused = p.transcript_focus;
+    ensure_transcript_rendered_for(p, pw);
     let Some(tv) = p.transcript.as_mut() else { return };
-    if tv.width != pw || tv.lines.is_empty() {
-        render_transcript(tv, pw, &terms);
-    }
     let body = ph.saturating_sub(1);
     let max_top = tv.lines.len().saturating_sub(body);
     if tv.top > max_top {
@@ -3631,21 +3672,139 @@ fn draw_transcript(p: &mut Picker, out: &mut String, x: usize, pw: usize, ph: us
     } else {
         format!("{} turns", tv.turns.len())
     };
-    let hint = if live { " · Tab pane" } else { "" };
-    let header = format!("conversation · {what}{hint} · [ ] scroll");
-    out.push_str(&format!("\x1b[1;{x}H\x1b[2m{}\x1b[0m", clip(&header, pw)));
+    let matches = match (tv.matches.len(), tv.match_idx) {
+        (0, _) => String::new(),
+        (n, Some(i)) => format!(" · match {}/{n}", i + 1),
+        (n, None) => format!(" · {n} matches"),
+    };
+    let hint = if focused {
+        " · Esc back"
+    } else if live {
+        " · Tab pane · click or l to scroll"
+    } else {
+        " · click or l to scroll"
+    };
+    let header = format!("conversation · {what}{matches}{hint}");
+    let sgr = if focused { "\x1b[1;36m" } else { "\x1b[2m" };
+    out.push_str(&format!("\x1b[1;{x}H{sgr}{}\x1b[0m", clip(&header, pw)));
     for (i, line) in tv.lines.iter().skip(tv.top).take(body).enumerate() {
         out.push_str(&format!("\x1b[{};{x}H{line}", i + 2));
     }
 }
 
+/// Render the conversation for the preview's current width, if it is
+/// not already.
+fn ensure_transcript_rendered(p: &mut Picker) {
+    let pw = (p.width as usize).saturating_sub(p.list_w() + 2);
+    ensure_transcript_rendered_for(p, pw);
+}
+
+fn ensure_transcript_rendered_for(p: &mut Picker, pw: usize) {
+    let (terms, _) = index::query_terms(&p.transcript_query);
+    if let Some(tv) = p.transcript.as_mut() {
+        if tv.width != pw || tv.lines.is_empty() {
+            render_transcript(tv, pw, &terms);
+        }
+    }
+}
+
+/// Scroll the conversation by `delta` rendered lines, clamped.
+fn scroll_transcript(p: &mut Picker, delta: i64) {
+    let body = (p.height as usize).saturating_sub(2).max(1);
+    if let Some(tv) = p.transcript.as_mut() {
+        let max_top = tv.lines.len().saturating_sub(body);
+        let t = (tv.top as i64 + delta).clamp(0, max_top as i64);
+        tv.top = t as usize;
+    }
+}
+
+/// A key while the conversation has the keyboard.
+fn transcript_key(p: &mut Picker, key: &str, is_up: bool, is_down: bool) {
+    let page = (p.height as usize).saturating_sub(2).max(2) as i64;
+    ensure_transcript_rendered(p);
+    match key {
+        "Escape" | "q" | "h" | "Left" => {
+            p.transcript_focus = false;
+        }
+        "Tab" => {
+            // Back to the pane (a live row): the keyboard goes with it
+            // to the list, the pane being where typing would go.
+            p.show_transcript = false;
+            p.transcript_focus = false;
+        }
+        "j" | "Down" | "C-n" | "C-j" | "Enter" => scroll_transcript(p, 1),
+        "k" | "Up" | "C-p" | "C-k" => scroll_transcript(p, -1),
+        "Space" | "PageDown" | "C-d" | "]" => scroll_transcript(p, page / 2),
+        "b" | "PageUp" | "C-u" | "[" => scroll_transcript(p, -(page / 2)),
+        "g" | "Home" => {
+            if let Some(tv) = p.transcript.as_mut() {
+                tv.top = 0;
+            }
+        }
+        "G" | "End" => {
+            if let Some(tv) = p.transcript.as_mut() {
+                tv.top = usize::MAX; // clamped when drawn
+            }
+        }
+        "n" | "N" => {
+            let forward = key == "n";
+            if let Some(tv) = p.transcript.as_mut() {
+                if !tv.matches.is_empty() {
+                    let n = tv.matches.len();
+                    let i = match tv.match_idx {
+                        None => {
+                            // The first match below the top (or above, for N).
+                            if forward {
+                                tv.matches.iter().position(|&l| l > tv.top).unwrap_or(0)
+                            } else {
+                                tv.matches.iter().rposition(|&l| l < tv.top).unwrap_or(n - 1)
+                            }
+                        }
+                        Some(i) if forward => (i + 1) % n,
+                        Some(i) => (i + n - 1) % n,
+                    };
+                    tv.match_idx = Some(i);
+                    tv.top = tv.matches[i].saturating_sub(2);
+                }
+            }
+            if p.transcript.as_ref().is_some_and(|tv| tv.matches.is_empty()) {
+                p.status = Some("no matches in this conversation".into());
+            }
+        }
+        _ => {
+            let _ = (is_up, is_down);
+            return;
+        }
+    }
+    pick_render(p);
+}
+
+// ---------------------------------------------------------------------------
+// the conversation, rendered: light Markdown to styled cells
+// ---------------------------------------------------------------------------
+
+const ST_BOLD: u8 = 1;
+const ST_ITALIC: u8 = 2;
+const ST_CODE: u8 = 4;
+const ST_UNDER: u8 = 8;
+const ST_DIM: u8 = 16;
+const ST_HIT: u8 = 32;
+const ST_CYAN: u8 = 64;
+
+/// One cell of a rendered line: a character and its style bits.
+type Styled = (char, u8);
+
 /// Lay the turns out for `width`: a prompt with a `❯` in front, in bold;
-/// the agent's text plain; a tool line dim; a blank line between turns;
-/// the query's terms in reverse video. Opens on the hit's turn when
-/// there is one, else at the end.
+/// the agent's text with its Markdown rendered (headings, emphasis,
+/// inline and fenced code, lists, quotes); a tool line dim; a blank line
+/// between turns; the query's terms in reverse video. Remembers which
+/// lines hold a match, and opens on the first match when there is one,
+/// else on the hit's turn, else at the end.
 fn render_transcript(tv: &mut TranscriptView, width: usize, terms: &[String]) {
     tv.width = width;
     tv.lines.clear();
+    tv.matches.clear();
+    tv.match_idx = None;
     let width = width.max(8);
     let mut open_at: Option<usize> = None;
     if tv.turns.is_empty() {
@@ -3653,129 +3812,343 @@ fn render_transcript(tv: &mut TranscriptView, width: usize, terms: &[String]) {
             tv.lines.push(clip(&strip_sgr(l), width));
         }
     }
+    let mut cells: Vec<Vec<Styled>> = Vec::new();
     for t in &tv.turns {
         if tv.open_seq >= 0 && open_at.is_none() && t.seq >= tv.open_seq {
-            open_at = Some(tv.lines.len());
+            open_at = Some(cells.len());
         }
         match t.kind.as_str() {
             "user" => {
-                for (i, l) in wrap(&t.text, width.saturating_sub(2)).into_iter().enumerate() {
-                    let lead = if i == 0 { "\x1b[1;36m❯\x1b[0m " } else { "  " };
-                    tv.lines.push(format!("{lead}\x1b[1m{}\x1b[0m", highlight(&l, terms)));
+                let body = markdown_lines(&t.text, width.saturating_sub(2), ST_BOLD);
+                for (i, l) in body.into_iter().enumerate() {
+                    let mut line: Vec<Styled> = if i == 0 {
+                        vec![('❯', ST_BOLD | ST_CYAN), (' ', 0)]
+                    } else {
+                        vec![(' ', 0), (' ', 0)]
+                    };
+                    line.extend(l);
+                    cells.push(line);
                 }
             }
             "tool" => {
-                for (i, l) in wrap(&t.text, width.saturating_sub(4)).into_iter().enumerate() {
-                    let lead = if i == 0 { "  ⚙ " } else { "    " };
-                    tv.lines.push(format!("\x1b[2m{lead}{}\x1b[0m", highlight(&l, terms)));
+                for (i, l) in wrap_cells(&plain_cells(&t.text, ST_DIM), width.saturating_sub(4)).into_iter().enumerate() {
+                    let mut line: Vec<Styled> = if i == 0 {
+                        vec![(' ', 0), (' ', 0), ('⚙', ST_DIM), (' ', 0)]
+                    } else {
+                        vec![(' ', 0); 4]
+                    };
+                    line.extend(l);
+                    cells.push(line);
                 }
             }
             _ => {
-                for l in wrap(&t.text, width) {
-                    tv.lines.push(highlight(&l, terms));
+                for l in markdown_lines(&t.text, width, 0) {
+                    cells.push(l);
                 }
             }
         }
-        tv.lines.push(String::new());
+        cells.push(Vec::new());
     }
-    while tv.lines.last().is_some_and(String::is_empty) {
-        tv.lines.pop();
+    while cells.last().is_some_and(Vec::is_empty) {
+        cells.pop();
     }
-    tv.top = match open_at {
-        Some(at) => at,
-        None => usize::MAX, // clamped to the end when drawn
+    // Highlight, remember the matching lines, emit.
+    let lower_terms: Vec<String> = terms.iter().map(|t| t.to_lowercase()).collect();
+    for mut line in cells {
+        if mark_hits(&mut line, &lower_terms) {
+            tv.matches.push(tv.lines.len());
+        }
+        tv.lines.push(emit_cells(&line));
+    }
+    tv.top = match (tv.matches.first(), open_at) {
+        (Some(&m), _) if !terms.is_empty() => {
+            tv.match_idx = Some(0);
+            m.saturating_sub(2)
+        }
+        (_, Some(at)) => at,
+        _ => usize::MAX, // clamped to the end when drawn
     };
 }
 
-/// Greedy word wrap on chars; a word longer than the width is split.
-fn wrap(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut out = Vec::new();
-    for para in text.split('\n') {
-        let mut line = String::new();
-        let mut n = 0usize;
-        for word in para.split(' ') {
-            let wl = word.chars().count();
-            if wl == 0 {
-                continue;
+/// Plain text as cells, one style throughout.
+fn plain_cells(text: &str, style: u8) -> Vec<Styled> {
+    text.chars().filter(|c| !c.is_control() || *c == '\n').map(|c| (c, style)).collect()
+}
+
+/// A block of Markdown as wrapped, styled lines. Handles what agents
+/// actually write: `#` headings, `**bold**`, `*italic*`, `` `code` ``,
+/// fenced code blocks, `-`/`*`/`1.` lists, `>` quotes, `---` rules and
+/// `[text](url)` links (the text, underlined). `base` is OR'd into every
+/// cell (a prompt is bold throughout).
+fn markdown_lines(text: &str, width: usize, base: u8) -> Vec<Vec<Styled>> {
+    let width = width.max(4);
+    let mut out: Vec<Vec<Styled>> = Vec::new();
+    let mut in_fence = false;
+    for raw in text.lines() {
+        let line = raw.trim_end();
+        if let Some(rest) = line.trim_start().strip_prefix("```") {
+            in_fence = !in_fence;
+            let lang = rest.trim();
+            let mut l: Vec<Styled> = vec![(if in_fence { '┌' } else { '└' }, ST_DIM | base), ('─', ST_DIM | base)];
+            if in_fence && !lang.is_empty() {
+                l.push((' ', 0));
+                l.extend(lang.chars().map(|c| (c, ST_DIM | base)));
             }
-            if n > 0 && n + 1 + wl > width {
-                out.push(std::mem::take(&mut line));
-                n = 0;
-            }
-            if wl > width {
-                // Hard-split a word wider than the line.
-                let chars: Vec<char> = word.chars().collect();
-                for piece in chars.chunks(width) {
-                    if n > 0 {
-                        out.push(std::mem::take(&mut line));
-                    }
-                    line.extend(piece.iter());
-                    n = piece.len();
-                }
-                continue;
-            }
-            if n > 0 {
-                line.push(' ');
-                n += 1;
-            }
-            line.push_str(word);
-            n += wl;
+            out.push(l);
+            continue;
         }
+        if in_fence {
+            // Code: no inline markup, hard-wrapped, a bar down the side.
+            let body: Vec<Styled> = line.chars().filter(|c| !c.is_control()).map(|c| (c, ST_CODE | base)).collect();
+            let mut first = true;
+            for piece in hard_wrap(&body, width.saturating_sub(2)) {
+                let mut l: Vec<Styled> = vec![('│', ST_DIM | base), (' ', 0)];
+                if !first {
+                    l[0] = (' ', 0);
+                }
+                first = false;
+                l.extend(piece);
+                out.push(l);
+            }
+            if body.is_empty() {
+                out.push(vec![('│', ST_DIM | base)]);
+            }
+            continue;
+        }
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        if trimmed.is_empty() {
+            out.push(Vec::new());
+            continue;
+        }
+        // Horizontal rule.
+        if trimmed.len() >= 3 && trimmed.chars().all(|c| c == '-' || c == '*' || c == '_') {
+            out.push(std::iter::repeat(('─', ST_DIM | base)).take(width.min(40)).collect());
+            continue;
+        }
+        // Heading.
+        if let Some(rest) = trimmed.strip_prefix('#') {
+            let level = 1 + rest.chars().take_while(|&c| c == '#').count();
+            let body = rest.trim_start_matches('#');
+            if body.starts_with(' ') && level <= 6 {
+                let style = base | ST_BOLD | if level == 1 { ST_UNDER } else { 0 };
+                let cells = inline_cells(body.trim(), style);
+                out.extend(wrap_cells(&cells, width));
+                continue;
+            }
+        }
+        // Quote.
+        if let Some(rest) = trimmed.strip_prefix('>') {
+            let cells = inline_cells(rest.trim_start(), base | ST_DIM);
+            for piece in wrap_cells(&cells, width.saturating_sub(2)) {
+                let mut l: Vec<Styled> = vec![('▎', ST_DIM | base), (' ', 0)];
+                l.extend(piece);
+                out.push(l);
+            }
+            continue;
+        }
+        // List item: a bullet, or a number.
+        let (lead, rest): (String, &str) = if let Some(r) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+            .or_else(|| trimmed.strip_prefix("+ "))
+        {
+            (format!("{}• ", " ".repeat(indent.min(8))), r)
+        } else if let Some(pos) = trimmed.find(". ").filter(|&pos| pos > 0 && pos <= 3 && trimmed[..pos].bytes().all(|b| b.is_ascii_digit())) {
+            (format!("{}{} ", " ".repeat(indent.min(8)), &trimmed[..pos + 1]), &trimmed[pos + 2..])
+        } else {
+            (String::new(), trimmed)
+        };
+        let cells = inline_cells(rest, base);
+        let hang = lead.chars().count();
+        for (i, piece) in wrap_cells(&cells, width.saturating_sub(hang)).into_iter().enumerate() {
+            let mut l: Vec<Styled> = if i == 0 {
+                lead.chars().map(|c| (c, base)).collect()
+            } else {
+                std::iter::repeat((' ', 0)).take(hang).collect()
+            };
+            l.extend(piece);
+            out.push(l);
+        }
+    }
+    out
+}
+
+/// Inline Markdown to cells: `**bold**`, `*italic*` / `_italic_`,
+/// `` `code` ``, `[text](url)`. Unmatched markers stay as text.
+fn inline_cells(text: &str, base: u8) -> Vec<Styled> {
+    let chars: Vec<char> = text.chars().filter(|c| !c.is_control()).collect();
+    let mut out: Vec<Styled> = Vec::with_capacity(chars.len());
+    let mut i = 0;
+    let n = chars.len();
+    let find = |from: usize, pat: &[char]| -> Option<usize> {
+        (from..n.saturating_sub(pat.len() - 1)).find(|&k| chars[k..k + pat.len()] == *pat)
+    };
+    while i < n {
+        let c = chars[i];
+        // Inline code: up to the next backtick.
+        if c == '`' {
+            if let Some(end) = find(i + 1, &['`']) {
+                if end > i + 1 {
+                    out.extend(chars[i + 1..end].iter().map(|&ch| (ch, base | ST_CODE)));
+                    i = end + 1;
+                    continue;
+                }
+            }
+        }
+        // Bold.
+        if c == '*' && i + 1 < n && chars[i + 1] == '*' {
+            if let Some(end) = find(i + 2, &['*', '*']) {
+                if end > i + 2 {
+                    out.extend(inline_cells(&chars[i + 2..end].iter().collect::<String>(), base | ST_BOLD));
+                    i = end + 2;
+                    continue;
+                }
+            }
+        }
+        // Italic: a single marker with a word right after it and a
+        // matching one before a non-word, so `2 * 3 * 4` stays as is.
+        if (c == '*' || c == '_') && i + 1 < n && !chars[i + 1].is_whitespace() && chars[i + 1] != c {
+            if let Some(end) = (i + 2..n).find(|&k| chars[k] == c && !chars[k - 1].is_whitespace()) {
+                let after_ok = end + 1 >= n || !chars[end + 1].is_alphanumeric();
+                let before_ok = i == 0 || !chars[i - 1].is_alphanumeric() || c == '*';
+                if after_ok && before_ok {
+                    out.extend(inline_cells(&chars[i + 1..end].iter().collect::<String>(), base | ST_ITALIC));
+                    i = end + 1;
+                    continue;
+                }
+            }
+        }
+        // Link: [text](url) -> text, underlined.
+        if c == '[' {
+            if let Some(close) = find(i + 1, &[']', '(']) {
+                if let Some(end) = find(close + 2, &[')']) {
+                    out.extend(inline_cells(&chars[i + 1..close].iter().collect::<String>(), base | ST_UNDER));
+                    i = end + 1;
+                    continue;
+                }
+            }
+        }
+        out.push((c, base));
+        i += 1;
+    }
+    out
+}
+
+/// Greedy word wrap over cells; a word wider than the line is split.
+fn wrap_cells(cells: &[Styled], width: usize) -> Vec<Vec<Styled>> {
+    let width = width.max(1);
+    let mut out: Vec<Vec<Styled>> = Vec::new();
+    let mut line: Vec<Styled> = Vec::new();
+    let mut word: Vec<Styled> = Vec::new();
+    let flush_word = |line: &mut Vec<Styled>, word: &mut Vec<Styled>, out: &mut Vec<Vec<Styled>>| {
+        if word.is_empty() {
+            return;
+        }
+        if !line.is_empty() && line.len() + 1 + word.len() > width {
+            out.push(std::mem::take(line));
+        }
+        if word.len() > width {
+            for piece in hard_wrap(word, width) {
+                if !line.is_empty() {
+                    out.push(std::mem::take(line));
+                }
+                *line = piece;
+            }
+            word.clear();
+            return;
+        }
+        if !line.is_empty() {
+            line.push((' ', 0));
+        }
+        line.append(word);
+    };
+    for &cell in cells {
+        if cell.0 == ' ' {
+            flush_word(&mut line, &mut word, &mut out);
+        } else {
+            word.push(cell);
+        }
+    }
+    flush_word(&mut line, &mut word, &mut out);
+    if !line.is_empty() || out.is_empty() {
         out.push(line);
     }
     out
 }
 
-/// Reverse-video every occurrence of a term, case-insensitively. Skipped
-/// for a line whose lowercase form changes length (rare non-ASCII), so a
-/// highlight can never land off by one.
-fn highlight(line: &str, terms: &[String]) -> String {
-    if terms.is_empty() {
-        return line.to_string();
+fn hard_wrap(cells: &[Styled], width: usize) -> Vec<Vec<Styled>> {
+    let width = width.max(1);
+    if cells.is_empty() {
+        return vec![Vec::new()];
     }
-    let lower = line.to_lowercase();
-    if lower.chars().count() != line.chars().count() {
-        return line.to_string();
+    cells.chunks(width).map(|c| c.to_vec()).collect()
+}
+
+/// Mark every occurrence of a term in the line (case-insensitively, on
+/// the visible text) with the hit bit. Returns whether any was marked.
+fn mark_hits(line: &mut [Styled], lower_terms: &[String]) -> bool {
+    if lower_terms.is_empty() || line.is_empty() {
+        return false;
     }
-    // Byte ranges to mark, on the lowercase string; the same char
-    // positions map onto the original.
-    let lchars: Vec<(usize, char)> = lower.char_indices().collect();
-    let ochars: Vec<(usize, char)> = line.char_indices().collect();
-    let mut marks: Vec<(usize, usize)> = Vec::new(); // char index ranges
-    for t in terms {
-        if t.is_empty() {
+    let lower: Vec<char> = line.iter().map(|(c, _)| c.to_lowercase().next().unwrap_or(*c)).collect();
+    let mut any = false;
+    for t in lower_terms {
+        let tc: Vec<char> = t.chars().collect();
+        if tc.is_empty() || tc.len() > lower.len() {
             continue;
         }
-        let mut from = 0;
-        while let Some(pos) = lower[from..].find(t.as_str()) {
-            let b0 = from + pos;
-            let b1 = b0 + t.len();
-            let c0 = lchars.iter().position(|(b, _)| *b == b0);
-            let c1 = lchars.iter().position(|(b, _)| *b >= b1).unwrap_or(lchars.len());
-            if let Some(c0) = c0 {
-                marks.push((c0, c1));
+        let mut i = 0;
+        while i + tc.len() <= lower.len() {
+            if lower[i..i + tc.len()] == tc[..] {
+                for cell in &mut line[i..i + tc.len()] {
+                    cell.1 |= ST_HIT;
+                }
+                any = true;
+                i += tc.len();
+            } else {
+                i += 1;
             }
-            from = b1;
         }
     }
-    if marks.is_empty() {
-        return line.to_string();
-    }
-    marks.sort();
-    let mut out = String::with_capacity(line.len() + marks.len() * 9);
-    let mut i = 0usize;
-    for (c0, c1) in marks {
-        if c0 < i {
-            continue; // overlaps an earlier mark
+    any
+}
+
+/// Cells to a terminal line: one SGR per run of equal style.
+fn emit_cells(line: &[Styled]) -> String {
+    let mut out = String::with_capacity(line.len() + 16);
+    let mut cur: Option<u8> = None;
+    for &(c, st) in line {
+        if cur != Some(st) {
+            out.push_str("\x1b[0");
+            if st & ST_BOLD != 0 {
+                out.push_str(";1");
+            }
+            if st & ST_DIM != 0 {
+                out.push_str(";2");
+            }
+            if st & ST_ITALIC != 0 {
+                out.push_str(";3");
+            }
+            if st & ST_UNDER != 0 {
+                out.push_str(";4");
+            }
+            if st & ST_HIT != 0 {
+                out.push_str(";7");
+            }
+            if st & ST_CODE != 0 {
+                out.push_str(";33");
+            } else if st & ST_CYAN != 0 {
+                out.push_str(";36");
+            }
+            out.push('m');
+            cur = Some(st);
         }
-        out.extend(ochars[i..c0].iter().map(|(_, c)| c));
-        out.push_str("\x1b[7m");
-        out.extend(ochars[c0..c1.min(ochars.len())].iter().map(|(_, c)| c));
-        out.push_str("\x1b[27m");
-        i = c1.min(ochars.len());
+        out.push(c);
     }
-    out.extend(ochars[i..].iter().map(|(_, c)| c));
+    if cur.is_some() {
+        out.push_str("\x1b[0m");
+    }
     out
 }
 
@@ -3830,4 +4203,67 @@ fn strip_sgr(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+
+    fn text(cells: &[Styled]) -> String {
+        cells.iter().map(|c| c.0).collect()
+    }
+
+    #[test]
+    fn inline_markup() {
+        let c = inline_cells("say **hi** and *there* with `code` [link](http://x)", 0);
+        assert_eq!(text(&c), "say hi and there with code link");
+        let bold: String = c.iter().filter(|c| c.1 & ST_BOLD != 0).map(|c| c.0).collect();
+        assert_eq!(bold, "hi");
+        let italic: String = c.iter().filter(|c| c.1 & ST_ITALIC != 0).map(|c| c.0).collect();
+        assert_eq!(italic, "there");
+        let code: String = c.iter().filter(|c| c.1 & ST_CODE != 0).map(|c| c.0).collect();
+        assert_eq!(code, "code");
+        let under: String = c.iter().filter(|c| c.1 & ST_UNDER != 0).map(|c| c.0).collect();
+        assert_eq!(under, "link");
+        // Arithmetic is not emphasis; an unmatched marker stays.
+        assert_eq!(text(&inline_cells("2 * 3 * 4 and a*b", 0)), "2 * 3 * 4 and a*b");
+        assert_eq!(text(&inline_cells("lone ` tick", 0)), "lone ` tick");
+    }
+
+    #[test]
+    fn blocks() {
+        let md = "# Title\n\n- one\n- two **b**\n\n```rust\nfn main() {}\n```\n\n> quoted\n\n1. first\n---\nplain para";
+        let lines: Vec<String> = markdown_lines(md, 40, 0).iter().map(|l| text(l)).collect();
+        assert_eq!(lines[0], "Title");
+        assert_eq!(lines[1], "");
+        assert_eq!(lines[2], "• one");
+        assert_eq!(lines[3], "• two b");
+        assert_eq!(lines[5], "┌─ rust");
+        assert_eq!(lines[6], "│ fn main() {}");
+        assert_eq!(lines[7], "└─");
+        assert_eq!(lines[9], "▎ quoted");
+        assert_eq!(lines[11], "1. first");
+        assert!(lines[12].starts_with("────"));
+        assert_eq!(lines[13], "plain para");
+        let title = &markdown_lines(md, 40, 0)[0];
+        assert!(title.iter().all(|c| c.1 & ST_BOLD != 0 && c.1 & ST_UNDER != 0));
+    }
+
+    #[test]
+    fn wrapping_and_hits() {
+        let cells = inline_cells("alpha beta gamma delta", 0);
+        let lines = wrap_cells(&cells, 11);
+        let t: Vec<String> = lines.iter().map(|l| text(l)).collect();
+        assert_eq!(t, vec!["alpha beta", "gamma delta"]);
+        let long = inline_cells("abcdefghijkl", 0);
+        assert_eq!(wrap_cells(&long, 5).len(), 3);
+        let mut line = inline_cells("The DFlash2 bench and dflash2 again", 0);
+        assert!(mark_hits(&mut line, &["dflash2".to_string()]));
+        let hit: String = line.iter().filter(|c| c.1 & ST_HIT != 0).map(|c| c.0).collect();
+        assert_eq!(hit, "DFlash2dflash2");
+        assert!(!mark_hits(&mut line, &["zzz".to_string()]));
+        let out = emit_cells(&line);
+        assert!(out.contains("\x1b[0;7m") && out.ends_with("\x1b[0m"));
+        assert_eq!(strip_sgr(&out), "The DFlash2 bench and dflash2 again");
+    }
 }

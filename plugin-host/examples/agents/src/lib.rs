@@ -66,10 +66,13 @@
 //! condensed to prompts, replies and one line per tool call, and
 //! kept in the store for `history_days` - past the harness's own cleanup
 //! of the file. It is searched through an inverted index held in memory,
-//! so the answer is inside the keystroke. See `transcript.rs`,
-//! `extract.rs` and `index.rs`. A finished agent's preview shows that
-//! conversation; `Tab` shows it for a live one too, in place of its pane;
-//! `[` and `]` scroll it.
+//! so the answer is inside the keystroke. See `transcript.rs` and
+//! `index.rs`; the formats live in the host (`transcript_extract`). A
+//! finished agent's preview shows that conversation with its Markdown
+//! rendered, opened on the match; `Tab` shows it for a live one too, in
+//! place of its pane. `l`, Right or a click on it gives it the keyboard:
+//! `j`/`k` scroll, `n`/`N` step through the matches, `g`/`G` top and end,
+//! Esc back to the list.
 //!
 //! An agent that stopped for you and you have not gotten to yet is
 //! UNREAD: it entered `needs_input` or `waiting` more recently than your
