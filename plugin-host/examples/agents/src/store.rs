@@ -963,6 +963,21 @@ pub async fn ingest_targets(now_ms: i64, recent_ms: i64) -> Result<Vec<Agent>, H
     Ok(agents_from(&rows))
 }
 
+/// Rows with no transcript path yet: what a backfill at start goes
+/// looking for. The provisional ids are left out (no session id to find
+/// a file by).
+pub async fn without_transcript() -> Result<Vec<Agent>, HostError> {
+    let rows = db_query(
+        &format!(
+            "SELECT {COLS} FROM agents WHERE transcript_path IS NULL \
+             AND id NOT LIKE 'prov-%'"
+        ),
+        params![],
+    )
+    .await?;
+    Ok(agents_from(&rows))
+}
+
 /// The next `seq` for an agent's turns.
 pub async fn next_seq(id: &str) -> Result<i64, HostError> {
     let rows = db_query(

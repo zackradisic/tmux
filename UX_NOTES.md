@@ -573,6 +573,18 @@ transcript.sh`.
   agent triggers a full rebuild from `turns` (page by page, one page per
   wake). Cheap at hundreds of sessions; at tens of thousands it would
   want tombstones and a merge instead.
+- **What the main thread pays per read, after the host took the scan.**
+  The host (`fs_read_lines`) hands the guest only the records whose head
+  holds `"role":"user"`/`"role":"assistant"` and not a tool result -
+  5-60% of a transcript's bytes, the assistant records carrying the tool
+  inputs. The guest parses those with a typed, borrowing parse (tool
+  inputs stay raw JSON; line counts are read off the escapes) at ~780
+  MB/s natively, ~half that in wasm, in 64 KiB per wake: about 0.1-0.2 ms
+  per wake during the one-time read of a large existing transcript, and
+  a turn-end read is a few KB. The 172 MB transcript reads end to end in
+  ~125 ms wall. Rows from before the transcript existed get their file
+  found by session id at start (`transcript::backfill`) and read once.
+  `tools/dev-server.sh` runs it all on a copy of the live store.
 
 ## Sessions and windows
 

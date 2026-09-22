@@ -28,7 +28,11 @@
 //! One extractor per harness, behind [`Extractor`]. Claude Code and Codex
 //! are here; a harness with no extractor is not indexed.
 
+use std::borrow::Cow;
+
 use memchr::memmem;
+use serde::Deserialize;
+use serde_json::value::RawValue;
 use serde_json::Value;
 
 /// One unit of conversation.
@@ -131,10 +135,13 @@ pub fn for_kind(kind: &str) -> Option<Box<dyn Extractor>> {
     }
 }
 
-/// How many bytes of a record the prefilter looks at. The type tags sit
-/// in the first few hundred bytes of every record shape seen so far; the
-/// window is generous because a record may carry ids before its type.
-pub const HEAD: usize = 512;
+/// How many bytes of a record the prefilter looks at. The needles are
+/// fields that sit near the start of every record shape seen so far
+/// (`"role":…` inside `message`, which Claude writes before or after the
+/// body depending on version - the top-level `"type"` tag can come a
+/// kilobyte in, after the content, so it is NOT the needle). The window
+/// is generous because a record may carry ids before its message.
+pub const HEAD: usize = 1024;
 
 fn head(line: &[u8]) -> &[u8] {
     &line[..line.len().min(HEAD)]
@@ -220,16 +227,6 @@ pub fn parse_rfc3339_ms(s: &str) -> Option<i64> {
     Some(secs * 1000 + millis)
 }
 
-/// Lines in a string, as a diff would count them: a trailing newline
-/// does not add an empty line, and an empty string is zero.
-fn line_count(s: &str) -> usize {
-    if s.is_empty() {
-        0
-    } else {
-        s.lines().count()
-    }
-}
-
 /// The last path component or two, for a tool line that should stay
 /// readable at a glance. The full path is kept in [`Turn::path`].
 fn short_path(p: &str) -> String {
@@ -285,9 +282,13 @@ fn is_command_noise(text: &str) -> bool {
 
 pub struct Claude;
 
-const CL_USER: &[u8] = b"\"type\":\"user\"";
-const CL_ASSISTANT: &[u8] = b"\"type\":\"assistant\"";
-const CL_TOOL_RESULT: &[u8] = b"\"tool_result\"";
+/// The message's role, which every user and assistant record carries
+/// near its start whatever the field order of the version that wrote it.
+const CL_USER: &[u8] = b"\"role\":\"user\"";
+const CL_ASSISTANT: &[u8] = b"\"role\":\"assistant\"";
+/// A user record whose content is a tool result: the block's type tag,
+/// which follows the role within a few dozen bytes.
+const CL_TOOL_RESULT: &[u8] = b"\"type\":\"tool_result\"";
 
 impl Extractor for Claude {
     fn candidate(&self, head: &[u8]) -> bool {
@@ -309,29 +310,33 @@ impl Extractor for Claude {
         if line.is_empty() || !self.candidate(head(line)) {
             return;
         }
-        let Ok(v) = serde_json::from_slice::<Value>(line) else { return };
-        let ty = v.get("type").and_then(Value::as_str).unwrap_or("");
-        if v.get("isMeta").and_then(Value::as_bool) == Some(true)
-            || v.get("isSidechain").and_then(Value::as_bool) == Some(true)
-        {
+        // A typed, borrowing parse: strings stay slices of the record
+        // unless they hold escapes, and a tool's `input` is kept as raw
+        // JSON and never built into a tree - it is the bulk of an
+        // assistant record (a Write carries the whole file) and the
+        // condenser needs a few fields and line counts from it.
+        let Ok(v) = serde_json::from_slice::<ClRecord<'_>>(line) else { return };
+        if v.is_meta || v.is_sidechain {
             return;
         }
         if fed.version.is_none() {
-            fed.version = v.get("version").and_then(Value::as_str).map(str::to_string);
+            fed.version = v.version.map(|s| s.into_owned());
         }
-        let ts_ms = v.get("timestamp").and_then(Value::as_str).and_then(parse_rfc3339_ms);
-        let Some(content) = v.pointer("/message/content") else { return };
-        match ty {
-            "user" => {
+        let ts_ms = v.timestamp.as_deref().and_then(parse_rfc3339_ms);
+        let Some(content) = v.message.and_then(|m| m.content).map(ClContent::parse) else {
+            return;
+        };
+        match v.ty.as_deref() {
+            Some("user") => {
                 let text = match content {
-                    Value::String(s) => s.clone(),
-                    Value::Array(blocks) => blocks
+                    ClContent::Text(s) => s.into_owned(),
+                    ClContent::Blocks(blocks) => blocks
                         .iter()
-                        .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
-                        .filter_map(|b| b.get("text").and_then(Value::as_str))
+                        .filter(|b| b.ty.as_deref() == Some("text"))
+                        .filter_map(|b| b.text.as_deref())
                         .collect::<Vec<_>>()
                         .join("\n"),
-                    _ => return,
+                    ClContent::Other => return,
                 };
                 let text = strip_injected(&text);
                 if text.is_empty() || is_command_noise(&text) {
@@ -339,27 +344,27 @@ impl Extractor for Claude {
                 }
                 fed.turns.push(Turn { kind: TurnKind::User, text, path: None, ts_ms, offset: off, len });
             }
-            "assistant" => {
-                let Value::Array(blocks) = content else { return };
-                    let mut texts: Vec<&str> = Vec::new();
-                    let mut tools: Vec<(String, Option<String>)> = Vec::new();
-                    for b in blocks {
-                        match b.get("type").and_then(Value::as_str) {
-                            Some("text") => {
-                                if let Some(t) = b.get("text").and_then(Value::as_str) {
-                                    if !t.trim().is_empty() {
-                                        texts.push(t);
-                                    }
+            Some("assistant") => {
+                let ClContent::Blocks(blocks) = content else { return };
+                let mut texts: Vec<&str> = Vec::new();
+                let mut tools: Vec<(String, Option<String>)> = Vec::new();
+                for b in &blocks {
+                    match b.ty.as_deref() {
+                        Some("text") => {
+                            if let Some(t) = b.text.as_deref() {
+                                if !t.trim().is_empty() {
+                                    texts.push(t);
                                 }
                             }
-                            Some("tool_use") => {
-                                let name = b.get("name").and_then(Value::as_str).unwrap_or("tool");
-                                let input = b.get("input").cloned().unwrap_or(Value::Null);
-                                tools.push(condense_claude(name, &input));
-                            }
-                            _ => {}
                         }
+                        Some("tool_use") => {
+                            let name = b.name.as_deref().unwrap_or("tool");
+                            let input = b.input.map(|r| r.get()).unwrap_or("null");
+                            tools.push(condense_claude(name, input));
+                        }
+                        _ => {}
                     }
+                }
                 if !texts.is_empty() {
                     fed.turns.push(Turn {
                         kind: TurnKind::Assistant,
@@ -379,74 +384,207 @@ impl Extractor for Claude {
     }
 }
 
+/// A Claude transcript record, the fields the extractor reads. Every
+/// string borrows from the record where it can (`Cow`); unknown fields
+/// are ignored, so a new field never breaks the parse.
+#[derive(Deserialize)]
+struct ClRecord<'a> {
+    #[serde(rename = "type", default, borrow)]
+    ty: Option<Cow<'a, str>>,
+    #[serde(rename = "isMeta", default)]
+    is_meta: bool,
+    #[serde(rename = "isSidechain", default)]
+    is_sidechain: bool,
+    #[serde(default, borrow)]
+    timestamp: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    version: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    message: Option<ClMessage<'a>>,
+}
+
+#[derive(Deserialize)]
+struct ClMessage<'a> {
+    /// A string (a typed prompt) or an array of blocks. Kept raw here
+    /// and split by its first byte: an untagged enum would buffer the
+    /// value and lose the borrow the blocks' `input` needs.
+    #[serde(default, borrow)]
+    content: Option<&'a RawValue>,
+}
+
+enum ClContent<'a> {
+    Text(Cow<'a, str>),
+    Blocks(Vec<ClBlock<'a>>),
+    Other,
+}
+
+impl<'a> ClContent<'a> {
+    fn parse(raw: &'a RawValue) -> ClContent<'a> {
+        let s = raw.get();
+        match s.as_bytes().first() {
+            Some(b'"') => serde_json::from_str::<Cow<'a, str>>(s)
+                .map(ClContent::Text)
+                .unwrap_or(ClContent::Other),
+            Some(b'[') => serde_json::from_str::<Vec<ClBlock<'a>>>(s)
+                .map(ClContent::Blocks)
+                .unwrap_or(ClContent::Other),
+            _ => ClContent::Other,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ClBlock<'a> {
+    #[serde(rename = "type", default, borrow)]
+    ty: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    text: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    name: Option<Cow<'a, str>>,
+    /// Raw JSON, not a tree: see [`condense_claude`].
+    #[serde(default, borrow)]
+    input: Option<&'a RawValue>,
+}
+
+/// The fields of a tool's input the condenser reads. The big ones (a
+/// file's content, an edit's old and new text) stay raw: only their line
+/// counts are wanted, and those come from the escaped JSON without
+/// unescaping it (see [`raw_str_lines`]).
+#[derive(Deserialize, Default)]
+struct ClInput<'a> {
+    #[serde(default, borrow)]
+    file_path: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    notebook_path: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    path: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    pattern: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    description: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    command: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    prompt: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    url: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    query: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    content: Option<&'a RawValue>,
+    #[serde(default, borrow)]
+    old_string: Option<&'a RawValue>,
+    #[serde(default, borrow)]
+    new_string: Option<&'a RawValue>,
+    #[serde(default, borrow)]
+    edits: Option<Vec<ClEdit<'a>>>,
+}
+
+#[derive(Deserialize)]
+struct ClEdit<'a> {
+    #[serde(default, borrow)]
+    old_string: Option<&'a RawValue>,
+    #[serde(default, borrow)]
+    new_string: Option<&'a RawValue>,
+}
+
+/// The line count of a JSON string literal, from its escaped form: the
+/// `\n` escapes, counted without unescaping (a backslash escaped as `\\`
+/// does not start one). Same answer as `str::lines().count()` on the
+/// decoded string: a trailing newline adds no line.
+fn raw_str_lines(raw: Option<&RawValue>) -> usize {
+    let Some(r) = raw else { return 0 };
+    let s = r.get().as_bytes();
+    if s.len() < 2 || s[0] != b'"' {
+        return 0;
+    }
+    let body = &s[1..s.len() - 1];
+    if body.is_empty() {
+        return 0;
+    }
+    let mut newlines = 0usize;
+    let mut i = 0;
+    let mut ends_with_nl = false;
+    while i < body.len() {
+        if body[i] == b'\\' {
+            if i + 1 < body.len() && body[i + 1] == b'n' {
+                newlines += 1;
+                ends_with_nl = i + 2 == body.len();
+            } else {
+                ends_with_nl = false;
+            }
+            i += 2;
+        } else {
+            ends_with_nl = false;
+            i += 1;
+        }
+    }
+    if ends_with_nl { newlines } else { newlines + 1 }
+}
+
 fn s_field<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(Value::as_str).filter(|s| !s.is_empty())
 }
 
 /// One line for a Claude tool call: the tool and what it touched. Never
-/// the content it wrote or the output it got. Returns the line and the
-/// file path it names, when it names one.
-pub fn condense_claude(name: &str, input: &Value) -> (String, Option<String>) {
-    let path = s_field(input, "file_path")
-        .or_else(|| s_field(input, "notebook_path"))
-        .or_else(|| s_field(input, "path"))
+/// the content it wrote or the output it got. `input` is the tool's
+/// input as raw JSON. Returns the line and the file path it names, when
+/// it names one.
+pub fn condense_claude(name: &str, input: &str) -> (String, Option<String>) {
+    let inp: ClInput<'_> = serde_json::from_str(input).unwrap_or_default();
+    let path = inp
+        .file_path
+        .as_deref()
+        .or(inp.notebook_path.as_deref())
+        .or(inp.path.as_deref())
+        .filter(|s| !s.is_empty())
         .map(str::to_string);
     let shown = path.as_deref().map(short_path);
+    let field = |o: &Option<Cow<'_, str>>| -> String {
+        o.as_deref().unwrap_or("").to_string()
+    };
     let line = match name {
-        "Read" | "LS" | "NotebookRead" => format!("{name} {}", shown.unwrap_or_default()),
-        "Glob" => format!(
+        "Read" | "LS" | "NotebookRead" | "NotebookEdit" => format!("{name} {}", shown.unwrap_or_default()),
+        "Glob" | "Grep" => format!(
             "{name} {}{}",
-            s_field(input, "pattern").unwrap_or(""),
+            field(&inp.pattern),
             shown.map(|p| format!(" in {p}")).unwrap_or_default()
         ),
-        "Grep" => format!(
-            "{name} {}{}",
-            s_field(input, "pattern").unwrap_or(""),
-            shown.map(|p| format!(" in {p}")).unwrap_or_default()
-        ),
-        "Write" => format!(
-            "{name} {} +{}",
-            shown.unwrap_or_default(),
-            line_count(s_field(input, "content").unwrap_or(""))
-        ),
+        "Write" => format!("{name} {} +{}", shown.unwrap_or_default(), raw_str_lines(inp.content)),
         "Edit" => format!(
             "{name} {} +{} −{}",
             shown.unwrap_or_default(),
-            line_count(s_field(input, "new_string").unwrap_or("")),
-            line_count(s_field(input, "old_string").unwrap_or(""))
+            raw_str_lines(inp.new_string),
+            raw_str_lines(inp.old_string)
         ),
         "MultiEdit" => {
             let (mut plus, mut minus) = (0, 0);
-            if let Some(edits) = input.get("edits").and_then(Value::as_array) {
-                for e in edits {
-                    plus += line_count(s_field(e, "new_string").unwrap_or(""));
-                    minus += line_count(s_field(e, "old_string").unwrap_or(""));
-                }
+            for e in inp.edits.as_deref().unwrap_or(&[]) {
+                plus += raw_str_lines(e.new_string);
+                minus += raw_str_lines(e.old_string);
             }
             format!("{name} {} +{plus} −{minus}", shown.unwrap_or_default())
         }
-        "NotebookEdit" => format!("{name} {}", shown.unwrap_or_default()),
         "Bash" => {
-            let what = s_field(input, "description")
+            let what = inp
+                .description
+                .as_deref()
+                .filter(|d| !d.is_empty())
                 .map(|d| first_line(d, 120))
-                .unwrap_or_else(|| first_line(s_field(input, "command").unwrap_or(""), 120));
+                .unwrap_or_else(|| first_line(&field(&inp.command), 120));
             format!("{name} {what}")
         }
         "Agent" | "Task" => format!(
             "{name} {}: {}",
-            first_line(s_field(input, "description").unwrap_or(""), 60),
-            first_line(s_field(input, "prompt").unwrap_or(""), 120)
+            first_line(&field(&inp.description), 60),
+            first_line(&field(&inp.prompt), 120)
         ),
-        "WebFetch" => format!("{name} {}", s_field(input, "url").unwrap_or("")),
-        "WebSearch" => format!("{name} {}", first_line(s_field(input, "query").unwrap_or(""), 120)),
+        "WebFetch" => format!("{name} {}", field(&inp.url)),
+        "WebSearch" => format!("{name} {}", first_line(&field(&inp.query), 120)),
         _ => {
             // Unknown tool: its name and the head of its input, so a new
             // tool renders as a line rather than breaking the extractor.
-            let compact = match input {
-                Value::Null => String::new(),
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
+            let compact = if input == "null" { "" } else { input };
             let mut head: String = compact.chars().take(120).collect();
             if compact.chars().count() > 120 {
                 head.push('…');
@@ -608,6 +746,37 @@ pub fn condense_codex(name: &str, args: &Value) -> (String, Option<String>) {
 mod tests {
     use super::*;
 
+    /// Timing, not a test: `AGENTS_BENCH_FILE=<transcript> cargo test -p
+    /// agents --lib bench_feed -- --ignored --nocapture`. Feeds only the
+    /// records the host prefilter would hand over (the candidates), and
+    /// reports the parse rate over those bytes - the guest's cost per
+    /// byte received.
+    #[test]
+    #[ignore]
+    fn bench_feed() {
+        let Ok(path) = std::env::var("AGENTS_BENCH_FILE") else { return };
+        let data = std::fs::read(&path).expect("read");
+        let mut kept: Vec<u8> = Vec::new();
+        for line in data.split_inclusive(|&b| b == b'\n') {
+            if Claude.candidate(head(strip_nl(line))) {
+                kept.extend_from_slice(line);
+            }
+        }
+        let t = std::time::Instant::now();
+        let mut n = 0;
+        for _ in 0..5 {
+            n = Claude.feed(&kept, 0).turns.len();
+        }
+        let per = t.elapsed() / 5;
+        eprintln!(
+            "bench_feed: {} MB file, {:.2} MB handed over, {n} turns, {:?} per pass = {:.0} MB/s over the handed bytes",
+            data.len() / 1_000_000,
+            kept.len() as f64 / 1e6,
+            per,
+            kept.len() as f64 / 1e6 / per.as_secs_f64()
+        );
+    }
+
     #[test]
     fn rfc3339() {
         assert_eq!(parse_rfc3339_ms("1970-01-01T00:00:00Z"), Some(0));
@@ -653,22 +822,38 @@ mod tests {
     fn claude_prefilter_drops_tool_results() {
         let head = br#"{"parentUuid":"x","type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_1","type":"tool_result","content":"..."#;
         assert!(!Claude.candidate(head));
-        assert!(Claude.candidate(br#"{"type":"assistant","message":{}}"#));
+        assert!(Claude.candidate(br#"{"type":"assistant","message":{"role":"assistant","content":[]}}"#));
+        // The version that writes the body first: the top-level type tag
+        // is far past the head, the role is not.
+        assert!(Claude.candidate(br#"{"parentUuid":"x","isSidechain":false,"message":{"model":"m","id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"..."#));
         assert!(!Claude.candidate(br#"{"type":"file-history-snapshot","snapshot":{}}"#));
     }
 
     #[test]
+    fn claude_body_first_record() {
+        // Claude 2.1.2xx writes `message` before `type` in assistant records.
+        let l = br#"{"parentUuid":"x","isSidechain":false,"message":{"model":"m","id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"Body first."},{"type":"tool_use","name":"Read","input":{"file_path":"/a.rs"}}]},"type":"assistant","timestamp":"2026-09-08T00:00:00.000Z"}
+"#;
+        let fed = Claude.feed(l, 0);
+        let texts: Vec<&str> = fed.turns.iter().map(|t| t.text.as_str()).collect();
+        assert_eq!(texts, vec!["Body first.", "Read /a.rs"]);
+    }
+
+    #[test]
     fn condense_rules() {
-        let v: Value = serde_json::from_str(r#"{"file_path":"/x/y.rs","content":"a\nb\nc\n"}"#).unwrap();
-        assert_eq!(condense_claude("Write", &v).0, "Write x/y.rs +3");
-        let v: Value = serde_json::from_str(r#"{"command":"ls -la","description":"List files"}"#).unwrap();
-        assert_eq!(condense_claude("Bash", &v).0, "Bash List files");
-        let v: Value = serde_json::from_str(r#"{"pattern":"fn main","path":"/src"}"#).unwrap();
-        assert_eq!(condense_claude("Grep", &v).0, "Grep fn main in /src");
-        let v: Value = serde_json::from_str(r#"{"file_path":"/x/y.rs","edits":[{"old_string":"a","new_string":"b\nc"},{"old_string":"","new_string":"d"}]}"#).unwrap();
-        assert_eq!(condense_claude("MultiEdit", &v).0, "MultiEdit x/y.rs +3 −1");
-        let v: Value = serde_json::from_str(r#"{"weird":"input"}"#).unwrap();
-        assert_eq!(condense_claude("Brand New Tool", &v).0, r#"Brand New Tool {"weird":"input"}"#);
+        assert_eq!(condense_claude("Write", r#"{"file_path":"/x/y.rs","content":"a\nb\nc\n"}"#).0, "Write x/y.rs +3");
+        assert_eq!(condense_claude("Bash", r#"{"command":"ls -la","description":"List files"}"#).0, "Bash List files");
+        assert_eq!(condense_claude("Grep", r#"{"pattern":"fn main","path":"/src"}"#).0, "Grep fn main in /src");
+        assert_eq!(
+            condense_claude("MultiEdit", r#"{"file_path":"/x/y.rs","edits":[{"old_string":"a","new_string":"b\nc"},{"old_string":"","new_string":"d"}]}"#).0,
+            "MultiEdit x/y.rs +3 −1"
+        );
+        assert_eq!(condense_claude("Brand New Tool", r#"{"weird":"input"}"#).0, r#"Brand New Tool {"weird":"input"}"#);
+        // Line counts come from the escaped JSON: an escaped backslash
+        // before an n is not a newline, and a trailing newline adds none.
+        assert_eq!(condense_claude("Write", r#"{"file_path":"/f","content":"x\\ny"}"#).0, "Write /f +1");
+        assert_eq!(condense_claude("Write", r#"{"file_path":"/f","content":""}"#).0, "Write /f +0");
+        assert_eq!(condense_claude("Edit", r#"{"file_path":"/f","old_string":"a\nb","new_string":"q\"r\ns\nt"}"#).0, "Edit /f +3 −2");
     }
 
     #[test]

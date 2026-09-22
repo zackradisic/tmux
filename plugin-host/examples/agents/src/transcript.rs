@@ -47,10 +47,12 @@ use crate::index::{self, Index};
 use crate::store::{self, NewTurn, TurnRow};
 
 /// The buffer `fs_read_lines` fills per call: the records that passed
-/// the host's prefilter, which on a Claude transcript is about one per
-/// cent of the bytes it scanned. The SDK grows it for a record that does
-/// not fit, up to `MAX_LINE`.
-pub const LINES_BUF: usize = 256 * 1024;
+/// the host's prefilter (5-60% of a Claude transcript's bytes - the
+/// assistant records carry the tool inputs). One call is one wake of the
+/// guest, and the typed parse runs at roughly 0.5-1 GB/s, so 64 KiB
+/// bounds a wake to about 0.1 ms. The SDK grows the buffer for a record
+/// that does not fit, up to `MAX_LINE`.
+pub const LINES_BUF: usize = 64 * 1024;
 /// A candidate record longer than this is skipped by the host unparsed,
 /// whatever its head said: nothing conversational is that long.
 pub const MAX_LINE: usize = 4 * 1024 * 1024;
@@ -327,13 +329,69 @@ pub async fn request_pane(pane: u32) {
 
 /// Every agent whose transcript may have grown: the live ones and the
 /// recently ended. Sequential, so a start with many agents is one file
-/// at a time rather than all at once.
+/// at a time rather than all at once. First, rows that never had a
+/// transcript path - written by a plugin from before the transcript
+/// existed - get one found for them, so history from before the upgrade
+/// is searchable too.
 pub async fn catch_up() {
+    backfill().await;
     let now = now_ms() as i64;
     let targets = store::ingest_targets(now, RECENT_MS).await.unwrap_or_default();
     for a in targets {
         ingest(&a.id, !a.live()).await;
     }
+}
+
+/// Find transcripts for the Claude rows that have none: one listing of
+/// the project directories gives every session id on disk, and a row
+/// whose id is among them gets the path and one read. Ended rows are read
+/// here and now, one at a time; live ones are read on their next turn.
+/// Rows whose transcript Claude has already cleaned up stay as they are.
+async fn backfill() {
+    let rows = store::without_transcript().await.unwrap_or_default();
+    let claude: Vec<&store::Agent> =
+        rows.iter().filter(|a| a.kind == "claude" && a.id.starts_with("claude:")).collect();
+    if claude.is_empty() {
+        return;
+    }
+    let Some(on_disk) = claude_transcripts().await else { return };
+    let mut found = 0usize;
+    for a in claude {
+        let Some(sid) = a.id.strip_prefix("claude:") else { continue };
+        let Some(path) = on_disk.get(sid) else { continue };
+        if store::set_transcript(&a.id, path).await.is_err() {
+            continue;
+        }
+        found += 1;
+        if !a.live() {
+            ingest(&a.id, false).await;
+        }
+    }
+    if found > 0 {
+        log(&format!("agents: transcripts found for {found} rows from before the upgrade"));
+        snapshot().await;
+    }
+}
+
+/// Every Claude transcript on disk, by session id: `~/.claude/projects/*/
+/// <sid>.jsonl`. One listing per project directory.
+async fn claude_transcripts() -> Option<std::collections::HashMap<String, String>> {
+    let home = home_dir().ok().filter(|s| !s.is_empty())?;
+    let root = format!("{home}/.claude/projects");
+    let dirs = fs_list(&root).await.ok()?;
+    let dirs: Vec<String> = dirs.iter().map(|e| e.name.to_string()).collect();
+    let mut out = std::collections::HashMap::new();
+    for d in dirs {
+        let dir = format!("{root}/{d}");
+        if let Ok(listing) = fs_list(&dir).await {
+            for e in listing.iter() {
+                if let Some(sid) = e.name.strip_suffix(".jsonl") {
+                    out.insert(sid.to_string(), format!("{dir}/{}", e.name));
+                }
+            }
+        }
+    }
+    Some(out)
 }
 
 /// Read what the transcript has past the cursor, store the turns, feed
@@ -473,20 +531,7 @@ async fn ingest_once(id: &str) -> Result<(), ()> {
 /// dozen directories once; not a per-render cost.
 async fn locate_claude(id: &str) -> Option<String> {
     let sid = id.strip_prefix("claude:")?;
-    let home = home_dir().ok().filter(|s| !s.is_empty())?;
-    let root = format!("{home}/.claude/projects");
-    let name = format!("{sid}.jsonl");
-    let dirs = fs_list(&root).await.ok()?;
-    let dirs: Vec<String> = dirs.iter().map(|e| e.name.to_string()).collect();
-    for d in dirs {
-        let dir = format!("{root}/{d}");
-        if let Ok(listing) = fs_list(&dir).await {
-            if listing.iter().any(|e| e.name == name) {
-                return Some(format!("{dir}/{name}"));
-            }
-        }
-    }
-    None
+    claude_transcripts().await?.remove(sid)
 }
 
 /// The Claude transcript path for a session started in `cwd`: Claude
