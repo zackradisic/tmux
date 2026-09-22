@@ -3817,7 +3817,16 @@ fn render_transcript(tv: &mut TranscriptView, width: usize, terms: &[String]) {
         }
     }
     let mut cells: Vec<Vec<Styled>> = Vec::new();
+    let mut prev_kind: Option<&str> = None;
     for t in &tv.turns {
+        // A blank line between turns, except between one tool line and
+        // the next: a run of tool calls reads as one block.
+        if let Some(prev) = prev_kind {
+            if !(prev == "tool" && t.kind == "tool") {
+                cells.push(Vec::new());
+            }
+        }
+        prev_kind = Some(t.kind.as_str());
         if tv.open_seq >= 0 && open_at.is_none() && t.seq >= tv.open_seq {
             open_at = Some(cells.len());
         }
@@ -3851,10 +3860,6 @@ fn render_transcript(tv: &mut TranscriptView, width: usize, terms: &[String]) {
                 }
             }
         }
-        cells.push(Vec::new());
-    }
-    while cells.last().is_some_and(Vec::is_empty) {
-        cells.pop();
     }
     // Highlight, remember the matching lines, emit.
     let lower_terms: Vec<String> = terms.iter().map(|t| t.to_lowercase()).collect();
