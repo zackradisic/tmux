@@ -628,12 +628,12 @@ pub struct Needle {
 
 /// The 16-byte header at the start of the out buffer:
 /// `u64 cursor | u32 need | u8 eof | u8[3] pad`, little-endian.
-pub(crate) const LINES_HEADER: usize = 16;
+pub const LINES_HEADER: usize = 16;
 /// Each kept line: `u64 offset | u32 len | u8 line[len]` (newline included).
-pub(crate) const LINES_REC_HEADER: usize = 12;
+pub const LINES_REC_HEADER: usize = 12;
 /// Bytes consumed per call at most (at a line boundary): bounds one
 /// worker task, and lets the guest see progress on a huge file.
-pub(crate) const LINES_SCAN_MAX: u64 = 8 * 1024 * 1024;
+pub const LINES_SCAN_MAX: u64 = 8 * 1024 * 1024;
 /// The read block.
 const LINES_BLOCK: usize = 256 * 1024;
 

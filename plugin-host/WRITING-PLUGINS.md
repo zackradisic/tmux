@@ -581,10 +581,6 @@ fs_read_lines(path, offset, &needles, head, max_line, cap).await -> Lines
 transcript_extract(path, offset, "claude").await -> Extracted
                                                         // an agent transcript's turns;
                                                         // scan + parse in the host
-send_key_from(pane, key, client)                        // a key as that client typed
-                                                        // it: reaches a pane in copy mode
-pane_feed(pane, bytes)                                  // text into a pane's screen,
-                                                        // no pty (<=256 KiB per call)
 fs_list(path) -> Listing                                // dir entries + d_type;
                                                         // names borrow the buffer
 fs_rename(from, to, RenameFlag).await                   // atomic in the sandbox;

@@ -585,31 +585,16 @@ transcript.sh`.
   all on a copy of the live store. The cost of the host knowing the
   formats: a Claude format change means a tmux update, not a plugin
   update - though both ship through the same release.
-- **The preview is copy mode.** The conversation (Markdown rendered to
-  ANSI: headings, emphasis, inline and fenced code, lists, quotes, rules,
-  links) is fed straight into the screen of a scratch pane in a detached
-  session (`_agents-preview`, killed with the picker) with the new
-  `pane_feed` import - not through its pty, which delivers one read per
-  event-loop turn and took 26 s for a 500 KB conversation; the feed takes
-  ~160 ms in 64 KiB slices. The preview blits that pane's copy-mode
-  screen (the host now blits `wp->screen`, not the base grid), entered
-  with `history-top` and a `search-forward` of the query's terms as a
-  regex (grouped: copy mode takes a pattern for a regex only if it holds
-  one of `^$*+()?[].\`, and `a|b` alone is searched literally). So the
-  highlights, the `(N results)` count, `n`/`N`, scrolling, selection and
-  yank are tmux's, and every copy-mode binding of the user's works in
-  the preview - including a bound regex that picks file paths out. `l`,
-  Right or a click gives it the keyboard through the same path as typing
-  into an agent's pane; the keys travel with the client that pressed them
-  (`send_keys_from`), because a pane in copy mode has no key callback and
-  its table binding must be dispatched the way `send-keys` does it. The
-  unfocus key or Left gives the keyboard back; the wheel over it scrolls.
-  A live row's conversation is refetched on the refresh cadence and
-  refilled only when it grew, never while the keyboard is in it. Not
-  done: tables stay as typed; the scratch session is visible in
-  `list-sessions` while the picker is open; `mode-keys emacs` leaves the
-  cursor after a match, so `N` right after `n` re-finds the same match
-  once (tmux's own behaviour).
+- **The preview renders Markdown and takes the keyboard.** Headings,
+  emphasis, inline and fenced code, lists, quotes, rules and links, to
+  styled cells that wrap and highlight without the markup fighting the
+  width. `l`, Right or a click on the conversation focuses it (the
+  separator lights up as it does for typing into a pane); `j`/`k`,
+  Space/`b`, `g`/`G` move, `n`/`N` step through the query's matches with
+  the count in the header, Esc returns. A live row's conversation is
+  refetched on the refresh cadence and keeps the scroll and match
+  position across the refetch. Not done: tables stay as typed, and a
+  match inside a wrapped word is highlighted only on the line it starts.
 
 ## Sessions and windows
 

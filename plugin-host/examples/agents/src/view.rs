@@ -20,7 +20,6 @@ use std::task::{Context, Poll};
 use tmux_plugin_sdk::abi::ErrorCode;
 use tmux_plugin_sdk::prelude::*;
 
-use crate::convo;
 use crate::index;
 use crate::provider::{self, mode_label, run_content_search, ListReq, Snapshot, TurnsReq};
 use crate::store::{self, Agent, TurnRow, LOCAL};
@@ -519,9 +518,7 @@ pub enum PickAfter {
     KillPane(u32),
     /// Type this key into the local pane the preview shows: the keyboard
     /// is the preview's. Same route as `Interrupt`, one key per press.
-    /// One key into the pane the preview shows, as typed by this client
-    /// (a pane in copy mode takes keys only from a client).
-    Type(u32, String, Option<u64>),
+    Type(u32, String),
     /// Open the new-agent form over the picker, prefilled from the
     /// highlighted row (see `newagent`).
     NewAgent,
@@ -629,6 +626,9 @@ pub struct Picker {
     pub fetching: HashMap<String, u64>,
     /// (server, remote pane) -> the local shadow pane that mirrors it.
     pub mirrors: HashMap<(String, u32), u32>,
+    /// The captured text of the highlighted remote row that has no local
+    /// mirror, by row key, once the provider answered.
+    pub remote_capture: Option<(String, Vec<String>)>,
     /// Rows come from more than one server: show server headers.
     pub multi: bool,
     /// The keyboard belongs to the preview: every key goes to the
@@ -654,32 +654,36 @@ pub struct Picker {
     pub roster_len: usize,
     /// The conversation in the preview, when the highlighted row shows
     /// one (a finished agent, a remote row with no mirror, or a live row
-    /// with `show_transcript`): the scratch pane it is in (see `convo`).
-    pub convo: Option<Convo>,
-    /// A conversation being fetched and shown right now, so a second
-    /// request for the same one (a key, a refresh) does not start another
-    /// fill: (row key, width, height, query).
-    pub convo_pending: Option<(String, u32, u32, String)>,
+    /// with `show_transcript`).
+    pub transcript: Option<TranscriptView>,
     /// Show the highlighted live row's conversation instead of its pane.
     pub show_transcript: bool,
+    /// The keyboard belongs to the conversation in the preview: keys
+    /// scroll it and step through its matches (see `dispatch_key`).
+    pub transcript_focus: bool,
 }
 
-/// A conversation shown in the preview: which row's, in which scratch
-/// pane, and what it was rendered from, so a refetch that found nothing
-/// new does not respawn it.
-pub struct Convo {
+/// A conversation rendered for the preview.
+pub struct TranscriptView {
+    /// The row it belongs to.
     pub key: String,
-    pub pane: u32,
-    /// How many turns (or capture lines) were rendered.
-    pub items: usize,
     /// When the turns were fetched (local clock): a live agent's
     /// conversation grows, so it is fetched again on the refresh cadence.
     pub fetched_ms: u64,
-    /// The preview size it was rendered for.
-    pub width: u32,
-    pub height: u32,
-    /// The query it was searched for.
-    pub query: String,
+    pub turns: Vec<TurnRow>,
+    /// The turn it opened on (a hit's), or -1 for the end.
+    pub open_seq: i64,
+    /// Scroll position, in rendered lines.
+    pub top: usize,
+    /// The width the lines were rendered for.
+    pub width: usize,
+    pub lines: Vec<String>,
+    /// The rendered lines that hold a match of the query, in order, and
+    /// which of them `n`/`N` last landed on.
+    pub matches: Vec<usize>,
+    pub match_idx: Option<usize>,
+    /// The saved capture that stands in when there are no turns.
+    pub capture: Vec<String>,
 }
 
 impl Picker {
@@ -701,17 +705,10 @@ impl Picker {
     /// the agent may have finished, or a refresh replaced the rows and
     /// the highlighted one is a remote row with no mirror here.
     fn sync_focus(&mut self) {
-        if self.preview_focus && preview_pane_of_selection(self).is_none() {
+        if self.preview_focus && live_pane_of_selection(self).is_none() {
             self.preview_focus = false;
         }
     }
-    /// Does the preview show the agent's own pane (a live local or
-    /// mirrored one, without Tab)? Then no header of ours is drawn.
-    fn local_pane_or_hidden(&self) -> bool {
-        let Some(a) = self.selected() else { return false };
-        self.local_pane_of(a).is_some() && !(self.show_transcript && convo_shown(self))
-    }
-
     /// What to ask the store and every provider for beyond the live rows.
     pub fn list_req(&self) -> ListReq {
         ListReq { history: self.show_history, archived: self.archived_only }
@@ -1050,15 +1047,16 @@ pub async fn pick_open(
         msg_buf: String::new(),
         unread: HashMap::new(),
         mirrors: if multi { find_mirrors() } else { HashMap::new() },
+        remote_capture: None,
         multi,
         preview_focus: false,
         transcript_query: String::new(),
         transcript_hits: HashMap::new(),
         hit_rows: Vec::new(),
         roster_len: 0,
-        convo: None,
-        convo_pending: None,
+        transcript: None,
         show_transcript: false,
+        transcript_focus: false,
     };
     p.roster_len = p.rows.len();
     pick_refilter(&mut p);
@@ -1170,21 +1168,19 @@ async fn refresh_timer(
 
 /// A remote row without a local mirror shows the provider's captured text
 /// Whatever the highlighted row needs in the preview that is not a live
-/// blit: its conversation, in the scratch pane (see `convo`).
+/// blit: its conversation, or a remote provider's captured text.
 fn request_preview(picker: &Rc<RefCell<Option<Picker>>>) {
-    request_convo(picker);
+    request_transcript(picker);
+    request_capture(picker);
 }
 
 /// The highlighted row shows its conversation in the preview (no live
-/// pane to blit, or `show_transcript`): fetch the turns, render them,
-/// and put them in the scratch pane in copy mode with the query as the
-/// search. Once per row and preview size; a live row again on the
-/// refresh cadence, respawning the pane only when the turn count grew
-/// (and never while the user has the keyboard in it). Local rows read
-/// the store; a remote row asks its provider's `turns`. A row with no
-/// turns falls back to its saved capture, so a finished agent from
-/// before the transcript existed still shows something.
-fn request_convo(picker: &Rc<RefCell<Option<Picker>>>) {
+/// pane to blit, or `show_transcript`): fetch the turns, once per row
+/// and opening turn. Local rows read the store; a remote row asks its
+/// provider's `turns`. A local row with no turns falls back to its saved
+/// capture, so a finished agent from before the transcript existed still
+/// shows something.
+fn request_transcript(picker: &Rc<RefCell<Option<Picker>>>) {
     let want = {
         let b = picker.borrow();
         let Some(p) = b.as_ref() else { return };
@@ -1193,38 +1189,20 @@ fn request_convo(picker: &Rc<RefCell<Option<Picker>>>) {
             return;
         }
         let key = a.key();
-        let (pw, ph) = preview_dims(p);
-        let query = p.transcript_query.clone();
-        let live = a.live();
-        if let Some(c) = p.convo.as_ref() {
-            let same = c.key == key && c.width == pw && c.height == ph && c.query == query;
-            let fresh = !live || now_ms().saturating_sub(c.fetched_ms) < REFRESH_MS;
-            if same && (fresh || p.preview_focus) {
-                return;
-            }
-        }
-        let want = (key.clone(), pw, ph, query.clone());
-        if p.convo_pending.as_ref() == Some(&want) {
+        let open_seq = p.transcript_hits.get(&key).map(|h| h.seq).unwrap_or(-1);
+        let fresh_for = if a.live() { REFRESH_MS } else { u64::MAX };
+        if p.transcript.as_ref().is_some_and(|tv| {
+            tv.key == key
+                && tv.open_seq == open_seq
+                && now_ms().saturating_sub(tv.fetched_ms) < fresh_for
+        }) {
             return;
         }
-        (key, a.server.clone(), a.id.clone(), a.is_local(), pw, ph, query, p.mode)
+        (key, a.server.clone(), a.id.clone(), a.is_local(), open_seq, p.mode)
     };
-    if let Some(p) = picker.borrow_mut().as_mut() {
-        p.convo_pending = Some((want.0.clone(), want.4, want.5, want.6.clone()));
-    }
     let picker = Rc::clone(picker);
     spawn(async move {
-        let (key, server, id, local, pw, ph, query, mode) = want;
-        // Whatever happens below, the request is no longer pending.
-        struct Done(Rc<RefCell<Option<Picker>>>);
-        impl Drop for Done {
-            fn drop(&mut self) {
-                if let Some(p) = self.0.borrow_mut().as_mut() {
-                    p.convo_pending = None;
-                }
-            }
-        }
-        let _done = Done(Rc::clone(&picker));
+        let (key, server, id, local, open_seq, mode) = want;
         let turns: Vec<TurnRow> = if local {
             store::turns_range(&id, 0, i64::MAX).await.unwrap_or_default()
         } else {
@@ -1233,60 +1211,85 @@ fn request_convo(picker: &Rc<RefCell<Option<Picker>>>) {
                 .await
                 .unwrap_or_default()
         };
-        let capture: Vec<String> = if turns.is_empty() {
-            let text = if local {
-                store::get_capture(&id).await.ok().flatten()
-            } else {
-                let req = provider::CaptureReq { id: id.clone() };
-                service::call(&format!("@{server}"), "capture", &serde_json::to_vec(&req).unwrap_or_default())
-                    .await
-                    .ok()
-                    .map(|b| String::from_utf8_lossy(&b).into_owned())
-            };
-            text.map(|t| t.lines().map(str::to_string).collect()).unwrap_or_default()
+        let capture: Vec<String> = if turns.is_empty() && local {
+            store::get_capture(&id)
+                .await
+                .ok()
+                .flatten()
+                .map(|t| t.lines().map(str::to_string).collect())
+                .unwrap_or_default()
         } else {
             Vec::new()
         };
-        let items = turns.len().max(capture.len());
-        // Still the same row, size and query? And anything new to show?
-        let go = {
-            let b = picker.borrow();
-            let Some(p) = b.as_ref() else { return };
-            if p.mode.0 != mode.0 || p.selected().map(|a| a.key()) != Some(key.clone()) {
-                return;
-            }
-            match p.convo.as_ref() {
-                Some(c) if c.key == key && c.width == pw && c.height == ph && c.query == query && c.items == items => false,
-                _ => true,
-            }
-        };
-        if !go {
-            let mut b = picker.borrow_mut();
-            if let Some(c) = b.as_mut().and_then(|p| p.convo.as_mut()) {
-                c.fetched_ms = now_ms();
-            }
-            return;
-        }
-        let lines = render_lines(&turns, &capture, pw as usize);
-        let (terms, _) = index::query_terms(&query);
-        let regex = convo::search_regex(&terms);
-        let Some(pane) = convo::show(&lines, regex.as_deref(), pw, ph).await else { return };
         let mut b = picker.borrow_mut();
         let Some(p) = b.as_mut() else { return };
         if p.mode.0 != mode.0 || p.selected().map(|a| a.key()) != Some(key.clone()) {
             return;
         }
-        p.convo = Some(Convo { key, pane, items, fetched_ms: now_ms(), width: pw, height: ph, query });
+        // A refetch of the same conversation (a live row, on the refresh
+        // cadence) keeps where the user is: the scroll position and the
+        // match they stepped to. Rendering would reset both.
+        let keep = p
+            .transcript
+            .as_ref()
+            .filter(|tv| tv.key == key && tv.open_seq == open_seq && !tv.lines.is_empty())
+            .map(|tv| (tv.top, tv.match_idx));
+        p.transcript = Some(TranscriptView {
+            key,
+            fetched_ms: now_ms(),
+            turns,
+            open_seq,
+            top: 0,
+            width: 0,
+            lines: Vec::new(),
+            matches: Vec::new(),
+            match_idx: None,
+            capture,
+        });
+        if let Some((top, match_idx)) = keep {
+            ensure_transcript_rendered(p);
+            if let Some(tv) = p.transcript.as_mut() {
+                tv.top = top;
+                tv.match_idx = match_idx.filter(|&i| i < tv.matches.len());
+            }
+        }
         pick_render(p);
     });
 }
 
-/// The preview's size in cells: its width right of the separator, and
-/// its height below the one header line.
-fn preview_dims(p: &Picker) -> (u32, u32) {
-    let pw = (p.width as usize).saturating_sub(p.list_w() + 2).max(10) as u32;
-    let ph = (p.height as usize).saturating_sub(2).max(3) as u32;
-    (pw, ph)
+/// in the preview area: ask for it (once per highlighted row).
+fn request_capture(picker: &Rc<RefCell<Option<Picker>>>) {
+    let want = {
+        let b = picker.borrow();
+        let Some(p) = b.as_ref() else { return };
+        let Some(a) = p.selected() else { return };
+        if a.is_local() || p.local_pane_of(a).is_some() {
+            return;
+        }
+        let key = a.key();
+        if p.remote_capture.as_ref().is_some_and(|(k, _)| *k == key) {
+            return;
+        }
+        (key, a.server.clone(), a.id.clone(), p.mode)
+    };
+    let picker = Rc::clone(picker);
+    spawn(async move {
+        let (key, server, id, mode) = want;
+        let target = format!("@{server}");
+        let req = provider::CaptureReq { id };
+        let text = match service::call(&target, "capture", &serde_json::to_vec(&req).unwrap_or_default()).await {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(e) => format!("(no capture: {})", e.message),
+        };
+        let mut b = picker.borrow_mut();
+        let Some(p) = b.as_mut() else { return };
+        if p.mode.0 != mode.0 {
+            return;
+        }
+        let lines = text.lines().map(str::to_string).collect();
+        p.remote_capture = Some((key, lines));
+        pick_render(p);
+    });
 }
 
 pub async fn apply_life(
@@ -1638,10 +1641,17 @@ pub fn on_mode_nav(
         match dir.as_str() {
             "left" => {
                 p.preview_focus = false;
+                p.transcript_focus = false;
                 pick_render(p);
             }
             "right" => {
-                ack = focus_preview(p);
+                if transcript_shown(p) {
+                    p.transcript_focus = true;
+                    ensure_transcript_rendered(p);
+                    pick_render(p);
+                } else {
+                    ack = focus_preview(p);
+                }
             }
             "up" | "down" => {
                 let typing = p.preview_focus;
@@ -1744,8 +1754,8 @@ fn dispatch_key(
                 p.preview_focus = false;
                 pick_render(p);
             } else {
-                match preview_pane_of_selection(p) {
-                    Some(pane) => after = PickAfter::Type(pane, key.clone(), client),
+                match live_pane_of_selection(p) {
+                    Some(pane) => after = PickAfter::Type(pane, key.clone()),
                     None => {
                         // The pane went away under the prompt: say so,
                         // rather than typing into nothing.
@@ -1755,6 +1765,10 @@ fn dispatch_key(
                     }
                 }
             }
+        } else if p.transcript_focus {
+            // The conversation has the keyboard: scroll it, step through
+            // its matches, or hand the keyboard back.
+            transcript_key(p, &key, is_up, is_down);
         } else if p.composing {
             // Compose mode: keys are text, except accept / cancel.
             if key == k.close {
@@ -1923,6 +1937,18 @@ fn dispatch_key(
                 "preview: pane".into()
             });
             pick_render(p);
+        } else if key == "[" || key == "]" {
+            if transcript_shown(p) {
+                let step = (p.height as usize).saturating_sub(2).max(2) / 2;
+                if let Some(tv) = p.transcript.as_mut() {
+                    tv.top = if key == "[" {
+                        tv.top.saturating_sub(step)
+                    } else {
+                        tv.top.saturating_add(step)
+                    };
+                }
+                pick_render(p);
+            }
         } else if key == k.rename {
             if let Some(a) = p.selected() {
                 p.rename_buf = a.user_name.clone().unwrap_or_default();
@@ -1940,10 +1966,16 @@ fn dispatch_key(
         } else if key == k.jump {
             after = jump_after(p, &mut ack);
         } else if key == k.focus || key == "Right" {
-            // Right, into the preview: the keyboard goes with it - to the
-            // agent's pane, or to the conversation's copy mode when that
-            // is what the preview shows.
-            ack = focus_preview(p);
+            // Right, into the preview: the keyboard goes with it. To the
+            // conversation when that is what the preview shows (a finished
+            // agent, or Tab on a live one); else to the pane.
+            if transcript_shown(p) {
+                p.transcript_focus = true;
+                ensure_transcript_rendered(p);
+                pick_render(p);
+            } else {
+                ack = focus_preview(p);
+            }
         } else if key == "h" || key == "Left" {
             // Left of the list is nothing; the key is spent so that it
             // is never mistaken for text. (`h` used to fold in history.)
@@ -2047,15 +2079,11 @@ fn dispatch_key(
     request_preview(picker);
     match after {
         PickAfter::None => {}
-        PickAfter::Type(pane, key, client) => {
+        PickAfter::Type(pane, key) => {
             // Synchronous, like the interrupt: one key into the pane.
             // Then hurry the preview along - the host re-blits it every
             // 500ms, which is fine for watching and too slow for typing.
-            let sent = match client {
-                Some(c) => send_key_from(PaneId(pane), &key, c),
-                None => send_key(PaneId(pane), &key),
-            };
-            match sent {
+            match send_key(PaneId(pane), &key) {
                 Ok(()) => poke_preview(picker),
                 Err(e) => {
                     if let Some(p) = picker.borrow_mut().as_mut() {
@@ -2351,20 +2379,10 @@ fn jump_after(p: &mut Picker, ack: &mut Option<(String, String)>) -> PickAfter {
 /// the keyboard acknowledges an unread row, as jumping to it would: you
 /// are about to talk to it. Returns the row to acknowledge.
 fn focus_preview(p: &mut Picker) -> Option<(String, String)> {
-    if preview_pane_of_selection(p).is_none() {
+    if live_pane_of_selection(p).is_none() {
         p.status = Some(unreachable_reason(p));
         pick_render(p);
         return None;
-    }
-    // Into the conversation: make sure its copy mode is on (the user
-    // may have left it with q last time).
-    if convo_shown(p) {
-        if let Some(c) = p.convo.as_ref() {
-            let pane = c.pane;
-            spawn(async move {
-                let _ = run_command(format!("copy-mode -t %{pane}")).await;
-            });
-        }
     }
     // Whatever was being typed into the picker itself is abandoned; the
     // keyboard cannot be in two places.
@@ -2407,13 +2425,20 @@ fn mouse_key(
         "MouseDown1Pane" | "DoubleClick1Pane" => {
             if !in_list {
                 if x > list_w {
-                    *ack = focus_preview(p);
+                    if transcript_shown(p) {
+                        p.transcript_focus = true;
+                        ensure_transcript_rendered(p);
+                        pick_render(p);
+                    } else {
+                        *ack = focus_preview(p);
+                    }
                 }
                 return false;
             }
             if p.preview_focus {
                 p.preview_focus = false;
             }
+            p.transcript_focus = false;
             // The search line: a click there focuses the box, as `/`.
             if y == 1 {
                 p.filtering = true;
@@ -2448,14 +2473,15 @@ fn mouse_key(
             // back first: a cursor that moves while the preview types
             // would send the rest of the prompt to another agent.
             p.preview_focus = false;
+            p.transcript_focus = false;
             move_sel(p, if base == "WheelUpPane" { -1 } else { 1 });
             true
         }
-        "WheelUpPane" | "WheelDownPane" if convo_shown(p) => {
-            // Over the conversation: scroll its copy mode.
-            if let Some(c) = p.convo.as_ref() {
-                let _ = send_key(PaneId(c.pane), if base == "WheelUpPane" { "C-y" } else { "C-e" });
-            }
+        "WheelUpPane" | "WheelDownPane" if transcript_shown(p) => {
+            // Over the conversation: scroll it.
+            ensure_transcript_rendered(p);
+            scroll_transcript(p, if base == "WheelUpPane" { -3 } else { 3 });
+            pick_render(p);
             false
         }
         _ => false,
@@ -3077,11 +3103,10 @@ fn local_hit_details(needle: String, missing: Vec<String>, windows: Vec<(String,
             pick_reshow(p, keep, false);
             pick_render(p);
         });
-        // The highlighted row may now be a hit: its conversation is
-        // searched for the query.
+        // The highlighted row may now be a hit with a turn to open on.
         PICKER.with(|cell| {
             if let Some(picker) = cell.borrow().clone() {
-                request_convo(&picker);
+                request_transcript(&picker);
             }
         });
     });
@@ -3531,7 +3556,7 @@ pub fn pick_render(p: &mut Picker) {
     // Vertical separator between the list and the preview. It lights up
     // while the preview has the keyboard: the one mark on screen that
     // says which side your keys are going to.
-    let sep = if p.preview_focus { "\x1b[1;36m┃" } else { "\x1b[2m│" };
+    let sep = if p.preview_focus || p.transcript_focus { "\x1b[1;36m┃" } else { "\x1b[2m│" };
     for r in 1..=h {
         out.push_str(&format!("\x1b[{r};{c}H{sep}\x1b[0m", c = list_w + 1));
     }
@@ -3549,11 +3574,8 @@ pub fn pick_render(p: &mut Picker) {
     } else {
         format!("{} contents", pretty_key(&k.content))
     };
-    let footer = if p.preview_focus && convo_shown(p) {
-        format!(
-            "copy mode · n/N next/prev match · j/k C-u C-d scroll · v y select/yank · {} back to list",
-            pretty_key(&k.unfocus)
-        )
+    let footer = if p.transcript_focus {
+        "j/k scroll · n/N match · g/G top/end · Space/b page · Tab pane · Esc back to list".to_string()
     } else if p.preview_focus {
         // Every key goes to the pane, so the footer can promise only one
         // thing about the keyboard: how to get it back.
@@ -3603,23 +3625,21 @@ pub fn pick_render(p: &mut Picker) {
     // row's conversation (a finished agent, or a live one with Tab); else
     // the provider's captured text for a remote row with no mirror here.
     let rect = preview_rect(p, list_w);
-    if convo_shown(p) && !p.local_pane_or_hidden() {
-        // The conversation: one header line of ours, the copy-mode
-        // screen of the scratch pane blitted below it.
+    if rect.is_none() {
         let x = list_w + 2;
         let pw = w.saturating_sub(list_w + 2);
-        let items = p.convo.as_ref().map(|c| c.items).unwrap_or(0);
-        let live = live_pane_of_selection(p).is_some();
-        let hint = if p.preview_focus {
-            ""
-        } else if live {
-            " · Tab pane · l or click: keys to copy mode"
-        } else {
-            " · l or click: keys to copy mode"
-        };
-        let header = format!("conversation · {items} turns{hint}");
-        let sgr = if p.preview_focus { "\x1b[1;36m" } else { "\x1b[2m" };
-        out.push_str(&format!("\x1b[1;{x}H{sgr}{}\x1b[0m", clip(&header, pw)));
+        let ph = h.saturating_sub(1);
+        if transcript_shown(p) {
+            draw_transcript(p, &mut out, x, pw, ph);
+        } else if let Some(text) = remote_preview_lines(p) {
+            for (i, line) in text.iter().rev().take(ph).rev().enumerate() {
+                out.push_str(&format!(
+                    "\x1b[{};{x}H{}",
+                    i + 1,
+                    clip(&strip_sgr(line), pw)
+                ));
+            }
+        }
     }
 
     let _ = mode_write(p.mode, out.as_bytes());
@@ -3627,10 +3647,136 @@ pub fn pick_render(p: &mut Picker) {
 }
 
 /// Does the preview show the highlighted row's conversation? Only once
-/// it is in the scratch pane.
-fn convo_shown(p: &Picker) -> bool {
+/// its turns (or a stand-in capture) have arrived for that row.
+fn transcript_shown(p: &Picker) -> bool {
     let Some(a) = p.selected() else { return false };
-    p.convo.as_ref().is_some_and(|c| c.key == a.key())
+    p.transcript
+        .as_ref()
+        .is_some_and(|tv| tv.key == a.key() && (!tv.turns.is_empty() || !tv.capture.is_empty()))
+}
+
+/// Draw the conversation into the preview area: a header line, then the
+/// rendered turns from the scroll position.
+fn draw_transcript(p: &mut Picker, out: &mut String, x: usize, pw: usize, ph: usize) {
+    let live = live_pane_of_selection(p).is_some();
+    let focused = p.transcript_focus;
+    ensure_transcript_rendered_for(p, pw);
+    let Some(tv) = p.transcript.as_mut() else { return };
+    let body = ph.saturating_sub(1);
+    let max_top = tv.lines.len().saturating_sub(body);
+    if tv.top > max_top {
+        tv.top = max_top;
+    }
+    let what = if tv.turns.is_empty() {
+        "last screen".to_string()
+    } else {
+        format!("{} turns", tv.turns.len())
+    };
+    let matches = match (tv.matches.len(), tv.match_idx) {
+        (0, _) => String::new(),
+        (n, Some(i)) => format!(" · match {}/{n}", i + 1),
+        (n, None) => format!(" · {n} matches"),
+    };
+    let hint = if focused {
+        " · Esc back"
+    } else if live {
+        " · Tab pane · click or l to scroll"
+    } else {
+        " · click or l to scroll"
+    };
+    let header = format!("conversation · {what}{matches}{hint}");
+    let sgr = if focused { "\x1b[1;36m" } else { "\x1b[2m" };
+    out.push_str(&format!("\x1b[1;{x}H{sgr}{}\x1b[0m", clip(&header, pw)));
+    for (i, line) in tv.lines.iter().skip(tv.top).take(body).enumerate() {
+        out.push_str(&format!("\x1b[{};{x}H{line}", i + 2));
+    }
+}
+
+/// Render the conversation for the preview's current width, if it is
+/// not already.
+fn ensure_transcript_rendered(p: &mut Picker) {
+    let pw = (p.width as usize).saturating_sub(p.list_w() + 2);
+    ensure_transcript_rendered_for(p, pw);
+}
+
+fn ensure_transcript_rendered_for(p: &mut Picker, pw: usize) {
+    let (terms, _) = index::query_terms(&p.transcript_query);
+    if let Some(tv) = p.transcript.as_mut() {
+        if tv.width != pw || tv.lines.is_empty() {
+            render_transcript(tv, pw, &terms);
+        }
+    }
+}
+
+/// Scroll the conversation by `delta` rendered lines, clamped.
+fn scroll_transcript(p: &mut Picker, delta: i64) {
+    let body = (p.height as usize).saturating_sub(2).max(1);
+    if let Some(tv) = p.transcript.as_mut() {
+        let max_top = tv.lines.len().saturating_sub(body);
+        let t = (tv.top as i64 + delta).clamp(0, max_top as i64);
+        tv.top = t as usize;
+    }
+}
+
+/// A key while the conversation has the keyboard.
+fn transcript_key(p: &mut Picker, key: &str, is_up: bool, is_down: bool) {
+    let page = (p.height as usize).saturating_sub(2).max(2) as i64;
+    ensure_transcript_rendered(p);
+    match key {
+        "Escape" | "q" | "h" | "Left" => {
+            p.transcript_focus = false;
+        }
+        "Tab" => {
+            // Back to the pane (a live row): the keyboard goes with it
+            // to the list, the pane being where typing would go.
+            p.show_transcript = false;
+            p.transcript_focus = false;
+        }
+        "j" | "Down" | "C-n" | "C-j" | "Enter" => scroll_transcript(p, 1),
+        "k" | "Up" | "C-p" | "C-k" => scroll_transcript(p, -1),
+        "Space" | "PageDown" | "C-d" | "]" => scroll_transcript(p, page / 2),
+        "b" | "PageUp" | "C-u" | "[" => scroll_transcript(p, -(page / 2)),
+        "g" | "Home" => {
+            if let Some(tv) = p.transcript.as_mut() {
+                tv.top = 0;
+            }
+        }
+        "G" | "End" => {
+            if let Some(tv) = p.transcript.as_mut() {
+                tv.top = usize::MAX; // clamped when drawn
+            }
+        }
+        "n" | "N" => {
+            let forward = key == "n";
+            if let Some(tv) = p.transcript.as_mut() {
+                if !tv.matches.is_empty() {
+                    let n = tv.matches.len();
+                    let i = match tv.match_idx {
+                        None => {
+                            // The first match below the top (or above, for N).
+                            if forward {
+                                tv.matches.iter().position(|&l| l > tv.top).unwrap_or(0)
+                            } else {
+                                tv.matches.iter().rposition(|&l| l < tv.top).unwrap_or(n - 1)
+                            }
+                        }
+                        Some(i) if forward => (i + 1) % n,
+                        Some(i) => (i + n - 1) % n,
+                    };
+                    tv.match_idx = Some(i);
+                    tv.top = tv.matches[i].saturating_sub(2);
+                }
+            }
+            if p.transcript.as_ref().is_some_and(|tv| tv.matches.is_empty()) {
+                p.status = Some("no matches in this conversation".into());
+            }
+        }
+        _ => {
+            let _ = (is_up, is_down);
+            return;
+        }
+    }
+    pick_render(p);
 }
 
 // ---------------------------------------------------------------------------
@@ -3642,6 +3788,7 @@ const ST_ITALIC: u8 = 2;
 const ST_CODE: u8 = 4;
 const ST_UNDER: u8 = 8;
 const ST_DIM: u8 = 16;
+const ST_HIT: u8 = 32;
 const ST_CYAN: u8 = 64;
 
 /// One cell of a rendered line: a character and its style bits.
@@ -3650,19 +3797,26 @@ type Styled = (char, u8);
 /// Lay the turns out for `width`: a prompt with a `❯` in front, in bold;
 /// the agent's text with its Markdown rendered (headings, emphasis,
 /// inline and fenced code, lists, quotes); a tool line dim; a blank line
-/// between turns. With no turns, the saved capture's lines. The search
-/// highlight is copy mode's, not ours.
-fn render_lines(turns: &[TurnRow], capture: &[String], width: usize) -> Vec<String> {
+/// between turns; the query's terms in reverse video. Remembers which
+/// lines hold a match, and opens on the first match when there is one,
+/// else on the hit's turn, else at the end.
+fn render_transcript(tv: &mut TranscriptView, width: usize, terms: &[String]) {
+    tv.width = width;
+    tv.lines.clear();
+    tv.matches.clear();
+    tv.match_idx = None;
     let width = width.max(8);
-    let mut out: Vec<String> = Vec::new();
-    if turns.is_empty() {
-        for l in capture {
-            out.push(clip(&strip_sgr(l), width));
+    let mut open_at: Option<usize> = None;
+    if tv.turns.is_empty() {
+        for l in &tv.capture {
+            tv.lines.push(clip(&strip_sgr(l), width));
         }
-        return out;
     }
     let mut cells: Vec<Vec<Styled>> = Vec::new();
-    for t in turns {
+    for t in &tv.turns {
+        if tv.open_seq >= 0 && open_at.is_none() && t.seq >= tv.open_seq {
+            open_at = Some(cells.len());
+        }
         match t.kind.as_str() {
             "user" => {
                 let body = markdown_lines(&t.text, width.saturating_sub(2), ST_BOLD);
@@ -3698,10 +3852,22 @@ fn render_lines(turns: &[TurnRow], capture: &[String], width: usize) -> Vec<Stri
     while cells.last().is_some_and(Vec::is_empty) {
         cells.pop();
     }
-    for line in cells {
-        out.push(emit_cells(&line));
+    // Highlight, remember the matching lines, emit.
+    let lower_terms: Vec<String> = terms.iter().map(|t| t.to_lowercase()).collect();
+    for mut line in cells {
+        if mark_hits(&mut line, &lower_terms) {
+            tv.matches.push(tv.lines.len());
+        }
+        tv.lines.push(emit_cells(&line));
     }
-    out
+    tv.top = match (tv.matches.first(), open_at) {
+        (Some(&m), _) if !terms.is_empty() => {
+            tv.match_idx = Some(0);
+            m.saturating_sub(2)
+        }
+        (_, Some(at)) => at,
+        _ => usize::MAX, // clamped to the end when drawn
+    };
 }
 
 /// Plain text as cells, one style throughout.
@@ -3919,6 +4085,35 @@ fn hard_wrap(cells: &[Styled], width: usize) -> Vec<Vec<Styled>> {
     cells.chunks(width).map(|c| c.to_vec()).collect()
 }
 
+/// Mark every occurrence of a term in the line (case-insensitively, on
+/// the visible text) with the hit bit. Returns whether any was marked.
+fn mark_hits(line: &mut [Styled], lower_terms: &[String]) -> bool {
+    if lower_terms.is_empty() || line.is_empty() {
+        return false;
+    }
+    let lower: Vec<char> = line.iter().map(|(c, _)| c.to_lowercase().next().unwrap_or(*c)).collect();
+    let mut any = false;
+    for t in lower_terms {
+        let tc: Vec<char> = t.chars().collect();
+        if tc.is_empty() || tc.len() > lower.len() {
+            continue;
+        }
+        let mut i = 0;
+        while i + tc.len() <= lower.len() {
+            if lower[i..i + tc.len()] == tc[..] {
+                for cell in &mut line[i..i + tc.len()] {
+                    cell.1 |= ST_HIT;
+                }
+                any = true;
+                i += tc.len();
+            } else {
+                i += 1;
+            }
+        }
+    }
+    any
+}
+
 /// Cells to a terminal line: one SGR per run of equal style.
 fn emit_cells(line: &[Styled]) -> String {
     let mut out = String::with_capacity(line.len() + 16);
@@ -3937,6 +4132,9 @@ fn emit_cells(line: &[Styled]) -> String {
             }
             if st & ST_UNDER != 0 {
                 out.push_str(";4");
+            }
+            if st & ST_HIT != 0 {
+                out.push_str(";7");
             }
             if st & ST_CODE != 0 {
                 out.push_str(";33");
@@ -3958,35 +4156,33 @@ fn emit_cells(line: &[Styled]) -> String {
 /// one), shown to the right of the list.
 fn preview_rect(p: &Picker, list_w: usize) -> Option<PreviewRect> {
     let a = p.selected()?;
+    let pane = p.local_pane_of(a)?;
+    // Tab: the conversation instead of the pane, once it has arrived (a
+    // blank preview while it loads would be worse than the pane).
+    if p.show_transcript && transcript_shown(p) {
+        return None;
+    }
     let x = (list_w + 1) as u32;
     let w = (p.width as usize).saturating_sub(list_w + 1) as u32;
     let h = p.height.saturating_sub(1);
     if w == 0 || h == 0 {
         return None;
     }
-    if let Some(pane) = p.local_pane_of(a) {
-        // Tab: the conversation instead of the pane, once it is in the
-        // scratch pane (a blank preview while it loads would be worse).
-        if !(p.show_transcript && convo_shown(p)) {
-            return Some(PreviewRect { pane: PaneId(pane), x, y: 0, w, h });
-        }
-    }
-    // The conversation's scratch pane, under our header line.
-    let c = p.convo.as_ref().filter(|c| c.key == a.key())?;
-    Some(PreviewRect { pane: PaneId(c.pane), x, y: 1, w, h: h.saturating_sub(1) })
+    Some(PreviewRect { pane: PaneId(pane), x, y: 0, w, h })
 }
 
-/// The pane the preview shows: the agent's own (local, or its mirror),
-/// or the conversation's scratch pane. Keys typed into the preview go
-/// here.
-fn preview_pane_of_selection(p: &Picker) -> Option<u32> {
+/// The captured text for the highlighted remote row, when the provider
+/// answered for it.
+fn remote_preview_lines(p: &Picker) -> Option<&Vec<String>> {
     let a = p.selected()?;
-    if let Some(pane) = p.local_pane_of(a) {
-        if !(p.show_transcript && convo_shown(p)) {
-            return Some(pane);
-        }
+    if a.is_local() {
+        return None;
     }
-    p.convo.as_ref().filter(|c| c.key == a.key()).map(|c| c.pane)
+    let (key, lines) = p.remote_capture.as_ref()?;
+    if *key != a.key() {
+        return None;
+    }
+    Some(lines)
 }
 
 /// Drop SGR escape sequences so the reverse-video selection line does not
@@ -4054,16 +4250,20 @@ mod render_tests {
     }
 
     #[test]
-    fn wrapping_and_emit() {
+    fn wrapping_and_hits() {
         let cells = inline_cells("alpha beta gamma delta", 0);
         let lines = wrap_cells(&cells, 11);
         let t: Vec<String> = lines.iter().map(|l| text(l)).collect();
         assert_eq!(t, vec!["alpha beta", "gamma delta"]);
         let long = inline_cells("abcdefghijkl", 0);
         assert_eq!(wrap_cells(&long, 5).len(), 3);
-        let line = inline_cells("The **DFlash2** bench", 0);
+        let mut line = inline_cells("The DFlash2 bench and dflash2 again", 0);
+        assert!(mark_hits(&mut line, &["dflash2".to_string()]));
+        let hit: String = line.iter().filter(|c| c.1 & ST_HIT != 0).map(|c| c.0).collect();
+        assert_eq!(hit, "DFlash2dflash2");
+        assert!(!mark_hits(&mut line, &["zzz".to_string()]));
         let out = emit_cells(&line);
-        assert!(out.contains("\x1b[0;1m") && out.ends_with("\x1b[0m"));
-        assert_eq!(strip_sgr(&out), "The DFlash2 bench");
+        assert!(out.contains("\x1b[0;7m") && out.ends_with("\x1b[0m"));
+        assert_eq!(strip_sgr(&out), "The DFlash2 bench and dflash2 again");
     }
 }

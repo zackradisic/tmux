@@ -975,16 +975,6 @@ fn register_imports(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
         }))
     })?;
 
-    linker.func_wrap(m, im::SEND_KEYS_FROM, |mut c: Caller<'_, StoreData>, pane: i32, keys_ptr: i32, keys_len: i32, literal: i32, client: i64| -> i32 {
-        ret_i32(with_mem(&mut c, |mem| {
-            dispatch::send_keys_from(mem, pane, keys_ptr, keys_len, literal, client)
-        }))
-    })?;
-
-    linker.func_wrap(m, im::PANE_FEED, |mut c: Caller<'_, StoreData>, pane: i32, data_ptr: i32, data_len: i32| -> i32 {
-        ret_i32(with_mem(&mut c, |mem| dispatch::pane_feed(mem, pane, data_ptr, data_len)))
-    })?;
-
     linker.func_wrap(m, im::CAPTURE_PANE, |mut c: Caller<'_, StoreData>, pane: i32, start: i32, end: i32, escapes: i32, out: i32, cap: i32, len_out: i32| -> i32 {
         ret_i32(with_mem(&mut c, |mem| {
             dispatch::capture_pane(mem, pane, start, end, escapes, out, cap, len_out)

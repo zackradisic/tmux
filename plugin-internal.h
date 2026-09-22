@@ -76,10 +76,6 @@ int64_t	 plugin_vtable_obj_relation(int, u_int, u_int);
 int	 plugin_vtable_format_expand(int, u_int, const char *, pgh_sink,
 	     void *);
 int	 plugin_vtable_send_keys(u_int, const char *, int);
-int	 plugin_vtable_send_keys_from(u_int, const char *, int, u_int);
-void	 plugin_vtable_pane_key(struct window_pane *, struct client *,
-	     struct session *, struct winlink *, key_code);
-int	 plugin_vtable_pane_feed(u_int, const u_char *, size_t);
 int	 plugin_vtable_capture_pane(u_int, int, int, int, pgh_sink, void *);
 int	 plugin_vtable_pane_env(u_int, const char *, pgh_sink, void *);
 int	 plugin_vtable_pane_fds(u_int, pgh_sink, void *);

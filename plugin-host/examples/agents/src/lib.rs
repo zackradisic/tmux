@@ -69,12 +69,10 @@
 //! so the answer is inside the keystroke. See `transcript.rs` and
 //! `index.rs`; the formats live in the host (`transcript_extract`). A
 //! finished agent's preview shows that conversation with its Markdown
-//! rendered, in a scratch pane's COPY MODE with the query as the search:
-//! tmux highlights the matches and `n`/`N` step through them, and every
-//! copy-mode key of yours works (scroll, select, yank, your own bindings
-//! for a file path under the cursor). `Tab` shows it for a live agent too,
-//! in place of its pane. `l`, Right or a click on it gives it the
-//! keyboard; the unfocus key or Left gives it back. See `convo.rs`.
+//! rendered, opened on the match; `Tab` shows it for a live one too, in
+//! place of its pane. `l`, Right or a click on it gives it the keyboard:
+//! `j`/`k` scroll, `n`/`N` step through the matches, `g`/`G` top and end,
+//! Esc back to the list.
 //!
 //! An agent that stopped for you and you have not gotten to yet is
 //! UNREAD: it entered `needs_input` or `waiting` more recently than your
@@ -163,10 +161,8 @@
 //!   claude = "IS_SANDBOX=1 claude --dangerously-skip-permissions"
 //!   claude-opus = "claude --dangerously-skip-permissions --model opus"
 //!
-//! `send-keys` is the picker's interrupt, its typing into the preview,
-//! and the conversation preview's scratch pane (fed with `pane_feed`,
-//! keys forwarded into its copy mode; see `convo.rs`); `run-process` and
-//! `fs-read-any` are the new-agent form's completion
+//! `send-keys` is the picker's interrupt and its typing into the preview;
+//! `run-process` and `fs-read-any` are the new-agent form's completion
 //! (`formkit::complete::CAPS`, with `fs-list`).
 //!
 //! The scoped lists (the variables env-read may read, the directories
@@ -184,7 +180,6 @@ use std::rc::Rc;
 use serde::Deserialize;
 use tmux_plugin_sdk::prelude::*;
 
-mod convo;
 mod index;
 mod newagent;
 mod provider;
@@ -588,9 +583,6 @@ impl Plugin for Agents {
                         cancel(t);
                     }
                     *b = None;
-                    // The conversation pane's scratch session goes with
-                    // the picker.
-                    ctx.spawn(convo::teardown());
                 }
             }
             _ => {}

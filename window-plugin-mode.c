@@ -204,7 +204,7 @@ window_plugin_key(struct window_mode_entry *wme, struct client *c,
 	plugin_event_send_mode(pb, data->mode_id);
 }
 
-/* Blit the preview source's visible screen into the retained rect. */
+/* Blit the preview source's live grid into the retained rect. */
 static void
 window_plugin_draw_preview(struct window_mode_entry *wme)
 {
@@ -242,15 +242,9 @@ window_plugin_draw_preview(struct window_mode_entry *wme)
 		return;
 	}
 
-	/*
-	 * What the pane is showing, not its base grid: a pane in copy mode
-	 * shows the copy-mode screen (its scrollback position, search
-	 * highlights, cursor), and a plugin that drives copy mode on a pane
-	 * to give its preview search and scrolling needs that screen.
-	 */
 	screen_write_start(&ctx, s);
 	screen_write_cursormove(&ctx, data->preview.px, data->preview.py, 0);
-	screen_write_preview(&ctx, src->screen, nx, ny);
+	screen_write_preview(&ctx, &src->base, nx, ny);
 	screen_write_stop(&ctx);
 	wme->wp->flags |= PANE_REDRAW;
 }
