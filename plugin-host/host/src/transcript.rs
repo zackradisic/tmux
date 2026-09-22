@@ -284,7 +284,9 @@ pub fn extract_line(h: Harness, record: &[u8], off: u64, fed: &mut Fed) {
     }
 }
 
-/// Complete lines in `buf`, the first at file offset `base`.
+/// Complete lines in `buf`, the first at file offset `base`. What the
+/// tests feed; the worker hands `extract_line` one record at a time.
+#[cfg(test)]
 pub fn extract_buf(h: Harness, buf: &[u8], base: u64) -> Fed {
     let mut fed = Fed::default();
     let mut pos = 0usize;
