@@ -615,6 +615,17 @@ transcript.sh`.
   microseconds. Reverted in full (`git log` has it) - the blit change and
   the two imports would be the pieces to bring back if a copy-mode
   preview is wanted again, with `n`/`N` handled by the plugin.
+- **`i` is the info card.** In the preview column, in place of the pane
+  or the conversation: id, name (and the other party's when you renamed
+  it), harness version and model, where it runs or when it ended, cwd
+  (a live pane's current path first, else what the transcript records
+  say - Claude stamps `cwd` and `gitBranch` on every record, so dead
+  agents have it too), branch with dirty/clean from one `git status`,
+  started and last active, status, turn totals with edits/reads/commands
+  and the files touched most, the transcript path and how much of it is
+  read, and the `claude --resume` line. `y` copies the cwd; Esc or `i`
+  puts the card away. Schema v10 (`cwd`, `git_branch`, `model`); remote
+  rows get their totals from the provider's `stats`.
 
 ## Sessions and windows
 

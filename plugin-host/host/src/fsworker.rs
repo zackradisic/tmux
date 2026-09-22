@@ -835,18 +835,18 @@ fn do_extract(
     }
     let needles = harness.needles();
     let mut body: Vec<u8> = Vec::new();
-    let mut version: Option<String> = None;
+    let mut facts = tx::Fed::default();
     let mut lines_kept = 0usize;
     let mut sink = |off: u64, line: &[u8]| -> bool {
         let mut fed = tx::Fed::default();
         tx::extract_line(harness, line, off, &mut fed);
-        if version.is_none() {
-            version = fed.version.take();
-        }
         let size: usize = fed.turns.iter().map(tx::turn_size).sum();
         if lines_kept > 0 && body.len() + size > tx::BLOCK_MAX {
             return false;
         }
+        // The facts follow the consumed lines only: a line that did not
+        // fit is read again next call, facts and all.
+        facts.merge_facts(&fed);
         for t in &fed.turns {
             tx::put_turn(&mut body, t);
         }
@@ -857,8 +857,8 @@ fn do_extract(
         Ok(e) => e,
         Err(e) => return err_completion(token, ErrorCode::Host, format!("{rel}: {e}")),
     };
-    let mut data = Vec::with_capacity(body.len() + 64);
-    tx::block_header(&mut data, version.as_deref());
+    let mut data = Vec::with_capacity(body.len() + 256);
+    tx::block_header(&mut data, &facts);
     data.extend_from_slice(&body);
     Completion { token, err: 0, v0: end.cursor as i64, v1: i64::from(end.eof), data }
 }

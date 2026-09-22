@@ -354,6 +354,7 @@ pub async fn request_pane(pane: u32) {
 /// is searchable too.
 pub async fn catch_up() {
     backfill().await;
+    backfill_facts().await;
     let now = now_ms() as i64;
     let targets = store::ingest_targets(now, RECENT_MS).await.unwrap_or_default();
     for a in targets {
@@ -389,6 +390,37 @@ async fn backfill() {
     if found > 0 {
         log(&format!("agents: transcripts found for {found} rows from before the upgrade"));
         snapshot().await;
+    }
+}
+
+/// Rows whose transcript was read by a plugin from before the facts
+/// (cwd, branch, model) were kept: one read of the transcript's first
+/// block gives them - Claude stamps cwd and branch on every record and
+/// the model on the first reply - with the turns it returns ignored.
+async fn backfill_facts() {
+    let rows = store::without_facts().await.unwrap_or_default();
+    let mut filled = 0usize;
+    for a in rows {
+        let Some(path) = a.transcript_path.as_deref() else { continue };
+        if !HARNESSES.contains(&a.kind.as_str()) {
+            continue;
+        }
+        let Ok(got) = transcript_extract(path, 0, &a.kind).await else { continue };
+        if got.cwd.is_none() && got.branch.is_none() && got.model.is_none() {
+            continue;
+        }
+        let facts = store::Facts {
+            version: got.version.as_deref(),
+            cwd: got.cwd.as_deref(),
+            branch: got.branch.as_deref(),
+            model: got.model.as_deref(),
+        };
+        if store::set_facts(&a.id, &facts).await.is_ok() {
+            filled += 1;
+        }
+    }
+    if filled > 0 {
+        log(&format!("agents: cwd/branch/model found for {filled} rows from before v10"));
     }
 }
 
@@ -499,7 +531,13 @@ async fn ingest_once(id: &str) -> Result<(), ()> {
                 len: t.len as i64,
             });
         }
-        match store::insert_turns(id, &rows, got.cursor as i64, got.version.as_deref()).await {
+        let facts = store::Facts {
+            version: got.version.as_deref(),
+            cwd: got.cwd.as_deref(),
+            branch: got.branch.as_deref(),
+            model: got.model.as_deref(),
+        };
+        match store::insert_turns(id, &rows, got.cursor as i64, &facts).await {
             Ok(max_rowid) => {
                 let added = with_index(|ix| {
                     let mut added = 0;

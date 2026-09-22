@@ -24,7 +24,8 @@
 //! resume from, `v1` = eof):
 //!
 //! ```text
-//! u16 version_len | u8 version[version_len]          (the harness's, or 0)
+//! u16 len | u8 version[]  u16 len | u8 cwd[]  u16 len | u8 branch[]
+//! u16 len | u8 model[]                       (each the latest seen, or 0)
 //! per turn: u8 kind | i64 ts_ms | u64 offset | u32 len | u32 text_len |
 //!           u8 text[text_len] | u16 path_len | u8 path[path_len]
 //! kind:  0 user, 1 assistant, 2 tool        ts_ms: i64::MIN = none
@@ -111,22 +112,47 @@ pub struct Turn {
     pub len: u32,
 }
 
-/// What a batch of records yielded besides turns.
+/// What a batch of records yielded besides turns: the harness version,
+/// the working directory, the git branch and the model, each the latest
+/// the records named.
 #[derive(Debug, Default)]
 pub struct Fed {
     pub turns: Vec<Turn>,
     pub version: Option<String>,
+    pub cwd: Option<String>,
+    pub branch: Option<String>,
+    pub model: Option<String>,
+}
+
+impl Fed {
+    /// Fold another batch's facts in: the later value wins.
+    pub fn merge_facts(&mut self, other: &Fed) {
+        if other.version.is_some() {
+            self.version = other.version.clone();
+        }
+        if other.cwd.is_some() {
+            self.cwd = other.cwd.clone();
+        }
+        if other.branch.is_some() {
+            self.branch = other.branch.clone();
+        }
+        if other.model.is_some() {
+            self.model = other.model.clone();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // the block
 // ---------------------------------------------------------------------------
 
-pub fn block_header(out: &mut Vec<u8>, version: Option<&str>) {
-    let v = version.unwrap_or("").as_bytes();
-    let v = &v[..v.len().min(u16::MAX as usize)];
-    out.extend_from_slice(&(v.len() as u16).to_le_bytes());
-    out.extend_from_slice(v);
+pub fn block_header(out: &mut Vec<u8>, facts: &Fed) {
+    for s in [&facts.version, &facts.cwd, &facts.branch, &facts.model] {
+        let v = s.as_deref().unwrap_or("").as_bytes();
+        let v = &v[..v.len().min(u16::MAX as usize)];
+        out.extend_from_slice(&(v.len() as u16).to_le_bytes());
+        out.extend_from_slice(v);
+    }
 }
 
 /// The encoded size of a turn, to decide whether it fits.
@@ -320,6 +346,10 @@ struct ClRecord<'a> {
     #[serde(default, borrow)]
     version: Option<Cow<'a, str>>,
     #[serde(default, borrow)]
+    cwd: Option<Cow<'a, str>>,
+    #[serde(rename = "gitBranch", default, borrow)]
+    git_branch: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
     message: Option<ClMessage<'a>>,
 }
 
@@ -330,6 +360,8 @@ struct ClMessage<'a> {
     /// value and lose the borrow the blocks' `input` needs.
     #[serde(default, borrow)]
     content: Option<&'a RawValue>,
+    #[serde(default, borrow)]
+    model: Option<Cow<'a, str>>,
 }
 
 enum ClContent<'a> {
@@ -455,8 +487,20 @@ fn claude_line(record: &[u8], off: u64, fed: &mut Fed) {
     if fed.version.is_none() {
         fed.version = v.version.map(|s| s.into_owned());
     }
+    // The working directory and branch the harness stamps on every
+    // record, and the model an assistant record names: the latest wins.
+    if let Some(c) = v.cwd.as_deref().filter(|c| !c.is_empty()) {
+        fed.cwd = Some(c.to_string());
+    }
+    if let Some(b) = v.git_branch.as_deref().filter(|b| !b.is_empty()) {
+        fed.branch = Some(b.to_string());
+    }
     let ts_ms = v.timestamp.as_deref().and_then(parse_rfc3339_ms);
-    let Some(content) = v.message.and_then(|m| m.content).map(ClContent::parse) else {
+    let Some(message) = v.message else { return };
+    if let Some(m) = message.model.as_deref().filter(|m| !m.is_empty()) {
+        fed.model = Some(m.to_string());
+    }
+    let Some(content) = message.content.map(ClContent::parse) else {
         return;
     };
     match v.ty.as_deref() {
@@ -607,6 +651,9 @@ fn codex_line(record: &[u8], off: u64, fed: &mut Fed) {
             if fed.version.is_none() {
                 fed.version = s_field(payload, "cli_version").map(str::to_string);
             }
+            if let Some(c) = s_field(payload, "cwd") {
+                fed.cwd = Some(c.to_string());
+            }
         }
         (Some("response_item"), Some("message")) => {
             let role = payload.get("role").and_then(Value::as_str).unwrap_or("");
@@ -712,8 +759,8 @@ mod tests {
 
     #[test]
     fn claude_turns_and_offsets() {
-        let l1 = br#"{"type":"user","message":{"role":"user","content":"hello there"},"timestamp":"2026-09-16T08:20:43.045Z","version":"2.1.273"}"#;
-        let l2 = br#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"hmm"},{"type":"text","text":"I will read it."},{"type":"tool_use","name":"Read","input":{"file_path":"/a/b/c.rs"}},{"type":"tool_use","name":"Edit","input":{"file_path":"/a/b/c.rs","old_string":"x\ny","new_string":"z"}}]}}"#;
+        let l1 = br#"{"type":"user","message":{"role":"user","content":"hello there"},"timestamp":"2026-09-16T08:20:43.045Z","version":"2.1.273","cwd":"/w/proj","gitBranch":"main"}"#;
+        let l2 = br#"{"type":"assistant","message":{"role":"assistant","model":"claude-x","content":[{"type":"thinking","thinking":"hmm"},{"type":"text","text":"I will read it."},{"type":"tool_use","name":"Read","input":{"file_path":"/a/b/c.rs"}},{"type":"tool_use","name":"Edit","input":{"file_path":"/a/b/c.rs","old_string":"x\ny","new_string":"z"}}]}}"#;
         let l3 = br#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t1","type":"tool_result","content":"huge output"}]}}"#;
         let l4 = br#"{"type":"user","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>x</local-command-caveat>"}}"#;
         let l5 = br#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"<system-reminder>ignore</system-reminder>real prompt"}]}}"#;
@@ -724,6 +771,9 @@ mod tests {
         }
         let fed = extract_buf(Harness::Claude, &buf, 1000);
         assert_eq!(fed.version.as_deref(), Some("2.1.273"));
+        assert_eq!(fed.cwd.as_deref(), Some("/w/proj"));
+        assert_eq!(fed.branch.as_deref(), Some("main"));
+        assert_eq!(fed.model.as_deref(), Some("claude-x"));
         let t = &fed.turns;
         assert_eq!(t.len(), 5, "{t:?}");
         assert_eq!(t[0].kind, Kind::User);
@@ -804,11 +854,13 @@ mod tests {
             len: 9,
         };
         let mut out = Vec::new();
-        block_header(&mut out, Some("2.1.0"));
+        let facts = Fed { version: Some("2.1.0".into()), cwd: Some("/w".into()), ..Fed::default() };
+        block_header(&mut out, &facts);
         put_turn(&mut out, &t);
-        assert_eq!(out.len(), 2 + 5 + turn_size(&t));
+        // version, cwd, an empty branch, an empty model, then the turn.
+        assert_eq!(out.len(), (2 + 5) + (2 + 2) + 2 + 2 + turn_size(&t));
         assert_eq!(&out[..2], &5u16.to_le_bytes());
-        assert_eq!(out[7], 2); // kind
-        assert_eq!(&out[8..16], &i64::MIN.to_le_bytes());
+        assert_eq!(out[15], 2); // kind
+        assert_eq!(&out[16..24], &i64::MIN.to_le_bytes());
     }
 }

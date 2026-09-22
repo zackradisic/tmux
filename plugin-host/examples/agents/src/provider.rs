@@ -12,6 +12,8 @@
 //!             transcript }              with `transcript` the conversation
 //!                                       hits plus the rows they belong to)
 //!   turns   { id, from, to }         -> the stored conversation, by seq
+//!   stats   { id }                   -> Stats (what the conversation adds
+//!                                       up to, for the info card)
 //!   act     { id, verb, name? }      -> "ok" (ack | archive | unarchive | rename)
 //!
 //! and follows the `changed` topic, which carries a fresh Snapshot after
@@ -98,6 +100,12 @@ pub struct SearchReply {
     pub transcript: Vec<TranscriptHit>,
     #[serde(default)]
     pub agents: Vec<Agent>,
+}
+
+/// One agent's conversation totals, for the info card.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatsReq {
+    pub id: String,
 }
 
 /// One agent's stored conversation, turns `[from, to)` by seq.
@@ -451,6 +459,12 @@ async fn apply(a: &mut Agent, mut r: Resolved) {
         if a.transcript_path.as_deref() != Some(tp.as_str()) {
             let _ = store::set_transcript(&a.id, &tp).await;
             a.transcript_path = Some(tp);
+        }
+    }
+    if let Some(cwd) = r.cwd {
+        if a.cwd.as_deref() != Some(cwd.as_str()) {
+            let _ = store::set_cwd(&a.id, &cwd).await;
+            a.cwd = Some(cwd);
         }
     }
 }
@@ -843,7 +857,7 @@ pub fn reply_mode(reply: &SearchReply) -> SearchMode {
 /// Register the methods a view calls. Needs `service-serve`; without it
 /// the plugin still works alone on its server.
 pub fn register_services() {
-    for m in ["list", "capture", "search", "turns", "act"] {
+    for m in ["list", "capture", "search", "turns", "stats", "act"] {
         if let Err(e) = service::register(m) {
             log(&format!("agents: register {m}: {}", e.message));
             return;
@@ -917,6 +931,14 @@ pub async fn handle(req: ServiceRequest, cfg: Rc<Config>) {
             let turns: Vec<TurnRow> =
                 store::turns_range(&q.id, q.from, q.to).await.unwrap_or_default();
             let _ = req.reply_json(&turns);
+        }
+        "stats" => {
+            let Ok(q) = req.json::<StatsReq>() else {
+                let _ = req.fail("stats: bad request");
+                return;
+            };
+            let st = store::stats(&q.id).await.unwrap_or_default();
+            let _ = req.reply_json(&st);
         }
         "act" => {
             let Ok(q) = req.json::<ActReq>() else {

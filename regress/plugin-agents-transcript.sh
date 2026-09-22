@@ -12,6 +12,8 @@
 #   Tab shows the conversation in the preview in place of the live pane,
 #     with its Markdown rendered; l gives it the keyboard, n steps to the
 #     next match;
+#   i swaps the preview for the info card: where the agent ran, its
+#     directory and branch (from the transcript), what it did;
 #   after the agent's pane is killed, the same search still finds it with
 #     history off, and its preview shows the conversation.
 #
@@ -117,8 +119,8 @@ SLUG=$(printf '%s' "$HOME" | sed 's/[^A-Za-z0-9]/-/g')
 mkdir -p "$HOME/.claude/projects/$SLUG"
 T="$HOME/.claude/projects/$SLUG/$SID.jsonl"
 cat >"$T" <<'EOF'
-{"type":"user","message":{"role":"user","content":"please measure the dflash2 acceptance length on the bench box"},"timestamp":"2026-09-16T08:20:43.045Z","version":"2.1.273","sessionId":"x"}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Running the drafter benchmark now.\n\n## Plan\n\n- warm up the **acceptance** counter\n- read `run.py`\n\n```python\nk = 8\n```\n\n| k | AL |\n|--:|:---|\n| 4 | 3.1 |\n| 16 | 3.9 |"},{"type":"tool_use","name":"Edit","input":{"file_path":"/x/bench/run.py","old_string":"k=4","new_string":"k=8\nverbose=True"}}]},"timestamp":"2026-09-16T08:20:50.000Z"}
+{"type":"user","message":{"role":"user","content":"please measure the dflash2 acceptance length on the bench box"},"timestamp":"2026-09-16T08:20:43.045Z","version":"2.1.273","sessionId":"x","cwd":"/work/bench-box","gitBranch":"feature/dflash"}
+{"type":"assistant","message":{"role":"assistant","model":"claude-test-1","content":[{"type":"text","text":"Running the drafter benchmark now.\n\n## Plan\n\n- warm up the **acceptance** counter\n- read `run.py`\n\n```python\nk = 8\n```\n\n| k | AL |\n|--:|:---|\n| 4 | 3.1 |\n| 16 | 3.9 |"},{"type":"tool_use","name":"Edit","input":{"file_path":"/x/bench/run.py","old_string":"k=4","new_string":"k=8\nverbose=True"}}]},"timestamp":"2026-09-16T08:20:50.000Z"}
 {"type":"user","message":{"role":"user","content":[{"tool_use_id":"t1","type":"tool_result","content":"a very long tool result that must never be stored"}]},"timestamp":"2026-09-16T08:20:51.000Z"}
 EOF
 
@@ -191,6 +193,20 @@ keys n
 screen | grep -q 'match 1/2' || fail "n did not wrap to the first match"
 keys Escape
 screen | grep -q 'Esc back to list' && fail "Esc did not give the keyboard back"
+# i: the info card in place of the preview, from the row and the store.
+keys i
+sleep 0.8
+shot "i: the info card"
+screen | grep -q 'harness  *claude 2.1.273 · claude-test-1' || fail "the card lacks harness and model"
+# A live pane's current path outranks what the transcript says.
+screen | grep -q 'cwd  */' || fail "the card lacks the working directory"
+screen | grep -q 'branch  *feature/dflash' || fail "the card lacks the branch"
+screen | grep -q 'turns  *1 prompts · 1 replies · 1 tool calls (1 edits' || fail "the card lacks the turn counts"
+screen | grep -q 'files  *run.py' || fail "the card lacks the files touched"
+screen | grep -q 'resume  *claude --resume 25a936a2' || fail "the card lacks the resume line"
+# i again: the conversation is back.
+keys i
+screen | grep -q 'conversation · 3 turns' || fail "i did not bring the conversation back"
 close_picker
 
 # The agent dies. Its pane goes, the row ends, the rest of the transcript
@@ -219,6 +235,16 @@ shot "killed agent found, preview is its conversation"
 # No pane to blit: the preview is the conversation, opened on the hit.
 screen | grep -q 'conversation · 3 turns' || fail "a finished agent's preview is not its conversation"
 screen | grep -q 'Running the drafter benchmark' || fail "the reply is not in the preview"
+# The card of a dead agent: when it ended, and the transcript's cwd.
+keys i
+sleep 0.8
+screen | grep -q 'where  *ended .* ago (closed)' || fail "the card does not say when the agent ended"
+# A live Claude's session file names its cwd, and that is what is kept
+# (here the fake home; the fixture's records say /work/bench-box, which a
+# real transcript would agree with).
+screen | grep -q 'cwd  *[/~]' || fail "the dead agent's card lacks a working directory"
+keys Escape
+screen | grep -q 'conversation · 3 turns' || fail "Esc did not put the card away"
 
 cleanup
 exit 0

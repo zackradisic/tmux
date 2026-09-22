@@ -113,7 +113,8 @@ never file content or a tool's output). The completion carries:
 ```
 v0:   cursor - the offset after the last record consumed, kept or skipped
 v1:   eof
-data: u16 version_len | u8 version[]            (the harness's, or 0)
+data: u16 len | u8 version[]  u16 len | u8 cwd[]  u16 len | u8 branch[]
+      u16 len | u8 model[]     (each the latest the records named, or 0)
       per turn: u8 kind | i64 ts_ms | u64 offset | u32 len |
                 u32 text_len | u8 text[] | u16 path_len | u8 path[]
       kind: 0 user, 1 assistant, 2 tool;  ts_ms: i64::MIN = none

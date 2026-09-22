@@ -21,8 +21,8 @@ use tmux_plugin_sdk::abi::ErrorCode;
 use tmux_plugin_sdk::prelude::*;
 
 use crate::index;
-use crate::provider::{self, mode_label, run_content_search, ListReq, Snapshot, TurnsReq};
-use crate::store::{self, Agent, TurnRow, LOCAL};
+use crate::provider::{self, mode_label, run_content_search, ListReq, Snapshot, StatsReq, TurnsReq};
+use crate::store::{self, Agent, Stats, TurnRow, LOCAL};
 use crate::transcript::{self, TranscriptHit};
 use crate::{Config, PickKeys, HISTORY_MAX};
 
@@ -661,6 +661,21 @@ pub struct Picker {
     /// The keyboard belongs to the conversation in the preview: keys
     /// scroll it and step through its matches (see `dispatch_key`).
     pub transcript_focus: bool,
+    /// Show the info card for the highlighted row in the preview (`i`).
+    pub show_info: bool,
+    /// The card's fetched half, for the row it was fetched for.
+    pub info: Option<InfoCard>,
+}
+
+/// What the info card fetches beyond the row itself.
+pub struct InfoCard {
+    pub key: String,
+    pub fetched_ms: u64,
+    pub stats: Option<Stats>,
+    /// A live local pane's directory right now (fresher than the store).
+    pub live_cwd: Option<String>,
+    /// `git status` says the tree has changes (local rows with a cwd).
+    pub dirty: Option<bool>,
 }
 
 /// A conversation rendered for the preview.
@@ -1059,6 +1074,8 @@ pub async fn pick_open(
         transcript: None,
         show_transcript: false,
         transcript_focus: false,
+        show_info: false,
+        info: None,
     };
     p.roster_len = p.rows.len();
     pick_refilter(&mut p);
@@ -1174,6 +1191,68 @@ async fn refresh_timer(
 fn request_preview(picker: &Rc<RefCell<Option<Picker>>>) {
     request_transcript(picker);
     request_capture(picker);
+    request_info(picker);
+}
+
+/// The info card is up: fetch what it shows beyond the row - the
+/// conversation's totals (from the store, or a remote provider's
+/// `stats`), a live local pane's directory, and whether that directory
+/// has uncommitted changes. Once per row; a live row again on the
+/// refresh cadence.
+fn request_info(picker: &Rc<RefCell<Option<Picker>>>) {
+    let want = {
+        let b = picker.borrow();
+        let Some(p) = b.as_ref() else { return };
+        if !p.show_info {
+            return;
+        }
+        let Some(a) = p.selected() else { return };
+        let key = a.key();
+        let fresh_for = if a.live() { REFRESH_MS } else { u64::MAX };
+        if p.info.as_ref().is_some_and(|c| {
+            c.key == key && now_ms().saturating_sub(c.fetched_ms) < fresh_for
+        }) {
+            return;
+        }
+        let local_pane = if a.is_local() { p.local_pane_of(a) } else { None };
+        (key, a.server.clone(), a.id.clone(), a.is_local(), local_pane, a.cwd.clone(), p.mode)
+    };
+    let picker = Rc::clone(picker);
+    spawn(async move {
+        let (key, server, id, local, local_pane, cwd, mode) = want;
+        let stats = if local {
+            store::stats(&id).await.ok()
+        } else {
+            service::call_json::<_, Stats>(&format!("@{server}"), "stats", &StatsReq { id: id.clone() })
+                .await
+                .ok()
+        };
+        let live_cwd = local_pane.and_then(|pane| {
+            format_expand(OptionTarget::Pane(PaneId(pane)), "#{pane_current_path}")
+                .ok()
+                .filter(|s| !s.is_empty())
+        });
+        // Dirty? One git status, only for a local row whose directory we
+        // know, and only when the path is plain enough to quote.
+        let dir = live_cwd.clone().or(cwd);
+        let dirty = match dir.filter(|_| local) {
+            Some(d) if !d.contains('\'') => run_job(
+                format!("git -C '{d}' status --porcelain --untracked-files=no 2>/dev/null | head -c 1"),
+                None,
+            )
+            .await
+            .ok()
+            .map(|j| !j.output.is_empty()),
+            _ => None,
+        };
+        let mut b = picker.borrow_mut();
+        let Some(p) = b.as_mut() else { return };
+        if p.mode.0 != mode.0 {
+            return;
+        }
+        p.info = Some(InfoCard { key, fetched_ms: now_ms(), stats, live_cwd, dirty });
+        pick_render(p);
+    });
 }
 
 /// The highlighted row shows its conversation in the preview (no live
@@ -1487,6 +1566,7 @@ async fn open_menu(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>) {
             items.push_str(&menu_item("mark read", &k.read, stopped && a.unread()));
             items.push_str(&menu_item("mark unread", &k.unread, stopped && !a.unread()));
             items.push_str(&menu_item("copy id", &k.copy, durable_id(a).is_some()));
+            items.push_str(&menu_item("info", "i", true));
             items.push_str(&menu_item("rename", &k.rename, true));
             items.push_str(" ''");
             let band = if flagged { "move to waiting" } else { "flag: needs input" };
@@ -1865,9 +1945,12 @@ fn dispatch_key(
                 pick_render(p);
             }
         } else if key == k.close || key == "q" {
-            // Esc or q cancels a pending selection first; a second press,
-            // with nothing marked, closes the picker.
-            if p.marked.is_empty() {
+            // Esc or q puts the info card away first, then cancels a
+            // pending selection; with neither, it closes the picker.
+            if p.show_info {
+                p.show_info = false;
+                pick_render(p);
+            } else if p.marked.is_empty() {
                 after = PickAfter::Close(p.mode);
             } else {
                 p.marked.clear();
@@ -1929,6 +2012,23 @@ fn dispatch_key(
             pick_render(p);
         } else if key == k.content {
             toggle_content(p);
+        } else if key == "i" {
+            // The info card in place of the preview, and back.
+            p.show_info = !p.show_info;
+            pick_render(p);
+        } else if key == "y" && p.show_info {
+            // Copy the working directory, the way c copies the id.
+            let cwd = p
+                .info
+                .as_ref()
+                .and_then(|c| c.live_cwd.clone())
+                .or_else(|| p.selected().and_then(|a| a.cwd.clone()));
+            match cwd {
+                Some(d) if !d.contains('\'') => after = PickAfter::Copy(d),
+                Some(_) => p.status = Some("that path has a quote I will not paste".into()),
+                None => p.status = Some("no working directory known".into()),
+            }
+            pick_render(p);
         } else if key == "Tab" {
             // The highlighted live row's conversation in place of its
             // pane, and back. A row with no pane shows it anyway.
@@ -3576,7 +3676,9 @@ pub fn pick_render(p: &mut Picker) {
     } else {
         format!("{} contents", pretty_key(&k.content))
     };
-    let footer = if p.transcript_focus {
+    let footer = if p.show_info {
+        format!("i back · {} jump · {} copy id · y copy cwd · Esc back", keyname(&k.jump), keyname(&k.copy))
+    } else if p.transcript_focus {
         "j/k scroll · n/N match · g/G top/end · Space/b page · Tab pane · Esc back to list".to_string()
     } else if p.preview_focus {
         // Every key goes to the pane, so the footer can promise only one
@@ -3631,7 +3733,9 @@ pub fn pick_render(p: &mut Picker) {
         let x = list_w + 2;
         let pw = w.saturating_sub(list_w + 2);
         let ph = h.saturating_sub(1);
-        if transcript_shown(p) {
+        if p.show_info {
+            draw_info(p, &mut out, x, pw, ph);
+        } else if transcript_shown(p) {
             draw_transcript(p, &mut out, x, pw, ph);
         } else if let Some(text) = remote_preview_lines(p) {
             for (i, line) in text.iter().rev().take(ph).rev().enumerate() {
@@ -3655,6 +3759,150 @@ fn transcript_shown(p: &Picker) -> bool {
     p.transcript
         .as_ref()
         .is_some_and(|tv| tv.key == a.key() && (!tv.turns.is_empty() || !tv.capture.is_empty()))
+}
+
+/// The info card: everything the roster knows about the highlighted
+/// agent, as labelled lines. The row's own facts draw at once; the
+/// fetched half (`InfoCard`) fills in when it lands.
+fn draw_info(p: &Picker, out: &mut String, x: usize, pw: usize, ph: usize) {
+    let Some(a) = p.selected() else { return };
+    let card = p.info.as_ref().filter(|c| c.key == a.key());
+    let home = home_dir().ok().filter(|h| !h.is_empty());
+    let tilde = |path: &str| -> String {
+        match &home {
+            Some(h) if path.starts_with(h.as_str()) => format!("~{}", &path[h.len()..]),
+            _ => path.to_string(),
+        }
+    };
+    let mut rows: Vec<(&str, String)> = Vec::new();
+    // Name: the shown one, and the other party's when both exist.
+    let shown = display_name(a);
+    let other = match (a.user_name.as_deref(), a.name.as_deref()) {
+        (Some(u), Some(h)) if u != h => {
+            if shown == u { format!("  (harness: {h})") } else { format!("  (you: {u})") }
+        }
+        _ => String::new(),
+    };
+    rows.push(("name", format!("{shown}{other}")));
+    let mut harness = a.kind.clone();
+    if let Some(v) = a.harness_version.as_deref() {
+        harness.push(' ');
+        harness.push_str(v);
+    }
+    if let Some(m) = a.model.as_deref() {
+        harness.push_str(" · ");
+        harness.push_str(m);
+    }
+    rows.push(("harness", harness));
+    let where_ = if a.live() {
+        format!(
+            "{}:{} · {} · {}",
+            a.session.as_deref().unwrap_or("?"),
+            a.window.as_deref().unwrap_or("?"),
+            a.pane.map(|n| format!("%{n}")).unwrap_or_else(|| "no pane".into()),
+            if a.is_local() { "this server".to_string() } else { a.server.clone() }
+        )
+    } else {
+        format!(
+            "ended {} ago ({}) · was {}:{}{}",
+            fmt_age(p.now_ms.saturating_sub(a.ended_ms.unwrap_or(0).max(0) as u64) / 1000),
+            a.reason.as_deref().unwrap_or("gone"),
+            a.session.as_deref().unwrap_or("?"),
+            a.window.as_deref().unwrap_or("?"),
+            if a.is_local() { String::new() } else { format!(" on {}", a.server) }
+        )
+    };
+    rows.push(("where", where_));
+    let cwd = card.and_then(|c| c.live_cwd.clone()).or_else(|| a.cwd.clone());
+    rows.push(("cwd", cwd.as_deref().map(tilde).unwrap_or_else(|| "unknown".into())));
+    let mut branch = a.git_branch.clone().unwrap_or_else(|| "unknown".into());
+    match card.and_then(|c| c.dirty) {
+        Some(true) => branch.push_str(" · dirty"),
+        Some(false) => branch.push_str(" · clean"),
+        None => {}
+    }
+    rows.push(("branch", branch));
+    rows.push((
+        "started",
+        format!(
+            "{} ago · last active {} ago",
+            fmt_age(p.now_ms.saturating_sub(a.started().max(0) as u64) / 1000),
+            fmt_age(p.age_ms(a) / 1000)
+        ),
+    ));
+    let mut status = a.status.clone();
+    if a.life == "archived" {
+        status.push_str(" · archived");
+    }
+    if a.unread() {
+        status.push_str(" · unread");
+    }
+    if let Some(n) = a.note.as_deref().filter(|s| !s.is_empty()) {
+        status.push_str(" · ");
+        status.push_str(&one_line(n));
+    }
+    rows.push(("status", status));
+    match card.and_then(|c| c.stats.as_ref()) {
+        Some(st) => {
+            rows.push((
+                "turns",
+                format!(
+                    "{} prompts · {} replies · {} tool calls ({} edits, {} reads, {} commands)",
+                    st.prompts, st.replies, st.tools, st.edits, st.reads, st.commands
+                ),
+            ));
+            if !st.files.is_empty() {
+                let files: Vec<String> = st
+                    .files
+                    .iter()
+                    .map(|(f, n)| {
+                        let short = f.rsplit('/').next().unwrap_or(f);
+                        if *n > 1 { format!("{short} ×{n}") } else { short.to_string() }
+                    })
+                    .collect();
+                rows.push(("files", files.join(" · ")));
+            }
+        }
+        None if card.is_none() => rows.push(("turns", "…".into())),
+        None => {}
+    }
+    if let Some(tp) = a.transcript_path.as_deref() {
+        rows.push((
+            "transcript",
+            format!("{} · {} KB read", tilde(tp), a.transcript_cursor.max(0) / 1024),
+        ));
+    }
+    if let Some(id) = durable_id(a) {
+        let resume = match a.kind.as_str() {
+            "claude" => format!("claude --resume {id}"),
+            "codex" => format!("codex resume {id}"),
+            _ => id.to_string(),
+        };
+        rows.push(("resume", resume));
+    }
+    // Draw: the id on the first line, then the rows, each wrapped to the
+    // column with the label's width hanging.
+    let mut y = 1usize;
+    out.push_str(&format!("\x1b[{y};{x}H\x1b[1;36m{}\x1b[0m", clip(&a.id, pw)));
+    y += 2;
+    let label_w = 11;
+    for (label, value) in rows {
+        if y > ph {
+            break;
+        }
+        let body_w = pw.saturating_sub(label_w).max(8);
+        for (i, piece) in wrap_cells(&plain_cells(&value, 0), body_w).into_iter().enumerate() {
+            if y > ph {
+                break;
+            }
+            let lead = if i == 0 { format!("{label:<label_w$}") } else { " ".repeat(label_w) };
+            out.push_str(&format!(
+                "\x1b[{y};{x}H\x1b[2m{lead}\x1b[0m{}",
+                emit_cells(&piece, false)
+            ));
+            y += 1;
+        }
+    }
 }
 
 /// Draw the conversation into the preview area: a header line, then the
@@ -4308,6 +4556,9 @@ fn emit_cells(line: &[Styled], current: bool) -> String {
 /// The live pane of the highlighted row (local, or a mirror of a remote
 /// one), shown to the right of the list.
 fn preview_rect(p: &Picker, list_w: usize) -> Option<PreviewRect> {
+    if p.show_info {
+        return None;
+    }
     let a = p.selected()?;
     let pane = p.local_pane_of(a)?;
     // Tab: the conversation instead of the pane, once it has arrived (a

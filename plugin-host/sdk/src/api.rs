@@ -933,6 +933,11 @@ pub struct Extracted {
     pub turns: Vec<TranscriptTurn>,
     /// The harness version the records named, when they did.
     pub version: Option<String>,
+    /// The working directory, git branch and model the records named,
+    /// each the latest seen in this call.
+    pub cwd: Option<String>,
+    pub branch: Option<String>,
+    pub model: Option<String>,
     /// The file offset to resume from: after the last record consumed,
     /// kept or skipped. A trailing record with no newline is not consumed.
     pub cursor: u64,
@@ -970,10 +975,16 @@ pub async fn transcript_extract(
         *pos += n;
         Ok(s)
     };
-    let vlen = u16::from_le_bytes(take(&mut pos, 2)?.try_into().unwrap()) as usize;
-    let v = take(&mut pos, vlen)?;
-    if vlen > 0 {
-        out.version = Some(String::from_utf8_lossy(v).into_owned());
+    for slot in 0..4 {
+        let n = u16::from_le_bytes(take(&mut pos, 2)?.try_into().unwrap()) as usize;
+        let v = take(&mut pos, n)?;
+        let s = (n > 0).then(|| String::from_utf8_lossy(v).into_owned());
+        match slot {
+            0 => out.version = s,
+            1 => out.cwd = s,
+            2 => out.branch = s,
+            _ => out.model = s,
+        }
     }
     while pos < d.len() {
         let kind = match take(&mut pos, 1)?[0] {

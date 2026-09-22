@@ -72,7 +72,12 @@
 //! rendered, opened on the match; `Tab` shows it for a live one too, in
 //! place of its pane. `l`, Right or a click on it gives it the keyboard:
 //! `j`/`k` scroll, `n`/`N` step through the matches, `g`/`G` top and end,
-//! Esc back to the list.
+//! Esc back to the list. `i` swaps the preview for an info card: the id,
+//! harness and model, where the agent runs (or ran), its working
+//! directory and git branch (from the transcript records, or the session
+//! file; `y` copies the directory), when it started, what it did (prompts,
+//! replies, tool calls, the files it touched most), its transcript, and
+//! the command that resumes it.
 //!
 //! An agent that stopped for you and you have not gotten to yet is
 //! UNREAD: it entered `needs_input` or `waiting` more recently than your

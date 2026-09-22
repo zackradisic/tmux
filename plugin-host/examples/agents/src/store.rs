@@ -20,7 +20,7 @@
 use serde::{Deserialize, Serialize};
 use tmux_plugin_sdk::prelude::*;
 
-pub const USER_VERSION: i64 = 9;
+pub const USER_VERSION: i64 = 10;
 
 /// The server a row belongs to. A provider only ever writes rows for its
 /// own server, so every stored row says "local"; the view stamps the link
@@ -55,7 +55,10 @@ CREATE TABLE IF NOT EXISTS agents (
   server TEXT NOT NULL DEFAULT 'local',
   transcript_path TEXT,
   transcript_cursor INTEGER NOT NULL DEFAULT 0,
-  harness_version TEXT);
+  harness_version TEXT,
+  cwd TEXT,
+  git_branch TEXT,
+  model TEXT);
 CREATE INDEX IF NOT EXISTS agents_live ON agents(ended_ms, last_active_ms);
 -- At most one live agent per pane per server; NULL panes (ended) do not
 -- collide.
@@ -93,7 +96,7 @@ CREATE TABLE IF NOT EXISTS search_index (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   blob BLOB NOT NULL,
   max_rowid INTEGER NOT NULL);
-PRAGMA user_version = 9;";
+PRAGMA user_version = 10;";
 
 /// The v1 -> v2 upgrade: the resolved columns did not exist in v1.
 const MIGRATE_V2: &str = "
@@ -199,12 +202,21 @@ CREATE TABLE IF NOT EXISTS search_index (
   max_rowid INTEGER NOT NULL);
 PRAGMA user_version = 9;";
 
+/// The v9 -> v10 upgrade: where the agent worked. The working directory
+/// and git branch the transcript records stamp (and the session file
+/// names, for a live Claude), and the model. For the info card (`i`).
+const MIGRATE_V10: &str = "
+ALTER TABLE agents ADD COLUMN cwd TEXT;
+ALTER TABLE agents ADD COLUMN git_branch TEXT;
+ALTER TABLE agents ADD COLUMN model TEXT;
+PRAGMA user_version = 10;";
+
 const COLS: &str = "id, kind, status, life, pane, session, window, task, \
                     note, name, name_ms, user_name, user_name_ms, \
                     waiting_ms, acked_ms, first_seen_ms, \
                     last_status_ms, started_ms, last_active_ms, source_path, \
                     ended_ms, reason, server, transcript_path, \
-                    transcript_cursor, harness_version";
+                    transcript_cursor, harness_version, cwd, git_branch, model";
 
 /// One agent. Serialized as JSON when a provider ships its rows to a view
 /// on another server, so every field is plain data.
@@ -249,6 +261,13 @@ pub struct Agent {
     /// The harness version that wrote the transcript, from its records.
     #[serde(default)]
     pub harness_version: Option<String>,
+    /// Where the agent worked: the directory, the branch, the model.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub git_branch: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 fn default_server() -> String {
@@ -341,6 +360,9 @@ fn agents_from(rows: &Rows) -> Vec<Agent> {
             transcript_path: s(row.get_named("transcript_path")),
             transcript_cursor: i(row.get_named("transcript_cursor")).unwrap_or(0),
             harness_version: s(row.get_named("harness_version")),
+            cwd: s(row.get_named("cwd")),
+            git_branch: s(row.get_named("git_branch")),
+            model: s(row.get_named("model")),
         })
         .collect()
 }
@@ -394,6 +416,10 @@ pub fn migrate_sync() -> Result<(), String> {
         }
         if version <= 8 {
             db_exec_sync(MIGRATE_V9, params![])
+                .map_err(|e| format!("db: {e}"))?;
+        }
+        if version <= 9 {
+            db_exec_sync(MIGRATE_V10, params![])
                 .map_err(|e| format!("db: {e}"))?;
         }
     }
@@ -978,6 +1004,99 @@ pub async fn without_transcript() -> Result<Vec<Agent>, HostError> {
     Ok(agents_from(&rows))
 }
 
+/// Rows with a transcript read but none of the facts (cwd, branch,
+/// model): read by a plugin from before v10. A facts backfill at start
+/// fills them from the transcript's first records.
+pub async fn without_facts() -> Result<Vec<Agent>, HostError> {
+    let rows = db_query(
+        &format!(
+            "SELECT {COLS} FROM agents WHERE transcript_path IS NOT NULL \
+             AND transcript_cursor > 0 AND cwd IS NULL AND git_branch IS NULL \
+             AND model IS NULL"
+        ),
+        params![],
+    )
+    .await?;
+    Ok(agents_from(&rows))
+}
+
+/// Record the facts alone (a backfill): each overwrites when present.
+pub async fn set_facts(id: &str, facts: &Facts<'_>) -> Result<(), HostError> {
+    db_exec(
+        "UPDATE agents SET harness_version = COALESCE(?2, harness_version), \
+            cwd = COALESCE(?3, cwd), git_branch = COALESCE(?4, git_branch), \
+            model = COALESCE(?5, model) WHERE id = ?1",
+        params![id, facts.version, facts.cwd, facts.branch, facts.model],
+    )
+    .await?;
+    Ok(())
+}
+
+/// The working directory a live agent's session file names.
+pub async fn set_cwd(id: &str, cwd: &str) -> Result<(), HostError> {
+    db_exec("UPDATE agents SET cwd = ?2 WHERE id = ?1", params![id, cwd]).await?;
+    Ok(())
+}
+
+/// What an agent's stored conversation adds up to, for the info card.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Stats {
+    pub prompts: i64,
+    pub replies: i64,
+    pub tools: i64,
+    pub edits: i64,
+    pub reads: i64,
+    pub commands: i64,
+    /// The paths the tools touched most, with how often.
+    pub files: Vec<(String, i64)>,
+}
+
+pub async fn stats(id: &str) -> Result<Stats, HostError> {
+    let mut st = Stats::default();
+    let rows = db_query(
+        "SELECT kind, COUNT(*) AS n FROM turns WHERE id = ?1 GROUP BY kind",
+        params![id],
+    )
+    .await?;
+    for r in rows.iter() {
+        let n = i(r.get_named("n")).unwrap_or(0);
+        match s(r.get_named("kind")).as_deref() {
+            Some("user") => st.prompts = n,
+            Some("assistant") => st.replies = n,
+            Some("tool") => st.tools = n,
+            _ => {}
+        }
+    }
+    // The tool is the first word of a tool line (always short, so TEXT).
+    let rows = db_query(
+        "SELECT substr(text, 1, instr(text || ' ', ' ') - 1) AS verb, COUNT(*) AS n \
+         FROM turns WHERE id = ?1 AND kind = 'tool' AND typeof(text) = 'text' \
+         GROUP BY verb",
+        params![id],
+    )
+    .await?;
+    for r in rows.iter() {
+        let n = i(r.get_named("n")).unwrap_or(0);
+        match s(r.get_named("verb")).as_deref() {
+            Some("Edit" | "MultiEdit" | "Write" | "NotebookEdit" | "apply_patch") => st.edits += n,
+            Some("Read" | "Glob" | "Grep" | "LS" | "NotebookRead") => st.reads += n,
+            Some("Bash" | "shell") => st.commands += n,
+            _ => {}
+        }
+    }
+    let rows = db_query(
+        "SELECT path, COUNT(*) AS n FROM turns WHERE id = ?1 AND path IS NOT NULL \
+         GROUP BY path ORDER BY n DESC, path LIMIT 6",
+        params![id],
+    )
+    .await?;
+    st.files = rows
+        .iter()
+        .filter_map(|r| Some((s(r.get_named("path"))?, i(r.get_named("n")).unwrap_or(0))))
+        .collect();
+    Ok(st)
+}
+
 /// The next `seq` for an agent's turns.
 pub async fn next_seq(id: &str) -> Result<i64, HostError> {
     let rows = db_query(
@@ -1000,15 +1119,25 @@ pub struct NewTurn<'a> {
     pub len: i64,
 }
 
+/// What a batch of transcript records said about the agent besides its
+/// turns; each overwrites the stored value when present.
+#[derive(Debug, Default, Clone)]
+pub struct Facts<'a> {
+    pub version: Option<&'a str>,
+    pub cwd: Option<&'a str>,
+    pub branch: Option<&'a str>,
+    pub model: Option<&'a str>,
+}
+
 /// Store a batch of turns and advance the transcript cursor, atomically:
 /// a crash between the two would otherwise re-read (duplicate) or skip
-/// (lose) the batch. `version` is recorded when the batch learned one.
+/// (lose) the batch. The facts the batch learned are recorded with it.
 /// Returns the rowid of the last turn inserted (for the index).
 pub async fn insert_turns(
     id: &str,
     turns: &[NewTurn<'_>],
     cursor: i64,
-    version: Option<&str>,
+    facts: &Facts<'_>,
 ) -> Result<i64, HostError> {
     const INSERT: &str = "INSERT OR REPLACE INTO turns \
         (id, seq, kind, ts_ms, text, path, offset, len) \
@@ -1031,14 +1160,24 @@ pub async fn insert_turns(
             DbValue::from(t.len),
         ]);
     }
-    owned.push(vec![DbValue::from(id), DbValue::from(cursor), DbValue::from(version)]);
+    owned.push(vec![
+        DbValue::from(id),
+        DbValue::from(cursor),
+        DbValue::from(facts.version),
+        DbValue::from(facts.cwd),
+        DbValue::from(facts.branch),
+        DbValue::from(facts.model),
+    ]);
     let mut stmts: Vec<(&str, &[DbValue])> = owned[..turns.len()]
         .iter()
         .map(|p| (INSERT, p.as_slice()))
         .collect();
     stmts.push((
         "UPDATE agents SET transcript_cursor = ?2, \
-            harness_version = COALESCE(?3, harness_version) WHERE id = ?1",
+            harness_version = COALESCE(?3, harness_version), \
+            cwd = COALESCE(?4, cwd), \
+            git_branch = COALESCE(?5, git_branch), \
+            model = COALESCE(?6, model) WHERE id = ?1",
         owned[turns.len()].as_slice(),
     ));
     db_batch(&stmts).await?;
