@@ -118,7 +118,7 @@ mkdir -p "$HOME/.claude/projects/$SLUG"
 T="$HOME/.claude/projects/$SLUG/$SID.jsonl"
 cat >"$T" <<'EOF'
 {"type":"user","message":{"role":"user","content":"please measure the dflash2 acceptance length on the bench box"},"timestamp":"2026-09-16T08:20:43.045Z","version":"2.1.273","sessionId":"x"}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Running the drafter benchmark now.\n\n## Plan\n\n- warm up the **acceptance** counter\n- read `run.py`\n\n```python\nk = 8\n```"},{"type":"tool_use","name":"Edit","input":{"file_path":"/x/bench/run.py","old_string":"k=4","new_string":"k=8\nverbose=True"}}]},"timestamp":"2026-09-16T08:20:50.000Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Running the drafter benchmark now.\n\n## Plan\n\n- warm up the **acceptance** counter\n- read `run.py`\n\n```python\nk = 8\n```\n\n| k | AL |\n|--:|:---|\n| 4 | 3.1 |\n| 16 | 3.9 |"},{"type":"tool_use","name":"Edit","input":{"file_path":"/x/bench/run.py","old_string":"k=4","new_string":"k=8\nverbose=True"}}]},"timestamp":"2026-09-16T08:20:50.000Z"}
 {"type":"user","message":{"role":"user","content":[{"tool_use_id":"t1","type":"tool_result","content":"a very long tool result that must never be stored"}]},"timestamp":"2026-09-16T08:20:51.000Z"}
 EOF
 
@@ -172,6 +172,13 @@ screen | grep -q '│Plan' || fail "the heading was not rendered"
 screen | grep -q '• warm up the acceptance counter' || fail "the list was not rendered"
 screen | grep -q '┌─ python' || fail "the code fence was not rendered"
 screen | grep -q '│ k = 8' || fail "the code line was not rendered"
+# A pipe table: header, rule, aligned rows.
+screen | grep -q ' k │ AL' || fail "the table header was not rendered"
+screen | grep -q '16 │ 3.9' || fail "the table row was not rendered"
+# Matches are black on yellow, as copy mode draws them; the one the
+# cursor is on, bright yellow. capture-pane -e spells each attribute as
+# its own code.
+$TMUX capture-pane -M -e -p -t "$FORM" | grep -q '\[43m\|\[103m' || fail "the match is not highlighted in yellow"
 # The query has two matches (the prompt and the bullet); the preview
 # opened on the first. l: the conversation takes the keyboard, and n
 # steps between them.

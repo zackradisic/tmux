@@ -586,15 +586,22 @@ transcript.sh`.
   formats: a Claude format change means a tmux update, not a plugin
   update - though both ship through the same release.
 - **The preview renders Markdown and takes the keyboard.** Headings,
-  emphasis, inline and fenced code, lists, quotes, rules and links, to
-  styled cells that wrap and highlight without the markup fighting the
-  width. `l`, Right or a click on the conversation focuses it (the
+  emphasis, inline and fenced code, lists, quotes, rules, links and pipe
+  tables (columns padded to the widest cell, aligned as the separator
+  row says, the widest columns giving way first when the table is wider
+  than the preview; a table never wraps), to styled cells that wrap and
+  highlight without the markup fighting the width. Matches are black on
+  yellow as copy mode's `mode-style` draws them, the one the cursor is
+  on bold on bright yellow. The renderer is hand-rolled (`markdown_lines`
+  in `view.rs`): no Markdown crate is in the offline registry, and what
+  agents write is a small, regular subset. `l`, Right or a click on the conversation focuses it (the
   separator lights up as it does for typing into a pane); `j`/`k`,
   Space/`b`, `g`/`G` move, `n`/`N` step through the query's matches with
   the count in the header, Esc returns. A live row's conversation is
   refetched on the refresh cadence and keeps the scroll and match
-  position across the refetch. Not done: tables stay as typed, and a
-  match inside a wrapped word is highlighted only on the line it starts.
+  position across the refetch. Not done: a match inside a wrapped word is
+  highlighted only on the line it starts; nested lists flatten to one
+  level; a table cell wider than its column is cut, not wrapped.
 - **Tried and dropped: copy mode as the preview.** The conversation in a
   scratch pane's copy mode, searched for the query, keys forwarded - so
   the user's own copy-mode bindings would work in the preview. It needed

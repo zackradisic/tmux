@@ -677,7 +677,9 @@ pub struct TranscriptView {
     pub top: usize,
     /// The width the lines were rendered for.
     pub width: usize,
-    pub lines: Vec<String>,
+    /// The rendered lines, as styled cells; emitted to the terminal at
+    /// draw time, so the match the cursor is on can be drawn brighter.
+    pub lines: Vec<Vec<Styled>>,
     /// The rendered lines that hold a match of the query, in order, and
     /// which of them `n`/`N` last landed on.
     pub matches: Vec<usize>,
@@ -3687,8 +3689,10 @@ fn draw_transcript(p: &mut Picker, out: &mut String, x: usize, pw: usize, ph: us
     let header = format!("conversation · {what}{matches}{hint}");
     let sgr = if focused { "\x1b[1;36m" } else { "\x1b[2m" };
     out.push_str(&format!("\x1b[1;{x}H{sgr}{}\x1b[0m", clip(&header, pw)));
+    let current = tv.match_idx.and_then(|m| tv.matches.get(m).copied());
     for (i, line) in tv.lines.iter().skip(tv.top).take(body).enumerate() {
-        out.push_str(&format!("\x1b[{};{x}H{line}", i + 2));
+        let emitted = emit_cells(line, current == Some(tv.top + i));
+        out.push_str(&format!("\x1b[{};{x}H{emitted}", i + 2));
     }
 }
 
@@ -3809,7 +3813,7 @@ fn render_transcript(tv: &mut TranscriptView, width: usize, terms: &[String]) {
     let mut open_at: Option<usize> = None;
     if tv.turns.is_empty() {
         for l in &tv.capture {
-            tv.lines.push(clip(&strip_sgr(l), width));
+            tv.lines.push(plain_cells(&clip(&strip_sgr(l), width), 0));
         }
     }
     let mut cells: Vec<Vec<Styled>> = Vec::new();
@@ -3858,7 +3862,7 @@ fn render_transcript(tv: &mut TranscriptView, width: usize, terms: &[String]) {
         if mark_hits(&mut line, &lower_terms) {
             tv.matches.push(tv.lines.len());
         }
-        tv.lines.push(emit_cells(&line));
+        tv.lines.push(line);
     }
     tv.top = match (tv.matches.first(), open_at) {
         (Some(&m), _) if !terms.is_empty() => {
@@ -3884,8 +3888,25 @@ fn markdown_lines(text: &str, width: usize, base: u8) -> Vec<Vec<Styled>> {
     let width = width.max(4);
     let mut out: Vec<Vec<Styled>> = Vec::new();
     let mut in_fence = false;
-    for raw in text.lines() {
+    let src: Vec<&str> = text.lines().collect();
+    let mut i = 0usize;
+    while i < src.len() {
+        let raw = src[i];
+        i += 1;
         let line = raw.trim_end();
+        // A pipe table: a header row, a separator row of dashes (with
+        // optional colons for alignment), then body rows, all with `|`.
+        if !in_fence && line.contains('|') && i < src.len() && is_table_separator(src[i]) {
+            let sep = src[i];
+            i += 1; // the separator
+            let mut rows: Vec<&str> = vec![line];
+            while i < src.len() && src[i].contains('|') && !src[i].trim().is_empty() {
+                rows.push(src[i].trim_end());
+                i += 1;
+            }
+            out.extend(table_lines(&rows, sep, width, base));
+            continue;
+        }
         if let Some(rest) = line.trim_start().strip_prefix("```") {
             in_fence = !in_fence;
             let lang = rest.trim();
@@ -3969,6 +3990,131 @@ fn markdown_lines(text: &str, width: usize, base: u8) -> Vec<Vec<Styled>> {
             };
             l.extend(piece);
             out.push(l);
+        }
+    }
+    out
+}
+
+/// A pipe table's separator row: cells of dashes, each with an optional
+/// colon at either end, between pipes.
+fn is_table_separator(line: &str) -> bool {
+    let t = line.trim();
+    if !t.contains('-') || !t.contains('|') {
+        return false;
+    }
+    split_row(t).into_iter().all(|c| {
+        let c = c.trim();
+        let body = c.trim_start_matches(':').trim_end_matches(':');
+        !body.is_empty() && body.chars().all(|ch| ch == '-')
+    })
+}
+
+/// The cells of a table row: split on `|` (an escaped `\|` stays), with
+/// the outer pipes and surrounding spaces dropped.
+fn split_row(line: &str) -> Vec<String> {
+    let t = line.trim();
+    let t = t.strip_prefix('|').unwrap_or(t);
+    let t = t.strip_suffix('|').unwrap_or(t);
+    let mut cells = Vec::new();
+    let mut cur = String::new();
+    let mut chars = t.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && chars.peek() == Some(&'|') {
+            cur.push('|');
+            chars.next();
+        } else if c == '|' {
+            cells.push(cur.trim().to_string());
+            cur = String::new();
+        } else {
+            cur.push(c);
+        }
+    }
+    cells.push(cur.trim().to_string());
+    cells
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Align {
+    Left,
+    Center,
+    Right,
+}
+
+/// A pipe table as lines: the header row bold, a rule under it, the body
+/// rows, columns padded to the widest cell and aligned as the separator
+/// says. Wider than the preview, the widest columns give way first and
+/// their cells are cut with an ellipsis; a table never wraps.
+fn table_lines(rows: &[&str], sep: &str, width: usize, base: u8) -> Vec<Vec<Styled>> {
+    let aligns: Vec<Align> = split_row(sep)
+        .iter()
+        .map(|c| {
+            let c = c.trim();
+            match (c.starts_with(':'), c.ends_with(':')) {
+                (true, true) => Align::Center,
+                (false, true) => Align::Right,
+                _ => Align::Left,
+            }
+        })
+        .collect();
+    let ncols = aligns.len().max(1);
+    let cells: Vec<Vec<Vec<Styled>>> = rows
+        .iter()
+        .enumerate()
+        .map(|(r, row)| {
+            let style = if r == 0 { base | ST_BOLD } else { base };
+            let mut cs: Vec<Vec<Styled>> = split_row(row).iter().map(|c| inline_cells(c, style)).collect();
+            cs.resize(ncols, Vec::new());
+            cs
+        })
+        .collect();
+    let mut widths: Vec<usize> = (0..ncols)
+        .map(|c| cells.iter().map(|r| r[c].len()).max().unwrap_or(0).max(1))
+        .collect();
+    // Fit: 3 cells between columns (" │ "), none outside.
+    let fits = |w: &[usize]| w.iter().sum::<usize>() + 3 * (ncols - 1);
+    while fits(&widths) > width {
+        let (widest, _) = widths.iter().enumerate().max_by_key(|(_, w)| **w).unwrap();
+        if widths[widest] <= 3 {
+            break;
+        }
+        widths[widest] -= 1;
+    }
+    let mut out: Vec<Vec<Styled>> = Vec::new();
+    let pad = |cell: &[Styled], w: usize, align: Align| -> Vec<Styled> {
+        let mut c: Vec<Styled> = cell.to_vec();
+        if c.len() > w {
+            c.truncate(w.saturating_sub(1));
+            c.push(('…', cell.last().map(|s| s.1).unwrap_or(0)));
+        }
+        let gap = w.saturating_sub(c.len());
+        let (left, right) = match align {
+            Align::Left => (0, gap),
+            Align::Right => (gap, 0),
+            Align::Center => (gap / 2, gap - gap / 2),
+        };
+        let mut line: Vec<Styled> = std::iter::repeat((' ', 0)).take(left).collect();
+        line.extend(c);
+        line.extend(std::iter::repeat((' ', 0)).take(right));
+        line
+    };
+    for (r, row) in cells.iter().enumerate() {
+        let mut line: Vec<Styled> = Vec::new();
+        for (c, cell) in row.iter().enumerate() {
+            if c > 0 {
+                line.extend([(' ', 0), ('│', base | ST_DIM), (' ', 0)]);
+            }
+            line.extend(pad(cell, widths[c], aligns.get(c).copied().unwrap_or(Align::Left)));
+        }
+        out.push(line);
+        if r == 0 {
+            let mut rule: Vec<Styled> = Vec::new();
+            for (c, w) in widths.iter().enumerate() {
+                if c > 0 {
+                    rule.extend([('─', base | ST_DIM), ('┼', base | ST_DIM), ('─', base | ST_DIM)]);
+                }
+                rule.extend(std::iter::repeat(('─', base | ST_DIM)).take(*w));
+            }
+            out.push(rule);
         }
     }
     out
@@ -4114,8 +4260,11 @@ fn mark_hits(line: &mut [Styled], lower_terms: &[String]) -> bool {
     any
 }
 
-/// Cells to a terminal line: one SGR per run of equal style.
-fn emit_cells(line: &[Styled]) -> String {
+/// Cells to a terminal line: one SGR per run of equal style. A match
+/// is black on yellow, as copy mode's `mode-style` draws one; on the
+/// line the cursor is on (`current`) it is bold on bright yellow, so
+/// `n`/`N` show where they landed.
+fn emit_cells(line: &[Styled], current: bool) -> String {
     let mut out = String::with_capacity(line.len() + 16);
     let mut cur: Option<u8> = None;
     for &(c, st) in line {
@@ -4124,7 +4273,7 @@ fn emit_cells(line: &[Styled]) -> String {
             if st & ST_BOLD != 0 {
                 out.push_str(";1");
             }
-            if st & ST_DIM != 0 {
+            if st & ST_DIM != 0 && st & ST_HIT == 0 {
                 out.push_str(";2");
             }
             if st & ST_ITALIC != 0 {
@@ -4134,9 +4283,8 @@ fn emit_cells(line: &[Styled]) -> String {
                 out.push_str(";4");
             }
             if st & ST_HIT != 0 {
-                out.push_str(";7");
-            }
-            if st & ST_CODE != 0 {
+                out.push_str(if current { ";1;30;103" } else { ";30;43" });
+            } else if st & ST_CODE != 0 {
                 out.push_str(";33");
             } else if st & ST_CYAN != 0 {
                 out.push_str(";36");
@@ -4250,6 +4398,24 @@ mod render_tests {
     }
 
     #[test]
+    fn tables() {
+        let md = "| k | AL | note |\n|---:|:---:|------|\n| 4 | 3.1 | the **baseline** |\n| 16 | 3.9 | wide |";
+        let lines: Vec<String> = markdown_lines(md, 60, 0).iter().map(|l| text(l)).collect();
+        assert_eq!(lines[0], " k │ AL  │ note        ");
+        assert_eq!(lines[1], "───┼─────┼─────────────");
+        assert_eq!(lines[2], " 4 │ 3.1 │ the baseline");
+        assert_eq!(lines[3], "16 │ 3.9 │ wide        ");
+        // The header is bold; a wide table gives up width in its widest column.
+        assert!(markdown_lines(md, 60, 0)[0].iter().filter(|c| c.0 != ' ' && c.0 != '│').all(|c| c.1 & ST_BOLD != 0));
+        let narrow: Vec<String> = markdown_lines(md, 16, 0).iter().map(|l| text(l)).collect();
+        assert!(narrow.iter().all(|l| l.chars().count() <= 16), "{narrow:?}");
+        assert!(narrow[2].ends_with('…'));
+        // Not a table without a separator row.
+        let plain = markdown_lines("a | b\nc | d", 60, 0);
+        assert_eq!(text(&plain[0]), "a | b");
+    }
+
+    #[test]
     fn wrapping_and_hits() {
         let cells = inline_cells("alpha beta gamma delta", 0);
         let lines = wrap_cells(&cells, 11);
@@ -4262,8 +4428,10 @@ mod render_tests {
         let hit: String = line.iter().filter(|c| c.1 & ST_HIT != 0).map(|c| c.0).collect();
         assert_eq!(hit, "DFlash2dflash2");
         assert!(!mark_hits(&mut line, &["zzz".to_string()]));
-        let out = emit_cells(&line);
-        assert!(out.contains("\x1b[0;7m") && out.ends_with("\x1b[0m"));
+        // Matches are black on yellow; on the current line, bold on bright yellow.
+        let out = emit_cells(&line, false);
+        assert!(out.contains("\x1b[0;30;43m") && out.ends_with("\x1b[0m"));
+        assert!(emit_cells(&line, true).contains("\x1b[0;1;30;103m"));
         assert_eq!(strip_sgr(&out), "The DFlash2 bench and dflash2 again");
     }
 }
