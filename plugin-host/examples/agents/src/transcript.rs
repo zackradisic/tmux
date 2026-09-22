@@ -17,22 +17,24 @@
 //! read, `DEBOUNCE_MS` after the last request. A request that arrives
 //! while a read is running queues exactly one more.
 //!
-//! Each run reads the transcript from the saved cursor in 128 KiB chunks
-//! (`fs_read`, straight into guest memory from the fs worker), hands the
-//! complete lines to the harness's extractor, and stores the turns and
-//! the new cursor in one transaction. Only complete lines count: the
-//! tail of a record still being written is re-read next time. A line the
-//! prefilter rejects is never buffered past one chunk: tool output can
-//! run to megabytes on one line, and it is skipped, not carried.
+//! Each run asks the host for the transcript's lines from the saved
+//! cursor (`fs_read_lines`): the host scans the file on the fs worker,
+//! keeps only the records whose head holds one of the extractor's
+//! needles, and lands those - about one per cent of the bytes - in guest
+//! memory with their offsets. The guest parses them and stores the turns
+//! and the new cursor in one transaction. Only complete lines count: the
+//! tail of a record still being written is re-read next time. Tool
+//! output that runs to megabytes on one line never reaches the guest.
 //!
 //! The index (see `index.rs`) is fed as turns are stored, one document
 //! per user turn. It is snapshotted to the store when an agent ends and
 //! every so many documents, and loaded at start with a catch-up over the
 //! turns stored since the snapshot.
 //!
-//! Cost, measured on real transcripts: 1.3 GB/s through the prefilter
-//! under wasm, worst chunk 0.8 ms; a typical turn-end ingest reads a few
-//! KB and takes microseconds.
+//! Cost: the scan is the host's, at native memchr speed off the main
+//! thread; the guest pays for parsing the records it was handed, about
+//! 2 µs per 128 KiB of transcript scanned, and a typical turn-end ingest
+//! is one call and one small batch of turns.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -44,14 +46,14 @@ use crate::extract::{self, TurnKind};
 use crate::index::{self, Index};
 use crate::store::{self, NewTurn, TurnRow};
 
-/// Bytes read per `fs_read`. One chunk is one wake of the guest; the
-/// worst chunk seen (a large candidate record) parsed in under a
-/// millisecond, inside the budget.
-pub const CHUNK: usize = 128 * 1024;
-/// A record still without its newline after this many bytes is dropped
-/// unparsed, whatever its head said: nothing conversational is that
-/// long, and carrying it would hold megabytes for nothing.
-pub const MAX_CARRY: usize = 4 * 1024 * 1024;
+/// The buffer `fs_read_lines` fills per call: the records that passed
+/// the host's prefilter, which on a Claude transcript is about one per
+/// cent of the bytes it scanned. The SDK grows it for a record that does
+/// not fit, up to `MAX_LINE`.
+pub const LINES_BUF: usize = 256 * 1024;
+/// A candidate record longer than this is skipped by the host unparsed,
+/// whatever its head said: nothing conversational is that long.
+pub const MAX_LINE: usize = 4 * 1024 * 1024;
 /// An agent that ended within this long may still have unread tail (the
 /// server was down when it died); older ones stopped writing long ago.
 pub const RECENT_MS: i64 = 24 * 3600 * 1000;
@@ -361,29 +363,35 @@ pub async fn ingest(id: &str, ended: bool) {
     }
 }
 
-/// One pass over the transcript from the cursor to EOF.
+/// One pass over the transcript from the cursor to EOF. The host does
+/// the scan (`fs_read_lines`): only the records whose head holds one of
+/// the extractor's needles come back, with their offsets, and the
+/// cursor the host consumed to - kept or skipped - is what is stored.
 async fn ingest_once(id: &str) -> Result<(), ()> {
     let Ok(Some(a)) = store::by_id(id).await else { return Err(()) };
     let Some(mut ex) = extract::for_kind(&a.kind) else { return Err(()) };
     let Some(mut path) = a.transcript_path.clone() else { return Err(()) };
     let started = now_ms();
     let start_cursor = a.transcript_cursor.max(0) as u64;
-    let (mut chunks, mut turns_stored) = (0u32, 0usize);
-    let mut base = start_cursor;
+    let (mut calls, mut turns_stored) = (0u32, 0usize);
+    let mut cursor = start_cursor;
     let mut seq = store::next_seq(id).await.map_err(|_| ())?;
-    let mut carry: Vec<u8> = Vec::new();
-    let mut skipping = false;
     let mut grouper = Grouper::default();
-    let mut pos = base;
     let mut first_read = true;
+    let needles: Vec<LineNeedle<'static>> = ex
+        .needles()
+        .into_iter()
+        .map(|(bytes, reject)| LineNeedle { bytes, reject })
+        .collect();
     loop {
-        let (bytes, eof) = match fs_read(&path, pos, CHUNK).await {
-            Ok(r) => r,
+        let lines = match fs_read_lines(&path, cursor, &needles, extract::HEAD, MAX_LINE, LINES_BUF).await
+        {
+            Ok(l) => l,
             Err(e) => {
                 // A derived path that does not exist yet (or a wrong
                 // guess): for a fresh Claude transcript, look for the
                 // session id under every project directory once.
-                if first_read && base == 0 && a.kind == "claude" {
+                if first_read && cursor == 0 && a.kind == "claude" {
                     if let Some(found) = locate_claude(&a.id).await {
                         if found != path {
                             let _ = store::set_transcript(id, &found).await;
@@ -400,109 +408,64 @@ async fn ingest_once(id: &str) -> Result<(), ()> {
             }
         };
         first_read = false;
-        if bytes.is_empty() {
+        calls += 1;
+        if lines.cursor <= cursor {
+            // Nothing consumed: a partial record at the end, or nothing new.
             break;
         }
-        chunks += 1;
-        pos += bytes.len() as u64;
-        let chunk: &[u8] = if skipping {
-            // Drop the rest of the over-long line; resume after it.
-            match memchr::memchr(b'\n', &bytes) {
-                Some(i) => {
-                    skipping = false;
-                    base = pos - (bytes.len() - i - 1) as u64;
-                    &bytes[i + 1..]
-                }
-                None => {
-                    if eof {
-                        break;
-                    }
-                    continue;
-                }
-            }
-        } else {
-            &bytes[..]
-        };
-        if carry.is_empty() && !skipping_tail(&bytes, chunk) {
-            // The common case: nothing carried, so the read buffer IS the
-            // carry - no copy of the chunk.
-            carry = bytes;
-        } else {
-            carry.extend_from_slice(chunk);
+        let mut fed = extract::Fed::default();
+        for (off, record) in lines.iter() {
+            ex.feed_line(record, off, &mut fed);
         }
-        match memchr::memrchr(b'\n', &carry) {
-            Some(cut) => {
-                let complete = &carry[..=cut];
-                let fed = ex.feed(complete, base);
-                base += complete.len() as u64;
-                let n = fed.turns.len();
-                let mut rows: Vec<NewTurn<'_>> = Vec::with_capacity(n);
-                for (i, t) in fed.turns.iter().enumerate() {
-                    rows.push(NewTurn {
-                        seq: seq + i as i64,
-                        kind: t.kind.as_str(),
-                        ts_ms: t.ts_ms,
-                        text: &t.text,
-                        path: t.path.as_deref(),
-                        offset: t.offset as i64,
-                        len: t.len as i64,
-                    });
-                }
-                match store::insert_turns(id, &rows, base as i64, fed.version.as_deref()).await {
-                    Ok(max_rowid) => {
-                        let added = with_index(|ix| {
-                            let mut added = 0;
-                            for (i, t) in fed.turns.iter().enumerate() {
-                                added += grouper.push(ix, id, seq + i as i64, t.kind, &t.text, t.path.as_deref());
-                            }
-                            if max_rowid > ix.max_rowid {
-                                ix.max_rowid = max_rowid;
-                            }
-                            added
-                        });
-                        SINCE_SNAPSHOT.with(|c| *c.borrow_mut() += added);
-                        seq += n as i64;
-                        turns_stored += n;
+        let n = fed.turns.len();
+        let mut rows: Vec<NewTurn<'_>> = Vec::with_capacity(n);
+        for (i, t) in fed.turns.iter().enumerate() {
+            rows.push(NewTurn {
+                seq: seq + i as i64,
+                kind: t.kind.as_str(),
+                ts_ms: t.ts_ms,
+                text: &t.text,
+                path: t.path.as_deref(),
+                offset: t.offset as i64,
+                len: t.len as i64,
+            });
+        }
+        match store::insert_turns(id, &rows, lines.cursor as i64, fed.version.as_deref()).await {
+            Ok(max_rowid) => {
+                let added = with_index(|ix| {
+                    let mut added = 0;
+                    for (i, t) in fed.turns.iter().enumerate() {
+                        added += grouper.push(ix, id, seq + i as i64, t.kind, &t.text, t.path.as_deref());
                     }
-                    Err(e) => {
-                        log(&format!("agents: transcript {id}: store: {}", e.message));
-                        return Err(());
+                    if max_rowid > ix.max_rowid {
+                        ix.max_rowid = max_rowid;
                     }
-                }
-                carry.drain(..=cut);
+                    added
+                });
+                SINCE_SNAPSHOT.with(|c| *c.borrow_mut() += added);
+                seq += n as i64;
+                turns_stored += n;
             }
-            None => {
-                // No complete line in the carry. A candidate record is
-                // kept until its newline arrives (up to MAX_CARRY); a
-                // record the prefilter rejects is dropped as soon as it
-                // outgrows one chunk.
-                let head = &carry[..carry.len().min(extract::HEAD)];
-                if carry.len() > MAX_CARRY || (carry.len() > CHUNK && !ex.candidate(head)) {
-                    carry.clear();
-                    skipping = true;
-                }
+            Err(e) => {
+                log(&format!("agents: transcript {id}: store: {}", e.message));
+                return Err(());
             }
         }
-        if eof {
+        cursor = lines.cursor;
+        if lines.eof {
             break;
         }
     }
     let added = with_index(|ix| grouper.flush(ix));
     SINCE_SNAPSHOT.with(|c| *c.borrow_mut() += added);
     let took = now_ms().saturating_sub(started);
-    if took >= SLOW_MS || chunks > 8 {
+    if took >= SLOW_MS || calls > 2 {
         log(&format!(
-            "agents: transcript {id}: {} KB in {chunks} chunks, {turns_stored} turns, {took} ms",
-            pos.saturating_sub(start_cursor) / 1024
+            "agents: transcript {id}: {} KB in {calls} calls, {turns_stored} turns, {took} ms",
+            cursor.saturating_sub(start_cursor) / 1024
         ));
     }
     Ok(())
-}
-
-/// Is `chunk` a proper suffix of `bytes` (the remainder after a skipped
-/// line), rather than the whole buffer?
-fn skipping_tail(bytes: &[u8], chunk: &[u8]) -> bool {
-    chunk.len() != bytes.len()
 }
 
 /// Find a Claude transcript by session id under every project directory:

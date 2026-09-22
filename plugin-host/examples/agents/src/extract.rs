@@ -12,12 +12,14 @@
 //! Every line is prefiltered before it is parsed: a cheap substring look
 //! at the head of the record decides whether it can hold conversation at
 //! all. On a Claude transcript that leaves about one per cent of the
-//! bytes for the JSON parser, so the parser's speed does not matter; the
-//! newline scan and the prefilter do, which is why both go through
-//! `memchr` (SIMD under simd128; measured 17 µs per 128 KiB chunk in wasm
-//! against 110 µs for a byte loop and a naive substring search). A
-//! record of a type the extractor does not know is skipped, not an
-//! error: harnesses add record types between versions.
+//! bytes for the JSON parser. The scan and that prefilter are the cost,
+//! not the parse, so they run in the host: `fs_read_lines` takes each
+//! extractor's [`Extractor::needles`] and hands back only the lines that
+//! pass (see `transcript`). The guest applies the exact rule again in
+//! [`Extractor::candidate`] - the host filter is a superset - and the
+//! same code path serves a plain buffer for the tests. A record of a
+//! type the extractor does not know is skipped, not an error: harnesses
+//! add record types between versions.
 //!
 //! Tool calls are condensed to one line each: the tool and what it
 //! touched (a path, a command's description), plus for an edit the count
@@ -80,16 +82,44 @@ pub struct Fed {
     pub version: Option<String>,
 }
 
-/// A harness's transcript reader. `feed` gets complete lines only (the
-/// caller cuts at the last newline and carries the tail); `base` is the
-/// file offset of the first byte of `buf`, so turns can say where they
-/// came from.
+/// A harness's transcript reader. [`feed_line`](Self::feed_line) takes
+/// one complete record (newline included) with its file offset; `feed`
+/// takes a buffer of complete lines and splits it, for a caller that has
+/// the bytes in hand.
 pub trait Extractor {
-    fn feed(&mut self, buf: &[u8], base: u64) -> Fed;
+    /// One record. Appends whatever conversation it holds to `fed`.
+    fn feed_line(&mut self, line: &[u8], offset: u64, fed: &mut Fed);
     /// Can a record whose head looks like this hold conversation? The
-    /// caller uses it to drop an over-long line unparsed (a megabyte of
-    /// tool output) without buffering the rest of it.
+    /// exact rule; the host's needles are a superset of it.
     fn candidate(&self, head: &[u8]) -> bool;
+    /// The needles the host prefilters lines with (see `fs_read_lines`):
+    /// a line is read back when any keep needle is in its head and no
+    /// reject needle is. Must accept every line `candidate` would.
+    fn needles(&self) -> Vec<(&'static [u8], bool)>;
+
+    /// Complete lines in `buf`, the first at file offset `base`. What the
+    /// tests use; the plugin gets its lines from the host.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn feed(&mut self, buf: &[u8], base: u64) -> Fed {
+        let mut fed = Fed::default();
+        let mut pos = 0usize;
+        for nl in memchr::memchr_iter(b'\n', buf) {
+            self.feed_line(&buf[pos..=nl], base + pos as u64, &mut fed);
+            pos = nl + 1;
+        }
+        if pos < buf.len() {
+            self.feed_line(&buf[pos..], base + pos as u64, &mut fed);
+        }
+        fed
+    }
+}
+
+/// A record without its trailing newline.
+fn strip_nl(line: &[u8]) -> &[u8] {
+    match line.last() {
+        Some(b'\n') => &line[..line.len() - 1],
+        _ => line,
+    }
 }
 
 /// The extractor for an agent kind, if it has one.
@@ -108,27 +138,6 @@ pub const HEAD: usize = 512;
 
 fn head(line: &[u8]) -> &[u8] {
     &line[..line.len().min(HEAD)]
-}
-
-/// Split `buf` into its lines, each with its offset from `base`. The
-/// trailing newline is part of the record's length; a final line without
-/// one is still yielded (the caller promised complete lines, but a file
-/// may end without a newline).
-fn lines(buf: &[u8], base: u64) -> impl Iterator<Item = (&[u8], u64, u32)> {
-    let mut pos = 0usize;
-    let mut newlines = memchr::memchr_iter(b'\n', buf);
-    std::iter::from_fn(move || {
-        if pos >= buf.len() {
-            return None;
-        }
-        let (line, len) = match newlines.next() {
-            Some(i) => (&buf[pos..i], i + 1 - pos),
-            None => (&buf[pos..], buf.len() - pos),
-        };
-        let off = base + pos as u64;
-        pos += len;
-        Some((line, off, len as u32))
-    })
 }
 
 /// The prefilter's needles, each with its searcher built once.
@@ -290,44 +299,48 @@ impl Extractor for Claude {
         })
     }
 
-    fn feed(&mut self, buf: &[u8], base: u64) -> Fed {
-        let mut fed = Fed::default();
-        for (line, off, len) in lines(buf, base) {
-            if line.is_empty() || !self.candidate(head(line)) {
-                continue;
-            }
-            let Ok(v) = serde_json::from_slice::<Value>(line) else { continue };
-            let ty = v.get("type").and_then(Value::as_str).unwrap_or("");
-            if v.get("isMeta").and_then(Value::as_bool) == Some(true)
-                || v.get("isSidechain").and_then(Value::as_bool) == Some(true)
-            {
-                continue;
-            }
-            if fed.version.is_none() {
-                fed.version = v.get("version").and_then(Value::as_str).map(str::to_string);
-            }
-            let ts_ms = v.get("timestamp").and_then(Value::as_str).and_then(parse_rfc3339_ms);
-            let Some(content) = v.pointer("/message/content") else { continue };
-            match ty {
-                "user" => {
-                    let text = match content {
-                        Value::String(s) => s.clone(),
-                        Value::Array(blocks) => blocks
-                            .iter()
-                            .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
-                            .filter_map(|b| b.get("text").and_then(Value::as_str))
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                        _ => continue,
-                    };
-                    let text = strip_injected(&text);
-                    if text.is_empty() || is_command_noise(&text) {
-                        continue;
-                    }
-                    fed.turns.push(Turn { kind: TurnKind::User, text, path: None, ts_ms, offset: off, len });
+    fn needles(&self) -> Vec<(&'static [u8], bool)> {
+        vec![(CL_USER, false), (CL_ASSISTANT, false), (CL_TOOL_RESULT, true)]
+    }
+
+    fn feed_line(&mut self, record: &[u8], off: u64, fed: &mut Fed) {
+        let len = record.len() as u32;
+        let line = strip_nl(record);
+        if line.is_empty() || !self.candidate(head(line)) {
+            return;
+        }
+        let Ok(v) = serde_json::from_slice::<Value>(line) else { return };
+        let ty = v.get("type").and_then(Value::as_str).unwrap_or("");
+        if v.get("isMeta").and_then(Value::as_bool) == Some(true)
+            || v.get("isSidechain").and_then(Value::as_bool) == Some(true)
+        {
+            return;
+        }
+        if fed.version.is_none() {
+            fed.version = v.get("version").and_then(Value::as_str).map(str::to_string);
+        }
+        let ts_ms = v.get("timestamp").and_then(Value::as_str).and_then(parse_rfc3339_ms);
+        let Some(content) = v.pointer("/message/content") else { return };
+        match ty {
+            "user" => {
+                let text = match content {
+                    Value::String(s) => s.clone(),
+                    Value::Array(blocks) => blocks
+                        .iter()
+                        .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+                        .filter_map(|b| b.get("text").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    _ => return,
+                };
+                let text = strip_injected(&text);
+                if text.is_empty() || is_command_noise(&text) {
+                    return;
                 }
-                "assistant" => {
-                    let Value::Array(blocks) = content else { continue };
+                fed.turns.push(Turn { kind: TurnKind::User, text, path: None, ts_ms, offset: off, len });
+            }
+            "assistant" => {
+                let Value::Array(blocks) = content else { return };
                     let mut texts: Vec<&str> = Vec::new();
                     let mut tools: Vec<(String, Option<String>)> = Vec::new();
                     for b in blocks {
@@ -347,24 +360,22 @@ impl Extractor for Claude {
                             _ => {}
                         }
                     }
-                    if !texts.is_empty() {
-                        fed.turns.push(Turn {
-                            kind: TurnKind::Assistant,
-                            text: texts.join("\n").trim().to_string(),
-                            path: None,
-                            ts_ms,
-                            offset: off,
-                            len,
-                        });
-                    }
-                    for (text, path) in tools {
-                        fed.turns.push(Turn { kind: TurnKind::Tool, text, path, ts_ms, offset: off, len });
-                    }
+                if !texts.is_empty() {
+                    fed.turns.push(Turn {
+                        kind: TurnKind::Assistant,
+                        text: texts.join("\n").trim().to_string(),
+                        path: None,
+                        ts_ms,
+                        offset: off,
+                        len,
+                    });
                 }
-                _ => {}
+                for (text, path) in tools {
+                    fed.turns.push(Turn { kind: TurnKind::Tool, text, path, ts_ms, offset: off, len });
+                }
             }
+            _ => {}
         }
-        fed
     }
 }
 
@@ -466,30 +477,35 @@ impl Extractor for Codex {
         })
     }
 
-    fn feed(&mut self, buf: &[u8], base: u64) -> Fed {
-        let mut fed = Fed::default();
-        for (line, off, len) in lines(buf, base) {
-            if line.is_empty() || !self.candidate(head(line)) {
-                continue;
-            }
-            let Ok(v) = serde_json::from_slice::<Value>(line) else { continue };
-            let ts_ms = v.get("timestamp").and_then(Value::as_str).and_then(parse_rfc3339_ms);
-            let Some(payload) = v.get("payload") else { continue };
-            match (v.get("type").and_then(Value::as_str), payload.get("type").and_then(Value::as_str)) {
-                (Some("session_meta"), _) => {
-                    if fed.version.is_none() {
-                        fed.version = s_field(payload, "cli_version").map(str::to_string);
-                    }
+    fn needles(&self) -> Vec<(&'static [u8], bool)> {
+        // A superset of `candidate`: the guest applies the exact rule.
+        vec![(CX_MESSAGE, false), (CX_CALL, false), (CX_META, false)]
+    }
+
+    fn feed_line(&mut self, record: &[u8], off: u64, fed: &mut Fed) {
+        let len = record.len() as u32;
+        let line = strip_nl(record);
+        if line.is_empty() || !self.candidate(head(line)) {
+            return;
+        }
+        let Ok(v) = serde_json::from_slice::<Value>(line) else { return };
+        let ts_ms = v.get("timestamp").and_then(Value::as_str).and_then(parse_rfc3339_ms);
+        let Some(payload) = v.get("payload") else { return };
+        match (v.get("type").and_then(Value::as_str), payload.get("type").and_then(Value::as_str)) {
+            (Some("session_meta"), _) => {
+                if fed.version.is_none() {
+                    fed.version = s_field(payload, "cli_version").map(str::to_string);
                 }
-                (Some("response_item"), Some("message")) => {
-                    let role = payload.get("role").and_then(Value::as_str).unwrap_or("");
-                    let kind = match role {
-                        "user" => TurnKind::User,
-                        "assistant" => TurnKind::Assistant,
-                        // developer / system: the harness's own instructions.
-                        _ => continue,
-                    };
-                    let Some(blocks) = payload.get("content").and_then(Value::as_array) else { continue };
+            }
+            (Some("response_item"), Some("message")) => {
+                let role = payload.get("role").and_then(Value::as_str).unwrap_or("");
+                let kind = match role {
+                    "user" => TurnKind::User,
+                    "assistant" => TurnKind::Assistant,
+                    // developer / system: the harness's own instructions.
+                    _ => return,
+                };
+                let Some(blocks) = payload.get("content").and_then(Value::as_array) else { return };
                     let text = blocks
                         .iter()
                         .filter(|b| {
@@ -501,26 +517,24 @@ impl Extractor for Codex {
                         .filter_map(|b| b.get("text").and_then(Value::as_str))
                         .collect::<Vec<_>>()
                         .join("\n");
-                    let text = text.trim().to_string();
-                    // A prompt the app injected: context wrappers such as
-                    // <app-context>, <environment_context>, <recommended_plugins>.
-                    if text.is_empty() || (kind == TurnKind::User && is_tag_wrapper(&text)) {
-                        continue;
-                    }
-                    fed.turns.push(Turn { kind, text, path: None, ts_ms, offset: off, len });
+                let text = text.trim().to_string();
+                // A prompt the app injected: context wrappers such as
+                // <app-context>, <environment_context>, <recommended_plugins>.
+                if text.is_empty() || (kind == TurnKind::User && is_tag_wrapper(&text)) {
+                    return;
                 }
-                (Some("response_item"), Some("function_call")) => {
-                    let name = s_field(payload, "name").unwrap_or("tool");
-                    let args = s_field(payload, "arguments")
-                        .and_then(|a| serde_json::from_str::<Value>(a).ok())
-                        .unwrap_or(Value::Null);
-                    let (text, path) = condense_codex(name, &args);
-                    fed.turns.push(Turn { kind: TurnKind::Tool, text, path, ts_ms, offset: off, len });
-                }
-                _ => {}
+                fed.turns.push(Turn { kind, text, path: None, ts_ms, offset: off, len });
             }
+            (Some("response_item"), Some("function_call")) => {
+                let name = s_field(payload, "name").unwrap_or("tool");
+                let args = s_field(payload, "arguments")
+                    .and_then(|a| serde_json::from_str::<Value>(a).ok())
+                    .unwrap_or(Value::Null);
+                let (text, path) = condense_codex(name, &args);
+                fed.turns.push(Turn { kind: TurnKind::Tool, text, path, ts_ms, offset: off, len });
+            }
+            _ => {}
         }
-        fed
     }
 }
 

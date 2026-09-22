@@ -778,6 +778,123 @@ pub async fn fs_read(
     Ok((buf, c.v1 != 0))
 }
 
+/// One needle of an [`fs_read_lines`] filter: a line is kept when any
+/// keep needle is in its head and no reject needle is.
+#[derive(Debug, Clone, Copy)]
+pub struct LineNeedle<'a> {
+    pub bytes: &'a [u8],
+    pub reject: bool,
+}
+
+/// The lines [`fs_read_lines`] kept, with where the scan stopped.
+pub struct Lines {
+    buf: Vec<u8>,
+    used: usize,
+    count: u32,
+    /// The file offset after the last line consumed (kept or skipped):
+    /// where the next call should start.
+    pub cursor: u64,
+    /// The scan reached the end of the file. A trailing line with no
+    /// newline is not consumed, so `cursor` may still be short of it.
+    pub eof: bool,
+}
+
+impl Lines {
+    /// How many lines were kept.
+    pub fn len(&self) -> usize {
+        self.count as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// The kept lines in file order: (offset, bytes with the newline).
+    pub fn iter(&self) -> impl Iterator<Item = (u64, &[u8])> + '_ {
+        let mut pos = LINES_HEADER;
+        let end = self.used.min(self.buf.len());
+        std::iter::from_fn(move || {
+            if pos + LINES_REC_HEADER > end {
+                return None;
+            }
+            let off = u64::from_le_bytes(self.buf[pos..pos + 8].try_into().ok()?);
+            let len = u32::from_le_bytes(self.buf[pos + 8..pos + 12].try_into().ok()?) as usize;
+            let start = pos + LINES_REC_HEADER;
+            if start + len > end {
+                return None;
+            }
+            pos = start + len;
+            Some((off, &self.buf[start..start + len]))
+        })
+    }
+}
+
+const LINES_HEADER: usize = 16;
+const LINES_REC_HEADER: usize = 12;
+
+/// Read the lines of `path` from `offset` whose first `head` bytes hold
+/// a keep needle and no reject needle, on the fs worker: the scan and
+/// the prefilter run in the host, and only the surviving lines - with
+/// their file offsets - land in guest memory. A kept line longer than
+/// `max_line` is skipped like a non-match. The host consumes at most a
+/// few MiB per call (at a line boundary); loop on `cursor` until `eof`.
+/// `capacity` is the buffer to start with; a kept line that does not fit
+/// grows it, up to `max_line`, and tries again.
+pub async fn fs_read_lines(
+    path: &str,
+    offset: u64,
+    needles: &[LineNeedle<'_>],
+    head: usize,
+    max_line: usize,
+    capacity: usize,
+) -> Result<Lines, HostError> {
+    let mut block = Vec::with_capacity(2 + needles.len() * 20);
+    block.extend_from_slice(&(needles.len() as u16).to_le_bytes());
+    for n in needles {
+        block.push(u8::from(n.reject));
+        block.extend_from_slice(&(n.bytes.len() as u16).to_le_bytes());
+        block.extend_from_slice(n.bytes);
+    }
+    let mut cap = capacity.max(LINES_HEADER + LINES_REC_HEADER + 1);
+    loop {
+        let mut buf = vec![0u8; cap];
+        let token = unsafe {
+            raw::fs_read_lines(
+                path.as_ptr() as i32,
+                path.len() as i32,
+                offset as i64,
+                block.as_ptr() as i32,
+                block.len() as i32,
+                head as i32,
+                max_line as i32,
+                buf.as_mut_ptr() as i32,
+                buf.len() as i32,
+            )
+        };
+        let fut = start_async(token)?;
+        let token = token as u64;
+        crate::executor::pin_buffer(token, buf);
+        let result = fut.await;
+        let buf = crate::executor::take_buffer(token);
+        let c = result?;
+        let buf = buf.unwrap_or_default();
+        let used = (c.v0.max(0) as usize).min(buf.len());
+        if used < LINES_HEADER {
+            return Err(HostError { code: ErrorCode::Host, message: "fs_read_lines: short reply".into() });
+        }
+        let cursor = u64::from_le_bytes(buf[0..8].try_into().unwrap_or([0; 8]));
+        let need = u32::from_le_bytes(buf[8..12].try_into().unwrap_or([0; 4])) as usize;
+        let eof = buf[12] != 0;
+        let count = c.v1.max(0) as u32;
+        // Nothing fit at all: the next line needs a bigger buffer.
+        if count == 0 && need > 0 && cap < LINES_HEADER + max_line + LINES_REC_HEADER {
+            cap = (LINES_HEADER + need).min(LINES_HEADER + LINES_REC_HEADER + max_line);
+            continue;
+        }
+        return Ok(Lines { buf, used, count, cursor, eof });
+    }
+}
+
 /// What a directory entry is, from `d_type`. `Unknown` means the
 /// filesystem did not say and no `stat` was made.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

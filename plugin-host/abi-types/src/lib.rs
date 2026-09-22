@@ -207,6 +207,12 @@ pub mod db;
 /// fs_write(path_ptr, path_len, data_ptr, data_len, append) -> i64
 ///                       // async; data PINNED by the SDK future; v0 = bytes
 /// fs_read(path_ptr, path_len, offset: i64, out_ptr, out_cap) -> i64
+/// fs_read_lines(path_ptr, path_len, offset: i64, needles_ptr, needles_len,
+///               head, max_line, out_ptr, out_cap) -> i64
+///                       // async; out PINNED; the lines from `offset` whose
+///                       // first `head` bytes hold a keep-needle and no
+///                       // reject-needle, packed with their offsets after a
+///                       // 16-byte header; v0 = bytes, v1 = lines. See ABI.md
 /// fs_list(path_ptr, path_len, flags, out_ptr, out_cap) -> i64
 ///                       // async; out PINNED; v0 = bytes, v1 = entries found
 ///                       // flags: 1 = mtime, 2 = directories only
@@ -311,6 +317,7 @@ pub mod imports {
 
     pub const FS_WRITE: &str = "fs_write";
     pub const FS_READ: &str = "fs_read";
+    pub const FS_READ_LINES: &str = "fs_read_lines";
     pub const FS_LIST: &str = "fs_list";
     pub const FS_WRITE_SYNC: &str = "fs_write_sync";
     pub const CLAUDE_NOTIFY: &str = "claude_notify";

@@ -91,6 +91,20 @@ pub enum FsJob {
         rel: String,
         reach: Reach,
     },
+    /// The lines of a file from an offset whose head holds a needle,
+    /// packed into the guest's pinned buffer. See [`do_read_lines`].
+    ReadLines {
+        token: u64,
+        key: InstKey,
+        root: Arc<Root>,
+        rel: String,
+        offset: u64,
+        reach: Reach,
+        needles: Vec<Needle>,
+        head: usize,
+        max_line: usize,
+        out: GuestSliceMut,
+    },
     /// List a directory, packing the entries straight into the guest's
     /// pinned buffer. See [`do_list`] for the record format.
     List {
@@ -111,6 +125,7 @@ pub fn submit(job: FsJob) -> Result<(), String> {
     let key = match &job {
         FsJob::Write { key, .. }
         | FsJob::Read { key, .. }
+        | FsJob::ReadLines { key, .. }
         | FsJob::List { key, .. }
         | FsJob::Rename { key, .. }
         | FsJob::Remove { key, .. } => key.clone(),
@@ -137,6 +152,9 @@ async fn run_job(job: FsJob) -> Completion {
         }
         FsJob::Read { token, key: _, root, rel, offset, reach, out } => {
             do_read(token, &root, &rel, offset, reach, &out)
+        }
+        FsJob::ReadLines { token, key: _, root, rel, offset, reach, needles, head, max_line, out } => {
+            do_read_lines(token, &root, &rel, offset, reach, &needles, head, max_line, &out)
         }
         FsJob::List { token, key: _, root, rel, reach, flags, out } => {
             do_list(token, &root, &rel, reach, flags, out).await
@@ -578,6 +596,308 @@ fn spawn_stats(
             stat_range(fd, buf.0, &offs)
         });
     })
+}
+
+// ---------------------------------------------------------------------------
+// fs_read_lines: the lines of a file whose head holds a needle
+// ---------------------------------------------------------------------------
+
+/// One needle of a line filter: keep a line whose head holds a keep
+/// needle, unless it also holds a reject needle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Needle {
+    pub bytes: Vec<u8>,
+    pub reject: bool,
+}
+
+/// The 16-byte header at the start of the out buffer:
+/// `u64 cursor | u32 need | u8 eof | u8[3] pad`, little-endian.
+pub const LINES_HEADER: usize = 16;
+/// Each kept line: `u64 offset | u32 len | u8 line[len]` (newline included).
+pub const LINES_REC_HEADER: usize = 12;
+/// Bytes consumed per call at most (at a line boundary): bounds one
+/// worker task, and lets the guest see progress on a huge file.
+pub const LINES_SCAN_MAX: u64 = 8 * 1024 * 1024;
+/// The read block.
+const LINES_BLOCK: usize = 256 * 1024;
+
+/// Where a scan stopped and why. `cursor` is the offset after the last
+/// line consumed (kept or skipped); `need` is the record size of a kept
+/// line that did not fit, or 0; `eof` says the file end was reached.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ScanEnd {
+    pub cursor: u64,
+    pub need: usize,
+    pub eof: bool,
+}
+
+/// Scan `src` from `offset` line by line. A line is judged on its first
+/// `head` bytes: kept if any keep needle is in them and no reject needle
+/// is, else skipped - and a skipped line is never buffered past `head`,
+/// however long it is. A kept line longer than `max_line` is skipped. Each
+/// kept line goes to `sink` (offset, bytes with newline); a sink that
+/// returns false has no room, and the scan stops before that line with
+/// `need` set. A trailing line with no newline is not consumed. Stops at
+/// `LINES_SCAN_MAX` consumed bytes.
+pub fn scan_lines(
+    src: &mut dyn std::io::Read,
+    offset: u64,
+    needles: &[Needle],
+    head: usize,
+    max_line: usize,
+    sink: &mut dyn FnMut(u64, &[u8]) -> bool,
+) -> std::io::Result<ScanEnd> {
+    let keep: Vec<memchr::memmem::Finder<'_>> = needles
+        .iter()
+        .filter(|n| !n.reject)
+        .map(|n| memchr::memmem::Finder::new(&n.bytes))
+        .collect();
+    let reject: Vec<memchr::memmem::Finder<'_>> = needles
+        .iter()
+        .filter(|n| n.reject)
+        .map(|n| memchr::memmem::Finder::new(&n.bytes))
+        .collect();
+    let judge = |h: &[u8]| -> bool {
+        keep.iter().any(|f| f.find(h).is_some()) && !reject.iter().any(|f| f.find(h).is_some())
+    };
+    let mut block = vec![0u8; LINES_BLOCK];
+    // The current line: its start offset, the bytes held for it (all of
+    // them while it is unjudged or a candidate, the head only once it is
+    // known to be skipped), its length so far, and the verdict.
+    let mut line_start = offset;
+    let mut line: Vec<u8> = Vec::new();
+    let mut line_len: usize = 0;
+    let mut verdict: Option<bool> = None;
+    let mut end = ScanEnd { cursor: offset, need: 0, eof: false };
+    'outer: loop {
+        let n = src.read(&mut block)?;
+        if n == 0 {
+            end.eof = true;
+            break;
+        }
+        let mut seg_start = 0usize;
+        for nl in memchr::memchr_iter(b'\n', &block[..n]) {
+            let seg = &block[seg_start..nl];
+            seg_start = nl + 1;
+            let complete_len = line_len + seg.len() + 1;
+            let kept = match verdict {
+                Some(v) => v,
+                None => {
+                    // Unjudged: `line` holds every byte so far. Judge on
+                    // the head, which is what we hold plus this segment.
+                    let take = head.saturating_sub(line.len()).min(seg.len());
+                    let mut h: Vec<u8> = Vec::with_capacity(head.min(line.len() + seg.len()));
+                    h.extend_from_slice(&line);
+                    h.extend_from_slice(&seg[..take]);
+                    judge(&h)
+                }
+            };
+            if kept {
+                line.extend_from_slice(seg);
+                line.push(b'\n');
+                if line.len() <= max_line && !sink(line_start, &line) {
+                    end.need = LINES_REC_HEADER + line.len();
+                    break 'outer;
+                }
+            }
+            line_start += complete_len as u64;
+            end.cursor = line_start;
+            line.clear();
+            line_len = 0;
+            verdict = None;
+            if end.cursor - offset >= LINES_SCAN_MAX {
+                break 'outer;
+            }
+        }
+        // The tail of the block: part of a line still open.
+        let tail = &block[seg_start..n];
+        if !tail.is_empty() {
+            match verdict {
+                None => {
+                    // Hold everything until the head is complete, then
+                    // judge; a skipped line keeps nothing from here on.
+                    line.extend_from_slice(tail);
+                    line_len += tail.len();
+                    if line.len() >= head {
+                        let v = judge(&line[..head]);
+                        verdict = Some(v);
+                        if !v {
+                            line.clear();
+                        }
+                    }
+                }
+                Some(true) => {
+                    line.extend_from_slice(tail);
+                    line_len += tail.len();
+                    if line.len() > max_line {
+                        // Too long to keep: from here on it is skipped.
+                        verdict = Some(false);
+                        line.clear();
+                    }
+                }
+                Some(false) => {
+                    line_len += tail.len();
+                }
+            }
+        }
+    }
+    Ok(end)
+}
+
+/// `fs_read_lines`: scan the file from `offset` and pack the lines that
+/// pass the needle filter into the guest's buffer, after a 16-byte
+/// header. v0 = bytes written, v1 = lines kept.
+#[allow(clippy::too_many_arguments)]
+fn do_read_lines(
+    token: u64,
+    root: &Root,
+    rel: &str,
+    offset: u64,
+    reach: Reach,
+    needles: &[Needle],
+    head: usize,
+    max_line: usize,
+    out: &GuestSliceMut,
+) -> Completion {
+    let mut file = match crate::fsbox::open_read(root, rel, reach) {
+        Ok(f) => f,
+        Err(e) => return open_failed(token, e),
+    };
+    if out.cap < LINES_HEADER {
+        return err_completion(token, ErrorCode::BadRequest, "fs_read_lines: buffer too small".into());
+    }
+    if let Err(e) = file.seek(std::io::SeekFrom::Start(offset)) {
+        return err_completion(token, ErrorCode::Host, format!("{rel}: {e}"));
+    }
+    let dst = unsafe { std::slice::from_raw_parts_mut(out.ptr, out.cap) };
+    let mut used = LINES_HEADER;
+    let mut count: u32 = 0;
+    let mut sink = |off: u64, line: &[u8]| -> bool {
+        let rec = LINES_REC_HEADER + line.len();
+        if used + rec > dst.len() {
+            return false;
+        }
+        dst[used..used + 8].copy_from_slice(&off.to_le_bytes());
+        dst[used + 8..used + 12].copy_from_slice(&(line.len() as u32).to_le_bytes());
+        dst[used + 12..used + rec].copy_from_slice(line);
+        used += rec;
+        count += 1;
+        true
+    };
+    let end = match scan_lines(&mut file, offset, needles, head, max_line, &mut sink) {
+        Ok(e) => e,
+        Err(e) => return err_completion(token, ErrorCode::Host, format!("{rel}: {e}")),
+    };
+    dst[0..8].copy_from_slice(&end.cursor.to_le_bytes());
+    dst[8..12].copy_from_slice(&(end.need as u32).to_le_bytes());
+    dst[12] = u8::from(end.eof);
+    dst[13..16].copy_from_slice(&[0, 0, 0]);
+    Completion { token, err: 0, v0: used as i64, v1: i64::from(count), data: Vec::new() }
+}
+
+#[cfg(test)]
+mod lines_tests {
+    use super::*;
+
+    fn n(b: &str, reject: bool) -> Needle {
+        Needle { bytes: b.as_bytes().to_vec(), reject }
+    }
+
+    fn run(
+        data: &[u8],
+        offset: u64,
+        needles: &[Needle],
+        head: usize,
+        max_line: usize,
+        room: usize,
+    ) -> (Vec<(u64, Vec<u8>)>, ScanEnd) {
+        let mut src = std::io::Cursor::new(data.to_vec());
+        src.set_position(offset);
+        let mut got = Vec::new();
+        let mut used = 0usize;
+        let mut sink = |off: u64, line: &[u8]| -> bool {
+            if used + LINES_REC_HEADER + line.len() > room {
+                return false;
+            }
+            used += LINES_REC_HEADER + line.len();
+            got.push((off, line.to_vec()));
+            true
+        };
+        let end = scan_lines(&mut src, offset, needles, head, max_line, &mut sink).unwrap();
+        (got, end)
+    }
+
+    #[test]
+    fn keeps_matching_lines_with_offsets() {
+        let data = b"{\"type\":\"user\",\"x\":1}\n{\"type\":\"snapshot\"}\n{\"type\":\"assistant\"}\n";
+        let needles = [n("\"type\":\"user\"", false), n("\"type\":\"assistant\"", false)];
+        let (got, end) = run(data, 0, &needles, 512, 1 << 20, 1 << 20);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0], (0, b"{\"type\":\"user\",\"x\":1}\n".to_vec()));
+        assert_eq!(got[1].0, 22 + 20);
+        assert_eq!(end, ScanEnd { cursor: data.len() as u64, need: 0, eof: true });
+    }
+
+    #[test]
+    fn reject_needle_and_partial_tail() {
+        let data = b"{\"type\":\"user\",\"c\":[{\"type\":\"tool_result\"}]}\n{\"type\":\"user\",\"c\":\"hi\"}\n{\"type\":\"user\",\"c\":\"half";
+        let needles = [n("\"type\":\"user\"", false), n("tool_result", true)];
+        let (got, end) = run(data, 0, &needles, 512, 1 << 20, 1 << 20);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].1.starts_with(b"{\"type\":\"user\",\"c\":\"hi\""));
+        // The half line is not consumed: the cursor stops before it.
+        let second_end = data.iter().rposition(|&b| b == b'\n').unwrap() as u64 + 1;
+        assert_eq!(end.cursor, second_end);
+        assert!(end.eof);
+    }
+
+    #[test]
+    fn long_skipped_line_is_not_buffered_and_long_kept_line_is_dropped() {
+        // A 3 MB non-candidate line, then a candidate, then a 1 MB
+        // candidate over max_line.
+        let mut data = Vec::new();
+        data.extend_from_slice(b"{\"type\":\"other\",\"blob\":\"");
+        data.extend(std::iter::repeat(b'x').take(3 * 1024 * 1024));
+        data.extend_from_slice(b"\"}\n{\"type\":\"user\",\"c\":1}\n{\"type\":\"user\",\"c\":\"");
+        data.extend(std::iter::repeat(b'y').take(1024 * 1024));
+        data.extend_from_slice(b"\"}\n");
+        let needles = [n("\"type\":\"user\"", false)];
+        let (got, end) = run(&data, 0, &needles, 512, 64 * 1024, 1 << 24);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1, b"{\"type\":\"user\",\"c\":1}\n".to_vec());
+        assert_eq!(end.cursor, data.len() as u64);
+    }
+
+    #[test]
+    fn stops_when_the_buffer_is_full_and_reports_need() {
+        let data = b"{\"type\":\"user\",\"c\":1}\n{\"type\":\"user\",\"c\":2}\n{\"type\":\"user\",\"c\":3}\n";
+        let needles = [n("\"type\":\"user\"", false)];
+        let line = 22usize;
+        let (got, end) = run(data, 0, &needles, 512, 1 << 20, 2 * (LINES_REC_HEADER + line) + 5);
+        assert_eq!(got.len(), 2);
+        assert_eq!(end.cursor, (2 * line) as u64);
+        assert_eq!(end.need, LINES_REC_HEADER + line);
+        assert!(!end.eof);
+        // Resume from the cursor: the third line comes.
+        let (got2, end2) = run(data, end.cursor, &needles, 512, 1 << 20, 1 << 20);
+        assert_eq!(got2.len(), 1);
+        assert_eq!(got2[0].0, (2 * line) as u64);
+        assert!(end2.eof);
+    }
+
+    #[test]
+    fn candidate_spanning_blocks_is_kept_whole() {
+        // A candidate line longer than the read block.
+        let mut data = Vec::new();
+        data.extend_from_slice(b"{\"type\":\"user\",\"c\":\"");
+        data.extend(std::iter::repeat(b'z').take(LINES_BLOCK + 1000));
+        data.extend_from_slice(b"\"}\n");
+        let needles = [n("\"type\":\"user\"", false)];
+        let (got, end) = run(&data, 0, &needles, 512, 1 << 24, 1 << 24);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1, data);
+        assert!(end.eof);
+    }
 }
 
 fn do_read(

@@ -28,6 +28,9 @@ async-executor = "1"
 async-channel = "2"
 futures-lite = "2"
 libc = "0.2"
+# fs_read_lines: the newline scan and the needle prefilter over a file,
+# SIMD; the reason the import exists is to keep that scan off the guest.
+memchr = "2"
 # The per-plugin SQLite connection sits behind an async mutex: a
 # statement task that finds it busy parks in the executor instead of
 # holding a runner thread. See sqlite.rs.

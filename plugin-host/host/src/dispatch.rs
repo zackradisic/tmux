@@ -1128,6 +1128,99 @@ pub fn fs_read_async(
     Ok(token as i64)
 }
 
+/// The lines of a file, from `offset`, whose first `head` bytes hold a
+/// keep needle and no reject needle, packed into the guest's pinned
+/// buffer (see `fsworker::do_read_lines`). The scan runs on the fs
+/// worker: the guest never sees the lines it would have skipped, which
+/// for a harness transcript is 99% of the bytes. Gated like `fs_read`.
+///
+/// `needles` is a block: `u16 count`, then per needle `u8 reject | u16
+/// len | bytes`. At most 16 needles of at most 256 bytes; `head` at most
+/// 4096; the buffer at least the 16-byte header.
+#[allow(clippy::too_many_arguments)]
+pub fn fs_read_lines_async(
+    mem: &mut GuestMem<'_, '_>,
+    path_ptr: i32,
+    path_len: i32,
+    offset: i64,
+    needles_ptr: i32,
+    needles_len: i32,
+    head: i32,
+    max_line: i32,
+    out_ptr: i32,
+    out_cap: i32,
+) -> Result<i64, HostError> {
+    check_cap(mem, crate::caps::FS_READ)?;
+    if offset < 0 {
+        return Err(err(ErrorCode::BadRequest, "negative offset"));
+    }
+    if (out_cap as usize) < crate::fsworker::LINES_HEADER {
+        return Err(err(ErrorCode::BadRequest, "fs_read_lines: buffer too small"));
+    }
+    if !(1..=4096).contains(&head) {
+        return Err(err(ErrorCode::BadRequest, "fs_read_lines: head out of range"));
+    }
+    if max_line < 1 {
+        return Err(err(ErrorCode::BadRequest, "fs_read_lines: max_line out of range"));
+    }
+    let block = mem.read(needles_ptr, needles_len)?;
+    let needles = parse_needles(&block)?;
+    if needles.iter().all(|n| n.reject) {
+        return Err(err(ErrorCode::BadRequest, "fs_read_lines: no keep needle"));
+    }
+    let root = fs_root_of(mem)?;
+    let rel = fs_rel(mem, path_ptr, path_len)?;
+    let reach = read_reach(mem, &root, &rel)?;
+    let ptr = mem.pinned_bytes_mut(out_ptr, out_cap)?;
+    let data = mem.data();
+    let key = (data.plugin.clone(), data.scope, data.generation);
+    let token = alloc_token(mem);
+    let job = crate::fsworker::FsJob::ReadLines {
+        token,
+        key,
+        root,
+        rel,
+        offset: offset as u64,
+        reach,
+        needles,
+        head: head as usize,
+        max_line: max_line as usize,
+        out: crate::fsworker::GuestSliceMut { ptr, cap: out_cap as usize },
+    };
+    if let Err(e) = crate::fsworker::submit(job) {
+        crate::tokens::discard(token);
+        return Err(err(ErrorCode::Host, e));
+    }
+    Ok(token as i64)
+}
+
+fn parse_needles(block: &[u8]) -> Result<Vec<crate::fsworker::Needle>, HostError> {
+    let bad = || err(ErrorCode::BadRequest, "fs_read_lines: bad needles block");
+    if block.len() < 2 {
+        return Err(bad());
+    }
+    let count = u16::from_le_bytes([block[0], block[1]]) as usize;
+    if count == 0 || count > 16 {
+        return Err(bad());
+    }
+    let mut out = Vec::with_capacity(count);
+    let mut pos = 2usize;
+    for _ in 0..count {
+        let reject = *block.get(pos).ok_or_else(bad)? != 0;
+        let len = u16::from_le_bytes([
+            *block.get(pos + 1).ok_or_else(bad)?,
+            *block.get(pos + 2).ok_or_else(bad)?,
+        ]) as usize;
+        if len == 0 || len > 256 {
+            return Err(bad());
+        }
+        let bytes = block.get(pos + 3..pos + 3 + len).ok_or_else(bad)?.to_vec();
+        out.push(crate::fsworker::Needle { bytes, reject });
+        pos += 3 + len;
+    }
+    Ok(out)
+}
+
 /// List a directory into the guest's pinned buffer. Async on the fs
 /// worker, so a slow or huge directory never stalls the event loop.
 /// Completion: `v0` = bytes written, `v1` = entries the directory holds

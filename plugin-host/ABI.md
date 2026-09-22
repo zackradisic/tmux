@@ -58,6 +58,41 @@ Neither grant gives a plugin power it could not already reach through
 `run-process`, which runs an arbitrary shell. They exist so a plugin can
 read a directory *without* reaching for a shell.
 
+## Filtered line read
+
+`fs_read_lines` is `fs_read` for a line-oriented file most of whose
+lines the caller would throw away. The scan runs on the fs executor:
+the host reads from `offset`, splits lines, judges each on its first
+`head` bytes (kept if any *keep* needle is in them and no *reject*
+needle is - SIMD `memmem`, needles compiled once per call) and packs the
+survivors straight into the guest's pinned buffer. The guest never sees
+a skipped line, and a skipped line is never buffered past its head
+however long it is. On a Claude Code transcript that is 99% of the
+bytes - tool results on lines that run to a megabyte - which is what
+kept a per-chunk scan in the guest at 17-110 µs per 128 KiB and why
+this import exists.
+
+```
+needles: u16 count | per needle: u8 reject | u16 len | u8 bytes[len]
+         (1..=16 needles of 1..=256 bytes; at least one keep needle)
+head:    1..=4096
+out:     u64 cursor | u32 need | u8 eof | u8 pad[3]        (16-byte header)
+         then per kept line: u64 offset | u32 len | u8 line[len]
+         (len includes the newline)                        (little-endian)
+```
+
+`cursor` is the file offset after the last line consumed, kept or
+skipped, so the next call starts there. A trailing line with no newline
+(a record still being written) is not consumed. `eof` says the scan
+reached the end of the file. A kept line that does not fit stops the
+scan before it and reports its record size in `need`; with no records
+written that means the buffer is too small for that line - grow to
+`need` and retry (the SDK's `fs_read_lines` does). A kept line longer
+than `max_line` is skipped as if it had not matched, so `need` is bounded
+by it. The host consumes at most 8 MiB per call, at a line boundary, so
+one worker task stays short and a caller reading a 200 MB file sees
+progress; loop on `cursor` until `eof`.
+
 ## Directory listing
 
 `fs_list` runs on the fs executor and writes packed records straight
@@ -320,6 +355,7 @@ guest frees (the error message bytes when `err != 0`; empty = none).
 | `timer_start` | `(ms: i64) -> i64` | nothing | timers |
 | `fs_write` | `(path, data, append) -> i64` | v0 = bytes written | fs-write |
 | `fs_read` | `(path, offset: i64, out_ptr, out_cap) -> i64` | v0 = bytes read, v1 = eof | fs-read |
+| `fs_read_lines` | `(path, offset: i64, needles Bytes, head, max_line, out_ptr, out_cap) -> i64` — the lines from `offset` whose first `head` bytes hold a keep needle and no reject needle; see **Filtered line read** | v0 = bytes written, v1 = lines kept | fs-read |
 | `fs_list` | `(path Str, out_ptr, out_cap) -> i64` (async; v0 = bytes, v1 = entries) | fs-list |
 | `fs_rename` | `(from Str, to Str, flags) -> i64` | nothing | fs-write |
 | `fs_remove` | `(path Str) -> i64` (async) | nothing | fs-write |

@@ -842,6 +842,7 @@ dependencies = [
  "crossbeam-channel",
  "futures-lite",
  "libc",
+ "memchr",
  "rusqlite",
  "serde",
  "serde_json",
