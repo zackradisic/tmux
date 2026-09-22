@@ -33,6 +33,11 @@ pub struct Resolved {
     pub started_ms: Option<i64>,
     pub last_active_ms: Option<i64>,
     pub source_path: Option<String>,
+    /// The harness's transcript file - the conversation itself, which the
+    /// extractor reads (see `transcript`). Claude's is derived from the
+    /// session's `cwd`; Codex's is the rollout, the same file as
+    /// `source_path`.
+    pub transcript_path: Option<String>,
 }
 
 fn home() -> Option<String> {
@@ -88,7 +93,7 @@ async fn claude_for_pane(pane: u32) -> Option<Resolved> {
     if let Ok(Some(pid)) = pane_pid(PaneId(pane)) {
         let path = format!("{dir}/{pid}.json");
         if let Ok((bytes, _)) = fs_read(&path, 0, 16 * 1024).await {
-            if let Some((p, w, r)) = parse_claude(&path, &bytes) {
+            if let Some((p, w, r)) = parse_claude(&path, &bytes, &home) {
                 if claims(p, w) {
                     return Some(r);
                 }
@@ -109,7 +114,7 @@ async fn claude_for_pane(pane: u32) -> Option<Resolved> {
         let Ok((bytes, _)) = fs_read(&path, 0, 16 * 1024).await else {
             continue;
         };
-        if let Some((p, w, r)) = parse_claude(&path, &bytes) {
+        if let Some((p, w, r)) = parse_claude(&path, &bytes, &home) {
             if claims(p, w) {
                 return Some(r);
             }
@@ -121,7 +126,7 @@ async fn claude_for_pane(pane: u32) -> Option<Resolved> {
 /// Parse one Claude session file into (pane, window, resolved). Returns
 /// None when the JSON is malformed or lacks a usable `tmux` field; the
 /// window is None when the field carries no `@N` part.
-fn parse_claude(path: &str, bytes: &[u8]) -> Option<(u32, Option<u32>, Resolved)> {
+fn parse_claude(path: &str, bytes: &[u8], home: &str) -> Option<(u32, Option<u32>, Resolved)> {
     let v = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
     // tmux is "session:@window.%pane".
     let field = v.get("tmux").and_then(|x| x.as_str())?;
@@ -133,6 +138,13 @@ fn parse_claude(path: &str, bytes: &[u8]) -> Option<(u32, Option<u32>, Resolved)
         .and_then(|w| w.strip_prefix('@'))
         .and_then(|n| n.parse::<u32>().ok());
     let sid = v.get("sessionId").and_then(|x| x.as_str());
+    // The transcript sits under the project directory named for the cwd.
+    let transcript_path = match (sid, v.get("cwd").and_then(|x| x.as_str())) {
+        (Some(sid), Some(cwd)) if !cwd.is_empty() => {
+            Some(crate::transcript::claude_transcript_path(home, cwd, sid))
+        }
+        _ => None,
+    };
     let status = match v.get("status").and_then(|x| x.as_str()) {
         Some("busy") => Some("working".to_string()),
         Some("idle") => Some("waiting".to_string()),
@@ -148,6 +160,7 @@ fn parse_claude(path: &str, bytes: &[u8]) -> Option<(u32, Option<u32>, Resolved)
             started_ms: v.get("startedAt").and_then(|x| x.as_i64()),
             last_active_ms: v.get("updatedAt").and_then(|x| x.as_i64()),
             source_path: Some(path.to_string()),
+            transcript_path,
         },
     ))
 }
@@ -206,7 +219,8 @@ pub async fn codex(a: &Agent) -> Option<Resolved> {
         real_id,
         name,
         last_active_ms: file_mtime_ms(&path).await,
-        source_path: Some(path),
+        source_path: Some(path.clone()),
+        transcript_path: Some(path),
         ..Default::default()
     })
 }

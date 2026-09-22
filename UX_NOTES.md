@@ -521,6 +521,59 @@ now wins over the `archived` tag on the row. Captures are grepped in
 Rust (substring, then subsequence), so a *regex* query only ever hits a
 grid, never a capture. `regress/plugin-agents-archived.sh` covers it.
 
+**Fixed, the structural half.** The transcript is now the source of the
+search and of the preview for anything without a pane. The harness's
+own file (Claude's `~/.claude/projects/<slug>/<id>.jsonl`, Codex's
+rollout) is read when a turn ends (a `waiting`/`needs_input` report)
+and when the agent ends (pane gone, `done`), condensed to prompts,
+replies and one line per tool call (`Edit view.rs +12 −3`; never the
+tool's output), and stored in `turns` for `history_days` (365 by
+default) - past Claude's own 30-day cleanup of the file, so the
+searchable history is no longer capped at what the harness keeps. The
+search box searches those conversations through an inverted index held
+in memory (`index.rs`; one document per user turn, bm25, paths at half
+weight), so a query brings in every agent that ever talked about the
+word, live or dead, history on or off, best first, with the matching
+line on the row - and the preview opens on the matching turn. A
+finished agent's preview is its conversation; `Tab` shows a live one's
+in place of its pane; `[`/`]` scroll it. The `HISTORY_MAX` cap now only
+bounds the empty-query browse. `extract.rs` (per harness),
+`transcript.rs` (ingest, index lifecycle), `regress/plugin-agents-
+transcript.sh`.
+
+### A3. What the conversation search does not do yet
+
+- **A harness with no hooks is indexed only when it ends.** The
+  turn-end trigger is the shim's status report; a Claude without the
+  hooks, or a pi/opencode with none, gets its transcript read when the
+  pane dies (and at server start). Its live pane is still grepped by
+  `^F`, so what is on screen is findable; what scrolled off is not until
+  it ends. A fallback off `pane-command-changed` plus a quiet period
+  would close this.
+- **The current turn is not searchable until it ends.** By design (the
+  file holds a half-written turn), but a long turn is invisible to the
+  conversation search for its whole duration.
+- **pi and opencode have no extractor.** `extract::for_kind` knows
+  Claude and Codex; the others get rows and captures as before, no
+  turns. The Codex extractor is written against archived rollouts, not a
+  live one.
+- **Tool results and full diffs are not stored.** The row keeps the
+  record's byte offset in the transcript, so expanding a tool call in
+  the preview could seek the original while it exists; nothing does yet.
+  Once Claude deletes the file, the one-line condensation is all there
+  is.
+- **The snippet lands a beat after the row.** The hit is computed in the
+  keystroke; its snippet (and the row itself, for an agent the roster did
+  not hold) comes back from the store a moment later, so a fast typist
+  sees rows appear before their matching lines do.
+- **Relevance order replaces the frozen order while a query is typed.**
+  Rows sort by band then score, so two keystrokes can reorder the live
+  band under the cursor. The cursor follows its row; the eye may not.
+- **Retention pruning rebuilds the whole index.** `prune` deleting any
+  agent triggers a full rebuild from `turns` (page by page, one page per
+  wake). Cheap at hundreds of sessions; at tens of thousands it would
+  want tombstones and a merge instead.
+
 ## Sessions and windows
 
 ### S1. `prefix w` and `prefix s` should look like the agents picker

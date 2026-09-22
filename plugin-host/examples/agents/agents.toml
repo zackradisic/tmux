@@ -66,7 +66,10 @@ names = [
 [caps.fs-read]
 paths = [
   "~/.claude/sessions",
+  # The transcripts the conversation search reads (see transcript.rs).
+  "~/.claude/projects",
   "~/.codex/sessions",
+  "~/.codex/archived_sessions",
   "~/.pi",
   "~/.local/share/opencode",
 ]

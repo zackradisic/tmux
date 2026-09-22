@@ -20,8 +20,10 @@ use std::task::{Context, Poll};
 use tmux_plugin_sdk::abi::ErrorCode;
 use tmux_plugin_sdk::prelude::*;
 
-use crate::provider::{self, mode_label, run_content_search, ListReq, Snapshot};
-use crate::store::{self, Agent, LOCAL};
+use crate::index;
+use crate::provider::{self, mode_label, run_content_search, ListReq, Snapshot, TurnsReq};
+use crate::store::{self, Agent, TurnRow, LOCAL};
+use crate::transcript::{self, TranscriptHit};
 use crate::{Config, PickKeys, HISTORY_MAX};
 
 /// The picker opens at a fraction of the window, clamped to this box. A
@@ -635,6 +637,46 @@ pub struct Picker {
     /// key moves the cursor - a selection that moved under your prompt
     /// would send the rest of it to another agent.
     pub preview_focus: bool,
+    /// The query the conversation hits below are for.
+    pub transcript_query: String,
+    /// Conversation hits for that query, by row key: the turn to open on,
+    /// the score, the line that matched. Local ones are computed inside
+    /// the keystroke (see `transcript_search`); their snippets, and the
+    /// remote servers' hits, land a moment later.
+    pub transcript_hits: HashMap<String, TranscriptHit>,
+    /// Rows a conversation hit brought in that the roster did not hold
+    /// (finished agents with history off, or past its cap). Appended to
+    /// `rows` after the roster's own on every refilter; gone with the
+    /// query.
+    pub hit_rows: Vec<Agent>,
+    /// How many of `rows` are the roster's own: the rest are hit rows,
+    /// and are cut off before they are merged again.
+    pub roster_len: usize,
+    /// The conversation in the preview, when the highlighted row shows
+    /// one (a finished agent, a remote row with no mirror, or a live row
+    /// with `show_transcript`).
+    pub transcript: Option<TranscriptView>,
+    /// Show the highlighted live row's conversation instead of its pane.
+    pub show_transcript: bool,
+}
+
+/// A conversation rendered for the preview.
+pub struct TranscriptView {
+    /// The row it belongs to.
+    pub key: String,
+    /// When the turns were fetched (local clock): a live agent's
+    /// conversation grows, so it is fetched again on the refresh cadence.
+    pub fetched_ms: u64,
+    pub turns: Vec<TurnRow>,
+    /// The turn it opened on (a hit's), or -1 for the end.
+    pub open_seq: i64,
+    /// Scroll position, in rendered lines.
+    pub top: usize,
+    /// The width the lines were rendered for.
+    pub width: usize,
+    pub lines: Vec<String>,
+    /// The saved capture that stands in when there are no turns.
+    pub capture: Vec<String>,
 }
 
 impl Picker {
@@ -1001,7 +1043,14 @@ pub async fn pick_open(
         remote_capture: None,
         multi,
         preview_focus: false,
+        transcript_query: String::new(),
+        transcript_hits: HashMap::new(),
+        hit_rows: Vec::new(),
+        roster_len: 0,
+        transcript: None,
+        show_transcript: false,
     };
+    p.roster_len = p.rows.len();
     pick_refilter(&mut p);
     // Open on the agent you are sitting in, when it has a row.
     p.select_here();
@@ -1021,7 +1070,7 @@ pub async fn pick_open(
     // stack up rounds of ssh - see fetch_remotes_on_open.
     spawn(fetch_remotes_on_open(Rc::clone(&picker), Rc::clone(&remotes), ListReq::default()));
     fetch_unread(Rc::clone(&picker));
-    request_capture(&picker);
+    request_preview(&picker);
 }
 
 /// Rebuild the picker's rows, preserving the highlight. `enrich` reads
@@ -1048,6 +1097,7 @@ pub async fn reload_picker(
         // Stable order (server + band + frozen rank), so a refresh never
         // reshuffles rows under the cursor.
         stable_sort(&mut p.order, &mut p.order_next, &mut rows);
+        p.roster_len = rows.len();
         p.rows = rows;
         p.captures = captures;
         p.now_ms = now_ms();
@@ -1067,7 +1117,7 @@ pub async fn reload_picker(
     }
     drop(b);
     fetch_unread(Rc::clone(&picker));
-    request_capture(&picker);
+    request_preview(&picker);
 }
 
 pub async fn refresh_if_open(
@@ -1109,6 +1159,95 @@ async fn refresh_timer(
 }
 
 /// A remote row without a local mirror shows the provider's captured text
+/// Whatever the highlighted row needs in the preview that is not a live
+/// blit: its conversation, or a remote provider's captured text.
+fn request_preview(picker: &Rc<RefCell<Option<Picker>>>) {
+    request_transcript(picker);
+    request_capture(picker);
+}
+
+/// The highlighted row shows its conversation in the preview (no live
+/// pane to blit, or `show_transcript`): fetch the turns, once per row
+/// and opening turn. Local rows read the store; a remote row asks its
+/// provider's `turns`. A local row with no turns falls back to its saved
+/// capture, so a finished agent from before the transcript existed still
+/// shows something.
+fn request_transcript(picker: &Rc<RefCell<Option<Picker>>>) {
+    let want = {
+        let b = picker.borrow();
+        let Some(p) = b.as_ref() else { return };
+        let Some(a) = p.selected() else { return };
+        if p.local_pane_of(a).is_some() && !p.show_transcript {
+            return;
+        }
+        let key = a.key();
+        let open_seq = p.transcript_hits.get(&key).map(|h| h.seq).unwrap_or(-1);
+        let fresh_for = if a.live() { REFRESH_MS } else { u64::MAX };
+        if p.transcript.as_ref().is_some_and(|tv| {
+            tv.key == key
+                && tv.open_seq == open_seq
+                && now_ms().saturating_sub(tv.fetched_ms) < fresh_for
+        }) {
+            return;
+        }
+        (key, a.server.clone(), a.id.clone(), a.is_local(), open_seq, p.mode)
+    };
+    let picker = Rc::clone(picker);
+    spawn(async move {
+        let (key, server, id, local, open_seq, mode) = want;
+        let turns: Vec<TurnRow> = if local {
+            store::turns_range(&id, 0, i64::MAX).await.unwrap_or_default()
+        } else {
+            let req = TurnsReq { id: id.clone(), from: 0, to: i64::MAX };
+            service::call_json::<_, Vec<TurnRow>>(&format!("@{server}"), "turns", &req)
+                .await
+                .unwrap_or_default()
+        };
+        let capture: Vec<String> = if turns.is_empty() && local {
+            store::get_capture(&id)
+                .await
+                .ok()
+                .flatten()
+                .map(|t| t.lines().map(str::to_string).collect())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let mut b = picker.borrow_mut();
+        let Some(p) = b.as_mut() else { return };
+        if p.mode.0 != mode.0 || p.selected().map(|a| a.key()) != Some(key.clone()) {
+            return;
+        }
+        // A refetch of the same conversation keeps the scroll position.
+        let top = match p.transcript.as_ref() {
+            Some(tv) if tv.key == key && tv.open_seq == open_seq && !tv.lines.is_empty() => {
+                Some(tv.top)
+            }
+            _ => None,
+        };
+        p.transcript = Some(TranscriptView {
+            key,
+            fetched_ms: now_ms(),
+            turns,
+            open_seq,
+            top: top.unwrap_or(0),
+            width: 0,
+            lines: Vec::new(),
+            capture,
+        });
+        if let Some(t) = top {
+            // Rendering resets `top` to the opening turn; keep the user's.
+            let pw = (p.width as usize).saturating_sub(p.list_w() + 2);
+            let (terms, _) = index::query_terms(&p.transcript_query);
+            if let Some(tv) = p.transcript.as_mut() {
+                render_transcript(tv, pw, &terms);
+                tv.top = t;
+            }
+        }
+        pick_render(p);
+    });
+}
+
 /// in the preview area: ask for it (once per highlighted row).
 fn request_capture(picker: &Rc<RefCell<Option<Picker>>>) {
     let want = {
@@ -1516,7 +1655,7 @@ pub fn on_mode_nav(
     if let Some((server, id)) = ack {
         ctx.spawn(acknowledge(server, id));
     }
-    request_capture(picker);
+    request_preview(picker);
 }
 
 /// A key the action menu sent back in. The menu's items are the picker's
@@ -1768,6 +1907,28 @@ fn dispatch_key(
             pick_render(p);
         } else if key == k.content {
             toggle_content(p);
+        } else if key == "Tab" {
+            // The highlighted live row's conversation in place of its
+            // pane, and back. A row with no pane shows it anyway.
+            p.show_transcript = !p.show_transcript;
+            p.status = Some(if p.show_transcript {
+                "preview: conversation".into()
+            } else {
+                "preview: pane".into()
+            });
+            pick_render(p);
+        } else if key == "[" || key == "]" {
+            if transcript_shown(p) {
+                let step = (p.height as usize).saturating_sub(2).max(2) / 2;
+                if let Some(tv) = p.transcript.as_mut() {
+                    tv.top = if key == "[" {
+                        tv.top.saturating_sub(step)
+                    } else {
+                        tv.top.saturating_add(step)
+                    };
+                }
+                pick_render(p);
+            }
         } else if key == k.rename {
             if let Some(a) = p.selected() {
                 p.rename_buf = a.user_name.clone().unwrap_or_default();
@@ -1785,7 +1946,9 @@ fn dispatch_key(
         } else if key == k.jump {
             after = jump_after(p, &mut ack);
         } else if key == k.focus || key == "Right" {
-            // Right, into the preview: the keyboard goes with it.
+            // Right, into the preview: the keyboard goes with it, and the
+            // pane comes back if the conversation was showing.
+            p.show_transcript = false;
             ack = focus_preview(p);
         } else if key == "h" || key == "Left" {
             // Left of the list is nothing; the key is spent so that it
@@ -1887,7 +2050,7 @@ fn dispatch_key(
     if let Some((server, id)) = ack {
         ctx.spawn(acknowledge(server, id));
     }
-    request_capture(picker);
+    request_preview(picker);
     match after {
         PickAfter::None => {}
         PickAfter::Type(pane, key) => {
@@ -2701,7 +2864,11 @@ fn pick_refilter_keep(
         if p.content_query != needle {
             p.content_hits.clear();
             p.content_query = needle.clone();
-            remote_search(p, &needle);
+            if p.transcript_query == needle {
+                // Otherwise transcript_search below sends the one request
+                // that serves both.
+                remote_search(p, &needle);
+            }
         } else {
             let local_prefix = store::row_key(LOCAL, "");
             p.content_hits.retain(|k, _| !k.starts_with(&local_prefix));
@@ -2716,6 +2883,22 @@ fn pick_refilter_keep(
         p.content_hits = HashMap::new();
         p.content_query.clear();
     }
+    // The conversation search: every agent's stored transcript, whether
+    // or not its row is in the roster.
+    transcript_search(p, &needle);
+    pick_reshow(p, keep, reset_scroll);
+}
+
+/// Rebuild the visible list from `rows` and the hits in hand, without
+/// searching again: the tail of a refilter, and what a late reply (rows
+/// for the hits, a remote server's answer) re-runs.
+fn pick_reshow(
+    p: &mut Picker,
+    keep: Option<(String, String, Option<i64>)>,
+    reset_scroll: bool,
+) {
+    let needle = p.filter.trim().to_string();
+    merge_hit_rows(p);
     p.view = p
         .rows
         .iter()
@@ -2723,6 +2906,31 @@ fn pick_refilter_keep(
         .filter(|(_, a)| row_shown(p, a, &needle))
         .map(|(i, _)| i)
         .collect();
+    if !needle.is_empty() {
+        // With a query, rows sort by relevance inside their band: a name
+        // that starts with the query, then one that contains it, then the
+        // conversation hits by score. Stable, so ties keep their order.
+        let mut keyed: Vec<(usize, (bool, String), u8, f32)> = p
+            .view
+            .iter()
+            .map(|&i| {
+                let a = &p.rows[i];
+                let tier = match rank(&haystack(a), &needle) {
+                    Some(0) => 2.0e6,
+                    Some(1) => 1.0e6,
+                    _ => 0.0,
+                };
+                let hit = p.transcript_hits.get(&a.key()).map(|h| h.score).unwrap_or(0.0);
+                (i, (!a.is_local(), a.server.clone()), band(a), tier + hit)
+            })
+            .collect();
+        keyed.sort_by(|x, y| {
+            x.1.cmp(&y.1)
+                .then(x.2.cmp(&y.2))
+                .then(y.3.partial_cmp(&x.3).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        p.view = keyed.into_iter().map(|k| k.0).collect();
+    }
     p.sel = keep
         .and_then(|(key, server, pane)| {
             // Prefer the key; fall back to the pane on the same server,
@@ -2756,28 +2964,134 @@ fn pick_refilter_keep(
 }
 
 /// Whether a row is in the view: it belongs to the view's set (every row,
-/// or only the archived ones), and the filter matches its metadata or a
-/// content hit landed on it.
+/// or only the archived ones), and the filter matches its metadata, a
+/// content hit landed on it, or its conversation matched.
 fn row_shown(p: &Picker, a: &Agent, needle: &str) -> bool {
     if p.archived_only && a.life != "archived" {
         return false;
     }
-    rank(&haystack(a), needle).is_some() || p.content_hits.contains_key(&a.key())
+    let key = a.key();
+    rank(&haystack(a), needle).is_some()
+        || p.content_hits.contains_key(&key)
+        || p.transcript_hits.contains_key(&key)
 }
 
-/// Ask every remote server with rows to search to grep them for `needle`:
-/// the live panes, and in the archive view the saved captures too. The
-/// replies fold into `content_hits` when they arrive. The picker is found
-/// again through the shared cell, so a reply for a closed picker or an
-/// outdated query is dropped.
+/// The rows the hits brought in follow the roster's own in `rows`, once
+/// each and never doubling a row the roster holds; without a query they
+/// leave again. Idempotent: the previous merge is cut off first.
+fn merge_hit_rows(p: &mut Picker) {
+    p.rows.truncate(p.roster_len);
+    if p.transcript_query.is_empty() {
+        p.hit_rows.clear();
+        return;
+    }
+    let present: HashSet<String> = p.rows.iter().map(Agent::key).collect();
+    for a in &p.hit_rows {
+        if !present.contains(&a.key()) {
+            p.rows.push(a.clone());
+        }
+    }
+}
+
+/// The conversation search for the query. The local index answers inside
+/// the keystroke (hits by row key, no snippet yet); the rows the roster
+/// lacks and the snippets follow from the store a moment later, and each
+/// linked server's provider answers for its own agents (`remote_search`).
+/// A query already searched is not searched again.
+fn transcript_search(p: &mut Picker, needle: &str) {
+    if needle.is_empty() {
+        p.transcript_query.clear();
+        p.transcript_hits.clear();
+        return;
+    }
+    if p.transcript_query == needle {
+        return;
+    }
+    p.transcript_query = needle.to_string();
+    p.transcript_hits.clear();
+    p.hit_rows.clear();
+    let hits = transcript::search(needle, transcript::HITS_MAX);
+    let missing: Vec<String> = hits
+        .iter()
+        .filter(|h| !p.rows.iter().any(|a| a.is_local() && a.id == h.id))
+        .map(|h| h.id.clone())
+        .collect();
+    let windows: Vec<(String, i64, i64)> = hits
+        .iter()
+        .map(|h| (h.id.clone(), h.seq, h.seq + transcript::DOC_WINDOW))
+        .collect();
+    for h in hits {
+        p.transcript_hits.insert(
+            store::row_key(LOCAL, &h.id),
+            TranscriptHit { id: h.id, seq: h.seq, score: h.score, snippet: String::new() },
+        );
+    }
+    if !windows.is_empty() {
+        local_hit_details(needle.to_string(), missing, windows);
+    }
+    remote_search(p, needle);
+}
+
+/// Fetch what the local hits still need - the rows the roster did not
+/// hold, and one snippet each - and fold them into the picker if it is
+/// still on the same query.
+fn local_hit_details(needle: String, missing: Vec<String>, windows: Vec<(String, i64, i64)>) {
+    spawn(async move {
+        let rows = store::by_ids(&missing).await.unwrap_or_default();
+        let turns = store::turns_windows(&windows).await.unwrap_or_default();
+        let (terms, _) = index::query_terms(&needle);
+        PICKER.with(|cell| {
+            let Some(picker) = cell.borrow().clone() else { return };
+            let mut b = picker.borrow_mut();
+            let Some(p) = b.as_mut() else { return };
+            if p.transcript_query != needle {
+                return;
+            }
+            for a in rows {
+                if !p.hit_rows.iter().any(|r| r.key() == a.key()) {
+                    p.hit_rows.push(a);
+                }
+            }
+            for (id, seq, _) in &windows {
+                let key = store::row_key(LOCAL, id);
+                if let Some(h) = p.transcript_hits.get_mut(&key) {
+                    h.snippet = transcript::snippet_for(&turns, id, *seq, &terms);
+                }
+            }
+            let keep = p.selected().map(|a| (a.key(), a.server.clone(), a.pane));
+            pick_reshow(p, keep, false);
+            pick_render(p);
+        });
+        // The highlighted row may now be a hit with a turn to open on.
+        PICKER.with(|cell| {
+            if let Some(picker) = cell.borrow().clone() {
+                request_transcript(&picker);
+            }
+        });
+    });
+}
+
+/// Ask every linked server's provider to search its agents for `needle`:
+/// their live grids (and, in the archive view, their saved captures) for
+/// content search, and their stored conversations. The replies fold into
+/// `content_hits` and `transcript_hits` when they arrive, with the rows
+/// the conversation hits belong to. The picker is found again through
+/// the shared cell, so a reply for a closed picker or an outdated query
+/// is dropped.
 fn remote_search(p: &mut Picker, needle: &str) {
     let archived = p.archived_only;
-    let servers: HashSet<String> = p
+    let mut servers: HashSet<String> = p
         .rows
         .iter()
-        .filter(|a| !a.is_local() && (a.live() || (archived && a.life == "archived")))
+        .filter(|a| !a.is_local())
         .map(|a| a.server.clone())
         .collect();
+    // A server whose roster is empty here still has conversations.
+    for s in service::servers().unwrap_or_default() {
+        if !s.local && s.up && s.linked {
+            servers.insert(s.name);
+        }
+    }
     if servers.is_empty() {
         return;
     }
@@ -2787,7 +3101,8 @@ fn remote_search(p: &mut Picker, needle: &str) {
         let needle = needle.clone();
         spawn(async move {
             let target = format!("@{server}");
-            let req = provider::SearchReq { needle: needle.clone(), archived };
+            let req =
+                provider::SearchReq { needle: needle.clone(), archived, transcript: true };
             let Ok(reply) =
                 service::call_json::<_, provider::SearchReply>(&target, "search", &req).await
             else {
@@ -2797,32 +3112,38 @@ fn remote_search(p: &mut Picker, needle: &str) {
                 let Some(picker) = cell.borrow().clone() else { return };
                 let mut b = picker.borrow_mut();
                 let Some(p) = b.as_mut() else { return };
-                if p.mode.0 != mode.0 || p.content_query != needle || !p.content_search {
+                if p.mode.0 != mode.0 {
                     return;
                 }
-                for (id, snip) in &reply.hits {
-                    p.content_hits.insert(store::row_key(&server, id), snip.clone());
+                let mut changed = false;
+                if p.content_search && p.content_query == needle {
+                    for (id, snip) in &reply.hits {
+                        p.content_hits.insert(store::row_key(&server, id), snip.clone());
+                    }
+                    if !reply.hits.is_empty() {
+                        p.content_mode = provider::reply_mode(&reply);
+                    }
+                    changed = true;
                 }
-                if !reply.hits.is_empty() {
-                    p.content_mode = provider::reply_mode(&reply);
+                if p.transcript_query == needle {
+                    for h in reply.transcript {
+                        p.transcript_hits.insert(store::row_key(&server, &h.id), h);
+                    }
+                    for mut a in reply.agents {
+                        a.server = server.clone();
+                        if !p.hit_rows.iter().any(|r| r.key() == a.key()) {
+                            p.hit_rows.push(a);
+                        }
+                    }
+                    changed = true;
+                }
+                if !changed {
+                    return;
                 }
                 let keep = p.selected().map(|a| (a.key(), a.server.clone(), a.pane));
                 // Rebuild the view with the new hits, without re-running
                 // the search (the query is unchanged).
-                let q = p.content_query.clone();
-                let view: Vec<usize> = p
-                    .rows
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, a)| row_shown(p, a, &q))
-                    .map(|(i, _)| i)
-                    .collect();
-                p.view = view;
-                p.sel = keep
-                    .and_then(|(key, _, _)| p.view.iter().position(|&i| p.rows[i].key() == key))
-                    .unwrap_or(0);
-                p.rebuild_lines();
-                p.scroll_to_selection();
+                pick_reshow(p, keep, false);
                 pick_render(p);
             });
         });
@@ -2831,7 +3152,8 @@ fn remote_search(p: &mut Picker, needle: &str) {
 
 thread_local! {
     /// The plugin's picker cell, so a detached task (a remote search
-    /// reply) can find the picker without holding a borrow across awaits.
+    /// reply, the rows for a conversation hit) can find the picker
+    /// without holding a borrow across awaits.
     pub static PICKER: RefCell<Option<Rc<RefCell<Option<Picker>>>>> =
         const { RefCell::new(None) };
 }
@@ -3097,10 +3419,17 @@ pub fn pick_render(p: &mut Picker) {
                     // why the row is here. Otherwise an archived row (only
                     // in the history views) says so, so the `a` un-archive
                     // is obvious; else the reported task.
+                    let key = a.key();
                     let snip = p
                         .content_hits
-                        .get(&a.key())
-                        .filter(|_| p.content_search);
+                        .get(&key)
+                        .filter(|_| p.content_search)
+                        .or_else(|| {
+                            p.transcript_hits
+                                .get(&key)
+                                .map(|h| &h.snippet)
+                                .filter(|s| !s.is_empty())
+                        });
                     // The note wins over the task: it is the reason this
                     // row is at the top of the list, and it only exists
                     // while the agent is blocked on the user.
@@ -3249,14 +3578,17 @@ pub fn pick_render(p: &mut Picker) {
     };
     out.push_str(&format!("\x1b[{h};1H  \x1b[2m{}\x1b[0m", footer));
 
-    // The preview: a live blit of the local (or mirrored) pane, else the
-    // provider's captured text for a remote row with no mirror here.
+    // The preview: a live blit of the local (or mirrored) pane; else the
+    // row's conversation (a finished agent, or a live one with Tab); else
+    // the provider's captured text for a remote row with no mirror here.
     let rect = preview_rect(p, list_w);
     if rect.is_none() {
-        if let Some(text) = remote_preview_lines(p) {
-            let x = list_w + 2;
-            let pw = w.saturating_sub(list_w + 1);
-            let ph = h.saturating_sub(1);
+        let x = list_w + 2;
+        let pw = w.saturating_sub(list_w + 2);
+        let ph = h.saturating_sub(1);
+        if transcript_shown(p) {
+            draw_transcript(p, &mut out, x, pw, ph);
+        } else if let Some(text) = remote_preview_lines(p) {
             for (i, line) in text.iter().rev().take(ph).rev().enumerate() {
                 out.push_str(&format!(
                     "\x1b[{};{x}H{}",
@@ -3271,11 +3603,192 @@ pub fn pick_render(p: &mut Picker) {
     let _ = mode_preview(p.mode, rect.as_ref());
 }
 
+/// Does the preview show the highlighted row's conversation? Only once
+/// its turns (or a stand-in capture) have arrived for that row.
+fn transcript_shown(p: &Picker) -> bool {
+    let Some(a) = p.selected() else { return false };
+    p.transcript
+        .as_ref()
+        .is_some_and(|tv| tv.key == a.key() && (!tv.turns.is_empty() || !tv.capture.is_empty()))
+}
+
+/// Draw the conversation into the preview area: a header line, then the
+/// rendered turns from the scroll position.
+fn draw_transcript(p: &mut Picker, out: &mut String, x: usize, pw: usize, ph: usize) {
+    let (terms, _) = index::query_terms(&p.transcript_query);
+    let live = live_pane_of_selection(p).is_some();
+    let Some(tv) = p.transcript.as_mut() else { return };
+    if tv.width != pw || tv.lines.is_empty() {
+        render_transcript(tv, pw, &terms);
+    }
+    let body = ph.saturating_sub(1);
+    let max_top = tv.lines.len().saturating_sub(body);
+    if tv.top > max_top {
+        tv.top = max_top;
+    }
+    let what = if tv.turns.is_empty() {
+        "last screen".to_string()
+    } else {
+        format!("{} turns", tv.turns.len())
+    };
+    let hint = if live { " · Tab pane" } else { "" };
+    let header = format!("conversation · {what}{hint} · [ ] scroll");
+    out.push_str(&format!("\x1b[1;{x}H\x1b[2m{}\x1b[0m", clip(&header, pw)));
+    for (i, line) in tv.lines.iter().skip(tv.top).take(body).enumerate() {
+        out.push_str(&format!("\x1b[{};{x}H{line}", i + 2));
+    }
+}
+
+/// Lay the turns out for `width`: a prompt with a `❯` in front, in bold;
+/// the agent's text plain; a tool line dim; a blank line between turns;
+/// the query's terms in reverse video. Opens on the hit's turn when
+/// there is one, else at the end.
+fn render_transcript(tv: &mut TranscriptView, width: usize, terms: &[String]) {
+    tv.width = width;
+    tv.lines.clear();
+    let width = width.max(8);
+    let mut open_at: Option<usize> = None;
+    if tv.turns.is_empty() {
+        for l in &tv.capture {
+            tv.lines.push(clip(&strip_sgr(l), width));
+        }
+    }
+    for t in &tv.turns {
+        if tv.open_seq >= 0 && open_at.is_none() && t.seq >= tv.open_seq {
+            open_at = Some(tv.lines.len());
+        }
+        match t.kind.as_str() {
+            "user" => {
+                for (i, l) in wrap(&t.text, width.saturating_sub(2)).into_iter().enumerate() {
+                    let lead = if i == 0 { "\x1b[1;36m❯\x1b[0m " } else { "  " };
+                    tv.lines.push(format!("{lead}\x1b[1m{}\x1b[0m", highlight(&l, terms)));
+                }
+            }
+            "tool" => {
+                for (i, l) in wrap(&t.text, width.saturating_sub(4)).into_iter().enumerate() {
+                    let lead = if i == 0 { "  ⚙ " } else { "    " };
+                    tv.lines.push(format!("\x1b[2m{lead}{}\x1b[0m", highlight(&l, terms)));
+                }
+            }
+            _ => {
+                for l in wrap(&t.text, width) {
+                    tv.lines.push(highlight(&l, terms));
+                }
+            }
+        }
+        tv.lines.push(String::new());
+    }
+    while tv.lines.last().is_some_and(String::is_empty) {
+        tv.lines.pop();
+    }
+    tv.top = match open_at {
+        Some(at) => at,
+        None => usize::MAX, // clamped to the end when drawn
+    };
+}
+
+/// Greedy word wrap on chars; a word longer than the width is split.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut out = Vec::new();
+    for para in text.split('\n') {
+        let mut line = String::new();
+        let mut n = 0usize;
+        for word in para.split(' ') {
+            let wl = word.chars().count();
+            if wl == 0 {
+                continue;
+            }
+            if n > 0 && n + 1 + wl > width {
+                out.push(std::mem::take(&mut line));
+                n = 0;
+            }
+            if wl > width {
+                // Hard-split a word wider than the line.
+                let chars: Vec<char> = word.chars().collect();
+                for piece in chars.chunks(width) {
+                    if n > 0 {
+                        out.push(std::mem::take(&mut line));
+                    }
+                    line.extend(piece.iter());
+                    n = piece.len();
+                }
+                continue;
+            }
+            if n > 0 {
+                line.push(' ');
+                n += 1;
+            }
+            line.push_str(word);
+            n += wl;
+        }
+        out.push(line);
+    }
+    out
+}
+
+/// Reverse-video every occurrence of a term, case-insensitively. Skipped
+/// for a line whose lowercase form changes length (rare non-ASCII), so a
+/// highlight can never land off by one.
+fn highlight(line: &str, terms: &[String]) -> String {
+    if terms.is_empty() {
+        return line.to_string();
+    }
+    let lower = line.to_lowercase();
+    if lower.chars().count() != line.chars().count() {
+        return line.to_string();
+    }
+    // Byte ranges to mark, on the lowercase string; the same char
+    // positions map onto the original.
+    let lchars: Vec<(usize, char)> = lower.char_indices().collect();
+    let ochars: Vec<(usize, char)> = line.char_indices().collect();
+    let mut marks: Vec<(usize, usize)> = Vec::new(); // char index ranges
+    for t in terms {
+        if t.is_empty() {
+            continue;
+        }
+        let mut from = 0;
+        while let Some(pos) = lower[from..].find(t.as_str()) {
+            let b0 = from + pos;
+            let b1 = b0 + t.len();
+            let c0 = lchars.iter().position(|(b, _)| *b == b0);
+            let c1 = lchars.iter().position(|(b, _)| *b >= b1).unwrap_or(lchars.len());
+            if let Some(c0) = c0 {
+                marks.push((c0, c1));
+            }
+            from = b1;
+        }
+    }
+    if marks.is_empty() {
+        return line.to_string();
+    }
+    marks.sort();
+    let mut out = String::with_capacity(line.len() + marks.len() * 9);
+    let mut i = 0usize;
+    for (c0, c1) in marks {
+        if c0 < i {
+            continue; // overlaps an earlier mark
+        }
+        out.extend(ochars[i..c0].iter().map(|(_, c)| c));
+        out.push_str("\x1b[7m");
+        out.extend(ochars[c0..c1.min(ochars.len())].iter().map(|(_, c)| c));
+        out.push_str("\x1b[27m");
+        i = c1.min(ochars.len());
+    }
+    out.extend(ochars[i..].iter().map(|(_, c)| c));
+    out
+}
+
 /// The live pane of the highlighted row (local, or a mirror of a remote
 /// one), shown to the right of the list.
 fn preview_rect(p: &Picker, list_w: usize) -> Option<PreviewRect> {
     let a = p.selected()?;
     let pane = p.local_pane_of(a)?;
+    // Tab: the conversation instead of the pane, once it has arrived (a
+    // blank preview while it loads would be worse than the pane).
+    if p.show_transcript && transcript_shown(p) {
+        return None;
+    }
     let x = (list_w + 1) as u32;
     let w = (p.width as usize).saturating_sub(list_w + 1) as u32;
     let h = p.height.saturating_sub(1);

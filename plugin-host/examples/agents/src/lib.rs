@@ -55,6 +55,21 @@
 //! substring), and falls back to fuzzy when it finds nothing; the active
 //! mode shows in the header and footer.
 //!
+//! The search box also searches every agent's CONVERSATION, live or long
+//! dead: what you typed, what the agent said, which files it touched. A
+//! query brings in the finished agents it matches whether or not history
+//! is on, best match first, each row showing the line that matched, and
+//! the preview opens on the matching turn. The conversation comes from
+//! the harness's own transcript file (Claude's `~/.claude/projects/...`
+//! jsonl, Codex's rollout), read when a turn ends and when the agent
+//! ends, condensed to prompts, replies and one line per tool call, and
+//! kept in the store for `history_days` - past the harness's own cleanup
+//! of the file. It is searched through an inverted index held in memory,
+//! so the answer is inside the keystroke. See `transcript.rs`,
+//! `extract.rs` and `index.rs`. A finished agent's preview shows that
+//! conversation; `Tab` shows it for a live one too, in place of its pane;
+//! `[` and `]` scroll it.
+//!
 //! An agent that stopped for you and you have not gotten to yet is
 //! UNREAD: it entered `needs_input` or `waiting` more recently than your
 //! last acknowledgement. Jumping to its pane or typing into it
@@ -129,7 +144,8 @@
 //!   # A table, not `config = { ... }`: an inline table cannot take the
 //!   # launch section below.
 //!   [plugins.agents.config]
-//!   keep_days = 14
+//!   keep_days = 14      # a finished agent with no stored conversation
+//!   history_days = 365  # one with a conversation (its turns, searchable)
 //!
 //!   # Named launchers for the new-agent form's command field. The name
 //!   # is what you type; the line is what runs (through the default
@@ -160,11 +176,14 @@ use std::rc::Rc;
 use serde::Deserialize;
 use tmux_plugin_sdk::prelude::*;
 
+mod extract;
+mod index;
 mod newagent;
 mod provider;
 mod push;
 mod resolve;
 mod store;
+mod transcript;
 mod view;
 
 use provider::{DEFAULT_COMMANDS, STATUSES};
@@ -180,6 +199,7 @@ pub(crate) const HISTORY_MAX: i64 = 100;
 #[serde(default)]
 struct AgentsConfig {
     keep_days: Option<serde_json::Value>,
+    history_days: Option<serde_json::Value>,
     commands: Option<Vec<String>>,
     /// Named launchers for the new-agent form: a table of `name = "shell
     /// line"`, or one string of such lines (the `-o` form).
@@ -271,6 +291,9 @@ impl Default for PickKeys {
 
 pub(crate) struct Config {
     pub keep_days: i64,
+    /// How long an agent with a stored conversation is kept (its turns
+    /// and its row), well past the harness's own transcript cleanup.
+    pub history_days: i64,
     pub commands: Vec<String>,
     /// The new-agent form's command field completes from these: the
     /// launchers by name (each with the line it runs), then every
@@ -291,6 +314,18 @@ impl Config {
                 let n: i64 = s.trim().parse().map_err(|_| format!("bad keep_days {v}"))?;
                 if n < 1 {
                     return Err("keep_days must be at least 1".into());
+                }
+                n
+            }
+        };
+        let history_days = match &c.history_days {
+            None => 365,
+            Some(v) => {
+                let s = v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string());
+                let n: i64 =
+                    s.trim().parse().map_err(|_| format!("bad history_days {v}"))?;
+                if n < 1 {
+                    return Err("history_days must be at least 1".into());
                 }
                 n
             }
@@ -335,6 +370,7 @@ impl Config {
             .unwrap_or(false);
         Ok(Config {
             keep_days,
+            history_days,
             commands,
             launchers,
             trust_env,

@@ -8,7 +8,10 @@
 //!
 //!   list    { history, archived }    -> Snapshot (enriched rows + clock)
 //!   capture { id }                   -> the pane's text, or the saved one
-//!   search  { needle, archived }     -> SearchReply (hits per agent id)
+//!   search  { needle, archived,      -> SearchReply (hits per agent id, and
+//!             transcript }              with `transcript` the conversation
+//!                                       hits plus the rows they belong to)
+//!   turns   { id, from, to }         -> the stored conversation, by seq
 //!   act     { id, verb, name? }      -> "ok" (ack | archive | unarchive | rename)
 //!
 //! and follows the `changed` topic, which carries a fresh Snapshot after
@@ -22,7 +25,8 @@ use serde::{Deserialize, Serialize};
 use tmux_plugin_sdk::prelude::*;
 
 use crate::resolve::{self, Resolved};
-use crate::store::{self, Agent};
+use crate::store::{self, Agent, TurnRow};
+use crate::transcript::{self, TranscriptHit};
 use crate::Config;
 
 /// The commands that mark a pane as an agent, if none are configured.
@@ -77,13 +81,31 @@ pub struct SearchReq {
     /// gone, for the archive-only view.
     #[serde(default)]
     pub archived: bool,
+    /// Also search the stored conversations (the transcript index), and
+    /// return the rows of the agents that hit, so the view can show ones
+    /// its roster does not hold. An older provider ignores this.
+    #[serde(default)]
+    pub transcript: bool,
 }
 
-/// Content-search hits, by agent id, with the matcher that found them.
+/// Content-search hits, by agent id, with the matcher that found them;
+/// and, when asked, the conversation hits with their rows.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SearchReply {
     pub mode: String,
     pub hits: HashMap<String, String>,
+    #[serde(default)]
+    pub transcript: Vec<TranscriptHit>,
+    #[serde(default)]
+    pub agents: Vec<Agent>,
+}
+
+/// One agent's stored conversation, turns `[from, to)` by seq.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnsReq {
+    pub id: String,
+    pub from: i64,
+    pub to: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -304,7 +326,7 @@ pub async fn classify(pane: u32, cfg: Rc<Config>) {
         }
         Detected::None => {
             PENDING_LOOKS.with(|p| p.borrow_mut().remove(&pane));
-            let _ = store::end_by_pane(pane as i64, now, "closed").await;
+            end_pane(pane, now, "closed").await;
             return;
         }
     };
@@ -425,6 +447,12 @@ async fn apply(a: &mut Agent, mut r: Resolved) {
     if let Some(v) = r.source_path {
         a.source_path = Some(v);
     }
+    if let Some(tp) = r.transcript_path {
+        if a.transcript_path.as_deref() != Some(tp.as_str()) {
+            let _ = store::set_transcript(&a.id, &tp).await;
+            a.transcript_path = Some(tp);
+        }
+    }
 }
 
 thread_local! {
@@ -466,7 +494,10 @@ async fn migrate_id(a: &mut Agent, real: &str) {
         (false, _) => store::rename_id(&a.id, real).await,
     };
     match moved {
-        Ok(()) => a.id = real.to_string(),
+        Ok(()) => {
+            transcript::on_rename(&a.id, real);
+            a.id = real.to_string();
+        }
         Err(e) => {
             let key = format!("{}\u{1}{real}", a.id);
             let first = MIGRATE_LOGGED.with(|s| s.borrow_mut().insert(key));
@@ -516,12 +547,18 @@ pub async fn on_identify(
 pub async fn report(pane: u32, status: String, task: Option<String>, cfg: Rc<Config>) {
     let now = now_ms() as i64;
     if status == "done" {
-        if let Ok(Some(a)) = store::live_by_pane(pane as i64).await {
+        let live = store::live_by_pane(pane as i64).await.ok().flatten();
+        if let Some(a) = &live {
             if let Some(text) = capture_tail(pane) {
                 let _ = store::save_capture(&a.id, &text).await;
             }
         }
         let _ = store::finish_by_pane(pane as i64, now).await;
+        // The agent is done: read the rest of its transcript, then
+        // snapshot the index.
+        if let Some(a) = live {
+            transcript::ingest_later(a.id, true);
+        }
     } else {
         // The trailing text of a report means different things either
         // side of `needs_input`. On a working/waiting report it is the
@@ -560,24 +597,53 @@ pub async fn report(pane: u32, status: String, task: Option<String>, cfg: Rc<Con
         // so bring an archived row back into the roster.
         if status == "working" {
             let _ = store::unarchive_by_pane(pane as i64).await;
+        } else {
+            // The turn is over (`waiting`, `needs_input`): the transcript
+            // holds all of it. Read what is new, off this handler.
+            spawn(transcript::ingest_pane(pane));
+        }
+    }
+}
+
+/// End the live agent on a pane, then read the rest of its transcript:
+/// the file outlives the pane, and this is what makes a killed agent
+/// searchable. The read runs off the caller's path.
+async fn end_pane(pane: u32, now: i64, reason: &str) {
+    let live = store::live_by_pane(pane as i64).await.ok().flatten();
+    let _ = store::end_by_pane(pane as i64, now, reason).await;
+    if let Some(a) = live {
+        if a.transcript_path.is_some() {
+            transcript::ingest_later(a.id, true);
         }
     }
 }
 
 /// A pane went away: its agent is done.
 pub async fn pane_gone(pane: u32) {
-    let _ = store::end_by_pane(pane as i64, now_ms() as i64, "closed").await;
+    end_pane(pane, now_ms() as i64, "closed").await;
 }
 
 /// On start (including after restart-server): rediscover agents in live
 /// panes, retire live rows whose pane is gone, and prune old history.
 pub async fn reconcile(cfg: Rc<Config>) {
+    // The index first, so nothing ingested below is missed by it.
+    transcript::load().await;
     let panes = list_panes().unwrap_or_default();
     for p in &panes {
         classify(p.id, Rc::clone(&cfg)).await;
     }
     sweep_gone().await;
-    let _ = store::prune(cfg.keep_days, now_ms() as i64).await;
+    let pruned = store::prune(cfg.keep_days, cfg.history_days, now_ms() as i64)
+        .await
+        .unwrap_or(0);
+    if pruned > 0 {
+        // Their turns went with them; the index must not keep answering
+        // for agents that are gone.
+        transcript::rebuild().await;
+    }
+    // Transcripts that grew while the server was down (an agent that died
+    // meanwhile has a tail nobody read).
+    spawn(transcript::catch_up());
 }
 
 /// Retire live rows whose pane no longer exists. Returns how many went.
@@ -593,6 +659,9 @@ pub async fn sweep_gone() -> usize {
         if let Some(pane) = a.pane {
             if !panes.iter().any(|p| p.id as i64 == pane) {
                 let _ = store::end_by_pane(pane, now, "gone").await;
+                if a.transcript_path.is_some() {
+                    transcript::ingest_later(a.id.clone(), true);
+                }
                 gone += 1;
             }
         }
@@ -733,7 +802,14 @@ async fn search_local(req: &SearchReq) -> SearchReply {
         })
         .collect();
     hits.extend(by_id);
-    SearchReply { mode: mode_label(mode).to_string(), hits }
+    let (transcript_hits, agents) = if req.transcript && !req.needle.trim().is_empty() {
+        let th = transcript::hits_with_snippets(&req.needle, transcript::HITS_MAX).await;
+        let ids: Vec<String> = th.iter().map(|h| h.id.clone()).collect();
+        (th, store::by_ids(&ids).await.unwrap_or_default())
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    SearchReply { mode: mode_label(mode).to_string(), hits, transcript: transcript_hits, agents }
 }
 
 /// Save the pane's text before an archive, so the archived agent keeps a
@@ -760,7 +836,7 @@ pub fn reply_mode(reply: &SearchReply) -> SearchMode {
 /// Register the methods a view calls. Needs `service-serve`; without it
 /// the plugin still works alone on its server.
 pub fn register_services() {
-    for m in ["list", "capture", "search", "act"] {
+    for m in ["list", "capture", "search", "turns", "act"] {
         if let Err(e) = service::register(m) {
             log(&format!("agents: register {m}: {}", e.message));
             return;
@@ -825,6 +901,15 @@ pub async fn handle(req: ServiceRequest, cfg: Rc<Config>) {
             };
             let reply = search_local(&q).await;
             let _ = req.reply_json(&reply);
+        }
+        "turns" => {
+            let Ok(q) = req.json::<TurnsReq>() else {
+                let _ = req.fail("turns: bad request");
+                return;
+            };
+            let turns: Vec<TurnRow> =
+                store::turns_range(&q.id, q.from, q.to).await.unwrap_or_default();
+            let _ = req.reply_json(&turns);
         }
         "act" => {
             let Ok(q) = req.json::<ActReq>() else {

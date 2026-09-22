@@ -20,7 +20,7 @@
 use serde::{Deserialize, Serialize};
 use tmux_plugin_sdk::prelude::*;
 
-pub const USER_VERSION: i64 = 8;
+pub const USER_VERSION: i64 = 9;
 
 /// The server a row belongs to. A provider only ever writes rows for its
 /// own server, so every stored row says "local"; the view stamps the link
@@ -52,7 +52,10 @@ CREATE TABLE IF NOT EXISTS agents (
   source_path TEXT,
   ended_ms INTEGER,
   reason TEXT,
-  server TEXT NOT NULL DEFAULT 'local');
+  server TEXT NOT NULL DEFAULT 'local',
+  transcript_path TEXT,
+  transcript_cursor INTEGER NOT NULL DEFAULT 0,
+  harness_version TEXT);
 CREATE INDEX IF NOT EXISTS agents_live ON agents(ended_ms, last_active_ms);
 -- At most one live agent per pane per server; NULL panes (ended) do not
 -- collide.
@@ -69,7 +72,28 @@ CREATE TABLE IF NOT EXISTS captures (
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT);
-PRAGMA user_version = 8;";
+-- The conversation, one row per turn (a prompt, an assistant message, a
+-- condensed tool call), extracted from the harness's transcript. `text`
+-- is TEXT for a short turn and a zstd BLOB for a long one. `offset`/`len`
+-- locate the record in the transcript for what is not kept here.
+CREATE TABLE IF NOT EXISTS turns (
+  id TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('user','assistant','tool')),
+  ts_ms INTEGER,
+  text,
+  path TEXT,
+  offset INTEGER NOT NULL,
+  len INTEGER NOT NULL,
+  PRIMARY KEY (id, seq),
+  FOREIGN KEY(id) REFERENCES agents(id)
+    ON DELETE CASCADE ON UPDATE CASCADE);
+-- The search index snapshot (see index.rs): one row.
+CREATE TABLE IF NOT EXISTS search_index (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  blob BLOB NOT NULL,
+  max_rowid INTEGER NOT NULL);
+PRAGMA user_version = 9;";
 
 /// The v1 -> v2 upgrade: the resolved columns did not exist in v1.
 const MIGRATE_V2: &str = "
@@ -149,11 +173,38 @@ const MIGRATE_V8: &str = "
 ALTER TABLE agents ADD COLUMN note TEXT;
 PRAGMA user_version = 8;";
 
+/// The v8 -> v9 upgrade: the transcript. Where the harness's own
+/// transcript file is, how far into it the extractor has read, and which
+/// harness version wrote it; the `turns` table the conversation lands in;
+/// and the search index snapshot. See `transcript.rs` and `index.rs`.
+const MIGRATE_V9: &str = "
+ALTER TABLE agents ADD COLUMN transcript_path TEXT;
+ALTER TABLE agents ADD COLUMN transcript_cursor INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE agents ADD COLUMN harness_version TEXT;
+CREATE TABLE IF NOT EXISTS turns (
+  id TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('user','assistant','tool')),
+  ts_ms INTEGER,
+  text,
+  path TEXT,
+  offset INTEGER NOT NULL,
+  len INTEGER NOT NULL,
+  PRIMARY KEY (id, seq),
+  FOREIGN KEY(id) REFERENCES agents(id)
+    ON DELETE CASCADE ON UPDATE CASCADE);
+CREATE TABLE IF NOT EXISTS search_index (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  blob BLOB NOT NULL,
+  max_rowid INTEGER NOT NULL);
+PRAGMA user_version = 9;";
+
 const COLS: &str = "id, kind, status, life, pane, session, window, task, \
                     note, name, name_ms, user_name, user_name_ms, \
                     waiting_ms, acked_ms, first_seen_ms, \
                     last_status_ms, started_ms, last_active_ms, source_path, \
-                    ended_ms, reason, server";
+                    ended_ms, reason, server, transcript_path, \
+                    transcript_cursor, harness_version";
 
 /// One agent. Serialized as JSON when a provider ships its rows to a view
 /// on another server, so every field is plain data.
@@ -189,6 +240,15 @@ pub struct Agent {
     pub source_path: Option<String>,
     pub ended_ms: Option<i64>,
     pub reason: Option<String>,
+    /// The harness's transcript file, once a resolver has derived it.
+    #[serde(default)]
+    pub transcript_path: Option<String>,
+    /// How many bytes of the transcript the extractor has consumed.
+    #[serde(default)]
+    pub transcript_cursor: i64,
+    /// The harness version that wrote the transcript, from its records.
+    #[serde(default)]
+    pub harness_version: Option<String>,
 }
 
 fn default_server() -> String {
@@ -278,6 +338,9 @@ fn agents_from(rows: &Rows) -> Vec<Agent> {
             source_path: s(row.get_named("source_path")),
             ended_ms: i(row.get_named("ended_ms")),
             reason: s(row.get_named("reason")),
+            transcript_path: s(row.get_named("transcript_path")),
+            transcript_cursor: i(row.get_named("transcript_cursor")).unwrap_or(0),
+            harness_version: s(row.get_named("harness_version")),
         })
         .collect()
 }
@@ -327,6 +390,10 @@ pub fn migrate_sync() -> Result<(), String> {
         }
         if version <= 7 {
             db_exec_sync(MIGRATE_V8, params![])
+                .map_err(|e| format!("db: {e}"))?;
+        }
+        if version <= 8 {
+            db_exec_sync(MIGRATE_V9, params![])
                 .map_err(|e| format!("db: {e}"))?;
         }
     }
@@ -790,13 +857,259 @@ pub async fn by_id(id: &str) -> Result<Option<Agent>, HostError> {
 // retention
 // ---------------------------------------------------------------------------
 
-/// Drop ended agents older than keep_days. Their captures cascade.
-pub async fn prune(keep_days: i64, now_ms: i64) -> Result<u64, HostError> {
+/// Retention. An ended agent with no stored conversation goes after
+/// `keep_days`: it was only ever a roster row. One with turns is the
+/// searchable history and stays for `history_days`, well past the
+/// harness's own cleanup of the transcript it came from. Turns and
+/// captures cascade with the row.
+pub async fn prune(keep_days: i64, history_days: i64, now_ms: i64) -> Result<u64, HostError> {
     let cutoff = now_ms - keep_days * 86_400_000;
-    let r = db_exec(
+    let r1 = db_exec(
+        "DELETE FROM agents WHERE ended_ms IS NOT NULL AND ended_ms < ?1 \
+         AND NOT EXISTS (SELECT 1 FROM turns t WHERE t.id = agents.id)",
+        params![cutoff],
+    )
+    .await?;
+    let cutoff = now_ms - history_days * 86_400_000;
+    let r2 = db_exec(
         "DELETE FROM agents WHERE ended_ms IS NOT NULL AND ended_ms < ?1",
         params![cutoff],
     )
     .await?;
-    Ok(r.changes as u64)
+    Ok((r1.changes + r2.changes) as u64)
+}
+
+// ---------------------------------------------------------------------------
+// the transcript: where it is, how far it has been read, and the turns
+// ---------------------------------------------------------------------------
+
+/// A stored turn. Serialized as JSON when a provider ships turns to a
+/// view on another server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnRow {
+    pub rowid: i64,
+    pub id: String,
+    pub seq: i64,
+    pub kind: String,
+    pub ts_ms: Option<i64>,
+    pub text: String,
+    pub path: Option<String>,
+    pub offset: i64,
+    pub len: i64,
+}
+
+/// A turn's text over this size is stored zstd-compressed (the host
+/// compresses a `zstd_ref` parameter on the way in); below it the frame
+/// would be larger than the text.
+const ZSTD_MIN: usize = 512;
+
+fn turn_text(v: Option<&DbValue>) -> String {
+    match v {
+        Some(DbValue::Text(t)) => t.clone(),
+        Some(DbValue::Blob(b)) => db_decompress(b)
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o).into_owned())
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn turns_from(rows: &Rows) -> Vec<TurnRow> {
+    rows.iter()
+        .map(|row| TurnRow {
+            rowid: i(row.get_named("rowid")).unwrap_or(0),
+            id: s(row.get_named("id")).unwrap_or_default(),
+            seq: i(row.get_named("seq")).unwrap_or(0),
+            kind: s(row.get_named("kind")).unwrap_or_default(),
+            ts_ms: i(row.get_named("ts_ms")),
+            text: turn_text(row.get_named("text")),
+            path: s(row.get_named("path")),
+            offset: i(row.get_named("offset")).unwrap_or(0),
+            len: i(row.get_named("len")).unwrap_or(0),
+        })
+        .collect()
+}
+
+const TURN_COLS: &str = "rowid, id, seq, kind, ts_ms, text, path, offset, len";
+
+/// Record where an agent's transcript lives. A different path resets the
+/// cursor: the extractor starts over on the new file. The same path is a
+/// no-op, so a render never disturbs an ingest in progress.
+pub async fn set_transcript(id: &str, path: &str) -> Result<(), HostError> {
+    db_exec(
+        "UPDATE agents SET transcript_path = ?2, \
+            transcript_cursor = CASE WHEN transcript_path IS ?2 \
+                                     THEN transcript_cursor ELSE 0 END \
+         WHERE id = ?1",
+        params![id, path],
+    )
+    .await?;
+    Ok(())
+}
+
+/// The agents whose transcript may have grown: every live one with a
+/// transcript, and the ones that ended within `recent_ms` (an agent that
+/// died while the server was down still has a tail to read). An agent
+/// that ended long ago has a transcript that stopped with it.
+pub async fn ingest_targets(now_ms: i64, recent_ms: i64) -> Result<Vec<Agent>, HostError> {
+    let rows = db_query(
+        &format!(
+            "SELECT {COLS} FROM agents WHERE transcript_path IS NOT NULL \
+             AND (ended_ms IS NULL OR ended_ms > ?1)"
+        ),
+        params![now_ms - recent_ms],
+    )
+    .await?;
+    Ok(agents_from(&rows))
+}
+
+/// The next `seq` for an agent's turns.
+pub async fn next_seq(id: &str) -> Result<i64, HostError> {
+    let rows = db_query(
+        "SELECT COALESCE(MAX(seq), -1) + 1 AS n FROM turns WHERE id = ?1",
+        params![id],
+    )
+    .await?;
+    Ok(rows.scalar().and_then(DbValue::as_i64).unwrap_or(0))
+}
+
+/// A turn about to be stored. `text` is borrowed so a long one can be
+/// bound as a `zstd_ref` straight out of the extractor's buffer.
+pub struct NewTurn<'a> {
+    pub seq: i64,
+    pub kind: &'a str,
+    pub ts_ms: Option<i64>,
+    pub text: &'a str,
+    pub path: Option<&'a str>,
+    pub offset: i64,
+    pub len: i64,
+}
+
+/// Store a batch of turns and advance the transcript cursor, atomically:
+/// a crash between the two would otherwise re-read (duplicate) or skip
+/// (lose) the batch. `version` is recorded when the batch learned one.
+/// Returns the rowid of the last turn inserted (for the index).
+pub async fn insert_turns(
+    id: &str,
+    turns: &[NewTurn<'_>],
+    cursor: i64,
+    version: Option<&str>,
+) -> Result<i64, HostError> {
+    const INSERT: &str = "INSERT OR REPLACE INTO turns \
+        (id, seq, kind, ts_ms, text, path, offset, len) \
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
+    let mut owned: Vec<Vec<DbValue>> = Vec::with_capacity(turns.len() + 1);
+    for t in turns {
+        let text = if t.text.len() >= ZSTD_MIN {
+            zstd_ref(t.text.as_bytes())
+        } else {
+            DbValue::Text(t.text.to_string())
+        };
+        owned.push(vec![
+            DbValue::from(id),
+            DbValue::from(t.seq),
+            DbValue::from(t.kind),
+            DbValue::from(t.ts_ms),
+            text,
+            DbValue::from(t.path),
+            DbValue::from(t.offset),
+            DbValue::from(t.len),
+        ]);
+    }
+    owned.push(vec![DbValue::from(id), DbValue::from(cursor), DbValue::from(version)]);
+    let mut stmts: Vec<(&str, &[DbValue])> = owned[..turns.len()]
+        .iter()
+        .map(|p| (INSERT, p.as_slice()))
+        .collect();
+    stmts.push((
+        "UPDATE agents SET transcript_cursor = ?2, \
+            harness_version = COALESCE(?3, harness_version) WHERE id = ?1",
+        owned[turns.len()].as_slice(),
+    ));
+    db_batch(&stmts).await?;
+    let rows = db_query("SELECT COALESCE(MAX(rowid), 0) AS m FROM turns", params![]).await?;
+    Ok(rows.scalar().and_then(DbValue::as_i64).unwrap_or(0))
+}
+
+/// One agent's turns in `[from, to)` by seq, in order.
+pub async fn turns_range(id: &str, from: i64, to: i64) -> Result<Vec<TurnRow>, HostError> {
+    let rows = db_query(
+        &format!(
+            "SELECT {TURN_COLS} FROM turns WHERE id = ?1 AND seq >= ?2 AND seq < ?3 \
+             ORDER BY seq"
+        ),
+        params![id, from, to],
+    )
+    .await?;
+    Ok(turns_from(&rows))
+}
+
+/// Turns stored after `rowid`, oldest first, at most `limit`: what the
+/// index has to catch up on after loading a snapshot.
+pub async fn turns_after(rowid: i64, limit: i64) -> Result<Vec<TurnRow>, HostError> {
+    let rows = db_query(
+        &format!(
+            "SELECT {TURN_COLS} FROM turns WHERE rowid > ?1 ORDER BY rowid LIMIT ?2"
+        ),
+        params![rowid, limit],
+    )
+    .await?;
+    Ok(turns_from(&rows))
+}
+
+/// The turns inside several windows of `[from, to)` by seq, one window
+/// per agent, for the snippets of a result list. One statement, however
+/// many windows; ordered by agent then seq.
+pub async fn turns_windows(windows: &[(String, i64, i64)]) -> Result<Vec<TurnRow>, HostError> {
+    if windows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut sql = format!("SELECT {TURN_COLS} FROM turns WHERE ");
+    let mut params: Vec<DbValue> = Vec::with_capacity(windows.len() * 3);
+    for (i, (id, from, to)) in windows.iter().enumerate() {
+        if i > 0 {
+            sql.push_str(" OR ");
+        }
+        let n = i * 3;
+        sql.push_str(&format!("(id = ?{} AND seq >= ?{} AND seq < ?{})", n + 1, n + 2, n + 3));
+        params.push(DbValue::from(id.as_str()));
+        params.push(DbValue::from(*from));
+        params.push(DbValue::from(*to));
+    }
+    sql.push_str(" ORDER BY id, seq");
+    let rows = db_query(&sql, &params).await?;
+    Ok(turns_from(&rows))
+}
+
+/// The agents with these ids, in no particular order.
+pub async fn by_ids(ids: &[String]) -> Result<Vec<Agent>, HostError> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let marks: Vec<String> = (1..=ids.len()).map(|i| format!("?{i}")).collect();
+    let sql = format!("SELECT {COLS} FROM agents WHERE id IN ({})", marks.join(", "));
+    let params: Vec<DbValue> = ids.iter().map(|s| DbValue::from(s.as_str())).collect();
+    let rows = db_query(&sql, &params).await?;
+    Ok(agents_from(&rows))
+}
+
+/// Store the index snapshot (compressed by the host).
+pub async fn save_index(blob: &[u8], max_rowid: i64) -> Result<(), HostError> {
+    db_exec(
+        "INSERT INTO search_index (id, blob, max_rowid) VALUES (1, ?1, ?2) \
+         ON CONFLICT(id) DO UPDATE SET blob = excluded.blob, \
+            max_rowid = excluded.max_rowid",
+        &[zstd_ref(blob), DbValue::from(max_rowid)],
+    )
+    .await?;
+    Ok(())
+}
+
+/// The stored index snapshot, inflated, if there is one.
+pub async fn load_index() -> Result<Option<Vec<u8>>, HostError> {
+    let rows = db_query("SELECT blob FROM search_index WHERE id = 1", params![]).await?;
+    match rows.scalar() {
+        Some(DbValue::Blob(b)) => Ok(db_decompress(b).ok().map(|o| o.to_vec())),
+        _ => Ok(None),
+    }
 }
