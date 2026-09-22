@@ -11,3 +11,6 @@ tmux-plugin-sdk = { path = "../../sdk" }
 formkit = { path = "../../formkit" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The transcript extractor's newline scan and prefilter (SIMD under
+# simd128, SWAR without); the scan is the cost, not the JSON parse.
+memchr = "2"

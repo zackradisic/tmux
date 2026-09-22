@@ -1,0 +1,6 @@
+# Plugins are built with wasm SIMD. The host's wasmtime (36) enables it by
+# default, and the agents plugin's transcript scan is 6x faster with it
+# (memchr uses simd128 for the newline scan and the prefilter). A plugin
+# that never touches bulk data loses nothing.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128"]

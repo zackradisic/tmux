@@ -407,7 +407,7 @@ async fn ingest_once(id: &str) -> Result<(), ()> {
         pos += bytes.len() as u64;
         let chunk: &[u8] = if skipping {
             // Drop the rest of the over-long line; resume after it.
-            match bytes.iter().position(|&b| b == b'\n') {
+            match memchr::memchr(b'\n', &bytes) {
                 Some(i) => {
                     skipping = false;
                     base = pos - (bytes.len() - i - 1) as u64;
@@ -423,8 +423,14 @@ async fn ingest_once(id: &str) -> Result<(), ()> {
         } else {
             &bytes[..]
         };
-        carry.extend_from_slice(chunk);
-        match carry.iter().rposition(|&b| b == b'\n') {
+        if carry.is_empty() && !skipping_tail(&bytes, chunk) {
+            // The common case: nothing carried, so the read buffer IS the
+            // carry - no copy of the chunk.
+            carry = bytes;
+        } else {
+            carry.extend_from_slice(chunk);
+        }
+        match memchr::memrchr(b'\n', &carry) {
             Some(cut) => {
                 let complete = &carry[..=cut];
                 let fed = ex.feed(complete, base);
@@ -491,6 +497,12 @@ async fn ingest_once(id: &str) -> Result<(), ()> {
         ));
     }
     Ok(())
+}
+
+/// Is `chunk` a proper suffix of `bytes` (the remainder after a skipped
+/// line), rather than the whole buffer?
+fn skipping_tail(bytes: &[u8], chunk: &[u8]) -> bool {
+    chunk.len() != bytes.len()
 }
 
 /// Find a Claude transcript by session id under every project directory:

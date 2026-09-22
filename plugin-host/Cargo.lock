@@ -16,6 +16,7 @@ name = "agents"
 version = "0.1.0"
 dependencies = [
  "formkit",
+ "memchr",
  "serde",
  "serde_json",
  "tmux-plugin-sdk",
