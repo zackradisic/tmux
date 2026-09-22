@@ -340,8 +340,9 @@ plugin_vtable_obj_relation(int rel, u_int a, u_int b)
  * "C-c", "M-x", ...). Returns 0, -1 if the pane is dead, -2 for a bad key
  * name.
  */
-int
-plugin_vtable_send_keys(u_int pane_id, const char *keys, int literal)
+static int
+plugin_vtable_send_keys_client(u_int pane_id, const char *keys, int literal,
+    struct client *c)
 {
 	struct window_pane	*wp;
 	struct winlink		*wl;
@@ -355,12 +356,15 @@ plugin_vtable_send_keys(u_int pane_id, const char *keys, int literal)
 		return (-1);
 	wl = TAILQ_FIRST(&wp->window->winlinks);
 	s = (wl != NULL) ? wl->session : NULL;
+	log_debug("%s: %%%u keys \"%s\" literal %d client %s mode %s",
+	    __func__, pane_id, keys, literal, c != NULL ? c->name : "none",
+	    TAILQ_FIRST(&wp->modes) != NULL ? "yes" : "no");
 
 	if (!literal) {
 		key = key_string_lookup_string(keys);
 		if (key == KEYC_NONE || key == KEYC_UNKNOWN)
 			return (-2);
-		window_pane_key(wp, NULL, s, wl, key, NULL);
+		plugin_vtable_pane_key(wp, c, s, wl, key);
 		return (0);
 	}
 
@@ -373,10 +377,89 @@ plugin_vtable_send_keys(u_int pane_id, const char *keys, int literal)
 				continue;
 			key = uc;
 		}
-		window_pane_key(wp, NULL, s, wl, key, NULL);
+		plugin_vtable_pane_key(wp, c, s, wl, key);
 	}
 	free(ud);
 	return (0);
+}
+
+/*
+ * One key into a pane, the way send-keys delivers it: a pane in a mode
+ * with a key table (copy mode) gets the table's binding dispatched on
+ * the pane, since such a mode has no key callback of its own; anything
+ * else goes to the pane (its process, or a mode with a key callback).
+ */
+void
+plugin_vtable_pane_key(struct window_pane *wp, struct client *c,
+    struct session *s, struct winlink *wl, key_code key)
+{
+	struct window_mode_entry	*wme;
+	struct key_table		*table;
+	struct key_binding		*bd;
+	struct cmd_find_state		 fs;
+
+	wme = TAILQ_FIRST(&wp->modes);
+	if (wme == NULL || wme->mode->key_table == NULL) {
+		window_pane_key(wp, c, s, wl, key, NULL);
+		return;
+	}
+	table = key_bindings_get_table(wme->mode->key_table(wme), 1);
+	bd = key_bindings_get(table, key & ~KEYC_MASK_FLAGS);
+	if (bd == NULL)
+		return;
+	cmd_find_from_winlink_pane(&fs, wl, wp, 0);
+	table->references++;
+	key_bindings_dispatch(bd, NULL, c, NULL, &fs);
+	key_bindings_unref_table(table);
+}
+
+/*
+ * Feed bytes into a pane's screen as if its process had written them,
+ * without the pty: the input parser runs on them now. For a plugin that
+ * fills a pane of its own with text to show (a preview it then puts in
+ * copy mode); through the pty the same text arrives one read per event
+ * loop turn.
+ */
+int
+plugin_vtable_pane_feed(u_int pane_id, const u_char *data, size_t len)
+{
+	struct window_pane	*wp;
+
+	wp = window_pane_find_by_id(pane_id);
+	if (wp == NULL || (wp->flags & PANE_DESTROYED))
+		return (-1);
+	input_parse_buffer(wp, (u_char *)data, len);
+	return (0);
+}
+
+/*
+ * Keys into a pane with no client behind them. A pane in a mode (copy
+ * mode) drops these: window_pane_key hands a key to the mode only with a
+ * client. Use plugin_vtable_send_keys_from for that case.
+ */
+int
+plugin_vtable_send_keys(u_int pane_id, const char *keys, int literal)
+{
+	return (plugin_vtable_send_keys_client(pane_id, keys, literal, NULL));
+}
+
+/*
+ * Keys into a pane on behalf of a client - the one that pressed them in
+ * a plugin's mode - so a pane in copy mode takes them as if that client
+ * had typed them there. -3 = no such client.
+ */
+int
+plugin_vtable_send_keys_from(u_int pane_id, const char *keys, int literal,
+    u_int client_id)
+{
+	struct client	*c;
+
+	TAILQ_FOREACH(c, &clients, entry) {
+		if (c->id == client_id)
+			return (plugin_vtable_send_keys_client(pane_id, keys,
+			    literal, c));
+	}
+	return (-3);
 }
 
 /*

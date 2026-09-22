@@ -231,6 +231,19 @@ pub struct pgh_host_vtable {
     /// before this returns. 0 ok, -1 no such peer or peer down.
     pub bridge_send:
         unsafe extern "C" fn(peer: u32, data: *const u8, len: usize) -> c_int,
+    /// Keys into a pane on behalf of a client (by id): a pane in a mode
+    /// takes keys only with a client behind them. 0 ok, -1 dead pane,
+    /// -2 bad key, -3 no such client.
+    pub send_keys_from: unsafe extern "C" fn(
+        pane_id: u32,
+        keys: *const c_char,
+        literal: c_int,
+        client_id: u32,
+    ) -> c_int,
+    /// Feed bytes into a pane's screen as if its process had written
+    /// them (the input parser runs on them now; no pty). 0 ok, -1 dead
+    /// pane.
+    pub pane_feed: unsafe extern "C" fn(pane_id: u32, data: *const u8, len: usize) -> c_int,
 }
 
 // Function pointers are Send + Sync; the vtable is stored in a OnceLock.

@@ -45,6 +45,19 @@ pub unsafe extern "C" fn vt_send_keys(
     0
 }
 
+pub unsafe extern "C" fn vt_send_keys_from(
+    _p: u32,
+    _k: *const c_char,
+    _l: c_int,
+    _c: u32,
+) -> c_int {
+    0
+}
+
+pub unsafe extern "C" fn vt_pane_feed(_p: u32, _d: *const u8, _n: usize) -> c_int {
+    0
+}
+
 pub unsafe extern "C" fn vt_capture_pane(
     _p: u32,
     _s: c_int,
@@ -237,6 +250,8 @@ pub fn base_vtable() -> pgh_host_vtable {
         format_expand: vt_format_expand,
         panes_search: vt_panes_search,
         bridge_send: vt_bridge_send,
+        send_keys_from: vt_send_keys_from,
+        pane_feed: vt_pane_feed,
     }
 }
 

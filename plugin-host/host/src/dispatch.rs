@@ -432,6 +432,61 @@ pub fn send_keys(
     }
 }
 
+/// Text into a pane's screen, bypassing its pty: the input parser runs
+/// on the bytes now, on this thread. Bounded per call so one call is one
+/// bounded wake; a plugin feeds a large text in slices. Gated like
+/// `send_keys`, whose effect on a pane it resembles.
+pub fn pane_feed(
+    mem: &mut GuestMem<'_, '_>,
+    pane: i32,
+    data_ptr: i32,
+    data_len: i32,
+) -> Result<(), HostError> {
+    check_cap(mem, crate::caps::SEND_KEYS)?;
+    let pane = pane_id(pane)?;
+    check_pane_target(mem, pane)?;
+    if data_len < 0 || data_len as usize > PANE_FEED_MAX {
+        return Err(err(ErrorCode::Limit, format!("pane_feed: at most {PANE_FEED_MAX} bytes per call")));
+    }
+    let data = mem.read(data_ptr, data_len)?;
+    let vt = vtable()?;
+    let rc = unsafe { (vt.pane_feed)(pane, data.as_ptr(), data.len()) };
+    match rc {
+        0 => Ok(()),
+        _ => Err(err(ErrorCode::NoSuchObject, format!("no such pane %{pane}"))),
+    }
+}
+
+/// The most one `pane_feed` takes: parsing it is main-thread work.
+pub const PANE_FEED_MAX: usize = 256 * 1024;
+
+/// `send_keys` on behalf of a client: the one whose key the plugin is
+/// forwarding, so a pane in copy mode takes it as typed by that client.
+pub fn send_keys_from(
+    mem: &mut GuestMem<'_, '_>,
+    pane: i32,
+    keys_ptr: i32,
+    keys_len: i32,
+    literal: i32,
+    client: i64,
+) -> Result<(), HostError> {
+    check_cap(mem, crate::caps::SEND_KEYS)?;
+    let pane = pane_id(pane)?;
+    check_pane_target(mem, pane)?;
+    if client < 0 || client > u32::MAX as i64 {
+        return Err(err(ErrorCode::BadRequest, "bad client id"));
+    }
+    let vt = vtable()?;
+    let keys = mem.c_str(keys_ptr, keys_len)?;
+    let rc = unsafe { (vt.send_keys_from)(pane, keys, literal, client as u32) };
+    match rc {
+        0 => Ok(()),
+        -2 => Err(err(ErrorCode::BadRequest, "bad key name")),
+        -3 => Err(err(ErrorCode::NoSuchObject, format!("no such client {client}"))),
+        _ => Err(err(ErrorCode::NoSuchObject, format!("no such pane %{pane}"))),
+    }
+}
+
 pub fn pane_env(
     mem: &mut GuestMem<'_, '_>,
     pane: i32,

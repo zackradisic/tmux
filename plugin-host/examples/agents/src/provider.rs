@@ -222,9 +222,14 @@ thread_local! {
 const PENDING_DELAYS_MS: [u64; 3] = [2000, 5000, 15000];
 
 /// Is this pane a shadow of a pane on another server? Its agent belongs
-/// to that server's provider, so this one leaves it alone.
+/// to that server's provider, so this one leaves it alone. The picker's
+/// own conversation pane (see `convo`) is never an agent either, whatever
+/// its environment says.
 fn is_shadow(pane: u32) -> bool {
-    resolve_pane(PaneId(pane)).map(|p| p.remote).unwrap_or(false)
+    if resolve_pane(PaneId(pane)).map(|p| p.remote).unwrap_or(false) {
+        return true;
+    }
+    crate::convo::owns(pane)
 }
 
 /// A provisional, pane-bound id for a freshly observed agent. A resolver

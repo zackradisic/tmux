@@ -280,6 +280,28 @@ pub fn send_key(pane: PaneId, key: impl AsTmuxStr) -> Result<(), HostError> {
     check(unsafe { raw::send_keys(pane.0 as i32, p, l, 0) })
 }
 
+/// One key into a pane as if `client` had typed it there. A pane in a
+/// mode (copy mode) takes keys only with a client behind them; a plugin
+/// forwarding a key from its own mode passes the client that pressed it
+/// (the `client` of the `mode-key` event).
+pub fn send_key_from(pane: PaneId, key: impl AsTmuxStr, client: u64) -> Result<(), HostError> {
+    let key = key.to_tmux();
+    let (p, l) = key.parts();
+    check(unsafe { raw::send_keys_from(pane.0 as i32, p, l, 0, client as i64) })
+}
+
+/// The most [`pane_feed`] takes in one call.
+pub const PANE_FEED_MAX: usize = 256 * 1024;
+
+/// Bytes into a pane's screen as if its process had written them,
+/// bypassing the pty: the input parser runs on them now, on the main
+/// thread, so a call is bounded to [`PANE_FEED_MAX`] and a large text
+/// goes in slices with an await between. What a plugin fills a scratch
+/// pane of its own with, to show text it then puts in copy mode.
+pub fn pane_feed(pane: PaneId, data: &[u8]) -> Result<(), HostError> {
+    check(unsafe { raw::pane_feed(pane.0 as i32, data.as_ptr() as i32, data.len() as i32) })
+}
+
 /// Capture pane text into a reusable buffer (cleared first). Rows are
 /// relative to the visible top (negative reaches history), `end`
 /// inclusive; `escapes` includes SGR/OSC sequences. At most 2000 lines

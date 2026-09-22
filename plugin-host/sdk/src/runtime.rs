@@ -33,6 +33,10 @@ pub(crate) mod raw {
             kind: i32, id: i32, fmt_ptr: i32, fmt_len: i32,
             out: i32, cap: i32, len_out: i32,
         ) -> i32;
+        pub fn pane_feed(pane: i32, data_ptr: i32, data_len: i32) -> i32;
+        pub fn send_keys_from(
+            pane: i32, keys_ptr: i32, keys_len: i32, literal: i32, client: i64,
+        ) -> i32;
         pub fn send_keys(
             pane: i32, keys_ptr: i32, keys_len: i32, literal: i32,
         ) -> i32;
@@ -162,6 +166,8 @@ pub(crate) mod raw {
     pub unsafe fn set_option(kind: i32, id: i32, name_ptr: i32, name_len: i32, val_ptr: i32, val_len: i32) -> i32 { -7 }
     pub unsafe fn format_expand(kind: i32, id: i32, fmt_ptr: i32, fmt_len: i32, out: i32, cap: i32, len_out: i32) -> i32 { -7 }
     pub unsafe fn send_keys(pane: i32, keys_ptr: i32, keys_len: i32, literal: i32) -> i32 { -7 }
+    pub unsafe fn send_keys_from(pane: i32, keys_ptr: i32, keys_len: i32, literal: i32, client: i64) -> i32 { -7 }
+    pub unsafe fn pane_feed(pane: i32, data_ptr: i32, data_len: i32) -> i32 { -7 }
     pub unsafe fn capture_pane(pane: i32, start: i32, end: i32, escapes: i32, out: i32, cap: i32, len_out: i32) -> i32 { -7 }
     pub unsafe fn pane_env(pane: i32, name_ptr: i32, name_len: i32, out: i32, cap: i32, len_out: i32) -> i32 { -7 }
     pub unsafe fn pane_fds(pane: i32, out: i32, cap: i32, len_out: i32) -> i32 { -7 }

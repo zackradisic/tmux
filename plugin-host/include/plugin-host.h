@@ -26,6 +26,13 @@
  */
 #define COMPRESS_ABOVE 4096
 
+/**
+ * Bridge protocol revision this side speaks. 0 (a hello without the
+ * field) pushes every provider after hello; 1 lists hashes and urls in
+ * hello and pushes only on `Want`.
+ */
+#define BRIDGE_REV 1
+
 #define READ_STATE (1 << 0)
 
 #define WRITE_OPTIONS (1 << 1)
@@ -125,6 +132,11 @@
  * Granted to every plugin without being asked for.
  */
 #define DEFAULT_CAPS ((READ_STATE | DISPLAY_MESSAGE) | TIMERS)
+
+/**
+ * The most one `pane_feed` takes: parsing it is main-thread work.
+ */
+#define PANE_FEED_MAX (256 * 1024)
 
 /**
  * Epoch tick granularity.
@@ -427,6 +439,18 @@ typedef struct {
    * before this returns. 0 ok, -1 no such peer or peer down.
    */
   int (*bridge_send)(uint32_t peer, const uint8_t *data, uintptr_t len);
+  /**
+   * Keys into a pane on behalf of a client (by id): a pane in a mode
+   * takes keys only with a client behind them. 0 ok, -1 dead pane,
+   * -2 bad key, -3 no such client.
+   */
+  int (*send_keys_from)(uint32_t pane_id, const char *keys, int literal, uint32_t client_id);
+  /**
+   * Feed bytes into a pane's screen as if its process had written
+   * them (the input parser runs on them now; no pty). 0 ok, -1 dead
+   * pane.
+   */
+  int (*pane_feed)(uint32_t pane_id, const uint8_t *data, uintptr_t len);
 } pgh_host_vtable;
 
 /**
@@ -725,7 +749,7 @@ int pgh_peers_revoke(const char *server, const char *plugin);
 void pgh_peers_menu(const char *server, const char *client);
 
 #ifdef __cplusplus
-}  // extern "C"
-#endif  // __cplusplus
+} // extern "C"
+#endif // __cplusplus
 
-#endif  /* PLUGIN_HOST_H */
+#endif /* PLUGIN_HOST_H */

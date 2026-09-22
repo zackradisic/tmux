@@ -33,7 +33,10 @@ fi
 DEPLOY="$DATA/deploy"; mkdir -p "$DEPLOY"
 cp "$WASM" "$DEPLOY/agents.wasm"
 cp "$ROOT/plugin-host/examples/agents/agents.toml" "$DEPLOY/agents.toml"
-$T -L $SOCK kill-server 2>/dev/null || true
+if $T -L $SOCK kill-server 2>/dev/null; then
+  # The server takes a moment to go; a new-session that races it dies.
+  sleep 1
+fi
 XDG_DATA_HOME="$DATA" $T -L $SOCK -f /dev/null new-session -d -s dev -x 220 -y 50
 XDG_DATA_HOME="$DATA" $T -L $SOCK load-plugin -s server -c capture-pane -c run-command -c mode -c db \
   -c env-read -c pane-fds -c fs-read -c fs-list -c service-serve -c service-call -c send-keys \

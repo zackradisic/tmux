@@ -10,8 +10,9 @@
 #   the search box finds the agent by a word only its conversation holds,
 #     and the row shows the matching line;
 #   Tab shows the conversation in the preview in place of the live pane,
-#     with its Markdown rendered; l gives it the keyboard, n steps to the
-#     next match;
+#     with its Markdown rendered, in a scratch pane's copy mode searched
+#     for the query; l gives it the keyboard and n steps to the next
+#     match, as copy mode does anywhere;
 #   after the agent's pane is killed, the same search still finds it with
 #     history off, and its preview shows the conversation.
 #
@@ -38,7 +39,7 @@ cp "$WASM" "$DEPLOY/agents.wasm"
 cat >"$DEPLOY/agents.toml" <<'TOML'
 [caps]
 requests = ["capture-pane", "run-command", "mode", "db", "env-read",
-            "pane-fds", "fs-read", "fs-list"]
+            "pane-fds", "fs-read", "fs-list", "send-keys"]
 [caps.env-read]
 names = ["AI_AGENT", "OPENCODE"]
 [caps.fs-read]
@@ -95,6 +96,10 @@ sleep 0.5
 # Window 0 is a plain shell, where the picker opens; the agent lives in
 # window 1, so killing its pane later leaves the picker's window alone.
 $TMUX -f/dev/null new-session -d -s alpha -x 200 -y 50 'sleep 600' || fail "new-session"
+# The conversation preview is copy mode with the user's own bindings; vi
+# keys here, as most configs have, so n/N behave as a vi user expects
+# (emacs leaves the cursor after a match, and N re-finds it once).
+$TMUX set -g mode-keys vi
 $TMUX new-window -d -t alpha:1 "sh -c 'AI_AGENT=claude exec sleep 600'" || fail "new-window"
 sleep 0.5
 
@@ -123,7 +128,7 @@ cat >"$T" <<'EOF'
 EOF
 
 $TMUX load-plugin -s server -o trust_env=1 -c capture-pane -c run-command -c mode \
-    -c db -c env-read -c pane-fds -c fs-read -c fs-list \
+    -c db -c env-read -c pane-fds -c fs-read -c fs-list -c send-keys \
     "$DEPLOY/agents.wasm" || fail "load-plugin"
 sleep 1.0
 
@@ -172,19 +177,26 @@ screen | grep -q '│Plan' || fail "the heading was not rendered"
 screen | grep -q '• warm up the acceptance counter' || fail "the list was not rendered"
 screen | grep -q '┌─ python' || fail "the code fence was not rendered"
 screen | grep -q '│ k = 8' || fail "the code line was not rendered"
-# The query has two matches (the prompt and the bullet); the preview
-# opened on the first. l: the conversation takes the keyboard, and n
-# steps between them.
-screen | grep -q 'match 1/2' || fail "the preview did not open on the first match"
+# The conversation is a scratch pane in copy mode, searched for the query:
+# the cursor sits on the first match (the prompt). l: keys go to that
+# pane, and n - copy mode's own - steps to the second (the bullet).
+SCRATCH=$($TMUX list-panes -a -F '#{session_name} #{pane_id}' | awk '$1 == "_agents-preview" { print $2 }')
+[ -n "$SCRATCH" ] || fail "no scratch pane for the conversation"
+cp_fmt() { $TMUX display-message -p -t "$SCRATCH" "$1"; }
+[ "$(cp_fmt '#{pane_in_mode}')" = "1" ] || fail "the scratch pane is not in copy mode"
+[ "$(cp_fmt '#{search_present}')" = "1" ] || fail "copy mode has no search"
+cp_fmt '#{copy_cursor_line}' | grep -q 'please measure' || fail "the search did not land on the prompt"
 keys l
-screen | grep -q 'Esc back to list' || fail "the footer does not say how to leave"
+screen | grep -q '^  copy mode ·' || fail "the footer does not say the keys go to copy mode"
 keys n
-screen | grep -q 'match 2/2' || fail "n did not step to the second match"
-keys n
-screen | grep -q 'match 1/2' || fail "n did not wrap to the first match"
-keys Escape
-screen | grep -q 'Esc back to list' && fail "Esc did not give the keyboard back"
+cp_fmt '#{copy_cursor_line}' | grep -q 'warm up the acceptance' || fail "n did not step to the second match ($(cp_fmt 'mode=#{pane_in_mode} y=#{copy_cursor_y} count=#{search_count} present=#{search_present} keys=#{mode-keys}'))"
+keys N
+cp_fmt '#{copy_cursor_line}' | grep -q 'please measure' || fail "N did not step back to the first match ($(cp_fmt 'y=#{copy_cursor_y} line=[#{copy_cursor_line}] count=#{search_count}'))"
+keys C-]
+screen | grep -q '^  copy mode ·' && fail "the unfocus key did not give the keyboard back"
 close_picker
+sleep 0.5
+$TMUX list-panes -a -F '#{session_name}' | grep -q '^_agents-preview$' && fail "the scratch session outlived the picker"
 
 # The agent dies. Its pane goes, the row ends, the rest of the transcript
 # (nothing new here) is read, and the index is snapshotted.

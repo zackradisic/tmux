@@ -336,6 +336,8 @@ an inbound peer's calls are always allowed).
 | `set_option` | `(kind, id, name Str, value Str) -> i32` (@-options only) | write-options |
 | `format_expand` | `(kind, id, fmt Str, out, cap, len_out) -> i32` — `#{...}` against the scope; `#()` disabled | read-state |
 | `send_keys` | `(pane, keys Str, literal) -> i32` | send-keys |
+| `pane_feed` | `(pane, data Bytes) -> i32` — bytes into the pane's screen as if its process had written them, bypassing the pty (≤256 KiB per call; the parse is main-thread work, so a large text goes in slices). For a plugin's own scratch pane: text to show, then `copy-mode` on it. Through the pty the same text arrives one read per event-loop turn | send-keys |
+| `send_keys_from` | `(pane, keys Str, literal, client: i64) -> i32` — as that client typed them. A pane in copy mode has no key callback of its own: the key is looked up in the mode's key table and its binding dispatched on the pane, as `send-keys` does. A pane in a mode (copy mode) takes keys only with a client behind them, so a plugin forwarding a key from its own mode passes the `client` of the `mode-key` event; -3/`E_NO_SUCH_OBJECT` for an unknown client | send-keys |
 | `capture_pane` | `(pane, start, end, escapes, out, cap, len_out) -> i32` (≤2000 lines/call) | capture-pane |
 | `pane_env` | `(pane, name Str, out, cap, len_out) -> i32` — one env var of the pane's foreground process; -2 = unset | env-read |
 | `pane_fds` | `(pane, out, cap, len_out) -> i32` — the open-file paths of the pane's foreground process, one per line; -2 = none | pane-fds |
@@ -344,7 +346,7 @@ an inbound peer's calls are always allowed).
 | `timer_cancel` | `(token: i64) -> i32` | timers |
 | `mode_open` | `(window /* -1 = default */, width, height, x, y, title Str?) -> i64` (mode id) | mode |
 | `mode_write` | `(mode: i64, data Bytes) -> i32` (≤256 KiB; raw ANSI, zero-copy) | mode |
-| `mode_preview` | `(mode: i64, pane: i64 /* -1 = clear */, x, y, w, h) -> i32` | mode |
+| `mode_preview` | `(mode: i64, pane: i64 /* -1 = clear */, x, y, w, h) -> i32` — blits the pane's VISIBLE screen: a pane in copy mode shows its copy-mode screen (scrollback position, search marks, cursor), which a plugin can drive with `copy-mode`/`send-keys -X` to give its preview search and scrolling | mode |
 | `mode_move` | `(mode: i64, window /* -1 = default */, x, y) -> i32` | mode |
 | `mode_resize` | `(mode: i64, width, height) -> i32` (content cells, clamped) | mode |
 | `mode_close` | `(mode: i64) -> i32` | mode |

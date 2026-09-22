@@ -45,13 +45,13 @@ use crate::fsworker::Needle;
 
 /// How many bytes of a record the prefilter looks at. The needles are
 /// fields near the start of every record shape seen so far.
-pub const HEAD: usize = 1024;
+pub(crate) const HEAD: usize = 1024;
 /// A candidate record longer than this is skipped unparsed, whatever
 /// its head said: nothing conversational is that long.
-pub const MAX_LINE: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_LINE: usize = 4 * 1024 * 1024;
 /// A call's block stops growing past this (soft: a line's turns are
 /// never split, and the first line always fits).
-pub const BLOCK_MAX: usize = 1024 * 1024;
+pub(crate) const BLOCK_MAX: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Harness {
