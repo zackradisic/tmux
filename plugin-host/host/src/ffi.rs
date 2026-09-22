@@ -198,6 +198,11 @@ pub struct pgh_host_vtable {
     /// -2 rect does not fit the mode screen.
     pub mode_preview:
         unsafe extern "C" fn(mode: u64, pane: i64, x: u32, y: u32, w: u32, h: u32) -> c_int,
+    /// Scroll a mode's retained preview `back` lines into its source
+    /// pane's history (0 = live). Returns the offset in effect after
+    /// clamping to the history the pane has, -1 no such mode, -3 no
+    /// preview set.
+    pub mode_preview_scroll: unsafe extern "C" fn(mode: u64, back: u32) -> c_int,
     /// Close a mode: the floating pane is torn down at the next safe
     /// point (never synchronously inside this call), which delivers
     /// pgh_mode_event(mode, "mode-closed", ...). 0 ok, -1 no such mode.

@@ -785,6 +785,25 @@ pub fn mode_preview(
     }
 }
 
+/// Scroll the mode's retained preview `back` lines into its source pane's
+/// history; 0 shows the live screen again. Returns the offset in effect,
+/// which the host clamps to the history the pane has right now.
+pub fn mode_preview_scroll(
+    mem: &mut GuestMem<'_, '_>,
+    mode: i64,
+    back: i32,
+) -> Result<i32, HostError> {
+    check_cap(mem, crate::caps::MODE)?;
+    let mode = check_mode(mem, mode)?;
+    let vt = vtable()?;
+    let rc = unsafe { (vt.mode_preview_scroll)(mode, back.max(0) as u32) };
+    match rc {
+        -3 => Err(err(ErrorCode::BadRequest, "no preview rect is set")),
+        -1 => Err(err(ErrorCode::NoSuchObject, format!("no such mode {mode}"))),
+        n => Ok(n),
+    }
+}
+
 pub fn mode_move(
     mem: &mut GuestMem<'_, '_>,
     mode: i64,

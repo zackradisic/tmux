@@ -81,6 +81,8 @@ struct window_plugin_mode_data {
 		int	 set;
 		u_int	 pane_id;
 		u_int	 px, py, sx, sy;
+		/* Lines scrolled back into the source's history; 0 = live. */
+		u_int	 back;
 	} preview;
 	struct event		 refresh;
 
@@ -212,7 +214,8 @@ window_plugin_draw_preview(struct window_mode_entry *wme)
 	struct screen			*s = &data->screen;
 	struct screen_write_ctx		 ctx;
 	struct window_pane		*src;
-	u_int				 nx, ny, i;
+	struct grid			*gd;
+	u_int				 nx, ny, i, total, max;
 
 	if (!data->preview.set)
 		return;
@@ -244,7 +247,32 @@ window_plugin_draw_preview(struct window_mode_entry *wme)
 
 	screen_write_start(&ctx, s);
 	screen_write_cursormove(&ctx, data->preview.px, data->preview.py, 0);
-	screen_write_preview(&ctx, &src->base, nx, ny);
+	if (data->preview.back == 0)
+		screen_write_preview(&ctx, &src->base, nx, ny);
+	else {
+		/*
+		 * Scrolled back: the rect shows ny rows of history plus
+		 * screen, anchored `back` lines above the live bottom, no
+		 * cursor. Clamp against the history there is now (it grows
+		 * while the pane runs), then blank the rows first, since a
+		 * copied line shorter than the one it replaces leaves the
+		 * tail of the old one behind.
+		 */
+		gd = src->base.grid;
+		total = gd->hsize + gd->sy;
+		max = total > ny ? total - ny : 0;
+		if (data->preview.back > max)
+			data->preview.back = max;
+		for (i = 0; i < ny; i++) {
+			screen_write_cursormove(&ctx, data->preview.px,
+			    data->preview.py + i, 0);
+			screen_write_clearcharacter(&ctx, nx, 8);
+		}
+		screen_write_cursormove(&ctx, data->preview.px,
+		    data->preview.py, 0);
+		screen_write_fast_copy(&ctx, &src->base, 0,
+		    max - data->preview.back, nx, ny);
+	}
 	screen_write_stop(&ctx);
 	wme->wp->flags |= PANE_REDRAW;
 }
@@ -342,6 +370,10 @@ window_plugin_mode_preview(struct window_mode_entry *wme, int64_t pane,
 	if (px + sx > screen_size_x(s) || py + sy > screen_size_y(s))
 		return (-2);
 
+	/* Another pane: back to its live bottom. The same pane keeps its
+	 * scroll across the re-sets a redraw makes. */
+	if (!data->preview.set || data->preview.pane_id != (u_int)pane)
+		data->preview.back = 0;
 	data->preview.set = 1;
 	data->preview.pane_id = (u_int)pane;
 	data->preview.px = px;
@@ -355,6 +387,25 @@ window_plugin_mode_preview(struct window_mode_entry *wme, int64_t pane,
 		evtimer_add(&data->refresh, &tv);
 	}
 	return (0);
+}
+
+/*
+ * Scroll the retained preview `back` lines into the source pane's history
+ * (0 = live). Returns the offset in effect after clamping to the history
+ * the pane has, or -3 when no preview is set.
+ */
+int
+window_plugin_mode_preview_scroll(struct window_mode_entry *wme, u_int back)
+{
+	struct window_plugin_mode_data	*data = wme->data;
+
+	if (!data->preview.set)
+		return (-3);
+	data->preview.back = back;
+	window_plugin_draw_preview(wme);
+	if (!data->preview.set)
+		return (-3);
+	return ((int)data->preview.back);
 }
 
 /* The mode screen, so capture-pane -M can read what the plugin drew. */

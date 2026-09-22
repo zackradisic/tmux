@@ -600,6 +600,20 @@ pub fn mode_preview(
 /// follows if the destination clamps the size). `window` defaults as in
 /// [`mode_open`]; position is re-centered unless `x`/`y` are given.
 /// Fails with `E_LIMIT` if the move would leave the source window empty
+/// Scroll the mode's retained preview `back` lines into the source pane's
+/// history; 0 shows the live screen again (the cursor-following view).
+/// The host clamps to the history the pane has and returns the offset in
+/// effect, so a wheel past the top settles at the top. The offset is kept
+/// across [`mode_preview`] re-sets for the same pane and dropped when the
+/// rect moves to another pane. Fails when no rect is set.
+pub fn mode_preview_scroll(mode: ModeId, back: u32) -> Result<u32, HostError> {
+    let rc = unsafe { raw::mode_preview_scroll(mode.0 as i64, back.min(i32::MAX as u32) as i32) };
+    if rc < 0 {
+        check(rc)?;
+    }
+    Ok(rc as u32)
+}
+
 /// (close instead).
 pub fn mode_move(
     mode: ModeId,

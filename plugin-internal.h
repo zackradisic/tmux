@@ -103,6 +103,7 @@ int	 plugin_vtable_mode_preview(uint64_t, int64_t, u_int, u_int, u_int,
 	     u_int);
 int	 plugin_vtable_mode_close(uint64_t);
 int	 plugin_vtable_mode_move(uint64_t, u_int, int, int);
+int	 plugin_vtable_mode_preview_scroll(uint64_t, u_int);
 int	 plugin_vtable_mode_resize(uint64_t, u_int, u_int);
 
 /* plugin-bridge.c */
@@ -119,6 +120,7 @@ void	 window_plugin_mode_write(struct window_mode_entry *,
 	     const u_char *, size_t);
 int	 window_plugin_mode_preview(struct window_mode_entry *, int64_t,
 	     u_int, u_int, u_int, u_int);
+int	 window_plugin_mode_preview_scroll(struct window_mode_entry *, u_int);
 
 /* plugin-events.c */
 void	 plugin_events_init(void);

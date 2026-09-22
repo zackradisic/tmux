@@ -626,6 +626,17 @@ transcript.sh`.
   read, and the `claude --resume` line. `y` copies the cwd; Esc or `i`
   puts the card away. Schema v10 (`cwd`, `git_branch`, `model`); remote
   rows get their totals from the provider's `stats`.
+- **The live preview scrolls.** The wheel over a local pane's preview
+  scrolls into that pane's history: a new host import,
+  `mode_preview_scroll(mode, back)`, moves the retained blit `back`
+  lines above the live bottom (history plus screen, no cursor, clamped
+  to what the pane holds), and the picker shows `↑ N lines back` under
+  it. Wheel down to 0, a key typed into the pane, or moving to another
+  row return to live. Not yet: keys for it without a mouse (every plain
+  key is the agent's while the preview has the keyboard), and the remote
+  rows' captured-text preview, which is the provider's visible screen
+  only - scrolling that needs a `CaptureReq` with a history depth.
+  `regress/plugin-agents-preview-scroll.sh`.
 
 ## Sessions and windows
 

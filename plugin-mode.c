@@ -337,6 +337,21 @@ plugin_vtable_mode_preview(uint64_t mode_id, int64_t pane, u_int x, u_int y,
 }
 
 /*
+ * Scroll a mode's retained preview `back` lines into its source pane's
+ * history (0 = live). Returns the offset in effect after clamping, -1 no
+ * such mode, -3 no preview set.
+ */
+int
+plugin_vtable_mode_preview_scroll(uint64_t mode_id, u_int back)
+{
+	struct window_mode_entry	*wme;
+
+	if (plugin_mode_find(mode_id, &wme) == NULL)
+		return (-1);
+	return (window_plugin_mode_preview_scroll(wme, back));
+}
+
+/*
  * Move a mode's floating pane to another window (join-pane mechanics:
  * the same struct window_pane is relinked, so the pane id, the mode
  * entry and its screen all survive; at most a resize follows). Runs
