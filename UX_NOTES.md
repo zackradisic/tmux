@@ -595,6 +595,19 @@ transcript.sh`.
   refetched on the refresh cadence and keeps the scroll and match
   position across the refetch. Not done: tables stay as typed, and a
   match inside a wrapped word is highlighted only on the line it starts.
+- **Tried and dropped: copy mode as the preview.** The conversation in a
+  scratch pane's copy mode, searched for the query, keys forwarded - so
+  the user's own copy-mode bindings would work in the preview. It needed
+  three host changes (blit `wp->screen` not the base grid; a key import
+  carrying the client, dispatched through the mode's key table as
+  `send-keys` does, since copy mode has no key callback; a `pane_feed`
+  import to fill the pane without the pty, which paced 500 KB to 26 s)
+  and it worked, but `n`/`N` were far too slow: copy mode re-runs the
+  search over the whole scrollback for every step, and the preview blit
+  refreshes on a 500 ms timer on top. The in-plugin renderer steps in
+  microseconds. Reverted in full (`git log` has it) - the blit change and
+  the two imports would be the pieces to bring back if a copy-mode
+  preview is wanted again, with `n`/`N` handled by the plugin.
 
 ## Sessions and windows
 
