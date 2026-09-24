@@ -612,6 +612,16 @@ pub struct Picker {
     /// cursor finds it by id in the history (or archive) view the picker
     /// opened into for it.
     pub here_id: Option<String>,
+    /// The server user's home, for `~` paths in the `~dir` filter and its
+    /// dropdown (one host call at open, not one per row per keystroke).
+    pub home: Option<String>,
+    /// The dropdown under the search box while a filter token is being
+    /// typed: the values on the roster that complete it, with how many
+    /// rows each has. Empty when there is nothing to offer, or after Esc
+    /// dismissed it for the token being typed.
+    pub completions: Vec<(String, usize)>,
+    pub completion_idx: usize,
+    pub completion_hidden: bool,
     /// The cursor has yet to land on `current_pane`'s row. Set at open;
     /// cleared once it lands, or once the user moves the cursor
     /// themselves. While set, each refresh tries again: a remote row's
@@ -1100,6 +1110,10 @@ pub async fn pick_open(
         timer: None,
         current_pane: here,
         here_id,
+        home: home_dir().ok().filter(|h| !h.is_empty()),
+        completions: Vec::new(),
+        completion_idx: 0,
+        completion_hidden: false,
         seek_here: here.is_some(),
         skew,
         down,
@@ -1961,8 +1975,26 @@ fn dispatch_key(
             // that unfocus it or move the selection. Esc (or Enter)
             // unfocuses and KEEPS the query, fzf-style; it never closes
             // the picker from here (close is q, or Esc from the list).
-            if key == k.close || key == "Enter" {
+            // With the dropdown open, Tab/Down and BTab/Up walk it, Enter
+            // takes the value, Esc puts it away for this token.
+            let dropdown = !p.completions.is_empty();
+            if dropdown && (key == "Tab" || is_down) {
+                p.completion_idx = (p.completion_idx + 1) % p.completions.len();
+                pick_render(p);
+            } else if dropdown && (key == "BTab" || is_up) {
+                p.completion_idx =
+                    (p.completion_idx + p.completions.len() - 1) % p.completions.len();
+                pick_render(p);
+            } else if dropdown && key == "Enter" {
+                accept_completion(p);
+                pick_render(p);
+            } else if dropdown && key == k.close {
+                p.completion_hidden = true;
+                p.completions.clear();
+                pick_render(p);
+            } else if key == k.close || key == "Enter" {
                 p.filtering = false;
+                p.completions.clear();
                 pick_render(p);
             } else if is_down {
                 move_sel(p, 1);
@@ -1970,24 +2002,24 @@ fn dispatch_key(
                 move_sel(p, -1);
             } else if key == "BSpace" {
                 p.filter.pop();
-                pick_refilter(p);
-                pick_render(p);
+                filter_edited(p);
             } else if key == "C-u" {
                 p.filter.clear();
-                pick_refilter(p);
-                pick_render(p);
+                filter_edited(p);
             } else if key == "Space" {
                 p.filter.push(' ');
-                pick_refilter(p);
-                pick_render(p);
+                filter_edited(p);
             } else if key == k.content {
                 toggle_content(p);
+            } else if key == "\\\\" {
+                // A backslash: tmux names the key with two.
+                p.filter.push('\\');
+                filter_edited(p);
             } else if key.chars().count() == 1
                 && !key.chars().next().unwrap().is_control()
             {
                 p.filter.push_str(&key);
-                pick_refilter(p);
-                pick_render(p);
+                filter_edited(p);
             }
         } else if key == k.close || key == "q" {
             // Esc or q puts the info card away first, then cancels a
@@ -2005,7 +2037,16 @@ fn dispatch_key(
         } else if key == k.filter {
             // `/` focuses the search box, and is the only way in.
             p.filtering = true;
+            p.completion_hidden = false;
+            update_completions(p);
             pick_render(p);
+        } else if key == "s" || key == "S" || key == "d" {
+            // Narrow to the highlighted row's session (s), server (S) or
+            // folder (d), as a token in the search box; the same key
+            // again takes the token out.
+            if let Some(tok) = narrow_token(p, &key) {
+                toggle_token(p, &tok);
+            }
         } else if key == "g" {
             // Vim `gg`: the first `g` waits, the second goes to the top.
             if g_pending {
@@ -3057,7 +3098,8 @@ fn pick_refilter_keep(
     keep: Option<(String, String, Option<i64>)>,
     reset_scroll: bool,
 ) {
-    let needle = p.filter.trim().to_string();
+    let query = parse_query(&p.filter);
+    let needle = query.words.clone();
     // Refresh the content-match set when content search is on. The local
     // grep runs in tmux over the live grids (`panes_search`); only the
     // needle and the matches cross the ABI, so it is cheap enough per
@@ -3114,13 +3156,14 @@ fn pick_reshow(
     keep: Option<(String, String, Option<i64>)>,
     reset_scroll: bool,
 ) {
-    let needle = p.filter.trim().to_string();
+    let query = parse_query(&p.filter);
+    let needle = query.words.clone();
     merge_hit_rows(p);
     p.view = p
         .rows
         .iter()
         .enumerate()
-        .filter(|(_, a)| row_shown(p, a, &needle))
+        .filter(|(_, a)| row_shown(p, a, &query))
         .map(|(i, _)| i)
         .collect();
     if !needle.is_empty() {
@@ -3183,14 +3226,254 @@ fn pick_reshow(
 /// Whether a row is in the view: it belongs to the view's set (every row,
 /// or only the archived ones), and the filter matches its metadata, a
 /// content hit landed on it, or its conversation matched.
-fn row_shown(p: &Picker, a: &Agent, needle: &str) -> bool {
+fn row_shown(p: &Picker, a: &Agent, q: &Query) -> bool {
     if p.archived_only && a.life != "archived" {
         return false;
     }
+    if !filters_pass(p, q, a) {
+        return false;
+    }
     let key = a.key();
-    rank(&haystack(a), needle).is_some()
+    rank(&haystack(a), &q.words).is_some()
         || p.content_hits.contains_key(&key)
         || p.transcript_hits.contains_key(&key)
+}
+
+// ---------------------------------------------------------------------------
+// filter tokens: @server #session ~dir
+// ---------------------------------------------------------------------------
+
+/// The sigils that start a filter token in the search box.
+pub const SIGILS: [char; 3] = ['@', '#', '~'];
+
+/// How many values the dropdown offers at most.
+const COMPLETIONS_MAX: usize = 8;
+
+/// A parsed search box: the free words that search names, tasks and
+/// transcripts, and the filter tokens - `@server`, `#session`, `~dir` -
+/// that narrow the roster. Several of one kind are alternatives; the
+/// kinds combine. A backslash escapes a sigil into an ordinary word:
+/// `\@foo` is the word `@foo`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Query {
+    pub words: String,
+    pub servers: Vec<String>,
+    pub sessions: Vec<String>,
+    pub dirs: Vec<String>,
+}
+
+impl Query {
+    pub fn has_filters(&self) -> bool {
+        !(self.servers.is_empty() && self.sessions.is_empty() && self.dirs.is_empty())
+    }
+
+    /// The active tokens, spelled as typed.
+    pub fn tokens(&self) -> String {
+        let mut t: Vec<String> = Vec::new();
+        t.extend(self.servers.iter().map(|v| format!("@{v}")));
+        t.extend(self.sessions.iter().map(|v| format!("#{v}")));
+        t.extend(self.dirs.iter().map(|v| format!("~{v}")));
+        t.join(" ")
+    }
+}
+
+pub fn parse_query(filter: &str) -> Query {
+    let mut q = Query::default();
+    let mut words: Vec<&str> = Vec::new();
+    for w in filter.split_whitespace() {
+        let Some(c) = w.chars().next() else { continue };
+        if c == '\\' {
+            let rest = &w[1..];
+            words.push(if rest.starts_with(SIGILS) { rest } else { w });
+        } else if SIGILS.contains(&c) {
+            let v = &w[c.len_utf8()..];
+            if v.is_empty() {
+                // A bare sigil is a token being typed, not a filter yet.
+                continue;
+            }
+            match c {
+                '@' => q.servers.push(v.to_string()),
+                '#' => q.sessions.push(v.to_string()),
+                _ => q.dirs.push(v.to_string()),
+            }
+        } else {
+            words.push(w);
+        }
+    }
+    q.words = words.join(" ");
+    q
+}
+
+/// `~/...` for a path under the home directory.
+fn tilde_of(home: &Option<String>, path: &str) -> String {
+    match home {
+        Some(h) if path.starts_with(h.as_str()) => format!("~{}", &path[h.len()..]),
+        _ => path.to_string(),
+    }
+}
+
+/// Does the row pass the query's filter tokens? Server and session by
+/// prefix, so `@dm` is dmatrix and `#tm` is tmux2; the directory by
+/// substring of its `~` form, so `~tmux2` takes both tmux2 trees.
+fn filters_pass(p: &Picker, q: &Query, a: &Agent) -> bool {
+    fn prefix(vals: &[String], target: &str) -> bool {
+        let t = target.to_lowercase();
+        vals.is_empty() || vals.iter().any(|v| t.starts_with(&v.to_lowercase()))
+    }
+    if !prefix(&q.servers, &a.server) {
+        return false;
+    }
+    if !prefix(&q.sessions, a.session.as_deref().unwrap_or("")) {
+        return false;
+    }
+    if !q.dirs.is_empty() {
+        let dir = a
+            .cwd
+            .as_deref()
+            .map(|c| tilde_of(&p.home, c))
+            .unwrap_or_default()
+            .to_lowercase();
+        if !q.dirs.iter().any(|v| dir.contains(&v.to_lowercase())) {
+            return false;
+        }
+    }
+    true
+}
+
+/// The token under the cursor: the search box ends in a word that starts
+/// with a sigil. Its sigil and what is typed after it.
+fn typing_token(filter: &str) -> Option<(char, &str)> {
+    if filter.ends_with(char::is_whitespace) {
+        return None;
+    }
+    let last = filter.split_whitespace().last()?;
+    let c = last.chars().next()?;
+    if !SIGILS.contains(&c) {
+        return None;
+    }
+    Some((c, &last[c.len_utf8()..]))
+}
+
+/// The search text changed under the cursor: refilter, and offer the
+/// values that complete a token being typed.
+fn filter_edited(p: &mut Picker) {
+    p.completion_hidden = false;
+    pick_refilter(p);
+    update_completions(p);
+    pick_render(p);
+}
+
+/// Rebuild the dropdown for the token being typed, from the values the
+/// roster holds: servers, sessions, or `~` directories, with how many
+/// rows have each. Prefix for servers and sessions, substring for
+/// directories; most rows first.
+fn update_completions(p: &mut Picker) {
+    p.completions.clear();
+    p.completion_idx = 0;
+    if !p.filtering || p.completion_hidden {
+        return;
+    }
+    let Some((sigil, partial)) = typing_token(&p.filter) else { return };
+    let partial = partial.to_lowercase();
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for a in &p.rows {
+        let v = match sigil {
+            '@' => Some(a.server.clone()),
+            '#' => a.session.clone(),
+            // The `~` form without its own tilde: the sigil is one, so
+            // the token reads `~/Code/x` and matches the path's tail.
+            _ => a.cwd.as_deref().map(|c| {
+                let t = tilde_of(&p.home, c);
+                t.strip_prefix('~').map(str::to_string).unwrap_or(t)
+            }),
+        };
+        let Some(v) = v.filter(|v| !v.is_empty()) else { continue };
+        let lv = v.to_lowercase();
+        let ok = if sigil == '~' { lv.contains(&partial) } else { lv.starts_with(&partial) };
+        if ok {
+            *counts.entry(v).or_insert(0) += 1;
+        }
+    }
+    let mut list: Vec<(String, usize)> = counts.into_iter().collect();
+    list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    list.truncate(COMPLETIONS_MAX);
+    // The one value left is what is typed already: nothing to offer.
+    if list.len() == 1 && list[0].0.to_lowercase() == partial {
+        list.clear();
+    }
+    p.completions = list;
+}
+
+/// Replace the token being typed with the highlighted value, and a space
+/// so the next word starts fresh.
+fn accept_completion(p: &mut Picker) {
+    let Some((v, _)) = p.completions.get(p.completion_idx).cloned() else { return };
+    let Some((sigil, plen)) = typing_token(&p.filter).map(|(s, t)| (s, t.len())) else {
+        return;
+    };
+    let cut = p.filter.len() - sigil.len_utf8() - plen;
+    p.filter.truncate(cut);
+    p.filter.push(sigil);
+    p.filter.push_str(&v);
+    p.filter.push(' ');
+    p.completions.clear();
+    pick_refilter(p);
+}
+
+/// The token that narrows to the highlighted row: `s` its session, `S`
+/// its server, `d` the last folder of its directory.
+fn narrow_token(p: &Picker, key: &str) -> Option<String> {
+    let a = p.selected()?;
+    match key {
+        "s" => a.session.as_deref().filter(|s| !s.is_empty()).map(|s| format!("#{s}")),
+        "S" => Some(format!("@{}", a.server)),
+        _ => a.cwd.as_deref().map(|c| {
+            let t = tilde_of(&p.home, c);
+            let base = t.trim_end_matches('/').rsplit('/').next().unwrap_or(&t).to_string();
+            format!("~{base}")
+        }),
+    }
+}
+
+/// Add the token to the search box, or take it out if it is there.
+fn toggle_token(p: &mut Picker, tok: &str) {
+    let mut words: Vec<String> = p.filter.split_whitespace().map(str::to_string).collect();
+    let before = words.len();
+    words.retain(|w| !w.eq_ignore_ascii_case(tok));
+    let removed = words.len() != before;
+    if !removed {
+        words.push(tok.to_string());
+    }
+    p.filter = words.join(" ");
+    if !p.filter.is_empty() {
+        p.filter.push(' ');
+    }
+    p.status = Some(if removed { format!("{tok} off") } else { format!("{tok} on") });
+    pick_refilter(p);
+    pick_render(p);
+}
+
+/// The dropdown: under the search box, aligned with the token being
+/// typed, one line per value with its row count; the highlighted one in
+/// reverse. Drawn last, over the top of the list.
+fn draw_completions(p: &Picker, out: &mut String, list_w: usize) {
+    if !p.filtering || p.completions.is_empty() {
+        return;
+    }
+    let Some((sigil, partial)) = typing_token(&p.filter) else { return };
+    // "  search " is nine cells; the sigil sits where the token starts.
+    let col = 10 + p.filter.chars().count() - 1 - partial.chars().count();
+    let wmax = p.completions.iter().map(|(v, _)| v.chars().count()).max().unwrap_or(0);
+    let width = (wmax + 8).min(list_w.saturating_sub(col + 1)).max(4);
+    for (i, (v, n)) in p.completions.iter().enumerate() {
+        let row = 3 + i;
+        if row >= p.height as usize - 1 {
+            break;
+        }
+        let line = clip(&format!(" {sigil}{v}  {n}"), width);
+        let sgr = if i == p.completion_idx { "7" } else { "48;5;238" };
+        out.push_str(&format!("\x1b[{row};{col}H\x1b[{sgr}m{line:<width$}\x1b[0m"));
+    }
 }
 
 /// The rows the hits brought in follow the roster's own in `rows`, once
@@ -3466,6 +3749,14 @@ pub fn pick_render(p: &mut Picker) {
     let mut out = String::from("\x1b[2J\x1b[H");
 
     let live = p.rows.iter().filter(|a| a.live()).count();
+    let query = parse_query(&p.filter);
+    // Narrowed by a filter token, the count says so: "9 of 22 live".
+    let live = if query.has_filters() {
+        let shown = p.view.iter().filter(|&&i| p.rows[i].live()).count();
+        format!("{shown} of {live}")
+    } else {
+        live.to_string()
+    };
     let selected = if p.marked.is_empty() {
         String::new()
     } else {
@@ -3503,6 +3794,13 @@ pub fn pick_render(p: &mut Picker) {
             ""
         },
     ));
+    if query.has_filters() {
+        // The active tokens, at the right edge of the header, so a
+        // narrowed list never passes for the whole roster.
+        let t = query.tokens();
+        let col = list_w.saturating_sub(t.chars().count() + 1).max(1);
+        out.push_str(&format!("\x1b[1;{col}H\x1b[33m{}\x1b[0m", clip(&t, list_w.saturating_sub(col))));
+    }
     if p.composing {
         // Compose mode takes over the prompt line, with a block cursor.
         let to = p.selected().map(display_name).unwrap_or_default();
@@ -3776,7 +4074,7 @@ pub fn pick_render(p: &mut Picker) {
     } else if p.renaming {
         "type a name · Enter accept · Esc cancel".to_string()
     } else if p.filtering {
-        format!("type to search · {ctok} · Esc unfocus")
+        format!("type to search · @server #session ~dir · {ctok} · Esc unfocus")
     } else {
         // Six hints, not twelve. Everything else - archive, rename,
         // copy, the band, interrupt, kill - lives in the action menu,
@@ -3802,6 +4100,7 @@ pub fn pick_render(p: &mut Picker) {
         footer
     };
     out.push_str(&format!("\x1b[{h};1H  \x1b[2m{}\x1b[0m", footer));
+    draw_completions(p, &mut out, list_w);
 
     // The preview: a live blit of the local (or mirrored) pane; else the
     // row's conversation (a finished agent, or a live one with Tab); else
@@ -4685,6 +4984,40 @@ fn strip_sgr(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod query_tests {
+    use super::*;
+
+    #[test]
+    fn tokens_and_words() {
+        let q = parse_query("dflash @dm #tmux2 ~cfb bench");
+        assert_eq!(q.words, "dflash bench");
+        assert_eq!(q.servers, vec!["dm"]);
+        assert_eq!(q.sessions, vec!["tmux2"]);
+        assert_eq!(q.dirs, vec!["cfb"]);
+        assert_eq!(q.tokens(), "@dm #tmux2 ~cfb");
+        assert!(q.has_filters());
+    }
+
+    #[test]
+    fn bare_sigil_and_escape() {
+        let q = parse_query("@ foo");
+        assert_eq!(q.words, "foo");
+        assert!(!q.has_filters());
+        let q = parse_query("\\@alpha \\x");
+        assert_eq!(q.words, "@alpha \\x");
+        assert!(!q.has_filters());
+    }
+
+    #[test]
+    fn typing() {
+        assert_eq!(typing_token("foo #al"), Some(('#', "al")));
+        assert_eq!(typing_token("foo #al "), None);
+        assert_eq!(typing_token("foo \\#al"), None);
+        assert_eq!(typing_token("@"), Some(('@', "")));
+    }
 }
 
 #[cfg(test)]

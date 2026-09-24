@@ -652,6 +652,22 @@ transcript.sh`.
   ask-popup he had stopped using), `prefix A` is `pick here`. Rows also
   gained a session column before the harness, since the name says
   nothing about where the pane is. `regress/plugin-agents-here-history.sh`.
+- **Filter tokens in the search box.** `@server`, `#session`, `~dir`
+  beside the free words (`parse_query`): server and session by prefix,
+  directory by substring of the `~` form, alternatives within a kind
+  and AND across kinds; a backslash escapes a sigil. A sigil at the end
+  of the box opens a dropdown of the values the roster holds with row
+  counts, drawn over the separator line under the token (Tab/Down,
+  BTab/Up, Enter, Esc); the header says `n of m live` and carries the
+  tokens at its right edge. `s`/`S`/`d` toggle the highlighted row's
+  session/server/folder token. Chosen over a filter popup because
+  tokens compose with the word search and live in the one place the
+  user already looks. Not done: tokens do not persist across opens
+  (deliberate); a session named with spaces cannot be typed as a token;
+  the transcript hit rows (agents outside the roster that a word
+  matched) pass the filters only by the fields they carry, so a `~dir`
+  needs the row's cwd, which pre-v10 rows lack.
+  `regress/plugin-agents-filters.sh`.
 
 ## Sessions and windows
 

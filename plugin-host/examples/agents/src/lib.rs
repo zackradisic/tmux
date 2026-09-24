@@ -12,7 +12,14 @@
 //! opens into the history (or the archive) so the row is there to land
 //! on. Bind the two to different keys (Zack: `prefix a` / `prefix A`).
 //! Each row ends in the session the pane lives in, the harness and the
-//! age.
+//! age. The search box takes filter tokens beside the words: `@server`,
+//! `#session` and `~dir` narrow the roster (prefix, prefix, substring of
+//! the `~` path; several of a kind are alternatives, kinds combine), a
+//! typed sigil opens a dropdown of the roster's values with their row
+//! counts (Tab/Down walk it, Enter takes one, Esc puts it away), a
+//! backslash makes a sigil an ordinary word, the header counts "n of m
+//! live" and shows the tokens. `s`, `S` and `d` on a row narrow to its
+//! session, server or folder, and again widen back.
 //! `l` (or Right, or a click on the preview) hands the keyboard to the
 //! preview: every key then goes to the agent's pane, so a prompt can be
 //! typed and sent without leaving the picker, and the preview shows the
