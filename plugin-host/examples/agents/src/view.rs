@@ -990,6 +990,7 @@ pub async fn pick_open(
     remotes: Rc<RefCell<Remotes>>,
     client: Option<u64>,
     here: Option<u32>,
+    seek: bool,
 ) {
     let window = client
         .and_then(|cid| {
@@ -1037,14 +1038,15 @@ pub async fn pick_open(
             return;
         }
     };
-    // The pane we were opened from may hold an agent that has finished or
-    // been archived (still running or not). Its row lives in the history
-    // (or the archive), so open that view for it and let the cursor land
-    // there, instead of a live list that has no row for where the user is.
+    // With `seek`, the pane we were opened from may hold an agent that has
+    // finished or been archived (still running or not). Its row lives in
+    // the history (or the archive), so open that view for it and let the
+    // cursor land there. Without it the default view opens, and the cursor
+    // lands on the pane's row only when that view has it.
     let mut req = ListReq::default();
     let mut here_id = None;
     let mut archived_only = false;
-    if let Some(pane) = here {
+    if let (true, Some(pane)) = (seek, here) {
         if let Ok(Some(a)) = store::latest_by_pane(i64::from(pane)).await {
             // An archived row is out of the live list whether or not its
             // pane still runs; a finished one is in the history.

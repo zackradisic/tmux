@@ -6,9 +6,11 @@
 //! first. A live preview of the highlighted pane sits to the right.
 //! `j`/`k` move, `gg`/`G` jump to the ends, Enter jumps to the pane, `a`
 //! archives, `.` folds in the finished ones. `q` or Esc closes the picker.
-//! The cursor opens on the row for the pane the hotkey was pressed in;
-//! when that pane's agent has finished, or was archived, the picker opens
-//! into the history (or the archive) so the row is there to land on.
+//! The cursor opens on the row for the pane the hotkey was pressed in,
+//! when the row is in the view. `plugin-command agents "pick here"` goes
+//! further: when that pane's agent has finished, or was archived, it
+//! opens into the history (or the archive) so the row is there to land
+//! on. Bind the two to different keys (Zack: `prefix a` / `prefix A`).
 //! Each row ends in the session the pane lives in, the harness and the
 //! age.
 //! `l` (or Right, or a click on the preview) hands the keyboard to the
@@ -666,7 +668,12 @@ impl Agents {
             let remotes = Rc::clone(&self.remotes);
             let client = event.scope.client.map(u64::from);
             let here = event.scope.pane;
-            ctx.spawn(view::pick_open(picker, cfg, remotes, client, here));
+            // "pick here": find the pane's agent wherever it is - open into
+            // the history or the archive when that is where its row lives.
+            // Plain "pick" opens the default view and lands on the row
+            // only if it is in it.
+            let seek = text.split_whitespace().nth(1) == Some("here");
+            ctx.spawn(view::pick_open(picker, cfg, remotes, client, here, seek));
             return;
         }
         if verb == "menu-key" {

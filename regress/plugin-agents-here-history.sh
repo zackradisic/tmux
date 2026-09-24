@@ -1,7 +1,8 @@
 #!/bin/sh
-# Opened from a pane whose agent has finished, the picker shows the
+# `pick here`, opened from a pane whose agent has finished, shows the
 # history and puts the cursor on that agent's row; opened from one whose
-# agent was archived, it shows the archive and lands there too. Rows
+# agent was archived, it shows the archive and lands there too. Plain
+# `pick` from the same panes opens the default view regardless. Rows
 # carry the session the pane lives in as a column.
 #
 # Needs the wasm example built:
@@ -26,9 +27,10 @@ screen() { $TMUX capture-pane -M -p -t "$FORM" | sed '/^ *$/d'; }
 shot() { [ -n "$SHOW" ] && { echo "--- $*"; screen; }; }
 keys() { $TMUX send-keys -t "$FORM" "$@"; sleep 0.5; }
 cursor_row() { screen | grep '▸' | head -1; }
+# open_from <pane> [verb]: the picker from that pane, `pick` or `pick here`.
 open_from() {
 	[ -n "$CTL" ] && kill $CTL 2>/dev/null
-	( sleep 0.3; echo "plugin-command -t $1 agents pick"; sleep 60 ) |
+	( sleep 0.3; echo "plugin-command -t $1 agents '${2:-pick}'"; sleep 60 ) |
 	    $TMUX -C attach -t alpha:0 >"$XDG_DATA_HOME/ctl.log" 2>&1 &
 	CTL=$!
 	i=0
@@ -66,8 +68,14 @@ sleep 1
 $TMUX plugin-command -t "$P" agents "working"
 sleep 3.5
 
-# The agent is gone from the live list...
+# The agent is gone from the live list: plain `pick` opens the default
+# view, which has no row for it...
 open_from "$P"
+screen | grep -q '+history' && fail "plain pick opened the history"
+screen | grep -q '▸' && fail "plain pick has a cursor row with nothing to land on"
+close_picker
+# ...and `pick here` opens the history for it.
+open_from "$P" "pick here"
 shot "from the finished pane"
 screen | grep -q 'live' || fail "picker header missing"
 # ...so the picker opened into the history, cursor on its row.
@@ -81,13 +89,16 @@ keys a
 sleep 0.5
 close_picker
 open_from "$P"
+screen | grep -q 'archive)' && fail "plain pick opened the archive"
+close_picker
+open_from "$P" "pick here"
 shot "from the archived pane"
 screen | grep -q 'archive)' || fail "the picker did not open into the archive for an archived agent's pane"
 cursor_row | grep -q 'claude.*archived' || fail "the cursor is not on the archived agent's row"
 
 # From a pane that never had an agent: the plain live list, no history.
 close_picker
-open_from "$P0"
+open_from "$P0" "pick here"
 screen | grep -q '+history' && fail "a non-agent pane opened the history"
 
 # A LIVE agent that is archived is out of the live list too: opened from
@@ -104,8 +115,11 @@ keys a
 sleep 0.5
 close_picker
 open_from "$P2"
+screen | grep -q 'archive)' && fail "plain pick from a live archived agent's pane opened the archive"
+close_picker
+open_from "$P2" "pick here"
 shot "from the live archived pane"
-screen | grep -q 'archive)' || fail "the picker did not open into the archive for a live archived agent's pane"
+screen | grep -q 'archive)' || fail "pick here did not open into the archive for a live archived agent's pane"
 cursor_row | grep -q 'claude.*archived' || fail "the cursor is not on the live archived agent's row"
 
 cleanup

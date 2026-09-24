@@ -79,26 +79,17 @@ screen | grep -q '0 live' || fail "archiving did not drop the agent"
 
 # Reload the plugin: init reconcile re-sights the same live pane. This is
 # the exact activate path a restart-server runs. The archive must survive.
-# The picker opens from the agent's own pane, and a pane whose agent is
-# archived opens the ARCHIVE view (header "archive", the row listed there);
-# a resurrected row would give the plain view instead.
 $TMUX unload-plugin agents 2>/dev/null; sleep 0.3
 load
 open_picker
-screen | grep -q 'archive)' ||
+screen | grep -q '0 live' ||
     fail "a reload resurrected the archived agent (restart bug)"
-screen | grep -q 'archived' ||
-    fail "the archive view does not list the archived agent"
 
 # A `working` report is a new turn - the user messaged the agent. It brings
-# the archived row back into the live roster: reopened from its pane, the
-# picker is the plain view again with the row in it.
+# the archived row back into the live roster.
 $TMUX plugin-command -t "$PANE" agents "working editing the file"
 sleep 0.6
-$TMUX send-keys -t "$FORM" q; sleep 0.4
-open_picker
-screen | grep -q 'archive)' && fail "a working report did not un-archive"
-screen | grep -q '1 live' || fail "the un-archived agent is not on the live roster"
+screen | grep -q '1 live' || fail "a working report did not un-archive"
 screen | grep -q 'claude' || fail "the un-archived agent is missing"
 
 cleanup
