@@ -1038,20 +1038,23 @@ pub async fn pick_open(
         }
     };
     // The pane we were opened from may hold an agent that has finished or
-    // been archived. Its row lives in the history (or the archive), so
-    // open that view for it and let the cursor land there, instead of a
-    // live list that has no row for where the user is.
+    // been archived (still running or not). Its row lives in the history
+    // (or the archive), so open that view for it and let the cursor land
+    // there, instead of a live list that has no row for where the user is.
     let mut req = ListReq::default();
     let mut here_id = None;
     let mut archived_only = false;
     if let Some(pane) = here {
         if let Ok(Some(a)) = store::latest_by_pane(i64::from(pane)).await {
-            if !a.live() {
+            // An archived row is out of the live list whether or not its
+            // pane still runs; a finished one is in the history.
+            if a.life == "archived" {
                 req.history = true;
-                if a.life == "archived" {
-                    req.archived = true;
-                    archived_only = true;
-                }
+                req.archived = true;
+                archived_only = true;
+                here_id = Some(a.id.clone());
+            } else if !a.live() {
+                req.history = true;
                 here_id = Some(a.id.clone());
             }
         }

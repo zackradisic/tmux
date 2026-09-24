@@ -90,5 +90,23 @@ close_picker
 open_from "$P0"
 screen | grep -q '+history' && fail "a non-agent pane opened the history"
 
+# A LIVE agent that is archived is out of the live list too: opened from
+# its pane, the picker shows the archive with the cursor on it.
+$TMUX new-window -d -t alpha:2 "sh -c 'AI_AGENT=claude exec sleep 600'" || fail "new-window 2"
+sleep 1
+P2=$($TMUX list-panes -t alpha:2 -F '#{pane_id}')
+$TMUX plugin-command -t "$P2" agents "working"
+sleep 0.5
+close_picker
+open_from "$P2"
+cursor_row | grep -q 'claude' || fail "the cursor is not on the live agent's row"
+keys a
+sleep 0.5
+close_picker
+open_from "$P2"
+shot "from the live archived pane"
+screen | grep -q 'archive)' || fail "the picker did not open into the archive for a live archived agent's pane"
+cursor_row | grep -q 'claude.*archived' || fail "the cursor is not on the live archived agent's row"
+
 cleanup
 echo ok
