@@ -638,6 +638,18 @@ transcript.sh`.
   and wheeling back down leaves it as it would in the pane. Only wheel
   keys are forwarded. Remote rows without a mirrored pane show captured
   text, which the wheel does nothing to. `regress/plugin-agents-preview-scroll.sh`.
+- **Opened from a finished agent's pane, the picker lands on it.** The
+  "you are here" cursor only found live rows: a pane whose agent had
+  exited (the pane now a shell) or been archived opened a picker with
+  nothing selected and no row for where the user was. Ending a row
+  clears `pane` (the one-live-agent-per-pane index needs that), so
+  schema v11 keeps `last_pane`; `pick` looks the pane up, and when the
+  row is finished it opens with history on (archived: the archive view)
+  and puts the cursor on it by id. Rows also gained a session column
+  before the harness, since the name says nothing about where the pane
+  is. `regress/plugin-agents-here-history.sh`. Zack's `prefix a` now
+  opens the picker too (it used to be an fzf ask-popup he had stopped
+  using); `prefix A` is unchanged.
 
 ## Sessions and windows
 

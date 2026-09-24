@@ -6,6 +6,11 @@
 //! first. A live preview of the highlighted pane sits to the right.
 //! `j`/`k` move, `gg`/`G` jump to the ends, Enter jumps to the pane, `a`
 //! archives, `.` folds in the finished ones. `q` or Esc closes the picker.
+//! The cursor opens on the row for the pane the hotkey was pressed in;
+//! when that pane's agent has finished, or was archived, the picker opens
+//! into the history (or the archive) so the row is there to land on.
+//! Each row ends in the session the pane lives in, the harness and the
+//! age.
 //! `l` (or Right, or a click on the preview) hands the keyboard to the
 //! preview: every key then goes to the agent's pane, so a prompt can be
 //! typed and sent without leaving the picker, and the preview shows the

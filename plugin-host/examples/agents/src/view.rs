@@ -607,6 +607,11 @@ pub struct Picker {
     /// border, so you can spot the agent you are currently sitting on, and
     /// the cursor opens on it.
     pub current_pane: Option<u32>,
+    /// The store row for `current_pane` when its agent is no longer live:
+    /// a finished or archived row has no live pane to match, so the
+    /// cursor finds it by id in the history (or archive) view the picker
+    /// opened into for it.
+    pub here_id: Option<String>,
     /// The cursor has yet to land on `current_pane`'s row. Set at open;
     /// cleared once it lands, or once the user moves the cursor
     /// themselves. While set, each refresh tries again: a remote row's
@@ -820,15 +825,27 @@ impl Picker {
         if !self.seek_here || self.current_pane.is_none() {
             return false;
         }
-        let pos = self
-            .view
-            .iter()
-            .position(|&i| self.local_pane_of(&self.rows[i]) == self.current_pane);
+        let pos = self.view.iter().position(|&i| self.is_here(&self.rows[i]));
         let Some(pos) = pos else { return false };
         self.sel = pos;
         self.seek_here = false;
         self.scroll_to_selection();
         true
+    }
+
+    /// Is this the row for the pane the picker was opened from? A live
+    /// row through its local pane (a remote row through its mirror; an
+    /// unmirrored remote row never, since its pane id is another
+    /// server's); a finished or archived row through the id resolved at
+    /// open, since it has no live pane to match.
+    pub fn is_here(&self, a: &Agent) -> bool {
+        if self.current_pane.is_none() {
+            return false;
+        }
+        if a.live() {
+            return self.local_pane_of(a) == self.current_pane;
+        }
+        a.is_local() && self.here_id.as_deref() == Some(a.id.as_str())
     }
 
     /// The highlighted row.
@@ -1020,8 +1037,27 @@ pub async fn pick_open(
             return;
         }
     };
+    // The pane we were opened from may hold an agent that has finished or
+    // been archived. Its row lives in the history (or the archive), so
+    // open that view for it and let the cursor land there, instead of a
+    // live list that has no row for where the user is.
+    let mut req = ListReq::default();
+    let mut here_id = None;
+    let mut archived_only = false;
+    if let Some(pane) = here {
+        if let Ok(Some(a)) = store::latest_by_pane(i64::from(pane)).await {
+            if !a.live() {
+                req.history = true;
+                if a.life == "archived" {
+                    req.archived = true;
+                    archived_only = true;
+                }
+                here_id = Some(a.id.clone());
+            }
+        }
+    }
     let Gathered { mut rows, captures, skew, down, mismatch, fetching } =
-        gather_rows(&remotes, ListReq::default(), true).await;
+        gather_rows(&remotes, req.clone(), true).await;
     let mut order: HashMap<String, u64> = HashMap::new();
     let mut order_next: u64 = 0;
     stable_sort(&mut order, &mut order_next, &mut rows);
@@ -1046,8 +1082,8 @@ pub async fn pick_open(
         content_mode: SearchMode::Plain,
         content_query: String::new(),
         now_ms: now_ms(),
-        show_history: false,
-        archived_only: false,
+        show_history: req.history,
+        archived_only,
         history_before_archive: false,
         keys: cfg.keys.clone(),
         launchers: cfg.launchers.clone(),
@@ -1058,6 +1094,7 @@ pub async fn pick_open(
         order_next,
         timer: None,
         current_pane: here,
+        here_id,
         seek_here: here.is_some(),
         skew,
         down,
@@ -3570,11 +3607,16 @@ pub fn pick_render(p: &mut Picker) {
                     let marked = p.marked.contains(&a.key());
                     let marker = if cur { "▸" } else { " " };
                     let age = fmt_age(p.age_ms(a) / 1000);
-                    // kind + age are fixed columns at the right edge; the
-                    // name (with the task, when there is one) fills all the
-                    // width that is left.
-                    let right =
-                        format!("{:<8} {:>6}", clip(&a.kind, 8), age);
+                    // session + kind + age are fixed columns at the right
+                    // edge - the session is where the pane lives, which
+                    // the name does not say; the name (with the task, when
+                    // there is one) fills all the width that is left.
+                    let right = format!(
+                        "{:<12} {:<8} {:>6}",
+                        clip(a.session.as_deref().unwrap_or(""), 12),
+                        clip(&a.kind, 8),
+                        age
+                    );
                     // prefix = "▸ ● " (marker + badge), gap = 2 before right.
                     let label_w = list_w
                         .saturating_sub(1)
@@ -3676,8 +3718,7 @@ pub fn pick_render(p: &mut Picker) {
                     // collide with an unrelated local pane's id). `None`
                     // never matches - an unmirrored remote row and a picker
                     // opened from nowhere must not agree.
-                    let here = p.current_pane.is_some()
-                        && p.local_pane_of(a) == p.current_pane;
+                    let here = p.is_here(a);
                     if here {
                         let g = if cur { "▸" } else { "▎" };
                         out.push_str(&format!("\x1b[{row};1H\x1b[1;94m{g}\x1b[0m"));

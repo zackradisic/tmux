@@ -20,7 +20,7 @@
 use serde::{Deserialize, Serialize};
 use tmux_plugin_sdk::prelude::*;
 
-pub const USER_VERSION: i64 = 10;
+pub const USER_VERSION: i64 = 11;
 
 /// The server a row belongs to. A provider only ever writes rows for its
 /// own server, so every stored row says "local"; the view stamps the link
@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS agents (
     ('working','needs_input','waiting','done')),
   life TEXT NOT NULL CHECK (life IN ('active','stale','archived')),
   pane INTEGER,
+  last_pane INTEGER,
   session TEXT,
   window TEXT,
   task TEXT,
@@ -96,7 +97,7 @@ CREATE TABLE IF NOT EXISTS search_index (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   blob BLOB NOT NULL,
   max_rowid INTEGER NOT NULL);
-PRAGMA user_version = 10;";
+PRAGMA user_version = 11;";
 
 /// The v1 -> v2 upgrade: the resolved columns did not exist in v1.
 const MIGRATE_V2: &str = "
@@ -210,6 +211,14 @@ ALTER TABLE agents ADD COLUMN cwd TEXT;
 ALTER TABLE agents ADD COLUMN git_branch TEXT;
 ALTER TABLE agents ADD COLUMN model TEXT;
 PRAGMA user_version = 10;";
+
+/// The v10 -> v11 upgrade: the pane an agent ran in, kept after it ends.
+/// Ending a row clears `pane` so the one-live-agent-per-pane index frees
+/// the pane at once; `last_pane` remembers it, so a picker opened from
+/// that pane can find the finished (or archived) row and land on it.
+const MIGRATE_V11: &str = "
+ALTER TABLE agents ADD COLUMN last_pane INTEGER;
+PRAGMA user_version = 11;";
 
 const COLS: &str = "id, kind, status, life, pane, session, window, task, \
                     note, name, name_ms, user_name, user_name_ms, \
@@ -422,6 +431,10 @@ pub fn migrate_sync() -> Result<(), String> {
             db_exec_sync(MIGRATE_V10, params![])
                 .map_err(|e| format!("db: {e}"))?;
         }
+        if version <= 10 {
+            db_exec_sync(MIGRATE_V11, params![])
+                .map_err(|e| format!("db: {e}"))?;
+        }
     }
     Ok(())
 }
@@ -458,6 +471,25 @@ pub async fn live_by_pane(pane: i64) -> Result<Option<Agent>, HostError> {
     let rows = db_query(
         &format!(
             "SELECT {COLS} FROM agents WHERE pane = ?1 AND ended_ms IS NULL \
+             LIMIT 1"
+        ),
+        params![pane],
+    )
+    .await?;
+    Ok(agents_from(&rows).into_iter().next())
+}
+
+/// The row most recently bound to a local pane, live or not: the live
+/// one when there is one, else the one that ended there last (ending
+/// clears `pane` and keeps `last_pane`). For a picker opened from a pane
+/// whose agent has finished or been archived.
+pub async fn latest_by_pane(pane: i64) -> Result<Option<Agent>, HostError> {
+    let rows = db_query(
+        &format!(
+            "SELECT {COLS} FROM agents \
+             WHERE (pane = ?1 OR last_pane = ?1) AND server = 'local' \
+             ORDER BY (ended_ms IS NULL) DESC, \
+                      COALESCE(ended_ms, last_active_ms) DESC \
              LIMIT 1"
         ),
         params![pane],
@@ -736,7 +768,7 @@ pub async fn end_by_pane(
     db_exec(
         "UPDATE agents SET ended_ms = ?2, reason = ?3, \
          status = CASE WHEN status = 'working' THEN 'done' ELSE status END, \
-         pane = NULL WHERE pane = ?1 AND ended_ms IS NULL",
+         last_pane = pane, pane = NULL WHERE pane = ?1 AND ended_ms IS NULL",
         params![pane, now_ms, reason],
     )
     .await?;
@@ -748,7 +780,8 @@ pub async fn end_by_pane(
 pub async fn finish_by_pane(pane: i64, now_ms: i64) -> Result<(), HostError> {
     db_exec(
         "UPDATE agents SET status = 'done', ended_ms = ?2, reason = 'exited', \
-         last_status_ms = ?2, pane = NULL WHERE pane = ?1 AND ended_ms IS NULL",
+         last_status_ms = ?2, last_pane = pane, pane = NULL \
+         WHERE pane = ?1 AND ended_ms IS NULL",
         params![pane, now_ms],
     )
     .await?;
