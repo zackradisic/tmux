@@ -21,6 +21,10 @@
 //! live" and shows the tokens. `s`, `S` and `d` on a row narrow to its
 //! session, server or folder, and again widen back.
 //! `?` puts a quick reference of all of this in the preview column.
+//! `plugin-command agents "pick id <agent-id>"` opens on that agent
+//! wherever its row is - a linked server, the history, the archive - for
+//! a hotkey over an id seen on screen (a mailbox message names its
+//! sender by id).
 //! `l` (or Right, or a click on the preview) hands the keyboard to the
 //! preview: every key then goes to the agent's pane, so a prompt can be
 //! typed and sent without leaving the picker, and the preview shows the
@@ -680,8 +684,15 @@ impl Agents {
             // the history or the archive when that is where its row lives.
             // Plain "pick" opens the default view and lands on the row
             // only if it is in it.
-            let seek = text.split_whitespace().nth(1) == Some("here");
-            ctx.spawn(view::pick_open(picker, cfg, remotes, client, here, seek));
+            let mut words = text.split_whitespace().skip(1);
+            let (seek, seek_id) = match words.next() {
+                Some("here") => (true, None),
+                // "pick id <agent-id>": open on that agent, wherever its
+                // row lives - any server, the history or the archive.
+                Some("id") => (false, words.next().map(str::to_string)),
+                _ => (false, None),
+            };
+            ctx.spawn(view::pick_open(picker, cfg, remotes, client, here, seek, seek_id));
             return;
         }
         if verb == "menu-key" {

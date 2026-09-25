@@ -834,7 +834,7 @@ impl Picker {
     /// if that row is on screen and the cursor has not been moved since
     /// open. Returns whether it landed.
     fn select_here(&mut self) -> bool {
-        if !self.seek_here || self.current_pane.is_none() {
+        if !self.seek_here || (self.current_pane.is_none() && self.here_id.is_none()) {
             return false;
         }
         let pos = self.view.iter().position(|&i| self.is_here(&self.rows[i]));
@@ -851,13 +851,15 @@ impl Picker {
     /// server's); a finished or archived row through the id resolved at
     /// open, since it has no live pane to match.
     pub fn is_here(&self, a: &Agent) -> bool {
-        if self.current_pane.is_none() {
+        // An id resolved at open (a finished or archived row of the pane,
+        // or the id `pick id` was given) matches wherever the row is.
+        if self.here_id.as_deref() == Some(a.id.as_str()) {
+            return true;
+        }
+        if self.current_pane.is_none() || !a.live() {
             return false;
         }
-        if a.live() {
-            return self.local_pane_of(a) == self.current_pane;
-        }
-        a.is_local() && self.here_id.as_deref() == Some(a.id.as_str())
+        self.local_pane_of(a) == self.current_pane
     }
 
     /// The highlighted row.
@@ -1003,6 +1005,7 @@ pub async fn pick_open(
     client: Option<u64>,
     here: Option<u32>,
     seek: bool,
+    seek_id: Option<String>,
 ) {
     let window = client
         .and_then(|cid| {
@@ -1073,8 +1076,33 @@ pub async fn pick_open(
             }
         }
     }
-    let Gathered { mut rows, captures, skew, down, mismatch, fetching } =
+    if let Some(id) = &seek_id {
+        here_id = Some(id.clone());
+    }
+    let Gathered { mut rows, mut captures, mut skew, mut down, mut mismatch, mut fetching } =
         gather_rows(&remotes, req.clone(), true).await;
+    // An id to open on that no roster holds: it may have finished or been
+    // archived, here or on a linked server, so ask every server for its
+    // history and archive too, once.
+    let mut missing_id = None;
+    if let Some(id) = &seek_id {
+        if !rows.iter().any(|a| a.id == *id) {
+            req.history = true;
+            req.archived = true;
+            let g = gather_rows(&remotes, req.clone(), true).await;
+            rows = g.rows;
+            captures = g.captures;
+            skew = g.skew;
+            down = g.down;
+            mismatch = g.mismatch;
+            fetching = g.fetching;
+            match rows.iter().find(|a| a.id == *id) {
+                Some(a) if a.life == "archived" => archived_only = true,
+                Some(_) => {}
+                None => missing_id = Some(id.clone()),
+            }
+        }
+    }
     let mut order: HashMap<String, u64> = HashMap::new();
     let mut order_next: u64 = 0;
     stable_sort(&mut order, &mut order_next, &mut rows);
@@ -1116,7 +1144,7 @@ pub async fn pick_open(
         completions: Vec::new(),
         completion_idx: 0,
         completion_hidden: false,
-        seek_here: here.is_some(),
+        seek_here: here.is_some() || seek_id.is_some(),
         skew,
         down,
         mismatch,
@@ -1139,6 +1167,9 @@ pub async fn pick_open(
         show_help: false,
         info: None,
     };
+    if let Some(id) = missing_id {
+        p.status = Some(format!("no agent {id} on any server"));
+    }
     p.roster_len = p.rows.len();
     pick_refilter(&mut p);
     // Open on the agent you are sitting in, when it has a row.
@@ -3057,7 +3088,8 @@ fn rank(hay: &str, needle: &str) -> Option<u8> {
 
 fn haystack(a: &Agent) -> String {
     format!(
-        "{} {} {} {} {} {} {} {} {} {}",
+        "{} {} {} {} {} {} {} {} {} {} {}",
+        a.id,
         display_name(a),
         a.kind,
         a.status,

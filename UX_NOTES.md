@@ -672,6 +672,18 @@ transcript.sh`.
   card: keys by area (moving, search box, rows, conversation, picker),
   configured keys shown as configured. Esc or `?` puts it away; it is in
   the Space menu too.
+- **An agent id on screen opens the picker on that agent.** Mailbox
+  messages name their sender by durable id, and the user wanted to get
+  from the id to the agent. `plugin-command agents "pick id <id>"` opens
+  on the row wherever it is: the rosters first, then every server's
+  history and archive once, with the cursor (and the here border) on it
+  and "no agent <id> on any server" when nothing has it. The id is in the
+  search haystack too, so pasting one into `/` finds the row. Zack's
+  config: `prefix F` is copy mode with a search for
+  `(claude|codex|pi|opencode):<hex>`, like his `prefix f` for file paths,
+  and Enter in copy mode runs `~/.config/util/bin/tmux-agent-at-cursor`,
+  which opens the picker on `#{search_match}` when it is an agent id and
+  nothing is selected, else copies the selection as Enter always did.
 
 ## Sessions and windows
 

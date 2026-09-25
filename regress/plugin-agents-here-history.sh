@@ -1,4 +1,5 @@
 #!/bin/sh
+# `pick id <id>` opens on that agent wherever its row is, and
 # `pick here`, opened from a pane whose agent has finished, shows the
 # history and puts the cursor on that agent's row; opened from one whose
 # agent was archived, it shows the archive and lands there too. Plain
