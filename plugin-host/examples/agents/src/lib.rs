@@ -21,6 +21,10 @@
 //! live" and shows the tokens. `s`, `S` and `d` on a row narrow to its
 //! session, server or folder, and again widen back.
 //! `?` puts a quick reference of all of this in the preview column.
+//! Enter (or `n`) on a finished or killed agent's row brings it back:
+//! the new-agent form opens prefilled to resume it - its harness session
+//! id in the `resume` field, its directory, a window in its session or
+//! a session named after the old one when that is gone (see `newagent`).
 //! `plugin-command agents "pick id <agent-id>"` opens on that agent
 //! wherever its row is - a linked server, the history, the archive - for
 //! a hotkey over an id seen on screen (a mailbox message names its

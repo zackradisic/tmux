@@ -2756,9 +2756,19 @@ fn jump_after(p: &mut Picker, ack: &mut Option<(String, String)>) -> PickAfter {
             PickAfter::None
         }
         (None, _) => {
-            p.status = Some("no live pane to jump to".into());
-            pick_render(p);
-            PickAfter::None
+            // No pane: bring the agent back. The form opens prefilled to
+            // resume it (its transcript, its directory, its session) and
+            // is the question - Esc says no. A row with nothing to resume
+            // (a provisional id) only says so.
+            if crate::newagent::resumable_id(&a.id).is_some() {
+                p.status = Some("gone: the form brings it back (Esc: no)".into());
+                pick_render(p);
+                PickAfter::NewAgent
+            } else {
+                p.status = Some("no live pane to jump to".into());
+                pick_render(p);
+                PickAfter::None
+            }
         }
     }
 }

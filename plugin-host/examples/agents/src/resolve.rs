@@ -70,7 +70,7 @@ async fn file_mtime_ms(path: &str) -> Option<i64> {
 /// launched under a wrapper, or a stale pid after a restart), fall back to
 /// scanning the directory and matching the `tmux` field.
 pub async fn claude(a: &Agent) -> Option<Resolved> {
-    claude_for_pane(a.pane? as u32).await
+    claude_for_pane_in(a.pane? as u32, a.session.as_deref()).await
 }
 
 /// Does a Claude session file name this pane? That file is the proof a
@@ -78,25 +78,39 @@ pub async fn claude(a: &Agent) -> Option<Resolved> {
 /// `AI_AGENT` is inherited by every pane of a server started inside
 /// Claude Code, but only Claude itself writes its pane into its file.
 pub async fn claude_claims_pane(pane: u32) -> bool {
-    claude_for_pane(pane).await.is_some()
+    claude_for_pane_in(pane, None).await.is_some()
 }
 
-async fn claude_for_pane(pane: u32) -> Option<Resolved> {
+/// `session` is the row's session name, for the one case the window id
+/// cannot be checked: the pane is already gone (its agent is ending, and
+/// this is the last chance to learn its id).
+async fn claude_for_pane_in(pane: u32, session: Option<&str>) -> Option<Resolved> {
     let home = home()?;
     let dir = format!("{home}/.claude/sessions");
     // A session file outlives the server that made it: after a restart
     // the new server hands out the same pane ids again, so a stale file
     // can name a live pane by number alone. The window id must match
     // too. The session name is left out: a rename must not lose a row.
-    let window = resolve_pane(PaneId(pane)).ok().map(|p| p.window);
-    let claims = |p: u32, w: Option<u32>| p == pane && (w.is_none() || w == window);
+    // A pane that is gone has no window to check; then the file's
+    // session name must be the row's, which a rename would have
+    // followed too.
+    let alive = resolve_pane(PaneId(pane)).ok();
+    let window = alive.as_ref().map(|p| p.window);
+    let claims = |p: u32, w: Option<u32>, s: &str| {
+        p == pane
+            && if alive.is_some() {
+                w.is_none() || w == window
+            } else {
+                session.is_some_and(|name| name == s)
+            }
+    };
 
     // Direct hit: <pid>.json, verified by its tmux field.
     if let Ok(Some(pid)) = pane_pid(PaneId(pane)) {
         let path = format!("{dir}/{pid}.json");
         if let Ok((bytes, _)) = fs_read(&path, 0, 16 * 1024).await {
-            if let Some((p, w, r)) = parse_claude(&path, &bytes, &home) {
-                if claims(p, w) {
+            if let Some((p, w, s, r)) = parse_claude(&path, &bytes, &home) {
+                if claims(p, w, &s) {
                     return Some(r);
                 }
             }
@@ -116,8 +130,8 @@ async fn claude_for_pane(pane: u32) -> Option<Resolved> {
         let Ok((bytes, _)) = fs_read(&path, 0, 16 * 1024).await else {
             continue;
         };
-        if let Some((p, w, r)) = parse_claude(&path, &bytes, &home) {
-            if claims(p, w) {
+        if let Some((p, w, s, r)) = parse_claude(&path, &bytes, &home) {
+            if claims(p, w, &s) {
                 return Some(r);
             }
         }
@@ -125,10 +139,14 @@ async fn claude_for_pane(pane: u32) -> Option<Resolved> {
     None
 }
 
-/// Parse one Claude session file into (pane, window, resolved). Returns
-/// None when the JSON is malformed or lacks a usable `tmux` field; the
-/// window is None when the field carries no `@N` part.
-fn parse_claude(path: &str, bytes: &[u8], home: &str) -> Option<(u32, Option<u32>, Resolved)> {
+/// Parse one Claude session file into (pane, window, session name,
+/// resolved). Returns None when the JSON is malformed or lacks a usable
+/// `tmux` field; the window is None when the field carries no `@N` part.
+fn parse_claude(
+    path: &str,
+    bytes: &[u8],
+    home: &str,
+) -> Option<(u32, Option<u32>, String, Resolved)> {
     let v = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
     // tmux is "session:@window.%pane".
     let field = v.get("tmux").and_then(|x| x.as_str())?;
@@ -139,6 +157,7 @@ fn parse_claude(path: &str, bytes: &[u8], home: &str) -> Option<(u32, Option<u32
         .next()
         .and_then(|w| w.strip_prefix('@'))
         .and_then(|n| n.parse::<u32>().ok());
+    let session_name = rest.rsplit_once(':').map(|(s, _)| s).unwrap_or("").to_string();
     let sid = v.get("sessionId").and_then(|x| x.as_str());
     // The transcript sits under the project directory named for the cwd.
     let cwd = v.get("cwd").and_then(|x| x.as_str()).filter(|c| !c.is_empty()).map(str::to_string);
@@ -154,6 +173,7 @@ fn parse_claude(path: &str, bytes: &[u8], home: &str) -> Option<(u32, Option<u32
     Some((
         pane,
         window,
+        session_name,
         Resolved {
             real_id: sid.map(|s| format!("claude:{s}")),
             name: v.get("name").and_then(|x| x.as_str()).map(str::to_string),

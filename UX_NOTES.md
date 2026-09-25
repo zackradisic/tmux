@@ -703,6 +703,29 @@ transcript.sh`.
   box (or into the agent's pane while typing into it). Other modes are
   unchanged. `regress/plugin-agents-filters.sh` covers paste-buffer,
   which shares the hook with a bracketed paste.
+- **A killed or finished agent comes back through the new-agent form.**
+  Enter (or `n`) on a row with no live pane opens the form prefilled to
+  resume it: a `resume` field (window and session kinds) with the
+  harness session id from the durable id, `folder` from the directory
+  the transcript recorded (Claude keeps sessions per project directory,
+  so `--resume` only finds it there), a window in the row's session when
+  that exists, else a session named after the old one. The form is the
+  "recreate it?" question: what it shows is what happens, Esc is no.
+  Enter runs the launcher plus `--resume <id>` (`codex resume <id>` for
+  Codex); the new pane carries the same durable id, so the roster
+  re-points the old row at it, turns and all. Never the old pane:
+  whatever runs there now is somebody's. Two things it turned up: a row
+  whose picker was never opened while it lived died with a provisional
+  id and nothing to resume, so ending a row now takes a last look at its
+  session file, and the Claude resolver accepts that file for a pane
+  that is already gone by matching the session name in place of the
+  window id it can no longer check. Test-harness lessons, for the
+  record: Esc from the list closes the picker; tmux drops a mode's keys
+  when no client is attached (a `( sleep N ) | attach` client outlives
+  nothing past N); a server started from inside a Claude session
+  inherits `AI_AGENT`, and under `trust_env` every helper pane is then
+  an agent - the test unsets it first.
+  `regress/plugin-agents-filters.sh`.
 
 ## Sessions and windows
 

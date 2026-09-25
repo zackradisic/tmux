@@ -639,6 +639,19 @@ pub async fn report(pane: u32, status: String, task: Option<String>, cfg: Rc<Con
 /// searchable. The read runs off the caller's path.
 async fn end_pane(pane: u32, now: i64, reason: &str) {
     let live = store::live_by_pane(pane as i64).await.ok().flatten();
+    // A row that never got its durable id - the picker never rendered
+    // while it lived, and rendering is what resolves - gets one last
+    // look at its session file now, while that may still exist. The id
+    // is what bringing the agent back needs, and what the transcript is
+    // found by.
+    let live = match live {
+        Some(a) if a.id.starts_with("prov-") => {
+            let mut rows = vec![a];
+            enrich_live(&mut rows).await;
+            rows.pop()
+        }
+        other => other,
+    };
     let _ = store::end_by_pane(pane as i64, now, reason).await;
     if let Some(a) = live {
         if a.transcript_path.is_some() {

@@ -12,6 +12,10 @@
 
 PATH=/bin:/usr/bin
 TERM=screen
+# The server inherits this environment, and every pane the server makes
+# inherits the server's; under trust_env a harness variable leaked in
+# from whoever runs this test would make every helper pane an agent.
+unset AI_AGENT OPENCODE
 
 [ -z "$TEST_TMUX" ] && TEST_TMUX=$(readlink -f ../tmux)
 TMUX="$TEST_TMUX -Lagents-filters-test"
@@ -37,7 +41,7 @@ cleanup() {
 	$TMUX kill-server 2>/dev/null
 	rm -rf "$HOME" "$DEPLOY"
 }
-fail() { echo "FAIL: $*" >&2; echo "--- plugin:" >&2; $TMUX show-plugins -v 2>&1 | grep -A3 "^agents" | cut -c1-160 >&2; echo "--- panes:" >&2; $TMUX list-panes -a -F "#{pane_id} #{pane_mode} #{session_name}:#{window_index}" >&2; echo "--- screen:" >&2; screen >&2; cleanup; exit 1; }
+fail() { echo "FAIL: $*" >&2; echo "--- screen:" >&2; screen >&2; cleanup; exit 1; }
 screen() { $TMUX capture-pane -M -p -t "$FORM" | sed '/^ *$/d'; }
 shot() { [ -n "$SHOW" ] && { echo "--- $*"; screen; }; }
 keys() { $TMUX send-keys -t "$FORM" "$@"; sleep 0.4; }
@@ -71,8 +75,7 @@ $TMUX load-plugin -s server -o trust_env=1 -c capture-pane -c run-command -c mod
     || fail "load-plugin"
 sleep 1.5
 
-( sleep 0.3; echo 'plugin-command agents pick'; sleep 90 ) |
-    $TMUX -C attach -t alpha:0 >/dev/null 2>&1 &
+( ( sleep 0.3; echo 'plugin-command agents pick'; sleep 600 ) | $TMUX -C attach -t alpha:0 ) >/dev/null 2>&1 &
 CTL=$!
 sleep 1.5
 FORM=$($TMUX list-panes -a -F '#{pane_id} #{pane_mode}' | awk '/plugin-mode/ { print $1 }')
@@ -170,8 +173,7 @@ BID=claude:1b2c3d4e-0000-4000-8000-000000000001
 $TMUX new-window -d -t alpha:3 "sh -c 'echo Message from $BID via the tmux2 mailbox; exec env -i PATH=/bin:/usr/bin sleep 600'" || fail "new-window 3"
 sleep 1
 P3=$($TMUX list-panes -t alpha:3 -F '#{pane_id}')
-( sleep 0.3; echo "plugin-command -t $P3 agents 'pick ids'"; sleep 90 ) |
-    $TMUX -C attach -t alpha:0 >/dev/null 2>&1 &
+( ( sleep 0.3; echo "plugin-command -t $P3 agents 'pick ids'"; sleep 600 ) | $TMUX -C attach -t alpha:0 ) >/dev/null 2>&1 &
 CTL=$!
 sleep 2
 FORM=$($TMUX list-panes -a -F '#{pane_id} #{pane_mode}' | awk '/plugin-mode/ { print $1 }')
@@ -190,7 +192,7 @@ screen | grep '▸' | grep -q 'beta' || fail "pick ids did not land on the agent
 keys q
 sleep 0.5
 kill $CTL 2>/dev/null; CTL=
-( sleep 90 ) | $TMUX -C attach -t alpha:0 >/dev/null 2>&1 &
+( ( sleep 600 ) | $TMUX -C attach -t alpha:0 ) >/dev/null 2>&1 &
 CTL=$!
 sleep 1
 $TMUX plugin-command -t "$P3" agents "open $BID" || fail "open failed"
@@ -207,6 +209,75 @@ $TMUX plugin-command agents pick
 sleep 2
 FORM=$($TMUX list-panes -a -F '#{pane_id} #{pane_mode}' | awk '/plugin-mode/ { print $1 }')
 [ -n "$FORM" ] || fail "picker did not reopen"
+
+# Bringing a killed agent back. Kill the beta agent's pane: its row ends.
+# In the history, Enter on it opens the new-agent form prefilled to
+# resume it: `resume` holds its session id, `folder` the directory its
+# session file gave, `session` beta (it still exists, so [window]); Esc
+# says no. With session beta gone, the form opens as [session] named
+# after it.
+[ -n "$BP" ] || fail "no beta pane id to kill"
+# A second window keeps session beta alive when the agent's pane dies.
+$TMUX new-window -d -t beta 'sleep 600' || fail "new-window in beta"
+$TMUX kill-pane -t "$BP" || fail "kill-pane $BP failed"
+i=0
+while [ "$i" -lt 30 ]; do
+	n=$(sqlite3 "$XDG_DATA_HOME/tmux/plugins/agents/store.db" \
+	    "select count(*) from agents where id = '$BID' and ended_ms is not null" 2>/dev/null)
+	[ "$n" = 1 ] && break
+	sleep 0.5; i=$((i + 1))
+done
+[ "$n" = 1 ] || fail "the beta agent did not end after kill-pane"
+modes() { $TMUX list-panes -a -F '#{pane_id} #{pane_mode}' | awk '/plugin-mode/ { print $1 }'; }
+fscreen() { $TMUX capture-pane -M -p -t "$NEWF" | sed '/^ *$/d'; }
+# A client that outlives the rest of the test: without one attached,
+# tmux drops the keys sent to a mode.
+kill $CTL 2>/dev/null; CTL=
+( ( sleep 600 ) | $TMUX -C attach -t alpha:0 ) >/dev/null 2>&1 &
+CTL=$!
+sleep 1
+# A fresh picker each time, with history on and the search narrowed to
+# beta, so the cursor is on its finished row.
+open_form_on_beta() {
+	for m in $(modes); do $TMUX send-keys -t "$m" Escape; done
+	sleep 0.5
+	for m in $(modes); do $TMUX send-keys -t "$m" q; done
+	sleep 0.5
+	$TMUX plugin-command agents pick
+	sleep 1.5
+	FORM=$(modes | head -1)
+	[ -n "$FORM" ] || fail "picker did not open for the revive check"
+	keys .
+	keys / '#' b e t a Enter
+	sleep 0.6
+	screen | grep '▸' | grep -q 'beta' || fail "the cursor is not on the finished beta row: $(screen | grep '▸')"
+	keys Enter
+	i=0
+	while [ "$i" -lt 20 ]; do
+		NEWF=$(modes | grep -v "^$FORM\$" | head -1)
+		[ -n "$NEWF" ] && break
+		sleep 0.3; i=$((i + 1))
+	done
+	[ -n "$NEWF" ] || fail "Enter on the finished row did not open the form"
+	sleep 0.5
+}
+open_form_on_beta
+shot "revive form"
+fscreen | grep -q '\[window\]' || fail "the form is not the window kind: $(fscreen | head -3)"
+fscreen | grep -q 'resume *1b2c3d4e-0000-4000-8000-000000000001' || fail "resume was not prefilled from the id"
+fscreen | grep -q 'folder .*proj-x' || fail "folder was not the directory the session file gave"
+fscreen | grep -q 'session *beta' || fail "session was not the row's"
+$TMUX send-keys -t "$NEWF" Escape; sleep 0.5
+modes | grep -q "^$NEWF\$" && fail "Esc did not close the form"
+# Session beta is gone: the form is the session kind, named after it.
+$TMUX kill-session -t beta; sleep 0.5
+open_form_on_beta
+shot "revive form, session gone"
+fscreen | grep -q '\[session\]' || fail "the form is not the session kind: $(fscreen | head -3)"
+fscreen | grep -q 'name *beta' || fail "the new session is not named after the old one"
+fscreen | grep -q 'resume *1b2c3d4e' || fail "resume was lost with the session"
+$TMUX send-keys -t "$NEWF" Escape; sleep 0.5
+keys / C-u Escape
 
 # ? shows the quick reference in the preview column; Esc puts it away.
 keys '?'

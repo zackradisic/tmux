@@ -16,10 +16,24 @@
 //!
 //! `folder` is the row's pane cwd, `command` its harness, `name` follows
 //! the folder's basename until edited. The command field completes from
-//! the configured harness list but takes anything, so `claude --resume
-//! <id>` is one Enter. The harness runs as the window's command, so the
-//! roster sees the pane the moment it appears and retires the row when
-//! the agent exits.
+//! the configured harness list but takes anything. The harness runs as
+//! the window's command, so the roster sees the pane the moment it
+//! appears and retires the row when the agent exits.
+//!
+//! `resume` (window and session kinds) holds a harness session id, and
+//! is what brings a finished or killed agent back: opened from a row
+//! with no live pane, the form prefills it from the row's durable id
+//! (`claude:<uuid>` gives `<uuid>`, `codex:<id>` its id), `folder` from
+//! the directory the transcript recorded (Claude keeps sessions per
+//! project directory, so that is where `--resume` finds it), and the
+//! kind is window in the row's session when that still exists, else a
+//! session named after the old one. Enter on such a row opens the form
+//! the same way, so the form is the "recreate it?" question: what it
+//! shows is what happens, Esc says no. On Enter the command gains
+//! `--resume <id>` (Claude, and anything unknown) or `resume <id>`
+//! (Codex). The new pane carries the same durable id, so the roster
+//! re-points the old row at it, turns and all, rather than making a new
+//! one. Never the old pane: whatever runs there now is somebody's.
 //!
 //! Built on `formkit`; this file is what the fields mean and what Enter
 //! does. The scans run in this plugin, so it needs
@@ -90,6 +104,10 @@ pub struct NewAgent {
     /// The picker's mode, closed together with the form on success so
     /// the new agent's pane is what you see.
     picker_mode: ModeId,
+    /// The row's harness, for the shape of the resume flag.
+    harness: String,
+    /// The resume id, kept across the worktree kind, which has no field.
+    resume: String,
 }
 
 fn value_of(fields: &[Field], label: &str) -> String {
@@ -275,15 +293,23 @@ pub fn owns(mode: Option<i64>) -> bool {
 }
 
 /// The fields of a kind, from the values that travel between kinds.
-fn fields_for(kind: Kind, session: &str, folder: &str, name: Field, command: Field) -> Vec<Field> {
+fn fields_for(
+    kind: Kind,
+    session: &str,
+    folder: &str,
+    name: Field,
+    command: Field,
+    resume: Field,
+) -> Vec<Field> {
     match kind {
         Kind::Window => vec![
             field("session", session.to_string()),
             field("folder", folder.to_string()),
             name,
             command,
+            resume,
         ],
-        Kind::Session => vec![field("folder", folder.to_string()), name, command],
+        Kind::Session => vec![field("folder", folder.to_string()), name, command, resume],
         Kind::Worktree => vec![
             field("repo", folder.to_string()),
             name,
@@ -313,6 +339,31 @@ pub fn expand_command(launchers: &[(String, String)], command: &str) -> String {
     }
 }
 
+/// The harness session id a row's durable id carries, when the harness
+/// can resume it: `claude:<uuid>` and `codex:<id>`. A provisional id
+/// (`prov-...`) names nothing to resume.
+pub fn resumable_id(id: &str) -> Option<String> {
+    let (kind, rest) = id.split_once(':')?;
+    if rest.is_empty() {
+        return None;
+    }
+    match kind {
+        "claude" | "codex" => Some(rest.to_string()),
+        _ => None,
+    }
+}
+
+/// The command line with the harness's resume flag: `claude --resume
+/// <id>` (Claude, and any harness without a known form), `codex resume
+/// <id>` (a subcommand; global flags in the launcher line stay ahead of
+/// it).
+pub fn resume_command(harness: &str, command: &str, resume: &str) -> String {
+    match harness {
+        "codex" => format!("{command} resume {resume}"),
+        _ => format!("{command} --resume {resume}"),
+    }
+}
+
 /// tmux session names may not contain '.' or ':'; spaces are legal but
 /// unpleasant in targets.
 fn session_name(name: &str) -> String {
@@ -332,6 +383,12 @@ fn session_exists(name: &str) -> bool {
 fn toggle(form: &mut Form<NewAgent>) -> Option<String> {
     let name = form.fields[form.idx("name")].clone();
     let command = form.fields[form.idx("command")].clone();
+    // The worktree kind has no resume field; the value survives the trip
+    // through it the way the session does, in a fresh field.
+    let resume = idx(&form.fields, "resume")
+        .map(|i| form.fields[i].clone())
+        .unwrap_or_else(|| field("resume", form.model.resume.clone()));
+    form.model.resume = resume.value.trim().to_string();
     let folder = idx(&form.fields, "folder")
         .or_else(|| idx(&form.fields, "repo"))
         .map(|i| form.fields[i].value.trim().to_string())
@@ -342,7 +399,7 @@ fn toggle(form: &mut Form<NewAgent>) -> Option<String> {
     let next = form.model.kind.next();
     form.model.kind = next;
     let session = form.model.session.clone();
-    form.replace_fields(fields_for(next, &session, &folder, name, command), "name");
+    form.replace_fields(fields_for(next, &session, &folder, name, command, resume), "name");
     form.model.confirm_create = false;
     form.model.reuse = false;
     (next == Kind::Worktree && !folder.is_empty() && form.model.remote.is_none())
@@ -357,7 +414,7 @@ pub async fn open(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>) {
         return;
     }
     // What the row gives us, read under one borrow.
-    let (picker_mode, launchers, session, remote, local_pane, harness) = {
+    let (picker_mode, launchers, session, remote, local_pane, harness, revive) = {
         let b = picker.borrow();
         let Some(p) = b.as_ref() else { return };
         let row = p.selected();
@@ -365,16 +422,24 @@ pub async fn open(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>) {
         let remote = row.filter(|a| !a.is_local()).map(|a| a.server.clone());
         // A remote row's session is mirrored here as "host/name"; only
         // offer it when the link is actually up (the session exists).
-        let session = row
-            .and_then(|a| a.session.clone())
-            .map(|s| match &remote {
-                Some(host) => format!("{host}/{s}"),
-                None => s,
-            })
-            .filter(|s| session_exists(s))
-            .unwrap_or_default();
+        let old_session = row.and_then(|a| a.session.clone()).map(|s| match &remote {
+            Some(host) => format!("{host}/{s}"),
+            None => s,
+        });
+        let session = old_session.clone().filter(|s| session_exists(s)).unwrap_or_default();
         let harness = row.map(|a| a.kind.clone()).unwrap_or_default();
-        (p.mode, p.launchers.clone(), session, remote, local_pane, harness)
+        // A row with no live pane: bring that agent back rather than
+        // start a fresh one - its harness session id, the directory its
+        // transcript recorded, and the old session's name for when that
+        // session is gone and a new one has to carry it.
+        let revive = row.filter(|a| !a.live()).map(|a| {
+            (
+                resumable_id(&a.id).unwrap_or_default(),
+                a.cwd.clone().unwrap_or_default(),
+                old_session.clone().unwrap_or_default(),
+            )
+        });
+        (p.mode, p.launchers.clone(), session, remote, local_pane, harness, revive)
     };
     // The folder: the row's pane cwd (a shadow's is the remote's cached
     // path), else the pressing client's pane, like `prefix S`.
@@ -390,11 +455,17 @@ pub async fn open(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>) {
         .and_then(|v| v.current_window)
         .and_then(|w| resolve_window(WindowId(w)).ok())
         .and_then(|w| w.active_pane);
-    let folder = local_pane
-        .or(client_pane)
-        .and_then(|p| resolve_pane(PaneId(p)).ok())
-        .map(|p| p.cwd)
+    let folder = revive
+        .as_ref()
+        .map(|(_, cwd, _)| cwd.clone())
         .filter(|c| !c.is_empty())
+        .or_else(|| {
+            local_pane
+                .or(client_pane)
+                .and_then(|p| resolve_pane(PaneId(p)).ok())
+                .map(|p| p.cwd)
+                .filter(|c| !c.is_empty())
+        })
         .unwrap_or_default();
     let window = client_info
         .as_ref()
@@ -423,17 +494,31 @@ pub async fn open(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>) {
     let command = if harness.is_empty() {
         launchers.first().map(|(n, _)| n.clone()).unwrap_or_default()
     } else {
-        harness
+        harness.clone()
     };
+    // Bringing one back: a window in its session when that exists, else
+    // a session named after the old one; the resume id in its field.
+    let (resume, old_session) = revive
+        .map(|(id, _, s)| (id, s))
+        .unwrap_or_default();
+    let kind = if !resume.is_empty() && session.is_empty() { Kind::Session } else { Kind::Window };
+    // The old session's name for the new session, held as if typed so
+    // the name's mirror (the folder's basename) leaves it be.
+    let mut name = field("name", String::new());
+    if kind == Kind::Session && !old_session.is_empty() {
+        name.value = session_name(&old_session);
+        name.touched = true;
+    }
     let fields = fields_for(
-        Kind::Window,
+        kind,
         &session,
         &folder,
-        field("name", String::new()),
+        name,
         field("command", command),
+        field("resume", resume.clone()),
     );
     let model = NewAgent {
-        kind: Kind::Window,
+        kind,
         launchers,
         session,
         remote,
@@ -442,6 +527,8 @@ pub async fn open(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>) {
         confirm_create: false,
         reuse: false,
         picker_mode,
+        harness,
+        resume,
     };
     let mut form = Form::new(mode, FORM_WIDTH, FORM_HEIGHT, fields, model);
     // Start on the first empty field; with everything prefilled, on the
@@ -449,7 +536,7 @@ pub async fn open(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>) {
     form.focused = form
         .fields
         .iter()
-        .position(|f| f.value.trim().is_empty())
+        .position(|f| f.label != "resume" && f.value.trim().is_empty())
         .unwrap_or_else(|| form.idx("name"));
     form::render(&mut form);
     *state().borrow_mut() = Some(form);
@@ -578,10 +665,11 @@ async fn submit() {
                 form.model.remote.is_some(),
                 form.model.client_name.clone(),
                 form.model.picker_mode,
+                form.model.harness.clone(),
             ),
         )
     };
-    let (confirmed, reuse, remote, client_name, picker_mode) = model_bits;
+    let (confirmed, reuse, remote, client_name, picker_mode, harness) = model_bits;
     let get = |l: &str| {
         labels
             .iter()
@@ -632,6 +720,10 @@ async fn submit() {
     let name = get("name");
     let launchers = st.borrow().as_ref().map(|f| f.model.launchers.clone()).unwrap_or_default();
     let command = expand_command(&launchers, &get("command"));
+    let command = match get("resume").as_str() {
+        "" => command,
+        id => resume_command(&harness, &command, id),
+    };
     let session = get("session");
     let (cmd, target) = if !session.is_empty() {
         (
