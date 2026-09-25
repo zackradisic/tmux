@@ -143,6 +143,37 @@ header | grep -q ' of 3 live' || fail "s did not narrow"
 keys s
 header | grep -q ' of ' && fail "s again did not widen"
 
+# A paste lands in the search box: paste-buffer on the float (the same
+# path a bracketed paste from the terminal takes) with a token narrows.
+# (Esc from the list would close the picker: clear the box from inside.)
+keys / C-u Escape
+$TMUX set-buffer '#alpha'
+$TMUX paste-buffer -t "$FORM"
+sleep 0.6
+shot pasted
+screen | grep -q 'search #alpha' || fail "a paste did not land in the search box"
+[ "$(rows)" -eq 2 ] || fail "the pasted token did not narrow ($(rows))"
+keys C-u Escape
+
+# `pick ids` from a pane whose screen shows an agent id (a mailbox
+# message, say) opens the picker on that agent.
+keys q
+sleep 0.5
+kill $CTL 2>/dev/null; CTL=
+BID=claude:1b2c3d4e-0000-4000-8000-000000000001
+$TMUX new-window -d -t alpha:3 "sh -c 'echo Message from $BID via the tmux2 mailbox; exec env -i PATH=/bin:/usr/bin sleep 600'" || fail "new-window 3"
+sleep 1
+P3=$($TMUX list-panes -t alpha:3 -F '#{pane_id}')
+( sleep 0.3; echo "plugin-command -t $P3 agents 'pick ids'"; sleep 90 ) |
+    $TMUX -C attach -t alpha:0 >/dev/null 2>&1 &
+CTL=$!
+sleep 2
+FORM=$($TMUX list-panes -a -F '#{pane_id} #{pane_mode}' | awk '/plugin-mode/ { print $1 }')
+[ -n "$FORM" ] || fail "pick ids did not open the picker"
+sleep 0.5
+shot "pick ids"
+screen | grep '▸' | grep -q 'beta' || fail "pick ids did not land on the agent named on screen"
+
 # ? shows the quick reference in the preview column; Esc puts it away.
 keys '?'
 shot help

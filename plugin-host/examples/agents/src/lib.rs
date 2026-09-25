@@ -24,7 +24,11 @@
 //! `plugin-command agents "pick id <agent-id>"` opens on that agent
 //! wherever its row is - a linked server, the history, the archive - for
 //! a hotkey over an id seen on screen (a mailbox message names its
-//! sender by id).
+//! sender by id). `"pick ids"` scans the pane the key was pressed in
+//! for agent ids - a local pane or a linked server's mirror alike - and
+//! opens on the one it finds, or offers a menu when there are several.
+//! A paste into the picker (Cmd-V, or `paste-buffer` on the float) goes
+//! to the search box, or to the agent's pane while typing into it.
 //! `l` (or Right, or a click on the preview) hands the keyboard to the
 //! preview: every key then goes to the agent's pane, so a prompt can be
 //! typed and sent without leaving the picker, and the preview shows the
@@ -582,6 +586,8 @@ impl Plugin for Agents {
             // events are told apart from the picker's by mode id.
             "mode-key" if newagent::owns(event.get_i64("mode")) => newagent::on_key(ctx, &event),
             "mode-nav" if newagent::owns(event.get_i64("mode")) => {}
+            "mode-paste" if newagent::owns(event.get_i64("mode")) => {}
+            "mode-paste" => view::on_mode_paste(&self.picker, &event),
             "mode-resize" if newagent::owns(event.get_i64("mode")) => newagent::on_resize(&event),
             "mode-closed" if newagent::owns(event.get_i64("mode")) => newagent::on_closed(),
             "mode-key" => {
@@ -690,6 +696,12 @@ impl Agents {
                 // "pick id <agent-id>": open on that agent, wherever its
                 // row lives - any server, the history or the archive.
                 Some("id") => (false, words.next().map(str::to_string)),
+                // "pick ids": the agent ids on the pane's screen - open
+                // on the one there is, or offer a menu of them.
+                Some("ids") => {
+                    ctx.spawn(view::pick_ids(picker, cfg, remotes, client, here));
+                    return;
+                }
                 _ => (false, None),
             };
             ctx.spawn(view::pick_open(picker, cfg, remotes, client, here, seek, seek_id));

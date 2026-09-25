@@ -683,8 +683,22 @@ transcript.sh`.
   `(claude|codex|pi|opencode):<hex>`, like his `prefix f` for file paths,
   and Enter in copy mode runs `~/.config/util/bin/tmux-agent-at-cursor`,
   which opens the picker on a selected agent id (copied first, as Enter
-  always did) or on `#{search_match}` when the prefix+F search put the
-  cursor on one; any other selection is just copied.
+  always did) or on `#{search_match}` when a search put the cursor on
+  one; any other selection is just copied. That only works in a LOCAL
+  pane: in a remote link's mirror, copy mode runs on the other server
+  with its bindings, which is where the user first tried it and nothing
+  happened. So `prefix F` is `plugin-command agents 'pick ids'` instead:
+  the plugin captures the pane's screen (a mirror is a local grid), finds
+  the ids (`ids_on_screen`, nearest the bottom first), opens on the one
+  there is, or offers a `display-menu` of them.
+- **Pasting into the picker.** A pane in a mode dropped pastes
+  (`window_pane_paste` returned early; `paste-buffer` wrote to the
+  float's pty, which nothing reads, or refused it as exited). Window
+  modes gained a `paste` hook; the plugin mode turns a paste into a
+  `mode-paste` event with the text, and the picker puts it in the search
+  box (or into the agent's pane while typing into it). Other modes are
+  unchanged. `regress/plugin-agents-filters.sh` covers paste-buffer,
+  which shares the hook with a bracketed paste.
 
 ## Sessions and windows
 

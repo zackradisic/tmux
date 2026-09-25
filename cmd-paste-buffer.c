@@ -60,15 +60,11 @@ cmd_paste_buffer_exec(struct cmd *self, struct cmdq_item *item)
 	struct args		*args = cmd_get_args(self);
 	struct cmd_find_state	*target = cmdq_get_target(item);
 	struct window_pane	*wp = target->wp;
+	struct window_mode_entry *wme;
 	struct paste_buffer	*pb;
 	const char		*sepstr, *bufname, *bufdata, *bufend, *line;
 	size_t			 seplen, bufsize, len;
 	int			 bracket = args_has(args, 'p');
-
-	if (window_pane_exited(wp)) {
-		cmdq_error(item, "target pane has exited");
-		return (CMD_RETURN_ERROR);
-	}
 
 	bufname = NULL;
 	if (args_has(args, 'b'))
@@ -82,6 +78,26 @@ cmd_paste_buffer_exec(struct cmd *self, struct cmdq_item *item)
 			cmdq_error(item, "no buffer %s", bufname);
 			return (CMD_RETURN_ERROR);
 		}
+	}
+
+	/*
+	 * A pane in a mode that takes pastes (a plugin's UI on a float,
+	 * which has no process of its own) gets the whole buffer as text,
+	 * never its pty. Any other pane, in a mode or not, gets the bytes
+	 * as before. Before the exited check: the float counts as exited.
+	 */
+	wme = TAILQ_FIRST(&wp->modes);
+	if (pb != NULL && wme != NULL && wme->mode->paste != NULL) {
+		bufdata = paste_buffer_data(pb, &bufsize);
+		wme->mode->paste(wme, bufdata, bufsize);
+		if (args_has(args, 'd'))
+			paste_free(pb);
+		return (CMD_RETURN_NORMAL);
+	}
+
+	if (window_pane_exited(wp)) {
+		cmdq_error(item, "target pane has exited");
+		return (CMD_RETURN_ERROR);
 	}
 
 	if (pb != NULL && ~wp->flags & PANE_INPUTOFF) {

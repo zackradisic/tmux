@@ -1876,6 +1876,125 @@ pub fn on_menu_key(
     dispatch_key(picker, busy, remotes, ctx, mode_id, key, mouse, client);
 }
 
+/// Text pasted into the picker (a bracketed paste, or `paste-buffer` on
+/// the float). While the preview has the keyboard it goes to the agent's
+/// pane, as typed keys do; otherwise into the search box, which takes
+/// the focus, so a pasted agent id or filter token lands where it works.
+pub fn on_mode_paste(picker: &Rc<RefCell<Option<Picker>>>, event: &Event) {
+    let mut b = picker.borrow_mut();
+    let Some(p) = b.as_mut() else { return };
+    if event.get_i64("mode") != Some(p.mode.0 as i64) {
+        return;
+    }
+    let Some(text) = event.get_str("text") else { return };
+    let text = text.to_string();
+    if p.preview_focus {
+        if let Some(pane) = live_pane_of_selection(p) {
+            let _ = send_text(PaneId(pane), &text);
+        }
+        return;
+    }
+    // One line for the box: newlines and runs of blanks become a space.
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.is_empty() {
+        return;
+    }
+    p.filtering = true;
+    p.composing = false;
+    p.renaming = false;
+    if !p.filter.is_empty() && !p.filter.ends_with(' ') {
+        p.filter.push(' ');
+    }
+    p.filter.push_str(&flat);
+    filter_edited(p);
+}
+
+/// The agent ids on a pane's screen (the last screens of its history
+/// too), nearest the bottom first, each once: `claude:<uuid>`,
+/// `codex:...`, `pi:...`, `opencode:...`.
+pub fn ids_on_screen(text: &str) -> Vec<String> {
+    const KINDS: [&str; 4] = ["claude:", "codex:", "pi:", "opencode:"];
+    let mut found: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let mut rest = line;
+        while let Some((at, kind)) = KINDS
+            .iter()
+            .filter_map(|k| rest.find(k).map(|i| (i, *k)))
+            .min_by_key(|(i, _)| *i)
+        {
+            // A word boundary before the kind, so `oldclaude:` is not one.
+            let before = rest[..at].chars().last();
+            let after = &rest[at + kind.len()..];
+            let n = after
+                .chars()
+                .take_while(|c| c.is_ascii_hexdigit() || *c == '-')
+                .count();
+            if before.is_none_or(|c| !c.is_alphanumeric()) && n >= 8 {
+                found.push(format!("{kind}{}", &after[..n]));
+            }
+            rest = &after[n.min(after.len())..];
+        }
+    }
+    // Nearest the bottom first, and once each.
+    let mut out: Vec<String> = Vec::new();
+    for id in found.into_iter().rev() {
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    out
+}
+
+/// `pick ids`: the agent ids on the screen of the pane the key was
+/// pressed in. One opens the picker on it; several are offered as a
+/// menu whose items do that; none says so. A linked server's mirror is
+/// a local pane with the remote grid in it, so this works there too,
+/// where copy mode would run on the other server.
+pub async fn pick_ids(
+    picker: Rc<RefCell<Option<Picker>>>,
+    cfg: Rc<Config>,
+    remotes: Rc<RefCell<Remotes>>,
+    client: Option<u64>,
+    here: Option<u32>,
+) {
+    let Some(pane) = here else {
+        let _ = display_message("agents: no pane to look at");
+        return;
+    };
+    let text = capture_pane(PaneId(pane), Some(-200), None).unwrap_or_default();
+    let ids = ids_on_screen(&text);
+    match ids.len() {
+        0 => {
+            let _ = display_message("agents: no agent id on this screen");
+        }
+        1 => pick_open(picker, cfg, remotes, client, here, false, ids.into_iter().next()).await,
+        _ => {
+            let target = client
+                .and_then(|cid| {
+                    list_clients().ok()?.into_iter().find(|c| u64::from(c.id) == cid)
+                })
+                .map(|c| c.name)
+                .filter(|n| {
+                    n.chars().all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c))
+                })
+                .map(|n| format!(" -c '{n}'"))
+                .unwrap_or_default();
+            let mut items = String::new();
+            for (i, id) in ids.iter().take(9).enumerate() {
+                // Ids are the kind, a colon, hex and dashes: safe as typed.
+                items.push_str(&format!(
+                    " '{id}' '{}' \"plugin-command agents 'pick id {id}'\"",
+                    i + 1
+                ));
+            }
+            let cmd = format!("display-menu{target} -T ' agents on this screen '{items}");
+            if let Err(e) = run_command(&cmd).await {
+                let _ = display_message(&format!("agents: menu failed: {}", e.message));
+            }
+        }
+    }
+}
+
 /// A mouse key, by name: a click, a release, a drag, a wheel notch, with
 /// or without a modifier prefix. Never text, and never forwarded to a
 /// pane - `send_key` would take the name, but a mouse key without its
@@ -5147,6 +5266,22 @@ mod query_tests {
         let q = parse_query("\\@alpha \\x");
         assert_eq!(q.words, "@alpha \\x");
         assert!(!q.has_filters());
+    }
+
+    #[test]
+    fn ids_found_bottom_first_once() {
+        let text = "Message from claude:6a91e2e5-a91c-4084-83c4-cfc84a1e285d via\n\
+                    see codex:0123abcd-ef and oldclaude:deadbeef00 and pi:ab\n\
+                    again claude:6a91e2e5-a91c-4084-83c4-cfc84a1e285d, then opencode:00ff00ff00";
+        let ids = ids_on_screen(text);
+        assert_eq!(
+            ids,
+            vec![
+                "opencode:00ff00ff00",
+                "claude:6a91e2e5-a91c-4084-83c4-cfc84a1e285d",
+                "codex:0123abcd-ef",
+            ]
+        );
     }
 
     #[test]

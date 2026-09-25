@@ -1977,8 +1977,15 @@ window_pane_copy_key(struct window_pane *wp, key_code key)
 void
 window_pane_paste(struct window_pane *wp, key_code key, char *buf, size_t len)
 {
-	if (!TAILQ_EMPTY(&wp->modes))
+	struct window_mode_entry	*wme;
+
+	/* A mode that takes pastes gets the text; any other mode eats it. */
+	wme = TAILQ_FIRST(&wp->modes);
+	if (wme != NULL) {
+		if (wme->mode->paste != NULL)
+			wme->mode->paste(wme, buf, len);
 		return;
+	}
 
 	if (wp->fd == -1 || wp->flags & PANE_INPUTOFF)
 		return;

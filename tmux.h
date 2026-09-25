@@ -1184,6 +1184,9 @@ struct window_mode {
 	void		 (*key)(struct window_mode_entry *, struct client *,
 			     struct session *, struct winlink *, key_code,
 			     struct mouse_event *);
+	/* Pasted text (bracketed paste, paste-buffer) while in the mode. */
+	void		 (*paste)(struct window_mode_entry *, const char *,
+			     size_t);
 
 	const char	*(*key_table)(struct window_mode_entry *);
 	void		 (*command)(struct window_mode_entry *, struct client *,

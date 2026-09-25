@@ -56,6 +56,8 @@ static void	window_plugin_key(struct window_mode_entry *,
 		    key_code, struct mouse_event *);
 static void	window_plugin_refresh_callback(int, short, void *);
 static void	window_plugin_draw_preview(struct window_mode_entry *);
+static void	window_plugin_paste(struct window_mode_entry *, const char *,
+		    size_t);
 static struct screen *window_plugin_get_screen(struct window_mode_entry *);
 
 const struct window_mode window_plugin_mode = {
@@ -65,6 +67,7 @@ const struct window_mode window_plugin_mode = {
 	.free = window_plugin_free,
 	.resize = window_plugin_resize,
 	.key = window_plugin_key,
+	.paste = window_plugin_paste,
 	.get_screen = window_plugin_get_screen,
 };
 
@@ -201,6 +204,27 @@ window_plugin_key(struct window_mode_entry *wme, struct client *c,
 		plugin_event_i64(pb, "mouse_y", my);
 		plugin_event_i64(pb, "mouse_b", m->b);
 	}
+	plugin_event_send_mode(pb, data->mode_id);
+}
+
+/*
+ * Pasted text into the mode - a bracketed paste from the terminal, or
+ * paste-buffer on the float - as one mode-paste event with the text. It
+ * never reaches the float's pty, which nothing reads.
+ */
+static void
+window_plugin_paste(struct window_mode_entry *wme, const char *buf,
+    size_t len)
+{
+	struct window_plugin_mode_data	*data = wme->data;
+	struct plugin_buf		*pb;
+	char				*s;
+
+	s = xstrndup(buf, len);
+	pb = plugin_event_create("mode-paste");
+	plugin_event_i64(pb, "mode", data->mode_id);
+	plugin_event_str(pb, "text", s);
+	free(s);
 	plugin_event_send_mode(pb, data->mode_id);
 }
 

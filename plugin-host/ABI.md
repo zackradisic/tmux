@@ -542,6 +542,10 @@ is not offered; the design for it is in [MODE-ATTACH.md](MODE-ATTACH.md).)
     "Escape", "MouseDown1Pane", ...), `client` (the pressing client),
     and for mouse keys `mouse_x`, `mouse_y`, `mouse_b` (pane-relative
     cell coordinates).
+  - `mode-paste` — fields `mode`, `text`: text pasted while the mode
+    held the float (a bracketed paste from the terminal, or
+    `paste-buffer` targeting the float). Without a mode the paste would
+    have gone to the pane's pty, which the float's does not read.
   - `mode-nav` — fields `mode`, `dir` (`"left"`, `"right"`, `"up"`,
     `"down"`): a directional `select-pane` (`-L`/`-R`/`-U`/`-D`) was run
     on the float while the mode held it. The panel is a modal UI with
