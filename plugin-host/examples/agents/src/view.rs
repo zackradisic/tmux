@@ -1014,18 +1014,29 @@ pub async fn pick_open(
     seek: bool,
     seek_id: Option<String>,
 ) {
-    // Opening on an id, the pane we were pressed in is nobody's business:
-    // the cursor and the here border go to the id's row, not to the
-    // agent that happens to live where the key was pressed.
-    let here = if seek_id.is_some() { None } else { here };
+    // The window to float over: the pressing client's current one; else
+    // the window of the pane the command targeted (a script run from a
+    // copy-mode binding has no attached client, only the pane); else the
+    // first attached client's, so a request that arrives over the link
+    // lands where the user looks; the first window only as a last resort.
+    let client_window = |cid: u64| {
+        list_clients()
+            .ok()?
+            .into_iter()
+            .find(|c| u64::from(c.id) == cid)?
+            .session
+            .and_then(|s| resolve_session(SessionId(s)).ok())
+            .and_then(|v| v.current_window)
+    };
     let window = client
-        .and_then(|cid| {
-            list_clients().ok()?.into_iter().find(|c| u64::from(c.id) == cid)
-        })
-        .and_then(|c| c.session)
-        .and_then(|s| resolve_session(SessionId(s)).ok())
-        .and_then(|v| v.current_window)
+        .and_then(client_window)
+        .or_else(|| here.and_then(|p| resolve_pane(PaneId(p)).ok().map(|pi| pi.window)))
+        .or_else(|| any_client().and_then(client_window))
         .or_else(|| list_windows().ok().and_then(|w| w.first().map(|x| x.id)));
+    // Opening on an id, the pane we were pressed in is nobody's business
+    // beyond that: the cursor and the here border go to the id's row, not
+    // to the agent that happens to live where the key was pressed.
+    let here = if seek_id.is_some() { None } else { here };
     let Some(window) = window else {
         let _ = display_message("agents: no window to open the picker");
         return;

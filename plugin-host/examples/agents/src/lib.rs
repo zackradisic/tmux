@@ -793,7 +793,8 @@ impl Agents {
             let picker = Rc::clone(&self.picker);
             let remotes = Rc::clone(&self.remotes);
             let client = event.scope.client.map(u64::from);
-            ctx.spawn(view::pick_open(picker, cfg, remotes, client, None, false, Some(id)));
+            let here = event.scope.pane;
+            ctx.spawn(view::pick_open(picker, cfg, remotes, client, here, false, Some(id)));
             return;
         }
         if verb == "message" {

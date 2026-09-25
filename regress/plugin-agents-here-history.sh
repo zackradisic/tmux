@@ -73,7 +73,16 @@ sleep 1
 P3=$($TMUX list-panes -t alpha:3 -F '#{pane_id}')
 $TMUX plugin-command -t "$P" agents "working"
 $TMUX plugin-command -t "$P3" agents "working"
-sleep 3.5
+# Both agents end when their panes' commands change; wait for the store
+# to say so rather than trust a fixed pause.
+i=0
+while [ "$i" -lt 30 ]; do
+	n=$(sqlite3 "$XDG_DATA_HOME/tmux/plugins/agents/store.db" \
+	    "select count(*) from agents where ended_ms is not null" 2>/dev/null)
+	[ "$n" = 2 ] && break
+	sleep 0.5; i=$((i + 1))
+done
+[ "$n" = 2 ] || fail "the two agents did not end (ended: $n)"
 
 # The agent is gone from the live list: plain `pick` opens the default
 # view, which has no row for it...
