@@ -682,8 +682,9 @@ transcript.sh`.
   config: `prefix F` is copy mode with a search for
   `(claude|codex|pi|opencode):<hex>`, like his `prefix f` for file paths,
   and Enter in copy mode runs `~/.config/util/bin/tmux-agent-at-cursor`,
-  which opens the picker on `#{search_match}` when it is an agent id and
-  nothing is selected, else copies the selection as Enter always did.
+  which opens the picker on a selected agent id (copied first, as Enter
+  always did) or on `#{search_match}` when the prefix+F search put the
+  cursor on one; any other selection is just copied.
 
 ## Sessions and windows
 
