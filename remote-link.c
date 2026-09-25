@@ -828,10 +828,31 @@ remote_link_collect_floats(struct window *w, u_int *n)
 {
 	struct remote_float	*floats = NULL;
 	struct window_pane	*wp;
+	u_int			 i;
 
 	*n = 0;
 	TAILQ_FOREACH(wp, &w->z_index, zentry) {
 		if (wp->remote != NULL || !window_pane_is_floating(wp))
+			continue;
+		floats = xreallocarray(floats, *n + 1, sizeof *floats);
+		floats[*n].wp = wp;
+		floats[*n].g = wp->layout_cell->g;
+		(*n)++;
+	}
+	/*
+	 * remote_link_order_panes() drops every local float from the pane
+	 * list, so one the z-order has lost must be collected from there
+	 * too or it is never put back: a live pane in no list, with the
+	 * window's active pointer possibly still on it.
+	 */
+	TAILQ_FOREACH(wp, &w->panes, entry) {
+		if (wp->remote != NULL || !window_pane_is_floating(wp))
+			continue;
+		for (i = 0; i < *n; i++) {
+			if (floats[i].wp == wp)
+				break;
+		}
+		if (i < *n)
 			continue;
 		floats = xreallocarray(floats, *n + 1, sizeof *floats);
 		floats[*n].wp = wp;
@@ -950,8 +971,19 @@ remote_link_apply_layout(struct remote_link *rl, struct remote_window *rw,
 		 */
 		while ((wp = TAILQ_FIRST(&w->z_index)) != NULL)
 			TAILQ_REMOVE(&w->z_index, wp, zentry);
+		/*
+		 * layout_init() does not free the old tree, and a pane the
+		 * split skips would keep a cell in it: freed by nobody,
+		 * floating by its stale flags. Clear the cells first.
+		 */
+		layout_free(w, 0);
 		layout_by_splitting(w);
 		layout_fix_zindexes(w, w->layout_root);
+		/* Every pane belongs in the z-order, cell or not. */
+		TAILQ_FOREACH(wp, &w->panes, entry) {
+			if (!window_in_zindex(w, wp))
+				TAILQ_INSERT_TAIL(&w->z_index, wp, zentry);
+		}
 	}
 	remote_link_restore_floats(w, floats, nfloats);
 	free(floats);

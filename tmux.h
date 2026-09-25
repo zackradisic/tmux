@@ -3735,6 +3735,7 @@ struct window_pane *window_get_active_at(struct window *, u_int, u_int);
 struct window_pane *window_find_string(struct window *, const char *);
 int		 window_has_floating_panes(struct window *);
 int		 window_has_pane(struct window *, struct window_pane *);
+int		 window_in_zindex(struct window *, struct window_pane *);
 int		 window_pane_contains(struct window_pane *, u_int, u_int);
 int		 window_set_active_pane(struct window *, struct window_pane *,
 		     int);

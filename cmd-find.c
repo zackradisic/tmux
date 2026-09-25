@@ -874,6 +874,7 @@ cmd_find_from_mouse(struct cmd_find_state *fs, struct mouse_event *m, int flags)
 int
 cmd_find_from_client(struct cmd_find_state *fs, struct client *c, int flags)
 {
+	struct window		*w;
 	struct window_pane	*wp;
 
 	/* If no client, treat as from nothing. */
@@ -884,7 +885,20 @@ cmd_find_from_client(struct cmd_find_state *fs, struct client *c, int flags)
 	if (c->session != NULL) {
 		cmd_find_clear_state(fs, flags);
 
-		fs->wp = c->session->curw->window->active;
+		/*
+		 * A remote link rebuilds shadow windows under us and can leave
+		 * the active pointer on a pane the window no longer holds.
+		 * Repair it to a pane the window does hold rather than handing
+		 * back a state cmd_find_target would reject.
+		 */
+		w = c->session->curw->window;
+		if (w->active == NULL || !window_has_pane(w, w->active)) {
+			server_add_message("window @%u active pane %s, repaired",
+			    w->id, w->active == NULL ? "missing" : "not in window");
+			w->active = TAILQ_FIRST(&w->panes);
+		}
+
+		fs->wp = w->active;
 		if (fs->wp == NULL) {
 			cmd_find_from_session(fs, c->session, flags);
 			return (0);
@@ -1000,8 +1014,17 @@ cmd_find_target(struct cmd_find_state *fs, struct cmdq_item *item,
 			cmdq_error(item, "no current target");
 		goto error;
 	}
-	if (!cmd_find_valid_state(fs->current))
-		fatalx("invalid current find state");
+	if (!cmd_find_valid_state(fs->current)) {
+		/*
+		 * Fail the command, not the server: exiting here takes every
+		 * session, link and pane process down with it.
+		 */
+		server_add_message("invalid current find state for %s",
+		    target == NULL ? "none" : target);
+		if (~flags & CMD_FIND_QUIET)
+			cmdq_error(item, "no current target");
+		goto error;
+	}
 
 	/* An empty or NULL target is the current. */
 	if (target == NULL || *target == '\0')

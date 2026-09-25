@@ -645,6 +645,18 @@ window_has_pane(struct window *w, struct window_pane *wp)
 }
 
 int
+window_in_zindex(struct window *w, struct window_pane *wp)
+{
+	struct window_pane	*wp1;
+
+	TAILQ_FOREACH(wp1, &w->z_index, zentry) {
+		if (wp1 == wp)
+			return (1);
+	}
+	return (0);
+}
+
+int
 window_pane_contains(struct window_pane *wp, u_int x, u_int y)
 {
 	int	xoff, yoff;
@@ -1124,7 +1136,14 @@ window_remove_pane(struct window *w, struct window_pane *wp)
 	menu_pane_destroyed(w, wp);
 	window_lost_pane(w, wp);
 	TAILQ_REMOVE(&w->panes, wp, entry);
-	TAILQ_REMOVE(&w->z_index, wp, zentry);
+	/*
+	 * A rebuilt z-order (layout_parse, a rejected remote layout) only
+	 * holds the panes with a layout cell. One it left out still carries
+	 * its old links, and TAILQ_REMOVE would splice those stale
+	 * neighbours together and silently drop a live pane from the list.
+	 */
+	if (window_in_zindex(w, wp))
+		TAILQ_REMOVE(&w->z_index, wp, zentry);
 	if (pop && window_pop_modal_zoom(w))
 		server_redraw_window(w);
 	redraw_invalidate_scene(w);

@@ -2038,9 +2038,16 @@ layout_by_splitting(struct window *w)
 		window_resize(w, w->sx, sy, -1, -1);
 
 	layout_init(w, prev);
+	/*
+	 * Give each new pane the minimum and leave the rest with the one it
+	 * split from: halving the previous pane each time runs out of room
+	 * after a few panes, and a pane skipped here ends up with no cell
+	 * and no place in the z-order. Spread them out at the end.
+	 */
 	for (wp = TAILQ_NEXT(prev, entry); wp != NULL;
 	    wp = TAILQ_NEXT(wp, entry)) {
-		lc = layout_split_pane(prev, LAYOUT_TOPBOTTOM, -1, 0);
+		lc = layout_split_pane(prev, LAYOUT_TOPBOTTOM, PANE_MINIMUM,
+		    0);
 		if (lc == NULL) {
 			log_debug("%s: @%u no room for %%%u", __func__, w->id,
 			    wp->id);
@@ -2049,6 +2056,7 @@ layout_by_splitting(struct window *w)
 		layout_assign_pane(lc, wp, 0);
 		prev = wp;
 	}
+	layout_spread_cell(w, w->layout_root);
 	layout_fix_offsets(w);
 	layout_fix_panes(w, NULL);
 	recalculate_sizes();

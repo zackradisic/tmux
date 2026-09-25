@@ -73,6 +73,7 @@ layout_dump_part(struct window *w, struct layout_cell *root, int floating)
 	char			 layout[8192], *out;
 	int			 bracket = 0;
 	struct window_pane	*wp;
+	struct layout_cell	*lc;
 
 	*layout = '\0';
 	if (layout_append(root, layout, sizeof layout, !floating) != 0)
@@ -82,14 +83,23 @@ layout_dump_part(struct window *w, struct layout_cell *root, int floating)
 		goto done;
 
 	TAILQ_FOREACH(wp, &w->z_index, zentry) {
-		if (!window_pane_is_floating(wp))
+		/*
+		 * Zoomed, every pane's cell is parked in saved_layout_cell
+		 * and layout_cell is NULL. Dumping the saved tree (as
+		 * window_layout does) must still list its floats, or the
+		 * string carries float leaves inline with nothing marking
+		 * them: a remote link then mirrors them as tiled panes.
+		 */
+		lc = wp->layout_cell;
+		if (lc == NULL && root == w->saved_layout_root)
+			lc = wp->saved_layout_cell;
+		if (lc == NULL || (~lc->flags & LAYOUT_CELL_FLOATING))
 			break;
 		if (!bracket) {
 			strlcat(layout, "<", sizeof layout);
 			bracket = 1;
 		}
-		if (layout_append(wp->layout_cell, layout, sizeof layout,
-		    0) != 0)
+		if (layout_append(lc, layout, sizeof layout, 0) != 0)
 			return (NULL);
 		strlcat(layout, ",", sizeof layout);
 	}
