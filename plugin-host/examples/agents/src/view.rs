@@ -1912,17 +1912,21 @@ pub fn on_mode_paste(picker: &Rc<RefCell<Option<Picker>>>, event: &Event) {
         }
         return;
     }
-    // One line for the box: newlines and runs of blanks become a space.
-    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Verbatim, with line breaks as spaces: a paste that tmux detected
+    // from typing speed arrives one character per event, so nothing may
+    // be added around a chunk - a separator per chunk put a space after
+    // every character of a pasted id.
+    let flat: String = text
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' || c == '\t' { ' ' } else { c })
+        .filter(|c| !c.is_control())
+        .collect();
     if flat.is_empty() {
         return;
     }
     p.filtering = true;
     p.composing = false;
     p.renaming = false;
-    if !p.filter.is_empty() && !p.filter.ends_with(' ') {
-        p.filter.push(' ');
-    }
     p.filter.push_str(&flat);
     filter_edited(p);
 }

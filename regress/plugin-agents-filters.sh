@@ -153,6 +153,12 @@ sleep 0.6
 shot pasted
 screen | grep -q 'search #alpha' || fail "a paste did not land in the search box"
 [ "$(rows)" -eq 2 ] || fail "the pasted token did not narrow ($(rows))"
+# A paste tmux detects from typing speed comes one character per event:
+# chunks join with nothing between them.
+$TMUX set-buffer 'x'; $TMUX paste-buffer -t "$FORM"
+$TMUX set-buffer 'y'; $TMUX paste-buffer -t "$FORM"
+sleep 0.5
+screen | grep -q 'search #alphaxy' || fail "pasted chunks were not joined verbatim: $(screen | sed -n 2p)"
 keys C-u Escape
 
 # `pick ids` from a pane whose screen shows an agent id (a mailbox
