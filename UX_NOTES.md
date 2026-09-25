@@ -668,6 +668,10 @@ transcript.sh`.
   matched) pass the filters only by the fields they carry, so a `~dir`
   needs the row's cwd, which pre-v10 rows lack.
   `regress/plugin-agents-filters.sh`.
+- **`?` is a quick reference** in the preview column, like the `i`
+  card: keys by area (moving, search box, rows, conversation, picker),
+  configured keys shown as configured. Esc or `?` puts it away; it is in
+  the Space menu too.
 
 ## Sessions and windows
 

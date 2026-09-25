@@ -143,5 +143,13 @@ header | grep -q ' of 3 live' || fail "s did not narrow"
 keys s
 header | grep -q ' of ' && fail "s again did not widen"
 
+# ? shows the quick reference in the preview column; Esc puts it away.
+keys '?'
+shot help
+screen | grep -q 'quick reference' || fail "? did not show the quick reference"
+screen | grep -q '#session' || fail "the reference does not mention the session token"
+keys Escape
+screen | grep -q 'quick reference' && fail "Esc did not put the reference away"
+
 cleanup
 echo ok

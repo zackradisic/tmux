@@ -20,6 +20,7 @@
 //! backslash makes a sigil an ordinary word, the header counts "n of m
 //! live" and shows the tokens. `s`, `S` and `d` on a row narrow to its
 //! session, server or folder, and again widen back.
+//! `?` puts a quick reference of all of this in the preview column.
 //! `l` (or Right, or a click on the preview) hands the keyboard to the
 //! preview: every key then goes to the agent's pane, so a prompt can be
 //! typed and sent without leaving the picker, and the preview shows the

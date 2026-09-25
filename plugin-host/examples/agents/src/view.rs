@@ -681,6 +681,8 @@ pub struct Picker {
     pub transcript_focus: bool,
     /// Show the info card for the highlighted row in the preview (`i`).
     pub show_info: bool,
+    /// The quick reference in place of the preview (`?`).
+    pub show_help: bool,
     /// The card's fetched half, for the row it was fetched for.
     pub info: Option<InfoCard>,
 }
@@ -1134,6 +1136,7 @@ pub async fn pick_open(
         show_transcript: false,
         transcript_focus: false,
         show_info: false,
+        show_help: false,
         info: None,
     };
     p.roster_len = p.rows.len();
@@ -1626,6 +1629,7 @@ async fn open_menu(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>) {
             items.push_str(&menu_item("mark unread", &k.unread, stopped && !a.unread()));
             items.push_str(&menu_item("copy id", &k.copy, durable_id(a).is_some()));
             items.push_str(&menu_item("info", "i", true));
+            items.push_str(&menu_item("help", "?", true));
             items.push_str(&menu_item("rename", &k.rename, true));
             items.push_str(" ''");
             let band = if flagged { "move to waiting" } else { "flag: needs input" };
@@ -2024,7 +2028,10 @@ fn dispatch_key(
         } else if key == k.close || key == "q" {
             // Esc or q puts the info card away first, then cancels a
             // pending selection; with neither, it closes the picker.
-            if p.show_info {
+            if p.show_help {
+                p.show_help = false;
+                pick_render(p);
+            } else if p.show_info {
                 p.show_info = false;
                 pick_render(p);
             } else if p.marked.is_empty() {
@@ -2101,6 +2108,12 @@ fn dispatch_key(
         } else if key == "i" {
             // The info card in place of the preview, and back.
             p.show_info = !p.show_info;
+            p.show_help = false;
+            pick_render(p);
+        } else if key == "?" {
+            // The quick reference in place of the preview, and back.
+            p.show_help = !p.show_help;
+            p.show_info = false;
             pick_render(p);
         } else if key == "y" && p.show_info {
             // Copy the working directory, the way c copies the id.
@@ -4052,7 +4065,9 @@ pub fn pick_render(p: &mut Picker) {
     } else {
         format!("{} contents", pretty_key(&k.content))
     };
-    let footer = if p.show_info {
+    let footer = if p.show_help {
+        "? back · Esc back".to_string()
+    } else if p.show_info {
         format!("i back · {} jump · {} copy id · y copy cwd · Esc back", keyname(&k.jump), keyname(&k.copy))
     } else if p.transcript_focus {
         "j/k scroll · n/N match · g/G top/end · Space/b page · Tab pane · Esc back to list".to_string()
@@ -4082,7 +4097,7 @@ pub fn pick_render(p: &mut Picker) {
         // under the cursor. A footer that lists every key fits none of
         // them at a usable width.
         format!(
-            "j/k move · {} type · {} jump · {} new · {} actions · {} search · {ctok} · {} history · q/{} close",
+            "j/k move · {} type · {} jump · {} new · {} actions · {} search · {ctok} · {} history · ? help · q/{} close",
             keyname(&k.focus),
             keyname(&k.jump),
             keyname(&k.new),
@@ -4110,7 +4125,9 @@ pub fn pick_render(p: &mut Picker) {
         let x = list_w + 2;
         let pw = w.saturating_sub(list_w + 2);
         let ph = h.saturating_sub(1);
-        if p.show_info {
+        if p.show_help {
+            draw_help(p, &mut out, x, pw, ph);
+        } else if p.show_info {
             draw_info(p, &mut out, x, pw, ph);
         } else if transcript_shown(p) {
             draw_transcript(p, &mut out, x, pw, ph);
@@ -4141,6 +4158,91 @@ fn transcript_shown(p: &Picker) -> bool {
 /// The info card: everything the roster knows about the highlighted
 /// agent, as labelled lines. The row's own facts draw at once; the
 /// fetched half (`InfoCard`) fills in when it lands.
+/// The quick reference, in the preview column: every key by area, and
+/// the search box's syntax. Configured keys are shown as configured.
+fn draw_help(p: &Picker, out: &mut String, x: usize, pw: usize, ph: usize) {
+    let k = &p.keys;
+    let n = |s: &str| keyname(s).to_string();
+    let mut lines: Vec<(String, String)> = Vec::new();
+    let section = |title: &str, rows: &[(String, &str)], lines: &mut Vec<(String, String)>| {
+        if !lines.is_empty() {
+            lines.push((String::new(), String::new()));
+        }
+        lines.push((format!("\x00{title}"), String::new()));
+        for (key, what) in rows {
+            lines.push((key.clone(), what.to_string()));
+        }
+    };
+    section("moving", &[
+        ("j/k ↑/↓".into(), "move the cursor"),
+        ("gg / G".into(), "first / last row"),
+        (n(&k.jump), "jump to the pane"),
+        ("Tab".into(), "conversation / pane in the preview"),
+        (format!("{} click", n(&k.focus)), "type into the pane; keys go there"),
+        (n(&k.unfocus), "take the keyboard back"),
+        ("wheel".into(), "over the preview: scrolls the pane itself"),
+    ], &mut lines);
+    section("search box", &[
+        (n(&k.filter), "focus the box; words match names, tasks, conversations"),
+        ("@server".into(), "narrow to a server (prefix)"),
+        ("#session".into(), "narrow to a session (prefix)"),
+        ("~dir".into(), "narrow to a directory (part of its ~ path)"),
+        ("dropdown".into(), "a sigil opens it: Tab/↓ BTab/↑ walk, Enter takes, Esc hides"),
+        ("\\@ \\# \\~".into(), "the character as a plain word"),
+        ("s / S / d".into(), "narrow to this row's session / server / folder; again widens"),
+        (n(&k.content), "also grep the panes' contents"),
+        ("C-u".into(), "clear the box"),
+        ("Esc Enter".into(), "leave the box, keep the query"),
+    ], &mut lines);
+    section("rows", &[
+        (n(&k.archive), "archive / un-archive"),
+        (n(&k.archived), "the archive view"),
+        (n(&k.history), "show finished agents too"),
+        (n(&k.attention), "move between attention and waiting"),
+        (format!("{} / {}", n(&k.read), n(&k.unread)), "mark read / unread"),
+        (n(&k.rename), "rename"),
+        (n(&k.copy), "copy the agent id"),
+        ("m".into(), "message the agent"),
+        (n(&k.interrupt), "interrupt (C-c) the agent"),
+        (n(&k.kill), "kill its pane (asks)"),
+        (n(&k.new), "new agent, prefilled from the row"),
+        ("J / K".into(), "mark the row and move"),
+        (n(&k.menu), "the action menu"),
+        ("i".into(), "info card (y copies its cwd)"),
+    ], &mut lines);
+    section("conversation (Tab)", &[
+        ("j/k".into(), "scroll"),
+        ("n / N".into(), "next / previous match"),
+        ("g / G".into(), "top / end"),
+        ("Space / b".into(), "page down / up"),
+        ("Esc".into(), "back to the list"),
+    ], &mut lines);
+    section("picker", &[
+        ("+ / -".into(), "resize"),
+        ("?".into(), "this card"),
+        (format!("q / {}", n(&k.close)), "close (Esc first puts a card or the marks away)"),
+    ], &mut lines);
+    out.push_str(&format!("\x1b[1;{x}H\x1b[1;36m{}\x1b[0m", clip("quick reference · ? or Esc back", pw)));
+    let key_w = 12;
+    let body_w = pw.saturating_sub(key_w + 1).max(8);
+    let mut row = 2;
+    for (key, what) in &lines {
+        if row > ph {
+            break;
+        }
+        if let Some(title) = key.strip_prefix('\x00') {
+            out.push_str(&format!("\x1b[{row};{x}H\x1b[1;2m{}\x1b[0m", clip(title, pw)));
+        } else if !key.is_empty() {
+            out.push_str(&format!(
+                "\x1b[{row};{x}H\x1b[33m{:<key_w$}\x1b[0m {}",
+                clip(key, key_w),
+                clip(what, body_w)
+            ));
+        }
+        row += 1;
+    }
+}
+
 fn draw_info(p: &Picker, out: &mut String, x: usize, pw: usize, ph: usize) {
     let Some(a) = p.selected() else { return };
     let card = p.info.as_ref().filter(|c| c.key == a.key());
@@ -4933,7 +5035,7 @@ fn emit_cells(line: &[Styled], current: bool) -> String {
 /// The live pane of the highlighted row (local, or a mirror of a remote
 /// one), shown to the right of the list.
 fn preview_rect(p: &Picker, list_w: usize) -> Option<PreviewRect> {
-    if p.show_info {
+    if p.show_info || p.show_help {
         return None;
     }
     let a = p.selected()?;
