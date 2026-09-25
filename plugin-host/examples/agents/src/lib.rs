@@ -24,7 +24,11 @@
 //! `plugin-command agents "pick id <agent-id>"` opens on that agent
 //! wherever its row is - a linked server, the history, the archive - for
 //! a hotkey over an id seen on screen (a mailbox message names its
-//! sender by id). `"pick ids"` scans the pane the key was pressed in
+//! sender by id). `"open <agent-id>"` is the form for a key binding on
+//! any host: on a server a workstation linked to it hands the id to the
+//! workstation's picker over the link (the `open` topic), since copy
+//! mode in a mirrored pane runs on the remote with its bindings; with no
+//! one linked in it opens locally. `"pick ids"` scans the pane the key was pressed in
 //! for agent ids - a local pane or a linked server's mirror alike - and
 //! opens on the one it finds, or offers a menu when there are several.
 //! A paste into the picker (Cmd-V, or `paste-buffer` on the float) goes
@@ -648,6 +652,26 @@ impl Plugin for Agents {
             });
             return;
         }
+        if event.topic == provider::OPEN_TOPIC && event.server != store::LOCAL {
+            // A provider we follow asks for its agent on our screen: the
+            // open key was pressed in copy mode on its pane, mirrored here.
+            if !self.role.views() {
+                return;
+            }
+            let Ok(o) = event.json::<provider::OpenReq>() else { return };
+            if let Some(old) = self.picker.borrow_mut().take() {
+                if let Some(t) = old.timer {
+                    cancel(t);
+                }
+                let _ = mode_close(old.mode);
+            }
+            let cfg = Rc::clone(&self.cfg);
+            let picker = Rc::clone(&self.picker);
+            let remotes = Rc::clone(&self.remotes);
+            let client = view::any_client();
+            ctx.spawn(view::pick_open(picker, cfg, remotes, client, None, false, Some(o.id)));
+            return;
+        }
         if event.topic != provider::TOPIC || event.server == store::LOCAL {
             return;
         }
@@ -734,6 +758,42 @@ impl Agents {
                 mouse,
                 event.scope.client.map(u64::from),
             );
+            return;
+        }
+        if verb == "open" {
+            // "open <agent-id>": the picker on that agent, on the screen
+            // the user looks at. On a server a workstation linked to, that
+            // screen is the workstation's: hand the id to the views that
+            // follow this provider instead of opening a float here that
+            // would only be mirrored back. With no one linked in, open
+            // locally, as `pick id` does.
+            let Some(id) = text.split_whitespace().nth(1).map(str::to_string) else {
+                let _ = display_message("agents: open <agent-id>");
+                return;
+            };
+            let inbound = service::servers()
+                .unwrap_or_default()
+                .iter()
+                .any(|s| !s.local && !s.linked && s.up);
+            if inbound && self.role.provides() {
+                provider::broadcast_open(&id);
+                return;
+            }
+            if !self.role.views() {
+                let _ = display_message("agents: a provider has no picker");
+                return;
+            }
+            if let Some(old) = self.picker.borrow_mut().take() {
+                if let Some(t) = old.timer {
+                    cancel(t);
+                }
+                let _ = mode_close(old.mode);
+            }
+            let cfg = Rc::clone(&self.cfg);
+            let picker = Rc::clone(&self.picker);
+            let remotes = Rc::clone(&self.remotes);
+            let client = event.scope.client.map(u64::from);
+            ctx.spawn(view::pick_open(picker, cfg, remotes, client, None, false, Some(id)));
             return;
         }
         if verb == "message" {

@@ -174,6 +174,20 @@ sleep 0.5
 shot "pick ids"
 screen | grep '▸' | grep -q 'beta' || fail "pick ids did not land on the agent named on screen"
 
+# `open <id>` with no one linked in opens locally, like pick id: the
+# form the copy-mode Enter script uses on every host.
+keys q
+sleep 0.5
+kill $CTL 2>/dev/null; CTL=
+( sleep 0.3; echo "plugin-command -t $P3 agents 'open $BID'"; sleep 90 ) |
+    $TMUX -C attach -t alpha:0 >/dev/null 2>&1 &
+CTL=$!
+sleep 2
+FORM=$($TMUX list-panes -a -F '#{pane_id} #{pane_mode}' | awk '/plugin-mode/ { print $1 }')
+[ -n "$FORM" ] || fail "open <id> did not open the picker"
+sleep 0.5
+screen | grep '▸' | grep -q 'beta' || fail "open <id> did not land on the agent"
+
 # ? shows the quick reference in the preview column; Esc puts it away.
 keys '?'
 shot help

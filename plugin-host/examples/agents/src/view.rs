@@ -449,6 +449,13 @@ fn start_spinner(picker: &Rc<RefCell<Option<Picker>>>, remotes: &Rc<RefCell<Remo
 /// Follow the roster topic of a server, so changes arrive without a poll.
 pub fn follow(server: &str) {
     let _ = service::subscribe(&format!("@{server}"), provider::TOPIC);
+    let _ = service::subscribe(&format!("@{server}"), provider::OPEN_TOPIC);
+}
+
+/// The client to open a picker for when no key press names one: the
+/// first attached client, which on a workstation is the user's.
+pub fn any_client() -> Option<u64> {
+    list_clients().ok()?.into_iter().next().map(|c| u64::from(c.id))
 }
 
 /// Ask a remote provider to act on one of its rows. The reply is a plain

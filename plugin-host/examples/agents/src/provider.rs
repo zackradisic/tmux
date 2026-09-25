@@ -47,6 +47,21 @@ pub const SEARCH_LINES: u32 = 5000;
 /// The service topic a provider publishes its roster on.
 pub const TOPIC: &str = "changed";
 
+/// A provider asks the views that follow it to open their picker on an
+/// agent: the user pressed the open key in copy mode on THIS server's
+/// pane (a mirrored one, from the workstation), where the picker they
+/// look at is not.
+pub const OPEN_TOPIC: &str = "open";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenReq {
+    pub id: String,
+}
+
+pub fn broadcast_open(id: &str) {
+    let _ = service::emit_json(OPEN_TOPIC, &OpenReq { id: id.to_string() });
+}
+
 // ---------------------------------------------------------------------------
 // wire shapes
 // ---------------------------------------------------------------------------

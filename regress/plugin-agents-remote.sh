@@ -126,5 +126,23 @@ wait_for 10 "! $TMUX capture-pane -M -p -t $FORM | grep -q 'disconnected'" ||
     fail "disconnected marker stayed after reconnect: $(screen)"
 screen | grep -q 'codex' || fail "codex missing after reconnect"
 
+# `agents open <id>` on B (what Enter in B's copy mode runs, since a
+# mirrored pane's copy mode is B's): B has A linked in, so it hands the
+# id to A over the `open` topic and A's picker opens on the row; B opens
+# no float of its own.
+keys q
+sleep 0.6
+$TMUX list-panes -a -F '#{pane_mode}' | grep -q plugin-mode && fail "picker did not close"
+BID=$(sqlite3 "$XDG_B/tmux/plugins/agents/store.db" "select id from agents where ended_ms is null limit 1")
+[ -n "$BID" ] || fail "no agent id in B's store"
+$TMUX2 plugin-command -t "$BPANE" agents "open $BID" || fail "open on B failed"
+wait_for 8 "$TMUX list-panes -a -F '#{pane_mode}' | grep -q plugin-mode" ||
+    fail "open on B did not open A's picker"
+FORM=$($TMUX list-panes -a -F '#{pane_id} #{pane_mode}' |
+    awk '/plugin-mode/ { print $1 }')
+wait_for 8 "$TMUX capture-pane -M -p -t $FORM | grep '▸' | grep -q codex" ||
+    fail "A's picker did not land on B's agent: $(screen)"
+$TMUX2 list-panes -a -F '#{pane_mode}' | grep -q plugin-mode && fail "B opened a picker of its own"
+
 kill $CTL 2>/dev/null
 exit 0

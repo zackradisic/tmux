@@ -684,13 +684,17 @@ transcript.sh`.
   and Enter in copy mode runs `~/.config/util/bin/tmux-agent-at-cursor`,
   which opens the picker on a selected agent id (copied first, as Enter
   always did) or on `#{search_match}` when a search put the cursor on
-  one; any other selection is just copied. That only works in a LOCAL
-  pane: in a remote link's mirror, copy mode runs on the other server
-  with its bindings, which is where the user first tried it and nothing
-  happened. So `prefix F` is `plugin-command agents 'pick ids'` instead:
-  the plugin captures the pane's screen (a mirror is a local grid), finds
-  the ids (`ids_on_screen`, nearest the bottom first), opens on the one
-  there is, or offers a `display-menu` of them.
+  one; any other selection is just copied. In a remote link's mirror,
+  copy mode runs on the other server with ITS bindings, which is where
+  the user first tried it and nothing happened. A first fix replaced the
+  search with a plugin scan of the screen (`pick ids`, still there, with
+  a `display-menu` when several ids are on screen) - rejected at once:
+  "prefix F now doesn't highlight the ids". The highlighting is the
+  point. So the search stays, and the same Enter binding + script go on
+  every host, calling `agents open <id>`: on a server a workstation
+  linked to (an inbound peer in `servers()`), the provider emits the
+  `open` topic and the workstation's view, which follows it, opens its
+  own picker on the id; with no one linked in, `open` opens locally.
 - **Pasting into the picker.** A pane in a mode dropped pastes
   (`window_pane_paste` returned early; `paste-buffer` wrote to the
   float's pty, which nothing reads, or refused it as exited). Window
