@@ -25,6 +25,9 @@
 //! the new-agent form opens prefilled to resume it - its harness session
 //! id in the `resume` field, its directory, a window in its session or
 //! a session named after the old one when that is gone (see `newagent`).
+//! `f` on any row with a session id forks it: the same form with `fork`
+//! on, so Enter runs `--resume <id> --fork-session` and the copy gets a
+//! name of its own (the row's plus `fork`).
 //! `plugin-command agents "pick id <agent-id>"` opens on that agent
 //! wherever its row is - a linked server, the history, the archive - for
 //! a hotkey over an id seen on screen (a mailbox message names its

@@ -35,6 +35,15 @@
 //! re-points the old row at it, turns and all, rather than making a new
 //! one. Never the old pane: whatever runs there now is somebody's.
 //!
+//! `fork` (a yes/no field, `C-f` flips it; `f` in the picker opens the
+//! form with it on, for a live row too) adds `--fork-session`: Claude
+//! copies the conversation into a new session instead of continuing the
+//! old one. The copy would carry the original's name and be
+//! indistinguishable in the roster, so the form names it - the old name
+//! plus `fork`, numbered when that is taken - and leaves that name for
+//! the agent that appears in the new window (`name_window_when_seen`),
+//! the way the rename key would.
+//!
 //! Built on `formkit`; this file is what the fields mean and what Enter
 //! does. The scans run in this plugin, so it needs
 //! `formkit::complete::CAPS` (run-process, fs-list, fs-read-any) on top
@@ -108,6 +117,13 @@ pub struct NewAgent {
     harness: String,
     /// The resume id, kept across the worktree kind, which has no field.
     resume: String,
+    /// The fork flag, kept the same way.
+    fork: String,
+}
+
+/// Is the fork field on?
+fn fork_on(v: &str) -> bool {
+    matches!(v.trim().to_lowercase().as_str(), "yes" | "y" | "on" | "1" | "true")
 }
 
 fn value_of(fields: &[Field], label: &str) -> String {
@@ -269,6 +285,10 @@ impl Model for NewAgent {
         None
     }
 
+    fn extra_hint(&self) -> Option<String> {
+        matches!(self.kind, Kind::Window | Kind::Session).then(|| "C-f fork".to_string())
+    }
+
     fn submit_label(&self) -> &'static str {
         "start"
     }
@@ -300,6 +320,7 @@ fn fields_for(
     name: Field,
     command: Field,
     resume: Field,
+    fork: Field,
 ) -> Vec<Field> {
     match kind {
         Kind::Window => vec![
@@ -308,8 +329,9 @@ fn fields_for(
             name,
             command,
             resume,
+            fork,
         ],
-        Kind::Session => vec![field("folder", folder.to_string()), name, command, resume],
+        Kind::Session => vec![field("folder", folder.to_string()), name, command, resume, fork],
         Kind::Worktree => vec![
             field("repo", folder.to_string()),
             name,
@@ -389,6 +411,10 @@ fn toggle(form: &mut Form<NewAgent>) -> Option<String> {
         .map(|i| form.fields[i].clone())
         .unwrap_or_else(|| field("resume", form.model.resume.clone()));
     form.model.resume = resume.value.trim().to_string();
+    let fork = idx(&form.fields, "fork")
+        .map(|i| form.fields[i].clone())
+        .unwrap_or_else(|| field("fork", form.model.fork.clone()));
+    form.model.fork = fork.value.trim().to_string();
     let folder = idx(&form.fields, "folder")
         .or_else(|| idx(&form.fields, "repo"))
         .map(|i| form.fields[i].value.trim().to_string())
@@ -399,7 +425,7 @@ fn toggle(form: &mut Form<NewAgent>) -> Option<String> {
     let next = form.model.kind.next();
     form.model.kind = next;
     let session = form.model.session.clone();
-    form.replace_fields(fields_for(next, &session, &folder, name, command, resume), "name");
+    form.replace_fields(fields_for(next, &session, &folder, name, command, resume, fork), "name");
     form.model.confirm_create = false;
     form.model.reuse = false;
     (next == Kind::Worktree && !folder.is_empty() && form.model.remote.is_none())
@@ -409,12 +435,12 @@ fn toggle(form: &mut Form<NewAgent>) -> Option<String> {
 /// Open the form over the picker, prefilled from its highlighted row.
 /// `picker` is read for the row and the picker's mode; the form is its
 /// own float.
-pub async fn open(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>) {
+pub async fn open(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>, fork: bool) {
     if state().borrow().is_some() {
         return;
     }
     // What the row gives us, read under one borrow.
-    let (picker_mode, launchers, session, remote, local_pane, harness, revive) = {
+    let (picker_mode, launchers, session, remote, local_pane, harness, revive, fork_name) = {
         let b = picker.borrow();
         let Some(p) = b.as_ref() else { return };
         let row = p.selected();
@@ -431,15 +457,31 @@ pub async fn open(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>) {
         // A row with no live pane: bring that agent back rather than
         // start a fresh one - its harness session id, the directory its
         // transcript recorded, and the old session's name for when that
-        // session is gone and a new one has to carry it.
-        let revive = row.filter(|a| !a.live()).map(|a| {
+        // session is gone and a new one has to carry it. A fork resumes
+        // a live row's session the same way, as a copy.
+        let revive = row.filter(|a| fork || !a.live()).map(|a| {
             (
                 resumable_id(&a.id).unwrap_or_default(),
                 a.cwd.clone().unwrap_or_default(),
                 old_session.clone().unwrap_or_default(),
             )
         });
-        (p.mode, p.launchers.clone(), session, remote, local_pane, harness, revive)
+        // The fork's own name: the row's, plus "fork", numbered past the
+        // names already on the roster.
+        let fork_name = row.filter(|_| fork).map(|a| {
+            let base = format!("{} fork", crate::view::display_name(a).trim());
+            let taken = |n: &str| {
+                p.rows.iter().any(|r| crate::view::display_name(r).trim() == n)
+            };
+            let mut name = base.clone();
+            let mut k = 2;
+            while taken(&name) {
+                name = format!("{base} {k}");
+                k += 1;
+            }
+            name
+        });
+        (p.mode, p.launchers.clone(), session, remote, local_pane, harness, revive, fork_name)
     };
     // The folder: the row's pane cwd (a shadow's is the remote's cached
     // path), else the pressing client's pane, like `prefix S`.
@@ -502,13 +544,18 @@ pub async fn open(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>) {
         .map(|(id, _, s)| (id, s))
         .unwrap_or_default();
     let kind = if !resume.is_empty() && session.is_empty() { Kind::Session } else { Kind::Window };
-    // The old session's name for the new session, held as if typed so
-    // the name's mirror (the folder's basename) leaves it be.
+    // The old session's name for the new session, or the fork's own
+    // name, held as if typed so the name's mirror (the folder's
+    // basename) leaves it be.
     let mut name = field("name", String::new());
-    if kind == Kind::Session && !old_session.is_empty() {
+    if let Some(fname) = &fork_name {
+        name.value = fname.clone();
+        name.touched = true;
+    } else if kind == Kind::Session && !old_session.is_empty() {
         name.value = session_name(&old_session);
         name.touched = true;
     }
+    let fork_value = if fork { "yes" } else { "no" }.to_string();
     let fields = fields_for(
         kind,
         &session,
@@ -516,6 +563,7 @@ pub async fn open(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>) {
         name,
         field("command", command),
         field("resume", resume.clone()),
+        field("fork", fork_value.clone()),
     );
     let model = NewAgent {
         kind,
@@ -529,6 +577,7 @@ pub async fn open(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>) {
         picker_mode,
         harness,
         resume,
+        fork: fork_value,
     };
     let mut form = Form::new(mode, FORM_WIDTH, FORM_HEIGHT, fields, model);
     // Start on the first empty field; with everything prefilled, on the
@@ -571,6 +620,15 @@ pub fn on_key(ctx: &Ctx, event: &Event) {
         let mut b = st.borrow_mut();
         let Some(form) = b.as_mut() else { return };
         let mode = form.mode;
+        if key == "C-f" {
+            if let Some(i) = idx(&form.fields, "fork") {
+                let on = fork_on(&form.fields[i].value);
+                form.fields[i].value = if on { "no" } else { "yes" }.to_string();
+                form.fields[i].touched = true;
+                form::render(form);
+            }
+            return;
+        }
         let mut action = form.key(key, Some("C-t"));
         let mut detect = None;
         if action == Action::Toggle {
@@ -720,9 +778,18 @@ async fn submit() {
     let name = get("name");
     let launchers = st.borrow().as_ref().map(|f| f.model.launchers.clone()).unwrap_or_default();
     let command = expand_command(&launchers, &get("command"));
+    let fork = fork_on(&get("fork")) && !get("resume").is_empty();
     let command = match get("resume").as_str() {
         "" => command,
-        id => resume_command(&harness, &command, id),
+        id => {
+            let c = resume_command(&harness, &command, id);
+            // Claude's fork: a copy of the conversation in a new session.
+            if fork && harness == "claude" {
+                format!("{c} --fork-session")
+            } else {
+                c
+            }
+        }
     };
     let session = get("session");
     let (cmd, target) = if !session.is_empty() {
@@ -748,6 +815,12 @@ async fn submit() {
             sess,
         )
     };
+    if fork {
+        // The copy is named before it appears: the roster applies this
+        // to whatever agent shows up in that window.
+        let sess = if session.is_empty() { session_name(&name) } else { session.clone() };
+        crate::provider::name_window_when_seen(&sess, &name, &name);
+    }
     if let Err(e) = run_command(&cmd).await {
         form::fail(&st, mode, e.message.clone());
         return;

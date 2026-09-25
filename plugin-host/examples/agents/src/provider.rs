@@ -238,6 +238,19 @@ thread_local! {
     /// Per pane: how many delayed looks a Pending detection has had.
     static PENDING_LOOKS: std::cell::RefCell<HashMap<u32, u8>> =
         std::cell::RefCell::new(HashMap::new());
+    /// (session, window) -> the user name for the agent that appears
+    /// there: a fork started from the form gets a name of its own, since
+    /// the harness gives the copy the original's.
+    static PENDING_NAMES: std::cell::RefCell<HashMap<(String, String), String>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Name the agent that appears in this session's window `window`, once,
+/// as the user would with the rename key.
+pub fn name_window_when_seen(session: &str, window: &str, name: &str) {
+    PENDING_NAMES.with(|p| {
+        p.borrow_mut().insert((session.to_string(), window.to_string()), name.to_string());
+    });
 }
 
 /// Delays between the looks at a Pending pane: a Claude writes its
@@ -380,6 +393,16 @@ pub async fn classify(pane: u32, cfg: Rc<Config>) {
         now,
     )
     .await;
+    // A name left for whatever agent appeared in this window (a fork
+    // started from the form): applied once, and it follows the row
+    // through its id migration like any user name.
+    if let (Some(s), Some(w)) = (session.as_deref(), window.as_deref()) {
+        let pending =
+            PENDING_NAMES.with(|p| p.borrow_mut().remove(&(s.to_string(), w.to_string())));
+        if let Some(user_name) = pending {
+            let _ = store::rename_by_user(&id, Some(&user_name), now).await;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

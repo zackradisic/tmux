@@ -277,6 +277,36 @@ fscreen | grep -q '\[session\]' || fail "the form is not the session kind: $(fsc
 fscreen | grep -q 'name *beta' || fail "the new session is not named after the old one"
 fscreen | grep -q 'resume *1b2c3d4e' || fail "resume was lost with the session"
 $TMUX send-keys -t "$NEWF" Escape; sleep 0.5
+
+# f on the same row: the form as a fork - fork yes, a name of its own
+# (the row's plus "fork"), the resume id kept; C-f flips fork off.
+for m in $(modes); do $TMUX send-keys -t "$m" Escape; done
+sleep 0.5
+for m in $(modes); do $TMUX send-keys -t "$m" q; done
+sleep 0.5
+$TMUX plugin-command agents pick
+sleep 1.5
+FORM=$(modes | head -1)
+keys .
+keys / '#' b e t a Enter
+sleep 0.6
+keys f
+i=0
+while [ "$i" -lt 20 ]; do
+	NEWF=$(modes | grep -v "^$FORM\$" | head -1)
+	[ -n "$NEWF" ] && break
+	sleep 0.3; i=$((i + 1))
+done
+[ -n "$NEWF" ] || fail "f did not open the form"
+sleep 0.5
+shot "fork form"
+fscreen | grep -q 'fork *yes' || fail "fork is not on"
+fscreen | grep -q 'name *beta-agent fork' || fail "the fork did not get a name of its own: $(fscreen | grep name)"
+fscreen | grep -q 'resume *1b2c3d4e' || fail "the fork lost the resume id"
+fscreen | grep -q 'C-f fork' || fail "the hint does not name C-f"
+$TMUX send-keys -t "$NEWF" C-f; sleep 0.4
+fscreen | grep -q 'fork *no' || fail "C-f did not flip fork off"
+$TMUX send-keys -t "$NEWF" Escape; sleep 0.5
 keys / C-u Escape
 
 # ? shows the quick reference in the preview column; Esc puts it away.

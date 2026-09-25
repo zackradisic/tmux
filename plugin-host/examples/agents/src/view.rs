@@ -531,7 +531,8 @@ pub enum PickAfter {
     Type(u32, String),
     /// Open the new-agent form over the picker, prefilled from the
     /// highlighted row (see `newagent`).
-    NewAgent,
+    /// The new-agent form; `true` opens it as a fork of the row.
+    NewAgent(bool),
     /// Mark these (server, id) rows read (true) or unread (false).
     Read(Vec<(String, String)>, bool),
 }
@@ -1675,6 +1676,7 @@ async fn open_menu(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>) {
             items.push_str(&menu_item("jump to pane", &k.jump, live));
             items.push_str(&menu_item("type into pane", &k.focus, live));
             items.push_str(&menu_item("new agent here", &k.new, true));
+            items.push_str(&menu_item("fork this agent", "f", true));
             items.push_str(&menu_item("message", "m", true));
             let stopped =
                 a.live() && matches!(a.status.as_str(), "needs_input" | "waiting");
@@ -2366,7 +2368,20 @@ fn dispatch_key(
             // Start another agent: the form prefills from the row under
             // the cursor, or from the pressing client's pane when the
             // list is empty.
-            after = PickAfter::NewAgent;
+            after = PickAfter::NewAgent(false);
+        } else if key == "f" {
+            // Fork the row's agent: the form, prefilled to resume its
+            // session as a copy with a name of its own.
+            match p.selected() {
+                Some(a) if crate::newagent::resumable_id(&a.id).is_some() => {
+                    after = PickAfter::NewAgent(true);
+                }
+                Some(_) => {
+                    p.status = Some("nothing to fork: this agent has no session id yet".into());
+                    pick_render(p);
+                }
+                None => {}
+            }
         } else if key == k.copy {
             match copy_after(p) {
                 Ok(a) => after = a,
@@ -2502,8 +2517,8 @@ fn dispatch_key(
                 open_menu(picker, client).await;
             });
         }
-        PickAfter::NewAgent => {
-            ctx.spawn(crate::newagent::open(Rc::clone(picker), client));
+        PickAfter::NewAgent(fork) => {
+            ctx.spawn(crate::newagent::open(Rc::clone(picker), client, fork));
         }
         PickAfter::Read(ids, read) => {
             ctx.spawn(apply_read(Rc::clone(picker), Rc::clone(remotes), ids, read));
@@ -2763,7 +2778,7 @@ fn jump_after(p: &mut Picker, ack: &mut Option<(String, String)>) -> PickAfter {
             if crate::newagent::resumable_id(&a.id).is_some() {
                 p.status = Some("gone: the form brings it back (Esc: no)".into());
                 pick_render(p);
-                PickAfter::NewAgent
+                PickAfter::NewAgent(false)
             } else {
                 p.status = Some("no live pane to jump to".into());
                 pick_render(p);
@@ -4393,6 +4408,7 @@ fn draw_help(p: &Picker, out: &mut String, x: usize, pw: usize, ph: usize) {
         (n(&k.interrupt), "interrupt (C-c) the agent"),
         (n(&k.kill), "kill its pane (asks)"),
         (n(&k.new), "new agent, prefilled from the row"),
+        ("f".into(), "fork this agent (a copy of its session, its own name)"),
         ("J / K".into(), "mark the row and move"),
         (n(&k.menu), "the action menu"),
         ("i".into(), "info card (y copies its cwd)"),

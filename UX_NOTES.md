@@ -726,6 +726,18 @@ transcript.sh`.
   inherits `AI_AGENT`, and under `trust_env` every helper pane is then
   an agent - the test unsets it first.
   `regress/plugin-agents-filters.sh`.
+- **`f` forks an agent.** The same form, opened with a `fork` field on
+  (`C-f` flips it), from a live row too: Enter runs the launcher with
+  `--resume <id> --fork-session`, so Claude copies the conversation into
+  a new session. Zack tried the flag by hand first and the copy came up
+  with the original's name, indistinguishable in the roster - so the
+  form names the fork (the row's name plus `fork`, numbered when that
+  is taken) and leaves the name for whatever agent appears in the new
+  window (`provider::name_window_when_seen`, keyed by session and
+  window name since `run_command` returns no output to learn the pane
+  from); the roster applies it as a user rename, which survives the
+  id migration. Codex has no fork flag: `fork` on a Codex row is a
+  plain resume. `regress/plugin-agents-filters.sh`.
 
 ## Sessions and windows
 

@@ -119,6 +119,12 @@ pub trait Model: 'static {
     fn submit_label(&self) -> &'static str {
         "create"
     }
+
+    /// A key of the model's own for the hint line (`C-f fork`), or
+    /// `None`.
+    fn extra_hint(&self) -> Option<String> {
+        None
+    }
 }
 
 pub struct Form<M: Model> {
@@ -586,6 +592,10 @@ pub fn render<M: Model>(form: &mut Form<M>) {
     }
     let verb = form.model.submit_label();
     let toggle = form.model.toggle_hint().map(|t| format!("C-t {t} · ")).unwrap_or_default();
+    let toggle = match form.model.extra_hint() {
+        Some(h) => format!("{toggle}{h} · "),
+        None => toggle,
+    };
     let hint = if form.listed() {
         if form.in_list() {
             "Tab/S-Tab cycle · Enter take · C-j/C-k field · Esc hide list".to_string()
