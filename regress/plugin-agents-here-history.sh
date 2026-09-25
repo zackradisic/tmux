@@ -59,6 +59,10 @@ sleep 0.5
 $TMUX -f/dev/null new-session -d -s alpha -x 200 -y 50 'env -i PATH=/bin:/usr/bin sleep 600' || fail "new-session"
 $TMUX new-window -d -t alpha:1 \
     "sh -c 'AI_AGENT=claude sleep 2; echo over; exec env -i PATH=/bin:/usr/bin cat'" || fail "new-window"
+# Window 3: the same, a second finished agent that stays plain (never
+# archived), for the `pick id` cases at the end.
+$TMUX new-window -d -t alpha:3 \
+    "sh -c 'AI_AGENT=claude sleep 2; echo over; exec env -i PATH=/bin:/usr/bin cat'" || fail "new-window 3"
 sleep 0.5
 P=$($TMUX list-panes -t alpha:1 -F '#{pane_id}')
 P0=$($TMUX list-panes -t alpha:0 -F '#{pane_id}')
@@ -66,7 +70,9 @@ P0=$($TMUX list-panes -t alpha:0 -F '#{pane_id}')
 $TMUX load-plugin -s server -o trust_env=1 -c capture-pane -c run-command -c mode \
     -c db -c env-read -c pane-fds "$WASM" || fail "load-plugin"
 sleep 1
+P3=$($TMUX list-panes -t alpha:3 -F '#{pane_id}')
 $TMUX plugin-command -t "$P" agents "working"
+$TMUX plugin-command -t "$P3" agents "working"
 sleep 3.5
 
 # The agent is gone from the live list: plain `pick` opens the default
@@ -122,6 +128,34 @@ open_from "$P2" "pick here"
 shot "from the live archived pane"
 screen | grep -q 'archive)' || fail "pick here did not open into the archive for a live archived agent's pane"
 cursor_row | grep -q 'claude.*archived' || fail "the cursor is not on the live archived agent's row"
+
+# `pick id <id>` from a pane that is nobody's: the finished agent's id
+# opens the history on its row, the archived one's opens the archive, an
+# unknown id says so.
+DB="$XDG_DATA_HOME/tmux/plugins/agents/store.db"
+FIN=$(sqlite3 "$DB" "select id from agents where ended_ms is not null and life != 'archived' limit 1")
+ARC=$(sqlite3 "$DB" "select id from agents where life = 'archived' and ended_ms is null limit 1")
+[ -n "$FIN" ] && [ -n "$ARC" ] || fail "no finished / archived ids in the store"
+close_picker
+open_from "$P0" "pick id $FIN"
+shot "pick id finished"
+screen | grep -q '+history' || fail "pick id of a finished agent did not open the history"
+cursor_row | grep -q 'claude' || fail "the cursor is not on the finished agent's row"
+cursor_row | grep -q 'archived' && fail "pick id of the finished agent landed on the archived one"
+close_picker
+open_from "$P0" "pick id $ARC"
+shot "pick id archived"
+screen | grep -q 'archive)' || fail "pick id of an archived agent did not open the archive"
+cursor_row | grep -q 'claude.*archived' || fail "the cursor is not on the archived agent's row"
+# From an agent's own pane, pick id still lands on the id, not on the
+# pane's agent.
+close_picker
+open_from "$P2" "pick id $FIN"
+cursor_row | grep -q 'claude' || fail "pick id from an agent pane has no cursor row"
+cursor_row | grep -q 'archived' && fail "pick id from an agent pane landed on that pane's agent instead"
+close_picker
+open_from "$P0" "pick id claude:00000000-0000-4000-8000-000000000000"
+screen | grep -q 'no agent claude:0000' || fail "an unknown id did not say so"
 
 cleanup
 echo ok

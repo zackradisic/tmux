@@ -1007,6 +1007,10 @@ pub async fn pick_open(
     seek: bool,
     seek_id: Option<String>,
 ) {
+    // Opening on an id, the pane we were pressed in is nobody's business:
+    // the cursor and the here border go to the id's row, not to the
+    // agent that happens to live where the key was pressed.
+    let here = if seek_id.is_some() { None } else { here };
     let window = client
         .and_then(|cid| {
             list_clients().ok()?.into_iter().find(|c| u64::from(c.id) == cid)
@@ -1083,12 +1087,12 @@ pub async fn pick_open(
         gather_rows(&remotes, req.clone(), true).await;
     // An id to open on that no roster holds: it may have finished or been
     // archived, here or on a linked server, so ask every server for its
-    // history and archive too, once.
+    // history once (which holds the archived rows too; asking for the
+    // archive instead would fetch only those).
     let mut missing_id = None;
     if let Some(id) = &seek_id {
         if !rows.iter().any(|a| a.id == *id) {
             req.history = true;
-            req.archived = true;
             let g = gather_rows(&remotes, req.clone(), true).await;
             rows = g.rows;
             captures = g.captures;
