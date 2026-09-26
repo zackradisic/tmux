@@ -1,0 +1,40 @@
+#!/bin/sh
+# Enter in copy mode. When an agent id is at hand - selected, or under the
+# cursor after the prefix+F search (claude:<uuid>, codex:..., pi:...,
+# opencode:...) - leave copy mode and open the agents picker on that
+# agent, wherever its row lives. A selection is copied first, as Enter
+# always did, and anything else is just that: copy and leave.
+#
+# The same script runs on every host. On a server a workstation linked
+# to, `agents open` hands the id to the workstation's picker over the
+# link, since this copy mode is the remote's, not the workstation's.
+#   $1 pane id   $2 #{search_match}   $3 #{selection_present}
+pane=$1; match=$2; selected=$3
+if [ -x "$HOME/.local/bin/tmux2" ]; then
+	TMUX2="$HOME/.local/bin/tmux2"
+else
+	TMUX2=$(command -v tmux2 || echo tmux)
+fi
+
+is_id() {
+	case "$1" in
+	claude:*|codex:*|pi:*|opencode:*) return 0 ;;
+	esac
+	return 1
+}
+open() {
+	exec "$TMUX2" plugin-command -t "$pane" agents "open $1"
+}
+
+if [ "$selected" = 1 ]; then
+	"$TMUX2" send-keys -t "$pane" -X copy-selection-and-cancel
+	text=$("$TMUX2" show-buffer 2>/dev/null | tr -d '\r\n' |
+	    sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/[].,;:)`"'"'"']*$//')
+	is_id "$text" && open "$text"
+	exit 0
+fi
+if is_id "$match"; then
+	"$TMUX2" send-keys -t "$pane" -X cancel
+	open "$match"
+fi
+exec "$TMUX2" send-keys -t "$pane" -X copy-selection-and-cancel
