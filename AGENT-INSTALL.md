@@ -90,6 +90,15 @@ path = "~/.local/share/tmux2/plugins/session_creator.wasm"
 scope = "server"
 caps = ["mode", "run-process", "run-command", "fs-list", "fs-read-any"]
 
+# Copy files to and from linked hosts with scp (a form: from / path /
+# to / path; host fields list local + every linked host, paths complete
+# here or over ssh). role = "view": nothing runs on the remote.
+[plugins.scp]
+path = "~/.local/share/tmux2/plugins/scp.wasm"
+scope = "server"
+role = "view"
+caps = ["mode", "run-process", "run-command", "fs-list", "fs-read-any"]
+
 # Save and restore sessions with scrollback; restart the server in place.
 [plugins.resurrect]
 path = "~/.local/share/tmux2/plugins/resurrect.wasm"
@@ -168,6 +177,7 @@ bind S   plugin-command session_creator new       # new session from a folder
 bind W   plugin-command session_creator worktree  # new session from a git worktree
 bind -T choose-tree S plugin-command session_creator new
 bind -T choose-tree W plugin-command session_creator worktree
+bind T   plugin-command scp copy                  # copy files to/from a linked host
 bind C-r plugin-command resurrect pick            # save/restore picker
 bind U   confirm-before -p 'update tmux2? (y/n)' 'update -y canary'
 

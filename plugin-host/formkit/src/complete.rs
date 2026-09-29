@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use tmux_plugin_sdk::abi::ErrorCode;
 use tmux_plugin_sdk::prelude::*;
 
-use crate::text::{age, basename, clip_end, quote, rank};
+use crate::text::{age, basename, clip_end, last_line, quote, rank};
 
 /// The capabilities a plugin needs granted for completion to work: the
 /// scans list directories anywhere the user types a path and run one
@@ -58,6 +58,8 @@ pub enum RowKind {
     Branch,
     /// An entry of a fixed word list.
     Word,
+    /// A plain file (a file source, local or remote).
+    File,
 }
 
 /// One candidate. `value` is what lands in the field; everything else is
@@ -141,6 +143,20 @@ pub enum Source {
     /// A fixed list, e.g. the commands a field may hold. `words` are
     /// (value, meta) pairs; the meta is the second column.
     Words { title: String, words: Vec<(String, String)> },
+    /// A dropdown: like [`Source::Words`], but the value is meant to be
+    /// one of the words, so a field that already holds one lists them
+    /// all and Tab cycles the whole set instead of filtering down to
+    /// the one it holds.
+    Choice { title: String, words: Vec<(String, String)> },
+    /// Every entry under `base` on this machine, files and directories
+    /// alike: a path to copy, not a place to work in. A directory row's
+    /// label ends in `/`, so taking it and pressing Tab again steps into
+    /// it.
+    Files { base: String },
+    /// Every entry under `base` on `host`, listed over ssh with one
+    /// `ls` per scan. `~` in `base` is the remote home; nothing local
+    /// touches the path.
+    Remote { host: String, base: String },
 }
 
 impl Source {
@@ -152,7 +168,11 @@ impl Source {
             Source::Repos { base } => format!("repos\t{base}"),
             Source::Dests { base, repo } => format!("dests\t{base}\t{repo}"),
             Source::Branches { repo } => format!("branches\t{repo}"),
-            Source::Words { title, .. } => format!("words\t{title}"),
+            Source::Words { title, .. } | Source::Choice { title, .. } => {
+                format!("words\t{title}")
+            }
+            Source::Files { base } => format!("files\t{base}"),
+            Source::Remote { host, base } => format!("remote\t{host}\t{base}"),
         }
     }
 }
@@ -191,9 +211,13 @@ pub struct Completion {
     pub generation: u64,
     /// Parallel to `rows`: the second probe has been asked for already.
     pub probed: Vec<bool>,
-    /// The scan was refused for want of a capability: what to grant.
-    /// Shown in the list's rule, so the empty list explains itself.
+    /// The scan was refused for want of a capability, or could not run
+    /// (an ssh that failed): what to grant, or what went wrong. Shown in
+    /// the list's rule, so the empty list explains itself.
     pub denied: Option<String>,
+    /// Directories are what this list is about (a file source), so they
+    /// are drawn like any other row. A repo scan draws them dim.
+    pub plain_dirs: bool,
 }
 
 impl Completion {
@@ -215,6 +239,7 @@ impl Completion {
             generation,
             probed: Vec::new(),
             denied: None,
+            plain_dirs: false,
         }
     }
 
@@ -226,6 +251,7 @@ impl Completion {
         self.base = scanned.base;
         self.truncated = scanned.truncated;
         self.denied = scanned.denied;
+        self.plain_dirs = scanned.plain_dirs;
         self.loading = false;
     }
 
@@ -296,7 +322,13 @@ impl Completion {
         // Safe even on a truncated scan: scan_dir ranked the whole listing
         // before cutting, so the rows in hand are genuinely the most recent.
         let mut scored: Vec<(u8, i64, usize)> = Vec::new();
+        // A dot entry is shown only when the fragment asks for one, so
+        // a file list does not open on .DS_Store and .git.
+        let dots = frag.starts_with('.');
         for (i, row) in self.rows.iter().enumerate() {
+            if !dots && row.label.starts_with('.') {
+                continue;
+            }
             if let Some(r) = rank(&row.label, frag) {
                 // Newest first inside a rank, so the repo you touched last
                 // is the one you reach first.
@@ -440,7 +472,7 @@ impl Completion {
             let line = clip_end(line.trim_end(), w.saturating_sub(2));
             if cur {
                 out.push_str(&format!("\x1b[7m {line:<pad$}\x1b[0m\r\n", pad = w - 1));
-            } else if !row.enabled || row.kind == RowKind::Dir {
+            } else if !row.enabled || (row.kind == RowKind::Dir && !self.plain_dirs) {
                 out.push_str(&format!(" \x1b[2m{line}\x1b[0m\r\n"));
             } else {
                 out.push_str(&format!(" {line}\r\n"));
@@ -461,6 +493,8 @@ pub struct Scanned {
     /// carry their own value.
     pub base: String,
     pub denied: Option<String>,
+    /// See [`Completion::plain_dirs`].
+    pub plain_dirs: bool,
 }
 
 // ---------------------------------------------------------------------
@@ -659,7 +693,15 @@ async fn scan_dir(base: &str, repos_only: bool) -> Scanned {
     if repos_only {
         rows.retain(|r| r.kind == RowKind::Repo);
     }
-    Scanned { rows, now, truncated, title: base.to_string(), base: base.to_string(), denied }
+    Scanned {
+        rows,
+        now,
+        truncated,
+        title: base.to_string(),
+        base: base.to_string(),
+        denied,
+        plain_dirs: false,
+    }
 }
 
 /// Parse `for-each-ref` output into branch rows.
@@ -691,11 +733,124 @@ fn parse_branches(out: &str) -> (Vec<Row>, i64) {
     (rows, now)
 }
 
+/// Files and directories under `base` on this machine, newest first.
+/// One `fs_list`, no job: nothing here asks git anything.
+async fn scan_files(base: &str) -> Scanned {
+    let opts = ListOpts { mtime: true, dirs_only: false };
+    let listing = match fs_list_with(base, opts).await {
+        Ok(l) => l,
+        Err(e) => {
+            return Scanned {
+                denied: denied_hint(&e, "fs-list and fs-read-any"),
+                base: base.to_string(),
+                plain_dirs: true,
+                ..Default::default()
+            }
+        }
+    };
+    // Same rule as scan_dir: rank the whole listing while the names are
+    // still borrowed, then build rows for the survivors only.
+    let mut ranked: Vec<(i64, bool, &str)> =
+        listing.iter().map(|e| (e.mtime, e.kind.is_dir(), e.name)).collect();
+    let overflowed = ranked.len() > SCAN_MAX;
+    ranked.sort_by(|a, b| b.0.cmp(&a.0));
+    ranked.truncate(SCAN_MAX);
+    let mut rows: Vec<Row> = Vec::with_capacity(ranked.len());
+    for (mtime, is_dir, name) in ranked {
+        let mut row = if is_dir {
+            Row::under_base(format!("{name}/"), RowKind::Dir)
+        } else {
+            Row::under_base(name.to_string(), RowKind::File)
+        };
+        row.when = (mtime > 0).then_some(mtime);
+        rows.push(row);
+    }
+    Scanned {
+        rows,
+        now: 0,
+        truncated: listing.truncated() || overflowed,
+        title: base.to_string(),
+        base: base.to_string(),
+        denied: None,
+        plain_dirs: true,
+    }
+}
+
+/// The `ls` that lists one remote directory: every entry on its own
+/// line tagged `L `, dot entries included, a `/` after each directory,
+/// newest first. `~` and `~/x` are left to the remote shell (`cd` alone is the
+/// remote home); anything else is quoted for it. A directory that is
+/// not there exits 3, so the caller can tell an empty directory from
+/// an ssh that never got through (ssh's own failures exit 255).
+pub fn remote_list_command(host: &str, base: &str) -> String {
+    let cd = match base {
+        "" | "~" => "cd".to_string(),
+        b if b.starts_with("~/") => format!("cd -- \"$HOME\"/{}", quote(&b[2..])),
+        b => format!("cd -- {}", quote(b)),
+    };
+    // Entries are tagged on the remote so that whatever else the ssh
+    // prints (a proxy's "already connected", a banner) is not a file.
+    let remote =
+        format!("{cd} 2>/dev/null || exit 3; ls -1ALpt 2>/dev/null | sed -e 's/^/L /'; exit 0");
+    format!(
+        "ssh -o BatchMode=yes -o ConnectTimeout=8 -- {} {}",
+        quote(host),
+        quote(&remote)
+    )
+}
+
+/// Files and directories under `base` on `host`: one ssh round trip. A
+/// failed ssh puts its last line where a refused capability would go,
+/// so the list says what is wrong instead of staying empty.
+async fn scan_remote(host: &str, base: &str) -> Scanned {
+    let title = format!("{host}:{}", if base.is_empty() { "~" } else { base });
+    let shown_base = if base.is_empty() { "~".to_string() } else { base.to_string() };
+    let empty = Scanned {
+        title: title.clone(),
+        base: shown_base.clone(),
+        plain_dirs: true,
+        ..Default::default()
+    };
+    match run_job(&remote_list_command(host, base), None).await {
+        Ok(out) if out.status == 0 => {
+            let mut rows: Vec<Row> = Vec::new();
+            for line in out.output.lines() {
+                let Some(name) = line.trim_end_matches('\r').strip_prefix("L ") else {
+                    continue;
+                };
+                if name.is_empty() || name == "./" || name == "../" {
+                    continue;
+                }
+                if rows.len() >= SCAN_MAX {
+                    break;
+                }
+                let kind = if name.ends_with('/') { RowKind::Dir } else { RowKind::File };
+                rows.push(Row::under_base(name.to_string(), kind));
+            }
+            let truncated = rows.len() >= SCAN_MAX;
+            Scanned { rows, truncated, ..empty }
+        }
+        // No such directory there: an empty list, like a local one.
+        Ok(out) if out.status == 3 && !out.signalled => empty,
+        Ok(out) => Scanned {
+            denied: Some(format!("{host}: {}", last_line(&out.output, "ssh failed"))),
+            ..empty
+        },
+        Err(e) => Scanned {
+            denied: denied_hint(&e, "run-process").or_else(|| Some(format!("ssh: {}", e.message))),
+            ..empty
+        },
+    }
+}
+
 /// Run one source's scan. Paths in the source must already be expanded
-/// (no `~`). The result is plain data; install it with
+/// (no `~`), except a remote one, whose `~` belongs to the other
+/// machine. The result is plain data; install it with
 /// [`Completion::install`] after checking it is still wanted.
 pub async fn scan(source: Source) -> Scanned {
     match source {
+        Source::Files { base } => scan_files(&base).await,
+        Source::Remote { host, base } => scan_remote(&host, &base).await,
         Source::Dirs { base } => scan_dir(&base, false).await,
         Source::Repos { base } => scan_dir(&base, true).await,
         Source::Dests { base, repo } => {
@@ -743,7 +898,7 @@ pub async fn scan(source: Source) -> Scanned {
                 },
             }
         }
-        Source::Words { title, words } => {
+        Source::Words { title, words } | Source::Choice { title, words } => {
             let rows = words
                 .into_iter()
                 .map(|(value, meta)| {

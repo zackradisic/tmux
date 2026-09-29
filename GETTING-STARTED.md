@@ -49,6 +49,10 @@ Everything here is quick and dirty on purpose. The real references are
   scrollback** and restores them; also saves-and-restarts the server in place.
 - **session_creator** (`prefix + S` / `prefix + W`) — a form for making a new
   session from a folder or a git worktree. *Still WIP.*
+- **scp** (`prefix + T`) — copy files between this machine and any linked
+  host: pick a side (`local` or a host, Tab lists them), a path that
+  completes here or over ssh, and Enter runs scp in a popup with its
+  progress. `C-t` swaps the direction.
 - **mailbox** — messages between agents, on this machine or a linked one.
   Stored as data, never typed into a pane, so it can't corrupt a half-written
   prompt.
@@ -143,6 +147,13 @@ path = "~/.local/share/tmux2/plugins/session_creator.wasm"
 scope = "server"
 caps = ["mode", "run-process", "run-command", "fs-list", "fs-read-any"]
 
+# Copy files to and from linked hosts with scp.
+[plugins.scp]
+path = "~/.local/share/tmux2/plugins/scp.wasm"
+scope = "server"
+role = "view"
+caps = ["mode", "run-process", "run-command", "fs-list", "fs-read-any"]
+
 # Save/restore sessions with scrollback.
 [plugins.resurrect]
 path = "~/.local/share/tmux2/plugins/resurrect.wasm"
@@ -183,6 +194,7 @@ bind A   plugin-command agents pick          # agent roster
 bind C-r plugin-command resurrect pick       # save/restore picker
 bind S   plugin-command session_creator new  # new session (folder)
 bind W   plugin-command session_creator worktree
+bind T   plugin-command scp copy             # copy files to/from a host
 bind N   plugin-command notify_toast chooser # notification tree
 
 # S / W also from inside the prefix+w tree

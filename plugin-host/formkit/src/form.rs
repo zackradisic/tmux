@@ -277,12 +277,21 @@ impl<M: Model> Form<M> {
     }
 
     /// The fragment the list filters on: the last path component for a
-    /// path source, the whole value otherwise.
+    /// path source, the whole value otherwise. A dropdown holding one of
+    /// its own words filters on nothing, so the whole set shows.
     pub fn fragment(&self, i: usize) -> String {
         let v = &self.fields[i].value;
         match self.model.source(&self.fields, i) {
             Some(Source::Branches { .. }) | Some(Source::Words { .. }) | None => {
                 v.trim().to_string()
+            }
+            Some(Source::Choice { words, .. }) => {
+                let t = v.trim();
+                if words.iter().any(|(w, _)| w == t) {
+                    String::new()
+                } else {
+                    t.to_string()
+                }
             }
             _ => match v.rfind('/') {
                 Some(p) => v[p + 1..].to_string(),
@@ -422,13 +431,21 @@ impl<M: Model> Form<M> {
                 // A highlighted suggestion is taken, and the list closes:
                 // Enter means "this one" while you are choosing. With no
                 // row highlighted the list is only showing what matches
-                // what you typed, and Enter means the form.
+                // what you typed, and Enter means the form. A directory
+                // taken from a file list is a place to go on from, so
+                // its own listing opens in place of the closed one.
                 if self.in_list() {
+                    let step_in = self.list.as_ref().is_some_and(|p| {
+                        p.plain_dirs && p.selected().is_some_and(|r| r.kind == RowKind::Dir)
+                    });
                     if let Some(p) = self.list.as_mut() {
                         p.sel = None;
                         p.hidden = true;
                     }
                     self.error = None;
+                    if step_in {
+                        return Action::Rescan { reveal: true };
+                    }
                     render(self);
                     Action::None
                 } else {
@@ -672,6 +689,8 @@ fn expand_source(source: Source, home: Option<&str>) -> Source {
             repo: expand_home(&repo, home),
         },
         Source::Branches { repo } => Source::Branches { repo: expand_home(&repo, home) },
+        Source::Files { base } => Source::Files { base: expand_home(&base, home) },
+        // A remote base is expanded by the remote shell, never here.
         other => other,
     }
 }
