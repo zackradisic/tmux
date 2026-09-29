@@ -1010,6 +1010,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "scp"
+version = "0.1.0"
+dependencies = [
+ "formkit",
+ "serde",
+ "serde_json",
+ "tmux-plugin-sdk",
+]
+
+[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -12,6 +12,7 @@ members = [
     "examples/notify-toast",
     "examples/resurrect",
     "examples/session_creator",
+    "examples/scp",
     "examples/cron",
     "examples/agents",
     "examples/mailbox",

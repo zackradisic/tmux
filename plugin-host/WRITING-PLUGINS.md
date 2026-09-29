@@ -869,9 +869,12 @@ can take separately:
 
 - `formkit::complete`: a completion list for one field. Sources are the
   directories under a base, only the repos among them, a repo's
-  worktrees, its branches, or a fixed word list. One `fs_list` plus one
-  shell job per scan; the expensive git questions run afterwards, for the
-  rows on screen only.
+  worktrees, its branches, the files and directories under a base (here,
+  or on a host over ssh), a fixed word list, or a dropdown (a word list
+  whose value is one of the words, so Tab cycles the whole set). One
+  `fs_list` plus one shell job per scan; the expensive git questions run
+  afterwards, for the rows on screen only. In a file list a directory
+  row ends in `/`; Enter on it opens its listing.
 - `formkit::form`: labelled fields, focus, the list keys (`C-j` steps in,
   `Tab` completes, `Esc` hides then closes), the touched/mirror rule, the
   render and the `mode_resize` handshake. What the fields mean comes from
@@ -884,8 +887,11 @@ It is compile-time only: your plugin runs the scans, so it needs the
 capabilities in `formkit::complete::CAPS` (`run-process`, `fs-list`,
 `fs-read-any`) granted to its own binary. A denied one is rendered as a
 hint in the list rule, never as a silent empty list. `session_creator`
-is the reference consumer; `regress/plugin-session-creator.sh` is what
-a change to the crate must keep green.
+is the reference consumer and `scp` (a copy form whose host fields are
+dropdowns and whose paths complete over ssh) the second;
+`regress/plugin-session-creator.sh`, `regress/plugin-scp.sh` and
+`regress/plugin-agents-new.sh` are what a change to the crate must keep
+green.
 
 ## Debugging checklist
 

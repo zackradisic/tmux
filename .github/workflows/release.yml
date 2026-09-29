@@ -45,7 +45,7 @@ jobs:
         run: |
           cargo build --profile wasm-release --target wasm32-unknown-unknown \
             -p notify-toast -p resurrect -p session_creator \
-            -p git-status -p cron -p agents -p mailbox
+            -p git-status -p cron -p agents -p mailbox -p scp
           cargo build --release -p plugin-index
       - name: bundle
         env:

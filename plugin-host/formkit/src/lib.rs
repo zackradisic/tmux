@@ -5,7 +5,8 @@
 //! Three layers, each usable without the others:
 //!
 //! - [`complete`]: a completion list for a text field. Directories,
-//!   git repos, a repo's worktrees and branches, or a fixed word list;
+//!   git repos, a repo's worktrees and branches, files (here or on a
+//!   host over ssh), or a fixed word list;
 //!   ranked, filtered by the typed fragment, with a cheap first scan and
 //!   an expensive second probe that runs only for the rows on screen.
 //! - [`form`]: a float with labelled text fields, one focused, each
