@@ -9295,6 +9295,52 @@ specified by
 .Fl t
 or the current pane if omitted) after the command finishes.
 If the command fails, the exit status is also displayed.
+.It Xo Ic skill
+.Op Fl d Ar directory
+.Op Fl t Ar target\-pane
+.Ar list Ns | Ns Ar show Ns | Ns Ar install
+.Op Ar skill
+.Xc
+The guides an agent needs to use
+.Nm
+(the cross-agent mailbox, for one), compiled into the binary from
+.Pa skills/ Ns Ar name Ns Pa /SKILL.md
+so that every host running this build has the text that matches it and
+nothing is copied between machines by hand.
+.Ar list
+prints each skill's name and description.
+.Ar show
+prints one.
+The part of the text between the lines
+.Ql <!-- live -->
+and
+.Ql <!-- /live -->
+is expanded as a format against
+.Ar target\-pane ,
+so an agent that passes its own pane sees its agent id (the
+.Ql @agent_id
+pane option the agents plugin sets), this server's name on the plugin
+bridge
+.Pq Ql peer_name ,
+its grant table
+.Pq Ql peer_grants
+and the linked servers; the rest is printed as it is.
+.Ar install
+writes one short stub
+.Pa SKILL.md
+per skill (or for
+.Ar skill
+alone) under
+.Ar directory ,
+by default
+.Pa ~/.claude/skills ,
+in the directory that agent harnesses load skills from.
+The stub carries the skill's name and description and tells the agent to
+run
+.Ic skill show ;
+it is static, written only when it differs, and never needs updating when
+.Nm
+does.
 .Tg wait
 .It Xo Ic wait\-for
 .Op Fl ELSUlv

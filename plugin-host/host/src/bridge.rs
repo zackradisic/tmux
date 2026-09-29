@@ -766,6 +766,13 @@ pub fn send_event(
     )
 }
 
+/// The name this server advertises to peers, and so the `@server` a
+/// remote agent addresses it by. For `pgh_peer_name` (the `skill` command
+/// prints it in a guide's live block).
+pub fn own_name() -> String {
+    local_hostname()
+}
+
 fn local_hostname() -> String {
     let mut buf = [0u8; 256];
     let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };

@@ -72,6 +72,11 @@ wait_for 20 "$TMUX plugin-command agents 'message $AID hello push' 2>/dev/null; 
 grep -q '"type":"user"' "$LOG" || fail "not a user turn: $(cat "$LOG")"
 grep -q '"role":"user"' "$LOG" || fail "no role: $(cat "$LOG")"
 grep -q 'via the tmux2 mailbox' "$LOG" || fail "no sender line: $(cat "$LOG")"
+# The prefix carries the reply command with the sender as its address, and
+# the guide, so a reader that never heard of the mailbox can answer.
+grep -q 'reply: tmux2 plugin-command -t \\"$TMUX_PANE\\" agents \\"message ' "$LOG" ||
+    fail "no reply command in the prefix: $(cat "$LOG")"
+grep -q 'guide: tmux2 skill -t' "$LOG" || fail "no guide in the prefix: $(cat "$LOG")"
 wait_for 5 "$TMUX plugin-command mailbox list; sleep 0.4; $TMUX show-messages | grep -q 'mailbox: no unread'" ||
     fail "pushed message not marked read: $($TMUX show-messages | grep mailbox: | tail -2)"
 

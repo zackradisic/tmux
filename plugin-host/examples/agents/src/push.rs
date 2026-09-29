@@ -60,7 +60,16 @@ pub async fn deliver(d: Delivered) {
         .ok()
         .and_then(|v| v.get("messagingSocketPath")?.as_str().map(str::to_string));
     let Some(sock) = sock else { return };
-    let text = format!("Message from {} via the tmux2 mailbox:\n{}", d.sender, d.body);
+    // The prefix carries the exact reply command (the sender string is
+    // already the full address, server suffix included when it crossed a
+    // link) and the guide, so a reader that never heard of the mailbox
+    // can still answer.
+    let text = format!(
+        "Message from {s} via the tmux2 mailbox (reply: tmux2 plugin-command -t \"$TMUX_PANE\" \
+         agents \"message {s} <text>\"; guide: tmux2 skill -t \"$TMUX_PANE\" show mailbox):\n{}",
+        d.body,
+        s = d.sender
+    );
     match claude_notify(&sock, &text) {
         Ok(()) => {
             let _ = service::call_json::<_, serde_json::Value>(

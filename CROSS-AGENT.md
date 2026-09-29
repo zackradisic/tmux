@@ -154,6 +154,19 @@ no roster yet (a message right after linking) the view fetches the rosters
 once, then routes. Each server's mailbox is asked for its unread counts,
 and a row with unread shows an envelope badge with the number.
 
+## The guide an agent reads
+
+`tmux2 skill -t "$TMUX_PANE" show mailbox` prints the how-to for all of
+this, from the binary: `skills/mailbox/SKILL.md` is compiled in at build
+time, so every host with tmux2 has the text that matches its commands and
+nothing is synced by hand. The live block at the top is a format expanded
+against the pane, giving the agent its own id (the `@agent_id` pane option
+the agents plugin sets), this server's peer name, its reply address, and
+the linked servers. The push prefix names the reply command and the guide,
+so a reader that never heard of the mailbox can answer. `tmux2 skill
+install` plants a static stub in the harness skills directory so the
+harness offers it; see the `skill` entry in `tmux.1`.
+
 ## Status
 
 Built and tested. `regress/plugin-mailbox.sh` runs the mailbox alone

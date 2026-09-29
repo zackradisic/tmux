@@ -11,12 +11,37 @@ agent by id. A message is never typed into the other agent's pane. It is
 stored, then pushed into that Claude session as one queued user turn, so it
 cannot corrupt a half-typed prompt or submit on Enter.
 
+This text lives inside the tmux2 binary. Print it with the live block below
+filled in for your pane, and reread it rather than trusting memory, because it
+tracks the installed tmux2:
+
+```bash
+tmux2 skill -t "$TMUX_PANE" show mailbox
+```
+
 The receiving agent sees:
 
 ```
-Message from claude:<uuid>[@<server>] via the tmux2 mailbox:
+Message from claude:<uuid>[@<server>] via the tmux2 mailbox (reply: ...; guide: ...):
 <your text>
 ```
+
+The prefix carries the exact reply command and the guide command, so a
+receiver that has never heard of the mailbox can still answer.
+
+<!-- live -->
+## You, right now
+
+Filled in by tmux2 when this text is printed with `-t "$TMUX_PANE"`. Empty
+or wrong values mean the pane given was not yours, or the agents plugin has
+not identified you yet; the sections below say how to find each by hand.
+
+- Your agent id: #{?@agent_id,`#{@agent_id}`,unknown (see Find agents)}
+- This server's peer name: #{?peer_name,`#{peer_name}`,unknown (built without plugins)}
+- Your reply address for agents on other servers: #{?@agent_id,`#{@agent_id}@#{peer_name}`,`<your id>@#{peer_name}`}
+- Linked servers: #{?#{S:#{?session_remote_host,x,}},#{S:#{?session_remote_host,#{session_remote_host} (#{remote_state}); ,}},none}
+- Peers allowed to call in: #{?peer_grants,#{peer_grants},no peer grants}
+<!-- /live -->
 
 ## Send a message
 

@@ -456,6 +456,7 @@ async fn apply(a: &mut Agent, mut r: Resolved) {
     if let Some(real) = r.real_id.as_deref().filter(|id| *id != a.id) {
         migrate_id(a, real).await;
     }
+    publish_id(a);
     let now = now_ms() as i64;
     // One decision, taken before either write: a status the row keeps must
     // not be persisted away behind the render's back.
@@ -504,6 +505,41 @@ async fn apply(a: &mut Agent, mut r: Resolved) {
             let _ = store::set_cwd(&a.id, &cwd).await;
             a.cwd = Some(cwd);
         }
+    }
+}
+
+thread_local! {
+    /// Per pane, the id last written to its `@agent_id` option, so a
+    /// render that changes nothing costs no host call.
+    static PUBLISHED_ID: std::cell::RefCell<HashMap<u32, String>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Put the durable id on the pane as `@agent_id`, so a format can name
+/// the agent in a pane: `skill -t <pane> show mailbox` prints it in the
+/// guide's live block. A provisional id is not published; nothing can
+/// address it. Needs `write-options`; without it this is a no-op.
+fn publish_id(a: &Agent) {
+    let Some(pane) = a.pane else { return };
+    let pane = pane as u32;
+    if a.id.starts_with("prov-") {
+        return;
+    }
+    let same = PUBLISHED_ID.with(|m| m.borrow().get(&pane) == Some(&a.id));
+    if same {
+        return;
+    }
+    if set_option_in(OptionTarget::Pane(PaneId(pane)), "@agent_id", &a.id).is_ok() {
+        PUBLISHED_ID.with(|m| m.borrow_mut().insert(pane, a.id.clone()));
+    }
+}
+
+/// The agent left the pane: clear `@agent_id` so a shell that follows it
+/// there is not mistaken for the agent.
+fn unpublish_id(pane: u32) {
+    let had = PUBLISHED_ID.with(|m| m.borrow_mut().remove(&pane).is_some());
+    if had {
+        let _ = set_option_in(OptionTarget::Pane(PaneId(pane)), "@agent_id", "");
     }
 }
 
@@ -661,6 +697,7 @@ pub async fn report(pane: u32, status: String, task: Option<String>, cfg: Rc<Con
 /// the file outlives the pane, and this is what makes a killed agent
 /// searchable. The read runs off the caller's path.
 async fn end_pane(pane: u32, now: i64, reason: &str) {
+    unpublish_id(pane);
     let live = store::live_by_pane(pane as i64).await.ok().flatten();
     // A row that never got its durable id - the picker never rendered
     // while it lived, and rendering is what resolves - gets one last

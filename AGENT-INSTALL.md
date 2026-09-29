@@ -115,7 +115,7 @@ path = "~/.local/share/tmux2/plugins/agents.wasm"
 scope = "server"
 caps = ["capture-pane", "run-command", "mode", "db", "env-read", "pane-fds",
         "fs-read", "fs-list", "service-serve", "service-call", "claude-notify",
-        "send-keys", "run-process", "fs-read-any"]
+        "send-keys", "run-process", "fs-read-any", "write-options"]
 
 [plugins.agents.config]
 keep_days = "14"        # finished agents stay in the default list this long
@@ -229,6 +229,20 @@ If a plugin is missing from `show-plugins`, run
 `tmux2 sync-plugins ~/.tmux/plugins.toml` and read what it prints. A
 plugin that loads but does nothing usually lacks a capability: compare
 its `caps` with step 3.
+
+Then, once:
+
+```sh
+tmux2 skill install
+```
+
+It writes a stub skill per guide into `~/.claude/skills/` (`-d dir` for
+another harness). The guides themselves live inside the tmux2 binary and
+follow every update; the stub only tells an agent to run
+`tmux2 skill -t "$TMUX_PANE" show mailbox`, so it is never touched again.
+An agent can also read a guide straight away with that command, and a
+mailbox message names it in its prefix, so nothing here is required for
+messages to be answered.
 
 ## 7. Remote links (optional)
 

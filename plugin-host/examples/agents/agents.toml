@@ -40,6 +40,9 @@ requests = [
   # screen, mkdir and git worktree add on Enter. fs-list is above.
   "run-process",
   "fs-read-any",
+  # Publishes the durable id on the agent's pane as the @agent_id option,
+  # so `skill show -t <pane> mailbox` (and any format) can name it.
+  "write-options",
 ]
 
 # The services this plugin calls: its own provider on any server, and the

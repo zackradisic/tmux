@@ -667,6 +667,18 @@ pub unsafe extern "C" fn pgh_peers_set_client(peer: u32, client: *const c_char) 
     })
 }
 
+/// The name this server advertises to linked peers: what a remote agent
+/// writes after `@` to address a box here.
+///
+/// # Safety
+/// `sink` valid; `ctx` its context.
+#[no_mangle]
+pub unsafe extern "C" fn pgh_peer_name(sink: pgh_sink, ctx: *mut c_void) {
+    ffi_guard!((), {
+        sink_str(sink, ctx, &bridge::own_name());
+    })
+}
+
 /// `plugin-peers list`: emit the grant rows through the sink.
 ///
 /// # Safety

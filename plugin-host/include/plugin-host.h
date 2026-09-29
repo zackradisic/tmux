@@ -740,6 +740,15 @@ void pgh_query_plugins(int verbose, pgh_sink sink, void *ctx);
 void pgh_peers_set_client(uint32_t peer, const char *client);
 
 /**
+ * The name this server advertises to linked peers: what a remote agent
+ * writes after `@` to address a box here.
+ *
+ * # Safety
+ * `sink` valid; `ctx` its context.
+ */
+void pgh_peer_name(pgh_sink sink, void *ctx);
+
+/**
  * `plugin-peers list`: emit the grant rows through the sink.
  *
  * # Safety

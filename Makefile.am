@@ -1,10 +1,17 @@
 # Obvious program stuff.
 bin_PROGRAMS = tmux
-CLEANFILES = tmux.1.mdoc tmux.1.man cmd-parse.c
+CLEANFILES = tmux.1.mdoc tmux.1.man cmd-parse.c skills-data.c
+
+# The agent guides compiled into the binary (skill list|show|install).
+SKILL_FILES = $(srcdir)/skills/mailbox/SKILL.md
+BUILT_SOURCES = skills-data.c
+skills-data.c: $(srcdir)/skills/mkskills.sh $(SKILL_FILES)
+	$(SHELL) $(srcdir)/skills/mkskills.sh $(SKILL_FILES) > $@.tmp && mv $@.tmp $@
 
 # Distribution tarball options.
 EXTRA_DIST = \
 	CHANGES README COPYING example_tmux.conf \
+	skills/mkskills.sh $(SKILL_FILES) \
 	osdep-*.c mdoc2man.awk tmux.1
 dist_EXTRA_tmux_SOURCES = compat/*.[ch]
 
@@ -127,6 +134,7 @@ dist_tmux_SOURCES = \
 	cmd-queue.c \
 	cmd-refresh-client.c \
 	cmd-remote-attach.c \
+	cmd-skill.c \
 	cmd-rename-session.c \
 	cmd-rename-window.c \
 	cmd-resize-pane.c \
@@ -235,7 +243,7 @@ dist_tmux_SOURCES = \
 	window.c \
 	xmalloc.c \
 	xmalloc.h
-nodist_tmux_SOURCES = osdep-@PLATFORM@.c
+nodist_tmux_SOURCES = osdep-@PLATFORM@.c skills-data.c
 
 # Add compat file for forkpty.
 if NEED_FORKPTY

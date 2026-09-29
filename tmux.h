@@ -4363,6 +4363,15 @@ struct hyperlinks	*hyperlinks_copy(struct hyperlinks *);
 void			 hyperlinks_reset(struct hyperlinks *);
 void			 hyperlinks_free(struct hyperlinks *);
 
+/* skills-data.c (generated from skills/<name>/SKILL.md, see cmd-skill.c) */
+struct skill {
+	const char	*name;		/* CLI name: the directory */
+	const char	*stub;		/* harness skill name (frontmatter) */
+	const char	*description;	/* frontmatter description */
+	const char	*text;		/* body after the frontmatter */
+};
+extern const struct skill skills[];
+
 #ifdef ENABLE_PLUGINS
 /* plugin.c */
 void	 plugin_init(void);
