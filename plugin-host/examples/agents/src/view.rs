@@ -819,23 +819,7 @@ impl Picker {
 
     /// Keep the selected row's display line inside the scroll window.
     fn scroll_to_selection(&mut self) {
-        let h = self.list_h();
-        let sel_line = self.sel_line();
-        if sel_line < self.top {
-            self.top = sel_line;
-        } else if sel_line >= self.top + h {
-            self.top = sel_line + 1 - h;
-        }
-        // Headers directly above the window waste lines; pull them in.
-        while self.top > 0
-            && matches!(self.lines.get(self.top), Some(Line::Item(_)) | Some(Line::Header(_)))
-            && matches!(
-                self.lines.get(self.top - 1),
-                Some(Line::Header(_)) | Some(Line::Server(_))
-            )
-        {
-            self.top -= 1;
-        }
+        self.top = scroll_window(self.top, self.sel_line(), self.list_h(), &self.lines);
     }
 
     /// Put the cursor on the row for the pane the picker was opened from,
@@ -897,6 +881,31 @@ impl Picker {
 /// at or above `min`.
 fn clamp_dim(v: u32, min: u32, avail: u32) -> u32 {
     v.min(avail.saturating_sub(2).max(min)).max(min)
+}
+
+/// The first display line of a list window `h` lines tall that shows
+/// `sel_line`, starting from `top`: scroll only as far as it takes to bring
+/// the selection in. A header (or server line) directly above the window
+/// wastes a line, so it is pulled in too, but never so far that the
+/// selection drops out the bottom again: with the cursor on the last row
+/// of a window whose top lands right under a band header, pulling the
+/// header in used to push the cursor one line below the screen, and the
+/// next `j` looked like it did nothing.
+fn scroll_window(mut top: usize, sel_line: usize, h: usize, lines: &[Line]) -> usize {
+    let h = h.max(1);
+    if sel_line < top {
+        top = sel_line;
+    } else if sel_line >= top + h {
+        top = sel_line + 1 - h;
+    }
+    while top > 0
+        && sel_line < top - 1 + h
+        && matches!(lines.get(top), Some(Line::Item(_)) | Some(Line::Header(_)))
+        && matches!(lines.get(top - 1), Some(Line::Header(_)) | Some(Line::Server(_)))
+    {
+        top -= 1;
+    }
+    top
 }
 
 /// The default picker size for a window: a fraction of it, clamped to the
@@ -5289,6 +5298,66 @@ fn strip_sgr(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::*;
+
+    /// Two servers, two bands each, five rows a band.
+    fn lines() -> Vec<Line> {
+        let mut v = Vec::new();
+        let mut item = 0;
+        for s in ["alpha", "beta"] {
+            v.push(Line::Server(s.into()));
+            for band in 0..2u8 {
+                v.push(Line::Header(band));
+                for _ in 0..5 {
+                    v.push(Line::Item(item));
+                    item += 1;
+                }
+            }
+        }
+        v
+    }
+
+    fn sel_line(lines: &[Line], sel: usize) -> usize {
+        lines.iter().position(|l| matches!(l, Line::Item(v) if *v == sel)).unwrap()
+    }
+
+    #[test]
+    fn selection_never_leaves_the_window() {
+        let lines = lines();
+        for h in 1..=lines.len() + 2 {
+            let mut top = 0;
+            let mut order: Vec<usize> = (0..20).collect();
+            order.extend((0..20).rev());
+            for sel in order {
+                let sl = sel_line(&lines, sel);
+                top = scroll_window(top, sl, h, &lines);
+                assert!(sl >= top && sl < top + h, "h={h} sel={sel} line={sl} top={top}");
+            }
+        }
+    }
+
+    #[test]
+    fn headers_pulled_in_only_when_there_is_room() {
+        let lines = lines();
+        // Line 0 is alpha's server line, 1 its first header, 2..6 items
+        // 0-4, 7 the second header, 8..12 items 5-9, 13 beta's server line.
+        // A header (and the server line above it) right above the window
+        // comes in when the cursor has room to spare.
+        assert_eq!(scroll_window(8, sel_line(&lines, 6), 10, &lines), 7);
+        assert_eq!(scroll_window(2, sel_line(&lines, 0), 10, &lines), 0);
+        // The case that used to lose the cursor: stepping down with the
+        // cursor on the window's last line, the top lands on the first item
+        // of a band (line 8, under the header at 7). The old code pulled
+        // the header in and left the cursor one line below the screen.
+        let sl = sel_line(&lines, 9);
+        let top = scroll_window(3, sl, 5, &lines);
+        assert_eq!(top, 8);
+        assert!(sl < top + 5);
+    }
 }
 
 #[cfg(test)]
