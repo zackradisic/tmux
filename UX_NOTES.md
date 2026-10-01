@@ -785,3 +785,42 @@ picker's state (bands, unread, archive, marks) is agent-specific and does
 not generalise to arbitrary panes, so "one view" probably means one
 rendering engine with two configurations, not literally one picker. Worth
 sketching where the seam goes before building either.
+
+## Copy mode
+
+### C1. Live copy mode: what it does not do yet
+
+Copy mode on a pane whose program owns the screen (alternate screen with mouse
+reporting on, which is Claude Code's full-screen renderer) is live: the copy
+refreshes as the program draws, and a motion off the top or bottom sends the
+program wheel events instead of stopping. `copy-mode-live` turns it off. The
+seams, in the order they are likely to bite:
+
+- **One wheel event is whatever the program says it is.** Claude Code scrolls
+  one line per event, which is why `k` at the top feels like a line. An app
+  that scrolls three per event will overshoot `C-u` by 3x. There is no option
+  for lines-per-event yet; add one if a second app matters.
+- **The program may not scroll at all** (already at the top, or a modal is
+  open). Nothing tells copy mode. The cursor stays where it is, which is the
+  right result; the only cost is that the wheel events sent are remembered for
+  one second as a possible selection shift, so a selection anchored just
+  before an ignored scroll can move by that much if the screen changes for
+  another reason within the second.
+- **A selection follows the content by guesswork.** The refresh matches row
+  hashes between the old copy and the live screen and takes the shift most
+  rows agree on. Claude Code's collapsed sidebar is a fixed right column, so
+  no row matches after a scroll; that case falls back to the count of wheel
+  events sent. Both are heuristics. A selection that spans a scroll is right
+  in every case tried, and wrong if the program re-wraps or re-renders the
+  rows under the anchor differently at the new position.
+- **Search, `{`, `}`, `g` and `G` stay on the screen.** They do not ask the
+  program to scroll. `g` and `G` move into whatever history the pane had
+  before the program started, which is rarely what was wanted; `G` gets back.
+- **`copy-mode -e` (exit when scrolled to the bottom) is ignored** on a live
+  pane: copy mode cannot tell where the program's bottom is.
+- **Alternate-screen programs without mouse reporting** (vim, less by
+  default) are not live. Copy mode on them is the same static screen as
+  before.
+- **Over a link** the wheel events ride `send-keys` like any key, so the
+  feature works on a remote pane. The refresh waits on the round trip, so a
+  burst of `C-u` lands as one jump rather than a scroll.

@@ -53,6 +53,9 @@ static void	window_copy_redraw_lines(struct window_mode_entry *, u_int,
 static void	window_copy_redraw_screen(struct window_mode_entry *);
 static void	window_copy_do_refresh(struct window_mode_entry *, int);
 static void	window_copy_refresh_timer(int, short, void *);
+static void	window_copy_refresh_start(struct window_mode_entry *);
+static int	window_copy_is_live(struct window_mode_entry *);
+static void	window_copy_live_tick(struct window_mode_entry *, int, u_int);
 static void	window_copy_refresh_arm(struct window_mode_entry *);
 static void	window_copy_refresh_start(struct window_mode_entry *);
 static void	window_copy_refresh_stop(struct window_mode_entry *);
@@ -360,6 +363,9 @@ struct window_copy_mode_data {
 	struct event	 refresh_timer;
 #define WINDOW_COPY_REFRESH_INTERVAL 50000
 	int		 refresh_active;
+
+	int		 live_pending;	/* wheel lines sent, not yet seen */
+	struct timeval	 live_time;	/* when the last wheel event went */
 };
 
 static void
@@ -634,6 +640,10 @@ window_copy_init(struct window_mode_entry *wme,
 
 	data->scroll_exit = args_has(args, 'e');
 	data->hide_position = args_has(args, 'H');
+
+	/* A live pane is only useful if the copy keeps up with it. */
+	if (window_copy_is_live(wme))
+		window_copy_refresh_start(wme);
 
 	if (base->hyperlinks != NULL) {
 		hyperlinks_free(data->screen.hyperlinks);
@@ -917,7 +927,14 @@ window_copy_pageup1(struct window_mode_entry *wme, int half_page)
 			n = screen_size_y(s) - 2;
 	}
 
-	if (data->oy + n > screen_hsize(data->backing)) {
+	if (window_copy_is_live(wme)) {
+		/* Whatever runs off the top becomes scrolling in the program. */
+		if (data->cy < n) {
+			window_copy_live_tick(wme, 1, n - data->cy);
+			data->cy = 0;
+		} else
+			data->cy -= n;
+	} else if (data->oy + n > screen_hsize(data->backing)) {
 		data->oy = screen_hsize(data->backing);
 		if (data->cy < n)
 			data->cy = 0;
@@ -976,7 +993,15 @@ window_copy_pagedown1(struct window_mode_entry *wme, int half_page,
 			n = screen_size_y(s) - 2;
 	}
 
-	if (data->oy < n) {
+	if (window_copy_is_live(wme)) {
+		/* Whatever runs off the bottom becomes scrolling in the program. */
+		if (data->cy + n >= screen_size_y(data->backing)) {
+			window_copy_live_tick(wme, 0,
+			    data->cy + n - (screen_size_y(data->backing) - 1));
+			data->cy = screen_size_y(data->backing) - 1;
+		} else
+			data->cy += n;
+	} else if (data->oy < n) {
 		data->oy = 0;
 		if (data->cy + (n - data->oy) >= screen_size_y(data->backing))
 			data->cy = screen_size_y(data->backing) - 1;
@@ -993,7 +1018,8 @@ window_copy_pagedown1(struct window_mode_entry *wme, int half_page,
 			window_copy_cursor_end_of_line(wme);
 	}
 
-	if (scroll_exit && data->oy == 0 && data->screen.sel == NULL)
+	if (scroll_exit && data->oy == 0 && data->screen.sel == NULL &&
+	    !window_copy_is_live(wme))
 		return (1);
 	if (data->searchmark != NULL && !data->timeout)
 		window_copy_search_marks(wme, NULL, data->searchregex, 1);
@@ -1136,6 +1162,7 @@ window_copy_formats(struct window_mode_entry *wme, struct format_tree *ft)
 	format_add(ft, "copy_line_numbers", "%d",
 	    window_copy_line_numbers_active(wme));
 	format_add(ft, "refresh_active", "%d", data->refresh_active);
+	format_add(ft, "live_active", "%d", window_copy_is_live(wme));
 	format_add(ft, "rectangle_toggle", "%d", data->rectflag);
 
 	format_add(ft, "copy_cursor_x", "%d", data->cx);
@@ -2380,7 +2407,7 @@ window_copy_cmd_scroll_down(struct window_copy_cmd_state *cs)
 	 * cancel/exit copy-mode. Otherwise nothing can change, so return
 	 * WINDOW_COPY_CMD_NOTHING.
 	 */
-	if (data->oy == 0) {
+	if (data->oy == 0 && !window_copy_is_live(wme)) {
 		if (data->scroll_exit && data->screen.sel == NULL)
 			return (WINDOW_COPY_CMD_CANCEL);
 		return (WINDOW_COPY_CMD_NOTHING);
@@ -2392,13 +2419,17 @@ window_copy_cmd_scroll_down(struct window_copy_cmd_state *cs)
 		data->cursordrag = CURSORDRAG_NONE;
 		data->lineflag = LINE_SEL_NONE;
 		/* Move down in the history. */
-		window_copy_scroll_up(wme, np);
+		if (window_copy_is_live(wme))
+			window_copy_live_tick(wme, 0, np);
+		else
+			window_copy_scroll_up(wme, np);
 		return (WINDOW_COPY_CMD_NOTHING);
 	}
 
 	for (; np != 0; np--)
 		window_copy_cursor_down(wme, 1);
-	if (data->scroll_exit && data->oy == 0 && data->screen.sel == NULL)
+	if (data->scroll_exit && data->oy == 0 && data->screen.sel == NULL &&
+	    !window_copy_is_live(wme))
 		return (WINDOW_COPY_CMD_CANCEL);
 	return (WINDOW_COPY_CMD_MOVE);
 }
@@ -2440,7 +2471,8 @@ window_copy_cmd_scroll_up(struct window_copy_cmd_state *cs)
 	 * If at the top, nothing can change, so return WINDOW_COPY_CMD_NOTHING
 	 * and do not repaint anything.
 	 */
-	if (data->oy == screen_hsize(data->backing))
+	if (data->oy == screen_hsize(data->backing) &&
+	    !window_copy_is_live(wme))
 		return (WINDOW_COPY_CMD_NOTHING);
 
 	/* With a selection but no active drag, only scroll the view. */
@@ -2449,7 +2481,10 @@ window_copy_cmd_scroll_up(struct window_copy_cmd_state *cs)
 		data->cursordrag = CURSORDRAG_NONE;
 		data->lineflag = LINE_SEL_NONE;
 		/* Move up in the history. */
-		window_copy_scroll_down(wme, np);
+		if (window_copy_is_live(wme))
+			window_copy_live_tick(wme, 1, np);
+		else
+			window_copy_scroll_down(wme, np);
 		return (WINDOW_COPY_CMD_NOTHING);
 	}
 
@@ -2993,6 +3028,259 @@ window_copy_cmd_search_forward_incremental(struct window_copy_cmd_state *cs)
 }
 
 /*
+ * A live pane is one whose program has taken over the screen and scrolls it
+ * itself: the alternate screen with mouse reporting on, such as a full-screen
+ * terminal UI. There is no history for copy mode to scroll into, so motions
+ * that would leave the screen ask the program to scroll instead. Only applies
+ * while the view is at the live screen, not scrolled back into history from
+ * before the program started.
+ */
+static int
+window_copy_is_live(struct window_mode_entry *wme)
+{
+	struct window_copy_mode_data	*data = wme->data;
+	struct window_pane		*wp = wme->wp;
+	struct screen			*base = &wp->base;
+
+	if (data->viewmode || wme->swp != wme->wp || data->oy != 0)
+		return (0);
+	if (!options_get_number(wp->options, "copy-mode-live"))
+		return (0);
+	if (base->saved_grid == NULL || (base->mode & ALL_MOUSE_MODES) == 0)
+		return (0);
+	return (1);
+}
+
+/*
+ * Ask the program in a live pane to scroll by n lines, by writing it the wheel
+ * events it asked for. The event is placed on the cursor column halfway down
+ * the pane, which keeps it over the program's main area rather than any fixed
+ * rows at the edges. What one event scrolls is up to the program.
+ */
+static void
+window_copy_live_tick(struct window_mode_entry *wme, int up, u_int n)
+{
+	struct window_copy_mode_data	*data = wme->data;
+	struct window_pane		*wp = wme->wp;
+	struct screen			*base = &wp->base;
+	struct mouse_event		 m;
+	const char			*buf;
+	size_t				 len;
+	u_int				 x, y, i;
+
+	memset(&m, 0, sizeof m);
+	m.b = m.sgr_b = up ? MOUSE_WHEEL_UP : MOUSE_WHEEL_DOWN;
+	m.sgr_type = 'M';
+
+	x = data->cx;
+	if (x >= screen_size_x(base))
+		x = screen_size_x(base) - 1;
+	y = screen_size_y(base) / 2;
+
+	if (!input_key_get_mouse(base, &m, x, y, &buf, &len))
+		return;
+	log_debug("%s: %u wheel %s to %%%u", __func__, n, up ? "up" : "down",
+	    wp->id);
+	for (i = 0; i < n; i++)
+		bufferevent_write(wp->event, buf, len);
+	data->live_pending += up ? (int)n : -(int)n;
+	gettimeofday(&data->live_time, NULL);
+}
+
+/* Hash one row of a grid, or 0 for a blank row so blanks never match. */
+static u_int
+window_copy_live_row_hash(struct grid *gd, u_int py)
+{
+	struct grid_cell	gc;
+	u_int			px, i, used, h = 5381;
+	int			blank = 1;
+
+	used = grid_get_line(gd, py)->cellused;
+	for (px = 0; px < used; px++) {
+		grid_get_cell(gd, px, py, &gc);
+		if (gc.flags & GRID_FLAG_PADDING)
+			continue;
+		if (gc.data.size != 1 || gc.data.data[0] != ' ')
+			blank = 0;
+		for (i = 0; i < gc.data.size; i++)
+			h = h * 33 + gc.data.data[i];
+	}
+	if (blank)
+		return (0);
+	return (h | 1);
+}
+
+/*
+ * Work out how many rows the program moved its content since the last copy of
+ * the screen, by matching row hashes of the old copy against the live screen.
+ * Positive means the content moved down (the program scrolled up). Blank rows
+ * are ignored and fixed rows such as a status bar vote for zero, so the result
+ * is the shift most of the screen agrees on. Returns 0 when no shift beats
+ * staying put; *changed says whether the screen differs much at all, which
+ * tells a scroll the matching cannot see (a fixed column beside the content
+ * changes every row) from a program that did not scroll.
+ */
+static int
+window_copy_live_shift(struct window_mode_entry *wme, int *changed)
+{
+	struct window_copy_mode_data	*data = wme->data;
+	struct grid			*og = data->backing->grid;
+	struct grid			*ng = wme->wp->base.grid;
+	u_int				 sy = og->sy, i, n, *oh, *nh;
+	u_int				 total = 0, same = 0, best_n = 0;
+	int				 k, best = 0;
+
+	*changed = 0;
+	if (og->sy != ng->sy || og->sx != ng->sx || sy == 0)
+		return (0);
+
+	oh = xreallocarray(NULL, sy, sizeof *oh);
+	nh = xreallocarray(NULL, sy, sizeof *nh);
+	for (i = 0; i < sy; i++) {
+		oh[i] = window_copy_live_row_hash(og, og->hsize + i);
+		nh[i] = window_copy_live_row_hash(ng, ng->hsize + i);
+		if (nh[i] != 0) {
+			total++;
+			if (nh[i] == oh[i])
+				same++;
+		}
+	}
+
+	for (k = -(int)sy + 1; k < (int)sy; k++) {
+		if (k == 0)
+			continue;
+		n = 0;
+		for (i = 0; i < sy; i++) {
+			if ((int)i - k < 0 || (int)i - k >= (int)sy)
+				continue;
+			if (nh[i] != 0 && nh[i] == oh[i - k])
+				n++;
+		}
+		if (n > best_n || (n == best_n && abs(k) < abs(best))) {
+			best_n = n;
+			best = k;
+		}
+	}
+	free(oh);
+	free(nh);
+
+	/* Changed if more than a fifth of the rows are not where they were. */
+	*changed = (total == 0 || same < total - total / 5);
+	log_debug("%s: %u rows, %u same, best shift %d (%u rows)", __func__,
+	    total, same, best, best_n);
+
+	/*
+	 * Trust a shift only if a good part of the screen agrees with it and
+	 * more rows than stayed put: a few repeated rows (separators, say) can
+	 * line up at any offset.
+	 */
+	if (best_n < 3 || best_n <= same || best_n * 4 < total)
+		return (0);
+	return (best);
+}
+
+/*
+ * Settle the wheel events sent against a shift seen on the screen. Returns the
+ * shift to apply to the selection: the one seen, or if the screen changed in a
+ * way the matching could not follow, the lines asked for. Events older than a
+ * second are forgotten, as the program evidently did not scroll for them.
+ */
+static int
+window_copy_live_settle(struct window_mode_entry *wme)
+{
+	struct window_copy_mode_data	*data = wme->data;
+	struct timeval			 now, age;
+	int				 shift, changed, pending;
+
+	pending = data->live_pending;
+	if (pending != 0) {
+		gettimeofday(&now, NULL);
+		timersub(&now, &data->live_time, &age);
+		if (age.tv_sec >= 1)
+			pending = data->live_pending = 0;
+	}
+
+	shift = window_copy_live_shift(wme, &changed);
+	if (shift != 0) {
+		if ((shift > 0) == (pending > 0) && abs(shift) < abs(pending))
+			data->live_pending = pending - shift;
+		else
+			data->live_pending = 0;
+		return (shift);
+	}
+	if (changed && pending != 0) {
+		data->live_pending = 0;
+		return (pending);
+	}
+	return (0);
+}
+
+/* Move a selection row by the live shift, keeping it on the screen. */
+static u_int
+window_copy_live_shift_row(u_int y, int shift, u_int hsize, u_int sy)
+{
+	int	row;
+
+	if (y < hsize)
+		return (y);
+	row = (int)(y - hsize) + shift;
+	if (row < 0)
+		row = 0;
+	if (row > (int)sy - 1)
+		row = sy - 1;
+	return (hsize + row);
+}
+
+/*
+ * Refresh the copy of a live pane. The view stays where it is (there is
+ * nowhere else for it to be), the selection follows the content by the shift
+ * the program applied, and search marks are recomputed. Driven by the
+ * automatic refresh timer.
+ */
+static void
+window_copy_live_refresh(struct window_mode_entry *wme)
+{
+	struct window_pane		*wp = wme->wp;
+	struct window_copy_mode_data	*data = wme->data;
+	u_int				 sy = screen_size_y(&data->screen), hsize;
+	int				 shift = 0;
+
+	if (data->screen.sel != NULL)
+		shift = window_copy_live_settle(wme);
+	else
+		data->live_pending = 0;
+
+	if (!window_copy_sync_backing(wme)) {
+		screen_free(data->backing);
+		free(data->backing);
+		data->backing = window_copy_clone_screen(&wp->base,
+		    &data->screen, NULL, NULL, 0);
+	}
+	window_copy_sync_snapshot(data, wp->base.grid);
+	data->oy = 0;
+
+	hsize = screen_hsize(data->backing);
+	if (data->screen.sel != NULL && shift != 0) {
+		log_debug("%s: selection follows shift %d", __func__, shift);
+		data->sely = window_copy_live_shift_row(data->sely, shift,
+		    hsize, sy);
+		data->endsely = window_copy_live_shift_row(data->endsely,
+		    shift, hsize, sy);
+		data->selry = window_copy_live_shift_row(data->selry, shift,
+		    hsize, sy);
+		data->endselry = window_copy_live_shift_row(data->endselry,
+		    shift, hsize, sy);
+		data->dy = window_copy_live_shift_row(data->dy, shift, hsize,
+		    sy);
+	}
+	if (data->screen.sel != NULL)
+		window_copy_update_selection(wme, 0, 1);
+
+	if (data->searchmark != NULL && !data->timeout)
+		window_copy_search_marks(wme, NULL, data->searchregex, 0);
+}
+
+/*
  * Reconcile the backing screen with the live pane, incrementally if possible
  * and otherwise by recloning, then reposition the view. When following, jump
  * to the bottom so new output stays visible; otherwise keep the same lines on
@@ -3051,7 +3339,7 @@ window_copy_refresh_timer(__unused int fd, __unused short events, void *arg)
 	struct window_mode_entry	*wme = arg;
 	struct window_pane		*wp = wme->wp;
 	struct window_copy_mode_data	*data = wme->data;
-	int				 follow;
+	int				 follow, live;
 
 	if (TAILQ_FIRST(&wp->modes) != wme || !data->refresh_active)
 		return;
@@ -3059,12 +3347,20 @@ window_copy_refresh_timer(__unused int fd, __unused short events, void *arg)
 	/*
 	 * Skip the refresh while a selection is being made, otherwise it would
 	 * move; only follow new output if the cursor is still at the bottom.
+	 * A live pane refreshes regardless: the selection is moved along with
+	 * the content instead.
 	 */
-	if ((wp->flags & PANE_UNSEENCHANGES) && data->screen.sel == NULL &&
-	    data->cursordrag == CURSORDRAG_NONE) {
-		follow = (data->oy == 0 &&
-		    data->cy == screen_size_y(&data->screen) - 1);
-		window_copy_do_refresh(wme, follow);
+	live = window_copy_is_live(wme);
+	if ((wp->flags & PANE_UNSEENCHANGES) && (live ||
+	    (data->screen.sel == NULL &&
+	    data->cursordrag == CURSORDRAG_NONE))) {
+		if (live)
+			window_copy_live_refresh(wme);
+		else {
+			follow = (data->oy == 0 &&
+			    data->cy == screen_size_y(&data->screen) - 1);
+			window_copy_do_refresh(wme, follow);
+		}
 		window_copy_redraw_screen(wme);
 		/* The timer runs outside key handling, so force a repaint. */
 		wp->flags |= PANE_REDRAW;
@@ -6398,7 +6694,10 @@ window_copy_cursor_up(struct window_mode_entry *wme, int scroll_only)
 	if (scroll_only || data->cy == 0) {
 		if (norectsel)
 			data->cx = data->lastcx;
-		window_copy_scroll_down(wme, 1);
+		if (window_copy_is_live(wme))
+			window_copy_live_tick(wme, 1, 1);
+		else
+			window_copy_scroll_down(wme, 1);
 		if (scroll_only) {
 			if (data->cy == screen_size_y(s) - 1)
 				window_copy_redraw_lines(wme, data->cy, 1);
@@ -6478,7 +6777,10 @@ window_copy_cursor_down(struct window_mode_entry *wme, int scroll_only)
 	if (scroll_only || data->cy == screen_size_y(s) - 1) {
 		if (norectsel)
 			data->cx = data->lastcx;
-		window_copy_scroll_up(wme, 1);
+		if (window_copy_is_live(wme))
+			window_copy_live_tick(wme, 0, 1);
+		else
+			window_copy_scroll_up(wme, 1);
 		if (scroll_only && data->cy > 0)
 			window_copy_redraw_lines(wme, data->cy - 1, 2);
 	} else {

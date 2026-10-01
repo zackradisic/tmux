@@ -1992,6 +1992,29 @@ commands.
 In copy mode an indicator is displayed in the top-right corner of the pane with
 the current position and the number of lines in the history.
 .Pp
+A pane whose program has taken over the screen, that is, one on the alternate
+screen with mouse reporting turned on, such as a full-screen editor or a chat
+client that scrolls its own view, has no history for copy mode to scroll into.
+On such a pane copy mode is live: the copy is refreshed from the pane as the
+program draws, the indicator shows
+.Ql [live] ,
+and a motion that would leave the screen asks the program to scroll instead by
+sending it the mouse wheel events it asked for, one per line, so the cursor
+stays put and the content moves under it.
+Page and half-page motions move the cursor first and send the remainder as
+wheel events; scrolling with
+.Ql C\-e
+and
+.Ql C\-y
+or the wheel sends them directly.
+A selection follows the content as it moves.
+What the program does with one wheel event is up to the program, and a pane
+that is not on the alternate screen, or whose program does not report the
+mouse, is unaffected.
+The behaviour is controlled by the
+.Ic copy\-mode\-live
+option.
+.Pp
 Commands are sent to copy mode using the
 .Fl X
 flag to the
@@ -5989,6 +6012,14 @@ For how to specify
 see the
 .Sx STYLES
 section.
+.Pp
+.It Xo Ic copy\-mode\-live
+.Op Ic on | off
+.Xc
+Whether copy mode on a pane whose program has taken over the screen (the
+alternate screen with mouse reporting on) asks that program to scroll when the
+cursor leaves the screen.
+The default is on.
 .Pp
 .It Ic copy\-mode\-mark\-style Ar style
 Set the style of the line containing the mark in copy mode.
