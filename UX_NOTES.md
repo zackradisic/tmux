@@ -790,11 +790,14 @@ sketching where the seam goes before building either.
 
 ### C1. Live copy mode: what it does not do yet
 
-Copy mode on a pane whose program owns the screen (alternate screen with mouse
-reporting on, which is Claude Code's full-screen renderer) is live: the copy
-refreshes as the program draws, and a motion off the top or bottom sends the
-program wheel events instead of stopping. `copy-mode-live` turns it off. The
-seams, in the order they are likely to bite:
+Live copy mode (`copy-mode -L`, or `|` inside copy mode) is for a program
+that owns the screen and scrolls it itself, which is Claude Code's full-screen
+renderer: the copy refreshes as the program draws, and a motion off the top or
+bottom sends the program wheel events instead of stopping. It is explicit on
+purpose: the first version keyed off `#{alternate_on}` plus mouse reporting,
+and `restart-server` does not carry the alternate-screen state across, so
+every existing pane silently stopped qualifying. The seams, in the order they
+are likely to bite:
 
 - **One wheel event is whatever the program says it is.** Claude Code scrolls
   one line per event, which is why `k` at the top feels like a line. An app
@@ -818,9 +821,9 @@ seams, in the order they are likely to bite:
   before the program started, which is rarely what was wanted; `G` gets back.
 - **`copy-mode -e` (exit when scrolled to the bottom) is ignored** on a live
   pane: copy mode cannot tell where the program's bottom is.
-- **Alternate-screen programs without mouse reporting** (vim, less by
-  default) are not live. Copy mode on them is the same static screen as
-  before.
+- **A program without mouse reporting gets nothing.** Turning live on in a
+  pane running vim without `mouse=a` or plain less just leaves the cursor at
+  the edge; the wheel event has no encoding the program asked for.
 - **Over a link** the wheel events ride `send-keys` like any key, so the
   feature works on a remote pane. The refresh waits on the round trip, so a
   burst of `C-u` lands as one jump rather than a scroll.

@@ -1435,15 +1435,6 @@ const struct options_table_entry options_table[] = {
 	  .text = "Style of the marked line in copy mode."
 	},
 
-	{ .name = "copy-mode-live",
-	  .type = OPTIONS_TABLE_FLAG,
-	  .scope = OPTIONS_TABLE_WINDOW|OPTIONS_TABLE_PANE,
-	  .default_num = 1,
-	  .text = "Whether copy mode on a pane whose program has taken over "
-		  "the screen (alternate screen with mouse reporting on) asks "
-		  "that program to scroll when the cursor leaves the screen."
-	},
-
 	{ .name = "copy-mode-position-format",
 	  .type = OPTIONS_TABLE_STRING,
 	  .scope = OPTIONS_TABLE_WINDOW|OPTIONS_TABLE_PANE,

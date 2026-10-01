@@ -55,6 +55,7 @@ static void	window_copy_do_refresh(struct window_mode_entry *, int);
 static void	window_copy_refresh_timer(int, short, void *);
 static void	window_copy_refresh_start(struct window_mode_entry *);
 static int	window_copy_is_live(struct window_mode_entry *);
+static void	window_copy_live_start(struct window_mode_entry *);
 static void	window_copy_live_tick(struct window_mode_entry *, int, u_int);
 static void	window_copy_refresh_arm(struct window_mode_entry *);
 static void	window_copy_refresh_start(struct window_mode_entry *);
@@ -364,6 +365,7 @@ struct window_copy_mode_data {
 #define WINDOW_COPY_REFRESH_INTERVAL 50000
 	int		 refresh_active;
 
+	int		 live;		/* live: edges scroll the program */
 	int		 live_pending;	/* wheel lines sent, not yet seen */
 	struct timeval	 live_time;	/* when the last wheel event went */
 };
@@ -641,9 +643,8 @@ window_copy_init(struct window_mode_entry *wme,
 	data->scroll_exit = args_has(args, 'e');
 	data->hide_position = args_has(args, 'H');
 
-	/* A live pane is only useful if the copy keeps up with it. */
-	if (window_copy_is_live(wme))
-		window_copy_refresh_start(wme);
+	if (args_has(args, 'L'))
+		window_copy_live_start(wme);
 
 	if (base->hyperlinks != NULL) {
 		hyperlinks_free(data->screen.hyperlinks);
@@ -3028,27 +3029,83 @@ window_copy_cmd_search_forward_incremental(struct window_copy_cmd_state *cs)
 }
 
 /*
- * A live pane is one whose program has taken over the screen and scrolls it
- * itself: the alternate screen with mouse reporting on, such as a full-screen
- * terminal UI. There is no history for copy mode to scroll into, so motions
- * that would leave the screen ask the program to scroll instead. Only applies
- * while the view is at the live screen, not scrolled back into history from
- * before the program started.
+ * Live copy mode is for a program that has taken over the screen and scrolls
+ * it itself (a full-screen terminal UI with mouse reporting on): there is no
+ * history for copy mode to scroll into, so motions that would leave the
+ * screen ask the program to scroll instead. It is turned on explicitly, with
+ * copy-mode -L or the live-on and live-toggle commands, and only applies
+ * while the view is at the live screen rather than scrolled back into history
+ * from before the program started.
  */
 static int
 window_copy_is_live(struct window_mode_entry *wme)
 {
 	struct window_copy_mode_data	*data = wme->data;
-	struct window_pane		*wp = wme->wp;
-	struct screen			*base = &wp->base;
 
-	if (data->viewmode || wme->swp != wme->wp || data->oy != 0)
+	if (!data->live || data->viewmode || wme->swp != wme->wp)
 		return (0);
-	if (!options_get_number(wp->options, "copy-mode-live"))
-		return (0);
-	if (base->saved_grid == NULL || (base->mode & ALL_MOUSE_MODES) == 0)
-		return (0);
-	return (1);
+	return (data->oy == 0);
+}
+
+/* Turn live mode on; the copy has to keep up with the program, so refresh. */
+static void
+window_copy_live_start(struct window_mode_entry *wme)
+{
+	struct window_copy_mode_data	*data = wme->data;
+
+	if (data->viewmode || wme->swp != wme->wp)
+		return;
+	data->live = 1;
+	window_copy_refresh_start(wme);
+}
+
+static void
+window_copy_live_stop(struct window_mode_entry *wme)
+{
+	struct window_copy_mode_data	*data = wme->data;
+
+	data->live = 0;
+	data->live_pending = 0;
+	window_copy_refresh_stop(wme);
+}
+
+void
+window_copy_set_live(struct window_pane *wp, int on)
+{
+	struct window_mode_entry	*wme = TAILQ_FIRST(&wp->modes);
+
+	if (wme == NULL || wme->mode != &window_copy_mode)
+		return;
+	if (on)
+		window_copy_live_start(wme);
+	else
+		window_copy_live_stop(wme);
+}
+
+static enum window_copy_cmd_action
+window_copy_cmd_live_on(struct window_copy_cmd_state *cs)
+{
+	window_copy_live_start(cs->wme);
+	return (WINDOW_COPY_CMD_REDRAW);
+}
+
+static enum window_copy_cmd_action
+window_copy_cmd_live_off(struct window_copy_cmd_state *cs)
+{
+	window_copy_live_stop(cs->wme);
+	return (WINDOW_COPY_CMD_REDRAW);
+}
+
+static enum window_copy_cmd_action
+window_copy_cmd_live_toggle(struct window_copy_cmd_state *cs)
+{
+	struct window_copy_mode_data	*data = cs->wme->data;
+
+	if (data->live)
+		window_copy_live_stop(cs->wme);
+	else
+		window_copy_live_start(cs->wme);
+	return (WINDOW_COPY_CMD_REDRAW);
 }
 
 /*
@@ -3935,6 +3992,24 @@ static const struct {
 	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
 	  .clear = WINDOW_COPY_CMD_CLEAR_NEVER,
 	  .f = window_copy_cmd_refresh_off
+	},
+	{ .command = "live-on",
+	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
+	  .clear = WINDOW_COPY_CMD_CLEAR_NEVER,
+	  .f = window_copy_cmd_live_on
+	},
+	{ .command = "live-off",
+	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
+	  .clear = WINDOW_COPY_CMD_CLEAR_NEVER,
+	  .f = window_copy_cmd_live_off
+	},
+	{ .command = "live-toggle",
+	  .args = { "", 0, 0, NULL },
+	  .flags = WINDOW_COPY_CMD_FLAG_READONLY,
+	  .clear = WINDOW_COPY_CMD_CLEAR_NEVER,
+	  .f = window_copy_cmd_live_toggle
 	},
 	{ .command = "refresh-toggle",
 	  .args = { "", 0, 0, NULL },

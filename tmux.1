@@ -1992,15 +1992,21 @@ commands.
 In copy mode an indicator is displayed in the top-right corner of the pane with
 the current position and the number of lines in the history.
 .Pp
-A pane whose program has taken over the screen, that is, one on the alternate
-screen with mouse reporting turned on, such as a full-screen editor or a chat
-client that scrolls its own view, has no history for copy mode to scroll into.
-On such a pane copy mode is live: the copy is refreshed from the pane as the
-program draws, the indicator shows
+A program that has taken over the screen and scrolls its own view, such as a
+full-screen chat client, leaves no history for copy mode to scroll into.
+For such a pane copy mode can be made live, either by entering it with
+.Ic copy\-mode \-L
+or with the
+.Ic live\-toggle
+command (bound to
+.Ql | )
+once inside.
+In live copy mode the copy is refreshed from the pane as the program draws,
+the indicator shows
 .Ql [live] ,
 and a motion that would leave the screen asks the program to scroll instead by
-sending it the mouse wheel events it asked for, one per line, so the cursor
-stays put and the content moves under it.
+sending it mouse wheel events, one per line, so the cursor stays put and the
+content moves under it.
 Page and half-page motions move the cursor first and send the remainder as
 wheel events; scrolling with
 .Ql C\-e
@@ -2008,12 +2014,14 @@ and
 .Ql C\-y
 or the wheel sends them directly.
 A selection follows the content as it moves.
-What the program does with one wheel event is up to the program, and a pane
-that is not on the alternate screen, or whose program does not report the
-mouse, is unaffected.
-The behaviour is controlled by the
-.Ic copy\-mode\-live
-option.
+What the program does with one wheel event is up to the program, and a program
+that does not report the mouse receives nothing.
+To make
+.Ql prefix [
+live whenever the program in the pane reports the mouse:
+.Bd -literal -offset indent
+bind [ if -F '#{mouse_any_flag}' { copy-mode -L } { copy-mode }
+.Ed
 .Pp
 Commands are sent to copy mode using the
 .Fl X
@@ -2471,6 +2479,22 @@ Toggle rectangle selection mode.
 .Xc
 Cycles the current line between centre, top, and bottom.
 .It Xo
+.Ic live\-on
+.Xc
+Turn on live copy mode, where motions off the screen ask the program in the
+pane to scroll; see
+.Sx WINDOW AND PANE MODES .
+.It Xo
+.Ic live\-off
+.Xc
+Turn off live copy mode.
+.It Xo
+.Ic live\-toggle
+(vi: |)
+(emacs: |)
+.Xc
+Toggle live copy mode.
+.It Xo
 .Ic refresh\-on
 .Xc
 Turn on automatic refresh of the content from the pane, so that new output
@@ -2758,7 +2782,7 @@ The synopsis for the
 command is:
 .Bl -tag -width Ds
 .It Xo Ic copy\-mode
-.Op Fl dekHMqSu
+.Op Fl dekHLMqSu
 .Op Fl s Ar src\-pane
 .Op Fl t Ar target\-pane
 .Xc
@@ -2770,6 +2794,9 @@ enters copy mode and scrolls one page up and
 one page down.
 .Fl H
 hides the position indicator in the top right.
+.Fl L
+enters live copy mode, or turns it on if copy mode is already entered; see
+.Sx WINDOW AND PANE MODES .
 .Fl q
 cancels copy mode and any other modes.
 .Pp
@@ -6012,14 +6039,6 @@ For how to specify
 see the
 .Sx STYLES
 section.
-.Pp
-.It Xo Ic copy\-mode\-live
-.Op Ic on | off
-.Xc
-Whether copy mode on a pane whose program has taken over the screen (the
-alternate screen with mouse reporting on) asks that program to scroll when the
-cursor leaves the screen.
-The default is on.
 .Pp
 .It Ic copy\-mode\-mark\-style Ar style
 Set the style of the line containing the mark in copy mode.

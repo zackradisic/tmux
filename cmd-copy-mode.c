@@ -30,8 +30,8 @@ const struct cmd_entry cmd_copy_mode_entry = {
 	.name = "copy-mode",
 	.alias = NULL,
 
-	.args = { "dekHMqSs:t:u", 0, 0, NULL },
-	.usage = "[-dekHMqSu] [-s src-pane] " CMD_TARGET_PANE_USAGE,
+	.args = { "dekHLMqSs:t:u", 0, 0, NULL },
+	.usage = "[-dekHLMqSu] [-s src-pane] " CMD_TARGET_PANE_USAGE,
 
 	.source =  { 's', CMD_FIND_PANE, 0 },
 	.target = { 't', CMD_FIND_PANE, 0 },
@@ -98,6 +98,8 @@ cmd_copy_mode_exec(struct cmd *self, struct cmdq_item *item)
 			window_copy_start_drag(c, &event->m);
 	} else
 		window_copy_set_line_numbers(wp, line_numbers);
+	if (args_has(args, 'L'))
+		window_copy_set_live(wp, 1);
 	if (args_has(args, 'u'))
 		window_copy_pageup(wp, 0);
 	if (args_has(args, 'd'))
