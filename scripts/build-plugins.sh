@@ -28,7 +28,7 @@ if [ $# -gt 0 ]; then
     for p in "$@"; do pkgs="$pkgs -p $p"; done
 else
     pkgs="-p notify-toast -p resurrect -p session_creator -p git-status \
-          -p cron -p agents -p mailbox -p scp"
+          -p cron -p agents -p mailbox -p scp -p sessions"
 fi
 
 # shellcheck disable=SC2086

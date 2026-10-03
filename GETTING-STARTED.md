@@ -191,6 +191,8 @@ you can keep one config for both:
 sync-plugins ~/.tmux/plugins.toml
 
 bind A   plugin-command agents pick          # agent roster
+bind s   plugin-command sessions 'pick s'    # sessions chooser (folded)
+bind w   plugin-command sessions 'pick w'    # the same, windows shown
 bind C-r plugin-command resurrect pick       # save/restore picker
 bind S   plugin-command session_creator new  # new session (folder)
 bind W   plugin-command session_creator worktree

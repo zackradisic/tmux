@@ -1,0 +1,26 @@
+# Capability sidecar for the sessions plugin: the session / window / pane
+# chooser (`plugin-command sessions pick s|w`, bind it to prefix s / w).
+#
+# read-state lists the tree and expands the row formats; run-command is
+# every action (switch-client, kill, rename, remote-attach, plugin-command
+# to session_creator and agents); mode is the picker float.
+#
+# service-serve and service-call carry the tree across linked servers:
+# the provider half answers `tree` and publishes `changed`, the view half
+# calls and follows them. The view also calls the agents plugin's `list`
+# on every server, to badge the rows that hold an agent; without agents
+# loaded there are no badges and nothing else changes.
+
+[caps]
+requests = [
+  "read-state",
+  "run-command",
+  "mode",
+  "service-serve",
+  "service-call",
+  # Typing into the preview: keys go to the highlighted pane.
+  "send-keys",
+]
+
+[caps.services]
+call = ["sessions@*", "agents@*"]

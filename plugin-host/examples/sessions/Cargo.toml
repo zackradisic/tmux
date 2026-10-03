@@ -1,0 +1,19 @@
+[package]
+name = "sessions"
+version = "0.1.0"
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["peers"]
+# The peer-request rows need the host's `peers_list` import (Oct 2026);
+# a build without this feature loads on an older tmux2 binary.
+peers = []
+
+[dependencies]
+tmux-plugin-sdk = { path = "../../sdk" }
+listkit = { path = "../../listkit" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

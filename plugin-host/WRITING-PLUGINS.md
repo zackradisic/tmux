@@ -893,6 +893,24 @@ dropdowns and whose paths complete over ssh) the second;
 `regress/plugin-agents-new.sh` are what a change to the crate must keep
 green.
 
+### Lists with a preview: the `listkit` crate
+
+A picker in the shape of the agents roster - a list on the left, a live
+pane (or text) on the right, search as you type with `@server`-style
+tokens and a dropdown, marks, expand and collapse, rebindable keys with
+a generated `?` card - is `plugin-host/listkit`. The consumer hands
+`listkit::Engine` a flat, pre-order list of `Node`s on every refresh
+(key, depth, what to draw, what to search, what to preview) and gets an
+`Outcome` back for every key the engine does not own; `render` returns
+the bytes and the preview rect, and never calls the host, so the engine
+runs in a unit test and never holds a borrow across an await. The
+smaller pieces stand alone: `styled` (Markdown to styled cells),
+`query` (the search box parsed), `lines` (the scroll rule), `remotes`
+(the per-server fetch with a spinner), `keys` (the key table).
+`sessions` is the reference consumer; the agents picker shares the
+pieces and is being moved onto the engine. `regress/plugin-sessions-*.sh`
+cover it.
+
 ## Debugging checklist
 
 - `tmux plugin-log [-n N] myplugin` — your `log()` lines, panics with
