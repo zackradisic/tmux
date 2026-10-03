@@ -907,9 +907,11 @@ runs in a unit test and never holds a borrow across an await. The
 smaller pieces stand alone: `styled` (Markdown to styled cells),
 `query` (the search box parsed), `lines` (the scroll rule), `remotes`
 (the per-server fetch with a spinner), `keys` (the key table).
-`sessions` is the reference consumer; the agents picker shares the
-pieces and is being moved onto the engine. `regress/plugin-sessions-*.sh`
-cover it.
+`sessions` and the agents picker are the two consumers: the agents view
+hands the engine a server header, a band header and the rows of that
+band as nodes, and runs its own conversation preview, info card and
+prompts on top through the outcomes. `regress/plugin-sessions-*.sh` and
+`regress/plugin-agents-*.sh` cover both.
 
 ## Debugging checklist
 

@@ -190,11 +190,11 @@ pub fn keys() -> KeyTable {
 
 pub fn sigils() -> Vec<SigilSpec> {
     vec![
-        SigilSpec::new('@', false, Some("S"), "narrow to a server (prefix)"),
-        SigilSpec::new('#', false, Some("s"), "narrow to a session (prefix)"),
-        SigilSpec::new(':', false, Some("c"), "narrow to a command (prefix)"),
-        SigilSpec::new('~', true, None, "narrow to a directory (part of its ~ path)"),
-        SigilSpec::new('!', false, None, "narrow to an agent status: working, waiting, needs_input"),
+        SigilSpec::new('@', "server", false, Some("S"), "narrow to a server (prefix)"),
+        SigilSpec::new('#', "session", false, Some("s"), "narrow to a session (prefix)"),
+        SigilSpec::new(':', "command", false, Some("c"), "narrow to a command (prefix)"),
+        SigilSpec::new('~', "dir", true, None, "narrow to a directory (part of its ~ path)"),
+        SigilSpec::new('!', "status", false, None, "narrow to an agent status: working, waiting, needs_input"),
     ]
 }
 

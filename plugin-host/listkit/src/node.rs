@@ -57,6 +57,15 @@ pub struct Node {
     pub dim: bool,
     /// "You are here": a bright left border.
     pub here: bool,
+    /// Shown whatever the search words say (a hit the consumer found in
+    /// the node's content); the sigil tokens still apply.
+    pub force_match: bool,
+    /// How a non-selectable header draws: `Some(glyph)` puts the glyph
+    /// and a space before bold text (a server); `None` draws the text as
+    /// given, indented (a band under a server).
+    pub header_glyph: Option<char>,
+    /// Cells of indent before the row's text; `None` is two per depth.
+    pub indent: Option<u8>,
 }
 
 impl Node {
@@ -72,7 +81,15 @@ impl Node {
             preview: Preview::None,
             dim: false,
             here: false,
+            force_match: false,
+            header_glyph: Some('▪'),
+            indent: None,
         }
+    }
+
+    /// The row's indent in cells.
+    pub fn indent_cells(&self) -> usize {
+        self.indent.map(usize::from).unwrap_or(self.depth as usize * 2)
     }
 
     pub fn group(key: impl Into<String>, depth: u8, expanded: bool, selectable: bool) -> Self {
@@ -107,14 +124,22 @@ impl Node {
 #[derive(Clone, Debug)]
 pub struct SigilSpec {
     pub ch: char,
+    /// What the value is, for the `?` card: `@server`, `#session`.
+    pub noun: &'static str,
     pub substring: bool,
     pub narrow_key: Option<&'static str>,
-    /// What the `?` card calls it: "narrow to a server (prefix)".
+    /// What the `?` card says it does: "narrow to a server (prefix)".
     pub help: &'static str,
 }
 
 impl SigilSpec {
-    pub const fn new(ch: char, substring: bool, narrow_key: Option<&'static str>, help: &'static str) -> Self {
-        Self { ch, substring, narrow_key, help }
+    pub const fn new(
+        ch: char,
+        noun: &'static str,
+        substring: bool,
+        narrow_key: Option<&'static str>,
+        help: &'static str,
+    ) -> Self {
+        Self { ch, noun, substring, narrow_key, help }
     }
 }

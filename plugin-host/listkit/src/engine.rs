@@ -108,6 +108,9 @@ pub struct Engine {
     completion_hidden: bool,
     pub preview_focus: bool,
     pub show_help: bool,
+    /// Light the separator as if the preview had the keyboard: for a
+    /// consumer-drawn preview with a focus of its own.
+    pub separator_lit: bool,
     /// Scroll position of a text or Markdown preview.
     pub(crate) preview_top: usize,
     pending_g: bool,
@@ -147,6 +150,7 @@ impl Engine {
             completion_hidden: false,
             preview_focus: false,
             show_help: false,
+            separator_lit: false,
             preview_top: 0,
             pending_g: false,
             status: None,
@@ -210,6 +214,30 @@ impl Engine {
         &self.nodes
     }
 
+    /// Replace one node's preview without rebuilding (the highlighted
+    /// row's, once what it shows has arrived).
+    pub fn set_preview(&mut self, key: &str, preview: Preview) {
+        if let Some(n) = self.nodes.iter_mut().find(|n| n.key == key) {
+            n.preview = preview;
+        }
+    }
+
+    /// Scroll to the top, then only as far down as the selection needs.
+    pub fn reset_scroll(&mut self) {
+        self.top = 0;
+        self.scroll_to_selection();
+    }
+
+    pub fn close_prompt(&mut self) {
+        self.prompt = None;
+    }
+
+    /// The visible nodes that passed the filter themselves (not the
+    /// ancestors shown for context).
+    pub fn visible_matched(&self) -> impl Iterator<Item = &Node> + '_ {
+        self.view.iter().zip(self.matched.iter()).filter(|(_, m)| **m).map(move |(&i, _)| &self.nodes[i])
+    }
+
     pub fn node(&self, key: &str) -> Option<&Node> {
         self.nodes.iter().find(|n| n.key == key)
     }
@@ -250,7 +278,7 @@ impl Engine {
     /// Does the node pass the filter on its own?
     fn node_matches(&self, i: usize, q: &Query) -> bool {
         let n = &self.nodes[i];
-        if rank(&n.haystack, &q.words).is_none() {
+        if !n.force_match && rank(&n.haystack, &q.words).is_none() {
             return false;
         }
         for s in &self.sigils {
@@ -657,10 +685,17 @@ impl Engine {
         let Some((sigil, partial)) = typing_token(&self.filter, &chars) else { return };
         let partial = partial.to_string();
         let substring = self.sigils.iter().find(|s| s.ch == sigil).is_some_and(|s| s.substring);
+        // A value that starts with its own sigil (a `~/x` path for `~`)
+        // is offered without it: the sigil in the box is the one.
         let values = self
             .nodes
             .iter()
-            .flat_map(|n| n.tokens.iter().filter(|(c, _)| *c == sigil).map(|(_, v)| v.clone()))
+            .flat_map(|n| {
+                n.tokens
+                    .iter()
+                    .filter(|(c, _)| *c == sigil)
+                    .map(|(_, v)| v.strip_prefix(sigil).unwrap_or(v).to_string())
+            })
             .collect::<Vec<_>>();
         self.completions = query::complete_values(values, &partial, substring);
     }
@@ -1052,7 +1087,9 @@ impl Engine {
                     self.scroll_preview(if base == "WheelUpPane" { -3 } else { 3 });
                     return Outcome::Redraw;
                 }
-                Outcome::Nothing
+                // Nothing of the engine's in the preview: the consumer
+                // may be drawing its own there.
+                Outcome::Key(base.to_string())
             }
             _ => Outcome::Nothing,
         }
@@ -1149,7 +1186,7 @@ mod tests {
     }
 
     fn engine() -> Engine {
-        let sig = vec![SigilSpec::new('@', false, Some("S"), "server")];
+        let sig = vec![SigilSpec::new('@', "server", false, Some("S"), "narrow to a server")];
         let mut e = Engine::new(ModeId(1), 120, 40, "t", Engine::base_keys(), sig);
         e.spacers = true;
         e.set_nodes(tree());

@@ -3,6 +3,15 @@
 //! linked servers (fetched through services and kept in [`Remotes`]), and
 //! shows them grouped by server, then by state band.
 //!
+//! The list itself - cursor, marks, the search box and its dropdown, the
+//! frame, the preview column - is `listkit::Engine`. The rows are handed
+//! to it as nodes on every refresh (a server and a band are groups, an
+//! agent is an item), and every key the engine does not own comes back
+//! as an `Outcome` that this module turns into an agent action. What is
+//! agent-specific sits on top: the bands, the unread badges, the
+//! conversation in the preview with its own focus and matches, the info
+//! card, the rename and message prompts, the content search.
+//!
 //! Rows carry their server; ids are unique per server only, so marks and
 //! ranks key on [`Agent::key`]. Ages use each provider's clock: the
 //! snapshot's `now_ms` gives the skew to correct by. A remote row's pane
@@ -14,11 +23,13 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use listkit::lines::{clamp_dim, default_size, scroll_window, Line, SizeBox};
-use listkit::query::{self, parse_query, rank, typing_token, Query};
+use listkit::engine::Outcome;
+use listkit::keys::KeyTable;
+use listkit::lines::{clamp_dim, default_size, SizeBox};
 use listkit::remotes::{spin_since, FETCH_STALE_MS, FETCH_STUCK_MS, SPIN_FRAMES, SPIN_GRACE_MS, SPIN_MS};
 use listkit::styled::*;
 use listkit::text::{clip, fmt_age, keyname, menu_item, menu_safe, one_line, pretty_key, strip_sgr, tilde_of};
+use listkit::{Engine, Node, Preview, SigilSpec};
 use tmux_plugin_sdk::prelude::*;
 
 use crate::index;
@@ -29,24 +40,7 @@ use crate::{Config, PickKeys, HISTORY_MAX};
 
 /// The picker opens at a fraction of the window, clamped to this box. A
 /// manual resize (+/-) is remembered and overrides the default.
-const MAX_WIDTH: u32 = 180;
-const MAX_HEIGHT: u32 = 54;
-const MIN_WIDTH: u32 = 72;
-const MIN_HEIGHT: u32 = 16;
-/// Fraction of the window the default size fills (in tenths).
-const FILL_TENTHS: u32 = 9;
-const SIZE: SizeBox = SizeBox {
-    min_w: MIN_WIDTH,
-    min_h: MIN_HEIGHT,
-    max_w: MAX_WIDTH,
-    max_h: MAX_HEIGHT,
-    fill_tenths: FILL_TENTHS,
-};
-/// The step a single +/- resize moves the width and height.
-const RESIZE_STEP_W: u32 = 12;
-const RESIZE_STEP_H: u32 = 4;
-/// Cap on rows the list draws; the window height drives the real count.
-const LIST_MAX: usize = 60;
+const SIZE: SizeBox = SizeBox { min_w: 72, min_h: 16, max_w: 180, max_h: 54, fill_tenths: 9 };
 /// While the picker stays open, re-read the harness session files (and
 /// the remote rosters) on this cadence.
 const REFRESH_MS: u64 = 2000;
@@ -62,6 +56,10 @@ const OPEN_FRESH_MS: u64 = REFRESH_MS;
 /// past a handful of servers that stops being true (each hop is an ssh
 /// process on this machine), so the rest queue behind these.
 const MAX_INFLIGHT: usize = 4;
+
+/// Prompt tags: what Enter in the search line means.
+const TAG_RENAME: u32 = 1;
+const TAG_MESSAGE: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // remote rosters
@@ -208,9 +206,8 @@ async fn fetch_all(
 }
 
 /// Turn the per-server spinner while any fetch is outstanding. Only the
-/// frame and the server headers move, so each tick re-renders off the
-/// rows already in hand: no DB read, no file scan, and no refilter (a
-/// content search would re-grep every tick).
+/// frame and the server headers move, so each tick rebuilds the rows
+/// already in hand: no DB read, no file scan, and no new search.
 fn start_spinner(picker: &Rc<RefCell<Option<Picker>>>, remotes: &Rc<RefCell<Remotes>>) {
     if picker.borrow().is_none() {
         return;
@@ -222,7 +219,8 @@ fn start_spinner(picker: &Rc<RefCell<Option<Picker>>>, remotes: &Rc<RefCell<Remo
         p.now_ms = now;
         p.fetching = fetching;
         p.multi = is_multi(&p.rows, &p.fetching, now);
-        p.rebuild_lines();
+        let keep = p.keep();
+        pick_reshow(p, keep, false);
         pick_render(p);
         true
     });
@@ -237,7 +235,7 @@ pub fn follow(server: &str) {
 /// The client to open a picker for when no key press names one: the
 /// first attached client, which on a workstation is the user's.
 pub fn any_client() -> Option<u64> {
-    list_clients().ok()?.into_iter().next().map(|c| u64::from(c.id))
+    listkit::any_client()
 }
 
 /// Ask a remote provider to act on one of its rows. The reply is a plain
@@ -311,9 +309,10 @@ pub enum PickAfter {
     /// Type this key into the local pane the preview shows: the keyboard
     /// is the preview's. Same route as `Interrupt`, one key per press.
     Type(u32, String),
+    /// Paste this text into the local pane the preview shows.
+    Paste(u32, String),
     /// Open the new-agent form over the picker, prefilled from the
-    /// highlighted row (see `newagent`).
-    /// The new-agent form; `true` opens it as a fork of the row.
+    /// highlighted row (see `newagent`); `true` opens it as a fork.
     NewAgent(bool),
     /// Mark these (server, id) rows read (true) or unread (false).
     Read(Vec<(String, String)>, bool),
@@ -322,26 +321,12 @@ pub enum PickAfter {
     Sessions(Option<u32>),
 }
 
-
 pub struct Picker {
-    pub mode: ModeId,
-    pub width: u32,
-    pub height: u32,
+    /// The list: cursor, marks, search box, frame, preview column.
+    pub engine: Engine,
     pub rows: Vec<Agent>,
-    pub view: Vec<usize>,
-    pub lines: Vec<Line>,
-    /// The server a `Line::Header { level: 0 }` names, by its id.
-    pub line_servers: Vec<String>,
-    pub sel: usize,
-    pub top: usize,
-    /// Row keys (server + id) marked for a bulk action, so they survive a
-    /// reload/refilter without a stale-index risk.
-    pub marked: HashSet<String>,
-    pub filter: String,
-    pub filtering: bool,
-    /// A rename in progress: the typed name for the selected agent.
-    pub renaming: bool,
-    pub rename_buf: String,
+    /// Row key -> index in `rows`, rebuilt with the nodes.
+    by_key: HashMap<String, usize>,
     /// When on, the filter also matches live pane CONTENTS: the grid of
     /// each live agent's pane is grep'd for the query, in tmux, through
     /// `panes_search` (locally) or the provider's `search` (remotely).
@@ -368,13 +353,9 @@ pub struct Picker {
     /// Whether history was on before the archive view was entered, so
     /// leaving it puts the roster back the way it was.
     pub history_before_archive: bool,
-    pub keys: PickKeys,
     /// The new-agent form's launchers (name, shell line): the configured
     /// ones, then the detected harness commands, see `Config::launchers`.
     pub launchers: Vec<(String, String)>,
-    pub status: Option<String>,
-    /// A `g` was pressed and waits for a second `g` (vim `gg` = go top).
-    pub pending_g: bool,
     /// A kill was asked for on this local pane and waits for a second
     /// press to confirm. Killing a pane cannot be undone, and the row the
     /// cursor sits on moves under a refresh, so the pane is remembered
@@ -400,13 +381,6 @@ pub struct Picker {
     /// The server user's home, for `~` paths in the `~dir` filter and its
     /// dropdown (one host call at open, not one per row per keystroke).
     pub home: Option<String>,
-    /// The dropdown under the search box while a filter token is being
-    /// typed: the values on the roster that complete it, with how many
-    /// rows each has. Empty when there is nothing to offer, or after Esc
-    /// dismissed it for the token being typed.
-    pub completions: Vec<(String, usize)>,
-    pub completion_idx: usize,
-    pub completion_hidden: bool,
     /// The cursor has yet to land on `current_pane`'s row. Set at open;
     /// cleared once it lands, or once the user moves the cursor
     /// themselves. While set, each refresh tries again: a remote row's
@@ -418,9 +392,6 @@ pub struct Picker {
     pub down: HashMap<String, u64>,
     /// Per server: why this side rejects its copy of the plugin.
     pub mismatch: HashMap<String, String>,
-    /// Composing a message to the selected agent.
-    pub composing: bool,
-    pub msg_buf: String,
     /// Unread message count per (server, agent id), from each server's
     /// mailbox plugin. Absent or zero means no badge.
     pub unread: HashMap<(String, String), i64>,
@@ -434,12 +405,6 @@ pub struct Picker {
     pub remote_capture: Option<(String, Vec<String>)>,
     /// Rows come from more than one server: show server headers.
     pub multi: bool,
-    /// The keyboard belongs to the preview: every key goes to the
-    /// highlighted agent's pane (see `PickAfter::Type`), except the one
-    /// that takes it back. The list still refreshes underneath, but no
-    /// key moves the cursor - a selection that moved under your prompt
-    /// would send the rest of it to another agent.
-    pub preview_focus: bool,
     /// The query the conversation hits below are for.
     pub transcript_query: String,
     /// Conversation hits for that query, by row key: the turn to open on,
@@ -466,8 +431,6 @@ pub struct Picker {
     pub transcript_focus: bool,
     /// Show the info card for the highlighted row in the preview (`i`).
     pub show_info: bool,
-    /// The quick reference in place of the preview (`?`).
-    pub show_help: bool,
     /// The card's fetched half, for the row it was fetched for.
     pub info: Option<InfoCard>,
 }
@@ -508,98 +471,114 @@ pub struct TranscriptView {
     pub capture: Vec<String>,
 }
 
+/// The filter tokens the search box takes: `@server`, `#session`, `~dir`
+/// (the directory by substring of its `~` form), and the keys that put
+/// the highlighted row's own value in the box.
+fn sigils() -> Vec<SigilSpec> {
+    vec![
+        SigilSpec::new('@', "server", false, Some("S"), "narrow to a server (prefix)"),
+        SigilSpec::new('#', "session", false, Some("s"), "narrow to a session (prefix)"),
+        SigilSpec::new('~', "dir", true, Some("d"), "narrow to a directory (part of its ~ path)"),
+    ]
+}
+
+/// The key table, from the configured keys. The engine looks up
+/// `activate`, `focus`, `unfocus`, `filter` and `close` itself; the rest
+/// come back as actions this module runs.
+fn key_table(k: &PickKeys) -> KeyTable {
+    let mut t = KeyTable::new()
+        .with("activate", "Enter", "moving", "jump to the pane")
+        .with("transcript", "Tab", "moving", "conversation / pane in the preview")
+        .with("focus", "l", "moving", "type into the pane; keys go there (a click too)")
+        .with("unfocus", "C-]", "moving", "take the keyboard back")
+        .note("moving", "j/k ↑/↓", "move the cursor")
+        .note("moving", "gg / G", "first / last row")
+        .note("moving", "J / K", "mark the row and move")
+        .note("moving", "wheel", "over the preview: scrolls the pane itself")
+        .with("filter", "/", "search box", "focus the box; words match names, tasks, conversations")
+        .with("content", "C-f", "search box", "also grep the panes' contents")
+        .note("search box", "dropdown", "a sigil opens it: Tab/↓ BTab/↑ walk, Enter takes, Esc hides")
+        .note("search box", "C-u", "clear the box")
+        .note("search box", "Esc Enter", "leave the box, keep the query")
+        .with("archive", "a", "rows", "archive / un-archive")
+        .with("archived", "A", "rows", "the archive view")
+        .with("history", ".", "rows", "show finished agents too")
+        .with("attention", "w", "rows", "move between attention and waiting")
+        .with("read", "r", "rows", "mark read")
+        .with("unread", "u", "rows", "mark unread")
+        .with("rename", "R", "rows", "rename")
+        .with("copy", "c", "rows", "copy the agent id")
+        .with("message", "m", "rows", "message the agent")
+        .with("interrupt", "x", "rows", "interrupt (C-c) the agent")
+        .with("kill", "X", "rows", "kill its pane (asks)")
+        .with("new", "n", "rows", "new agent, prefilled from the row")
+        .with("fork", "f", "rows", "fork this agent (a copy of its session, its own name)")
+        .with("menu", "Space", "rows", "the action menu")
+        .with("info", "i", "rows", "info card (y copies its cwd)")
+        .with("copy_cwd", "y", "rows", "copy the info card's directory")
+        .with("sessions", "t", "rows", "the sessions chooser, on this row's pane")
+        .note("conversation (Tab)", "j/k", "scroll")
+        .note("conversation (Tab)", "n / N", "next / previous match")
+        .note("conversation (Tab)", "g / G", "top / end")
+        .note("conversation (Tab)", "Space / b", "page down / up")
+        .note("conversation (Tab)", "Esc", "back to the list")
+        .with("close", "Escape", "picker", "close (Esc first puts a card or the marks away)")
+        .note("picker", "+ / -", "resize")
+        .note("picker", "?", "this card");
+    for (action, key) in [
+        ("activate", &k.jump),
+        ("filter", &k.filter),
+        ("archive", &k.archive),
+        ("attention", &k.attention),
+        ("copy", &k.copy),
+        ("menu", &k.menu),
+        ("history", &k.history),
+        ("archived", &k.archived),
+        ("close", &k.close),
+        ("content", &k.content),
+        ("rename", &k.rename),
+        ("interrupt", &k.interrupt),
+        ("kill", &k.kill),
+        ("focus", &k.focus),
+        ("unfocus", &k.unfocus),
+        ("new", &k.new),
+        ("read", &k.read),
+        ("unread", &k.unread),
+        ("sessions", &k.sessions),
+    ] {
+        t.bind(action, Some(key));
+    }
+    t
+}
+
 impl Picker {
-    /// The width of the list column; the preview takes the rest. 60% of
-    /// the width, but never let the clamp's min exceed its max: a narrow
-    /// mode (a split pane) would panic `clamp(30, <30)` and trap the
-    /// guest. Below ~50 cols give the list almost everything and skip the
-    /// side preview.
-    fn list_w(&self) -> usize {
-        let w = self.width as usize;
-        if w <= 50 {
-            w.saturating_sub(2).max(1)
-        } else {
-            (w * 6 / 10).clamp(30, w - 20)
-        }
+    fn key(&self, action: &str) -> &str {
+        self.engine.keys.key_of(action)
+    }
+
+    fn status(&mut self, s: impl Into<String>) {
+        self.engine.status = Some(s.into());
     }
 
     /// The preview cannot keep the keyboard without a pane to type into:
     /// the agent may have finished, or a refresh replaced the rows and
     /// the highlighted one is a remote row with no mirror here.
     fn sync_focus(&mut self) {
-        if self.preview_focus && live_pane_of_selection(self).is_none() {
-            self.preview_focus = false;
+        if self.engine.preview_focus && live_pane_of_selection(self).is_none() {
+            self.engine.preview_focus = false;
         }
     }
+
     /// What to ask the store and every provider for beyond the live rows.
     pub fn list_req(&self) -> ListReq {
         ListReq { history: self.show_history, archived: self.archived_only }
     }
 
-    /// Rebuild the display lines from `view`, inserting a server header
-    /// whenever the server changes (multi-server only) and a band header
-    /// whenever the band changes.
-    fn rebuild_lines(&mut self) {
-        self.lines.clear();
-        self.line_servers.clear();
-        let mut prev_server: Option<&str> = None;
-        let mut prev: Option<u8> = None;
-        for (vpos, &ri) in self.view.iter().enumerate() {
-            let a = &self.rows[ri];
-            if self.multi && prev_server != Some(a.server.as_str()) {
-                self.lines.push(Line::Header { level: 0, id: self.line_servers.len() });
-                self.line_servers.push(a.server.clone());
-                prev_server = Some(a.server.as_str());
-                prev = None;
-            }
-            let b = band(a);
-            if prev != Some(b) {
-                self.lines.push(Line::Header { level: 1, id: b as usize });
-                prev = Some(b);
-            }
-            self.lines.push(Line::Item(vpos));
-        }
-        // A server whose copy this side rejects has no rows, and nor
-        // does one being fetched for the first time; give both a line
-        // anyway, so the reason (or the spinner) is on screen. A fetch
-        // still inside its grace is not one of them: a line that appears
-        // and vanishes within 500ms is worse than no line.
-        let now = self.now_ms;
-        let mut odd: Vec<&String> = self
-            .mismatch
-            .keys()
-            .chain(
-                self.fetching
-                    .iter()
-                    .filter(|(_, t)| now.saturating_sub(**t) >= SPIN_GRACE_MS)
-                    .map(|(k, _)| k),
-            )
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .filter(|s| !self.rows.iter().any(|a| a.server == **s))
-            .collect();
-        odd.sort();
-        for s in odd {
-            self.lines.push(Line::Header { level: 0, id: self.line_servers.len() });
-            self.line_servers.push(s.clone());
-        }
-    }
-
-    /// The display line of the selected row.
-    fn sel_line(&self) -> usize {
-        self.lines
-            .iter()
-            .position(|l| matches!(l, Line::Item(v) if *v == self.sel))
-            .unwrap_or(0)
-    }
-
-    fn list_h(&self) -> usize {
-        LIST_MAX.min((self.height as usize).saturating_sub(5)).max(1)
-    }
-
-    /// Keep the selected row's display line inside the scroll window.
-    fn scroll_to_selection(&mut self) {
-        self.top = scroll_window(self.top, self.sel_line(), self.list_h(), &self.lines);
+    /// The highlighted row, as (key, server, pane): what a rebuild keeps
+    /// the cursor on. The pane is the fallback for an id migration (prov
+    /// -> durable), which changes the key but never the pane.
+    fn keep(&self) -> Option<(String, String, Option<i64>)> {
+        self.selected().map(|a| (a.key(), a.server.clone(), a.pane))
     }
 
     /// Put the cursor on the row for the pane the picker was opened from,
@@ -609,11 +588,14 @@ impl Picker {
         if !self.seek_here || (self.current_pane.is_none() && self.here_id.is_none()) {
             return false;
         }
-        let pos = self.view.iter().position(|&i| self.is_here(&self.rows[i]));
-        let Some(pos) = pos else { return false };
-        self.sel = pos;
+        let key = self
+            .engine
+            .visible()
+            .find(|n| self.by_key.get(&n.key).is_some_and(|&i| self.is_here(&self.rows[i])))
+            .map(|n| n.key.clone());
+        let Some(key) = key else { return false };
+        self.engine.select_key(&key);
         self.seek_here = false;
-        self.scroll_to_selection();
         true
     }
 
@@ -636,11 +618,27 @@ impl Picker {
 
     /// The highlighted row.
     pub fn selected(&self) -> Option<&Agent> {
-        self.rows.get(*self.view.get(self.sel)?)
+        let key = self.engine.selected_key()?;
+        self.rows.get(*self.by_key.get(&key)?)
+    }
+
+    fn selected_index(&self) -> Option<usize> {
+        let key = self.engine.selected_key()?;
+        self.by_key.get(&key).copied()
+    }
+
+    /// The rows a bulk key acts on: the marked ones, else the highlighted.
+    fn targets(&self) -> Vec<&Agent> {
+        self.engine
+            .targets()
+            .iter()
+            .filter_map(|k| self.by_key.get(k))
+            .filter_map(|&i| self.rows.get(i))
+            .collect()
     }
 
     /// The local pane a row's pane shows in: the pane itself for a local
-    /// row, the shadow pane for a mirrored remote row.
+    /// row, the shadow pane for a mirrored remote one.
     pub fn local_pane_of(&self, a: &Agent) -> Option<u32> {
         let pane = a.pane.filter(|_| a.live())? as u32;
         if a.is_local() {
@@ -655,8 +653,12 @@ impl Picker {
         let active = (a.active_ms() + skew).max(0) as u64;
         self.now_ms.saturating_sub(active)
     }
-}
 
+    /// The preview column's width.
+    fn preview_w(&self) -> usize {
+        (self.engine.width as usize).saturating_sub(self.engine.list_w() + 2)
+    }
+}
 
 /// The shadow panes this server holds for panes elsewhere:
 /// (host, remote pane id) -> local pane id.
@@ -716,17 +718,11 @@ async fn gather_rows(
     }
     let r = remotes.borrow();
     rows.extend(r.rows());
-    let skew = r.servers.iter().map(|(k, v)| (k.clone(), v.skew_ms)).collect();
-    let down = r
-        .servers
-        .iter()
-        .filter_map(|(k, v)| v.down_since.map(|t| (k.clone(), t)))
-        .collect();
     Gathered {
         rows,
         captures,
-        skew,
-        down,
+        skew: r.skews(),
+        down: r.downs(),
         mismatch: r.mismatch.clone(),
         fetching: r.fetching(),
     }
@@ -760,20 +756,7 @@ pub async fn pick_open(
     // copy-mode binding has no attached client, only the pane); else the
     // first attached client's, so a request that arrives over the link
     // lands where the user looks; the first window only as a last resort.
-    let client_window = |cid: u64| {
-        list_clients()
-            .ok()?
-            .into_iter()
-            .find(|c| u64::from(c.id) == cid)?
-            .session
-            .and_then(|s| resolve_session(SessionId(s)).ok())
-            .and_then(|v| v.current_window)
-    };
-    let window = client
-        .and_then(client_window)
-        .or_else(|| here.and_then(|p| resolve_pane(PaneId(p)).ok().map(|pi| pi.window)))
-        .or_else(|| any_client().and_then(client_window))
-        .or_else(|| list_windows().ok().and_then(|w| w.first().map(|x| x.id)));
+    let window = listkit::window_for(client, here);
     // Opening on an id, the pane we were pressed in is nobody's business
     // beyond that: the cursor and the here border go to the id's row, not
     // to the agent that happens to live where the key was pressed.
@@ -786,7 +769,7 @@ pub async fn pick_open(
     // let a remembered manual size override it. mode_open clamps again.
     let (ww, wh) = resolve_window(WindowId(window))
         .map(|wi| (wi.width, wi.height))
-        .unwrap_or((MAX_WIDTH, MAX_HEIGHT));
+        .unwrap_or((SIZE.max_w, SIZE.max_h));
     let (mut width, mut height) = default_size(ww, wh, &SIZE);
     if let Ok(Some(v)) = store::get_setting("pick_w").await {
         if let Ok(n) = v.parse::<u32>() {
@@ -870,21 +853,12 @@ pub async fn pick_open(
     let mut order_next: u64 = 0;
     stable_sort(&mut order, &mut order_next, &mut rows);
     let multi = is_multi(&rows, &fetching, now_ms());
+    let mut engine = Engine::new(mode, width, height, "agents", key_table(&cfg.keys), sigils());
+    engine.size = SIZE;
     let mut p = Picker {
-        mode,
-        width,
-        height,
+        engine,
         rows,
-        view: Vec::new(),
-        lines: Vec::new(),
-        line_servers: Vec::new(),
-        sel: 0,
-        top: 0,
-        marked: HashSet::new(),
-        filter: String::new(),
-        filtering: false,
-        renaming: false,
-        rename_buf: String::new(),
+        by_key: HashMap::new(),
         content_search: false,
         content_hits: HashMap::new(),
         captures,
@@ -894,10 +868,7 @@ pub async fn pick_open(
         show_history: req.history,
         archived_only,
         history_before_archive: false,
-        keys: cfg.keys.clone(),
         launchers: cfg.launchers.clone(),
-        status: None,
-        pending_g: false,
         pending_kill: None,
         order,
         order_next,
@@ -905,21 +876,15 @@ pub async fn pick_open(
         current_pane: here,
         here_id,
         home: home_dir().ok().filter(|h| !h.is_empty()),
-        completions: Vec::new(),
-        completion_idx: 0,
-        completion_hidden: false,
         seek_here: here.is_some() || seek_id.is_some(),
         skew,
         down,
         mismatch,
-        fetching,
-        composing: false,
-        msg_buf: String::new(),
         unread: HashMap::new(),
+        fetching,
         mirrors: if multi { find_mirrors() } else { HashMap::new() },
         remote_capture: None,
         multi,
-        preview_focus: false,
         transcript_query: String::new(),
         transcript_hits: HashMap::new(),
         hit_rows: Vec::new(),
@@ -928,11 +893,10 @@ pub async fn pick_open(
         show_transcript: false,
         transcript_focus: false,
         show_info: false,
-        show_help: false,
         info: None,
     };
     if let Some(id) = missing_id {
-        p.status = Some(format!("no agent {id} on any server"));
+        p.status(format!("no agent {id} on any server"));
     }
     p.roster_len = p.rows.len();
     pick_refilter(&mut p);
@@ -974,10 +938,8 @@ pub async fn reload_picker(
     let mut b = picker.borrow_mut();
     if let Some(p) = b.as_mut() {
         // Capture the selected agent (key AND pane) against the OLD rows
-        // before we swap them in, so the highlight follows the agent. The
-        // pane is the fallback: an id migration (prov -> durable) changes
-        // the id but never the pane, so the cursor stays put across it.
-        let keep = p.selected().map(|a| (a.key(), a.server.clone(), a.pane));
+        // before we swap them in, so the highlight follows the agent.
+        let keep = p.keep();
         // Stable order (server + band + frozen rank), so a refresh never
         // reshuffles rows under the cursor.
         stable_sort(&mut p.order, &mut p.order_next, &mut rows);
@@ -1030,7 +992,7 @@ async fn refresh_timer(
         let (live, req) = {
             let b = picker.borrow();
             match b.as_ref() {
-                Some(p) if p.mode.0 == mode.0 => (true, p.list_req()),
+                Some(p) if p.engine.mode.0 == mode.0 => (true, p.list_req()),
                 _ => (false, ListReq::default()),
             }
         };
@@ -1042,9 +1004,9 @@ async fn refresh_timer(
     }
 }
 
-/// A remote row without a local mirror shows the provider's captured text
 /// Whatever the highlighted row needs in the preview that is not a live
-/// blit: its conversation, or a remote provider's captured text.
+/// blit: its conversation, a remote provider's captured text, the info
+/// card's fetched half.
 fn request_preview(picker: &Rc<RefCell<Option<Picker>>>) {
     request_transcript(picker);
     request_capture(picker);
@@ -1072,7 +1034,7 @@ fn request_info(picker: &Rc<RefCell<Option<Picker>>>) {
             return;
         }
         let local_pane = if a.is_local() { p.local_pane_of(a) } else { None };
-        (key, a.server.clone(), a.id.clone(), a.is_local(), local_pane, a.cwd.clone(), p.mode)
+        (key, a.server.clone(), a.id.clone(), a.is_local(), local_pane, a.cwd.clone(), p.engine.mode)
     };
     let picker = Rc::clone(picker);
     spawn(async move {
@@ -1104,7 +1066,7 @@ fn request_info(picker: &Rc<RefCell<Option<Picker>>>) {
         };
         let mut b = picker.borrow_mut();
         let Some(p) = b.as_mut() else { return };
-        if p.mode.0 != mode.0 {
+        if p.engine.mode.0 != mode.0 {
             return;
         }
         p.info = Some(InfoCard { key, fetched_ms: now_ms(), stats, live_cwd, dirty });
@@ -1136,7 +1098,7 @@ fn request_transcript(picker: &Rc<RefCell<Option<Picker>>>) {
         }) {
             return;
         }
-        (key, a.server.clone(), a.id.clone(), a.is_local(), open_seq, p.mode)
+        (key, a.server.clone(), a.id.clone(), a.is_local(), open_seq, p.engine.mode)
     };
     let picker = Rc::clone(picker);
     spawn(async move {
@@ -1161,7 +1123,7 @@ fn request_transcript(picker: &Rc<RefCell<Option<Picker>>>) {
         };
         let mut b = picker.borrow_mut();
         let Some(p) = b.as_mut() else { return };
-        if p.mode.0 != mode.0 || p.selected().map(|a| a.key()) != Some(key.clone()) {
+        if p.engine.mode.0 != mode.0 || p.selected().map(|a| a.key()) != Some(key.clone()) {
             return;
         }
         // A refetch of the same conversation (a live row, on the refresh
@@ -1195,6 +1157,7 @@ fn request_transcript(picker: &Rc<RefCell<Option<Picker>>>) {
     });
 }
 
+/// A remote row without a local mirror shows the provider's captured text
 /// in the preview area: ask for it (once per highlighted row).
 fn request_capture(picker: &Rc<RefCell<Option<Picker>>>) {
     let want = {
@@ -1208,7 +1171,7 @@ fn request_capture(picker: &Rc<RefCell<Option<Picker>>>) {
         if p.remote_capture.as_ref().is_some_and(|(k, _)| *k == key) {
             return;
         }
-        (key, a.server.clone(), a.id.clone(), p.mode)
+        (key, a.server.clone(), a.id.clone(), p.engine.mode)
     };
     let picker = Rc::clone(picker);
     spawn(async move {
@@ -1221,7 +1184,7 @@ fn request_capture(picker: &Rc<RefCell<Option<Picker>>>) {
         };
         let mut b = picker.borrow_mut();
         let Some(p) = b.as_mut() else { return };
-        if p.mode.0 != mode.0 {
+        if p.engine.mode.0 != mode.0 {
             return;
         }
         let lines = text.lines().map(str::to_string).collect();
@@ -1251,13 +1214,13 @@ pub async fn apply_life(
         let mut b = picker.borrow_mut();
         if let Some(p) = b.as_mut() {
             let verb = if life == "active" { "unarchived" } else { "archived" };
-            p.status = Some(if ids.len() == 1 {
+            p.status(if ids.len() == 1 {
                 verb.to_string()
             } else {
                 format!("{} {verb}", ids.len())
             });
             // The bulk action consumed the selection.
-            p.marked.clear();
+            p.engine.clear_marks();
         }
     }
     // The same request the view is showing: an archive from the history
@@ -1302,13 +1265,13 @@ pub async fn apply_read(
         let mut b = picker.borrow_mut();
         if let Some(p) = b.as_mut() {
             let verb = if read { "marked read" } else { "marked unread" };
-            p.status = Some(match (done, refused) {
+            p.status(match (done, refused) {
                 (1, None) => verb.to_string(),
                 (n, None) => format!("{n} {verb}"),
                 (0, Some(why)) => why,
                 (n, Some(why)) => format!("{n} {verb}; {why}"),
             });
-            p.marked.clear();
+            p.engine.clear_marks();
         }
     }
     let req = list_req_of(&picker);
@@ -1353,20 +1316,19 @@ pub async fn apply_status(
         let mut b = picker.borrow_mut();
         if let Some(p) = b.as_mut() {
             let verb = if status == "waiting" { "moved to waiting" } else { "flagged" };
-            p.status = Some(match (moved, refused) {
+            p.status(match (moved, refused) {
                 (1, None) => verb.to_string(),
                 (n, None) => format!("{n} {verb}"),
                 (0, Some(why)) => why,
                 (n, Some(why)) => format!("{n} {verb}; {why}"),
             });
-            p.marked.clear();
+            p.engine.clear_marks();
         }
     }
     let req = list_req_of(&picker);
     fetch_remotes_now(Rc::clone(&picker), Rc::clone(&remotes), req).await;
     reload_picker(picker, remotes, false).await;
 }
-
 
 /// The action menu for the selected row: every picker action, with the
 /// ones that do not apply dimmed, opened on the client that asked for it.
@@ -1380,34 +1342,34 @@ async fn open_menu(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>) {
         let b = picker.borrow();
         b.as_ref().and_then(|p| {
             let a = p.selected()?;
-            let k = &p.keys;
+            let k = |action: &str| p.key(action).to_string();
             let live = live_pane_of_selection(p).is_some();
             let flagged = a.status == "needs_input";
             let movable =
                 a.live() && matches!(a.status.as_str(), "needs_input" | "waiting");
             let mut items = String::new();
-            items.push_str(&menu_item("agents", "jump to pane", &k.jump, live));
-            items.push_str(&menu_item("agents", "type into pane", &k.focus, live));
-            items.push_str(&menu_item("agents", "new agent here", &k.new, true));
-            items.push_str(&menu_item("agents", "fork this agent", "f", true));
-            items.push_str(&menu_item("agents", "message", "m", true));
+            items.push_str(&menu_item("agents", "jump to pane", &k("activate"), live));
+            items.push_str(&menu_item("agents", "type into pane", &k("focus"), live));
+            items.push_str(&menu_item("agents", "new agent here", &k("new"), true));
+            items.push_str(&menu_item("agents", "fork this agent", &k("fork"), true));
+            items.push_str(&menu_item("agents", "message", &k("message"), true));
             let stopped =
                 a.live() && matches!(a.status.as_str(), "needs_input" | "waiting");
-            items.push_str(&menu_item("agents", "mark read", &k.read, stopped && a.unread()));
-            items.push_str(&menu_item("agents", "mark unread", &k.unread, stopped && !a.unread()));
-            items.push_str(&menu_item("agents", "sessions chooser here", &k.sessions, true));
-            items.push_str(&menu_item("agents", "copy id", &k.copy, durable_id(a).is_some()));
-            items.push_str(&menu_item("agents", "info", "i", true));
+            items.push_str(&menu_item("agents", "mark read", &k("read"), stopped && a.unread()));
+            items.push_str(&menu_item("agents", "mark unread", &k("unread"), stopped && !a.unread()));
+            items.push_str(&menu_item("agents", "sessions chooser here", &k("sessions"), true));
+            items.push_str(&menu_item("agents", "copy id", &k("copy"), durable_id(a).is_some()));
+            items.push_str(&menu_item("agents", "info", &k("info"), true));
             items.push_str(&menu_item("agents", "help", "?", true));
-            items.push_str(&menu_item("agents", "rename", &k.rename, true));
+            items.push_str(&menu_item("agents", "rename", &k("rename"), true));
             items.push_str(" ''");
             let band = if flagged { "move to waiting" } else { "flag: needs input" };
-            items.push_str(&menu_item("agents", band, &k.attention, movable));
+            items.push_str(&menu_item("agents", band, &k("attention"), movable));
             let arch = if a.life == "archived" { "un-archive" } else { "archive" };
-            items.push_str(&menu_item("agents", arch, &k.archive, true));
+            items.push_str(&menu_item("agents", arch, &k("archive"), true));
             items.push_str(" ''");
-            items.push_str(&menu_item("agents", "interrupt (C-c)", &k.interrupt, live));
-            items.push_str(&menu_item("agents", "kill pane", &k.kill, live));
+            items.push_str(&menu_item("agents", "interrupt (C-c)", &k("interrupt"), live));
+            items.push_str(&menu_item("agents", "kill pane", &k("kill"), live));
             // The one view toggle in a menu of row actions: a key that
             // is not in the footer has to be findable somewhere.
             items.push_str(" ''");
@@ -1416,7 +1378,7 @@ async fn open_menu(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>) {
             } else {
                 "show finished (history)"
             };
-            items.push_str(&menu_item("agents", hist, &k.history, true));
+            items.push_str(&menu_item("agents", hist, &k("history"), true));
             Some((menu_safe(&display_name(a), 30), items))
         })
     }) else {
@@ -1438,7 +1400,7 @@ async fn open_menu(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>) {
     let cmd = format!("display-menu{target} -T ' {title} '{items}");
     if let Err(e) = run_command(&cmd).await {
         if let Some(p) = picker.borrow_mut().as_mut() {
-            p.status = Some(format!("menu failed: {}", e.message));
+            p.status(format!("menu failed: {}", e.message));
             pick_render(p);
         }
     }
@@ -1472,7 +1434,7 @@ async fn copy_to_clipboard(
         Err(e) => format!("copy failed: {}", e.message),
     };
     if let Some(p) = picker.borrow_mut().as_mut() {
-        p.status = Some(msg);
+        p.status(msg);
         pick_render(p);
     }
 }
@@ -1545,16 +1507,16 @@ pub fn on_mode_nav(
     {
         let mut b = picker.borrow_mut();
         let Some(p) = b.as_mut() else { return };
-        if event.get_i64("mode") != Some(p.mode.0 as i64) {
+        if event.get_i64("mode") != Some(p.engine.mode.0 as i64) {
             return;
         }
         if busy.get() {
             return;
         }
-        p.status = None;
+        p.engine.status = None;
         match dir.as_str() {
             "left" => {
-                p.preview_focus = false;
+                p.engine.preview_focus = false;
                 p.transcript_focus = false;
                 pick_render(p);
             }
@@ -1568,16 +1530,16 @@ pub fn on_mode_nav(
                 }
             }
             "up" | "down" => {
-                let typing = p.preview_focus;
-                move_sel(p, if dir == "up" { -1 } else { 1 });
+                let typing = p.engine.preview_focus;
+                p.engine.move_sel(if dir == "up" { -1 } else { 1 });
+                p.seek_here = false;
                 // The keyboard stays with the preview, which now shows
                 // another agent - unless that row has no pane to type
                 // into, in which case the focus drops and the footer says
-                // so (rendered again, since move_sel drew the old state).
+                // so.
                 p.sync_focus();
-                if typing {
-                    pick_render(p);
-                }
+                let _ = typing;
+                pick_render(p);
             }
             _ => return,
         }
@@ -1601,7 +1563,7 @@ pub fn on_menu_key(
     mouse: Option<(u32, u32)>,
     client: Option<u64>,
 ) {
-    let mode_id = picker.borrow().as_ref().map(|p| p.mode.0 as i64);
+    let mode_id = picker.borrow().as_ref().map(|p| p.engine.mode.0 as i64);
     // No picker: the menu outlived it (its window went away, or someone
     // ran the command by hand). Nothing to act on.
     if mode_id.is_none() {
@@ -1612,44 +1574,36 @@ pub fn on_menu_key(
 
 /// Text pasted into the picker (a bracketed paste, or `paste-buffer` on
 /// the float). While the preview has the keyboard it goes to the agent's
-/// pane, as typed keys do; otherwise into the search box, which takes
-/// the focus, so a pasted agent id or filter token lands where it works.
+/// pane, as typed keys do; otherwise into the search box (or an open
+/// prompt), which takes the focus, so a pasted agent id or filter token
+/// lands where it works.
 pub fn on_mode_paste(picker: &Rc<RefCell<Option<Picker>>>, event: &Event) {
     let mut b = picker.borrow_mut();
     let Some(p) = b.as_mut() else { return };
-    if event.get_i64("mode") != Some(p.mode.0 as i64) {
+    if event.get_i64("mode") != Some(p.engine.mode.0 as i64) {
         return;
     }
     let Some(text) = event.get_str("text") else { return };
     let text = text.to_string();
-    if p.preview_focus {
+    if p.engine.preview_focus {
         if let Some(pane) = live_pane_of_selection(p) {
             let _ = send_text(PaneId(pane), &text);
         }
         return;
     }
-    // Verbatim, with line breaks as spaces: a paste that tmux detected
-    // from typing speed arrives one character per event, so nothing may
-    // be added around a chunk - a separator per chunk put a space after
-    // every character of a pasted id.
-    let flat: String = text
-        .chars()
-        .map(|c| if c == '\n' || c == '\r' || c == '\t' { ' ' } else { c })
-        .filter(|c| !c.is_control())
-        .collect();
-    if flat.is_empty() {
-        return;
+    match p.engine.handle_paste(&text) {
+        Outcome::FilterChanged => {
+            pick_refilter(p);
+            pick_render(p);
+        }
+        Outcome::Redraw => pick_render(p),
+        _ => {}
     }
-    p.filtering = true;
-    p.composing = false;
-    p.renaming = false;
-    p.filter.push_str(&flat);
-    filter_edited(p);
 }
 
-/// The agent ids on a pane's screen (the last screens of its history
-/// too), nearest the bottom first, each once: `claude:<uuid>`,
-/// `codex:...`, `pi:...`, `opencode:...`.
+/// The agent ids written on a screen: `kind:hex-or-dash`, as the mailbox
+/// prints them ("Message from claude:… via the tmux2 mailbox") and as
+/// the picker copies them. Nearest the bottom first, each once.
 pub fn ids_on_screen(text: &str) -> Vec<String> {
     const KINDS: [&str; 4] = ["claude:", "codex:", "pi:", "opencode:"];
     let mut found: Vec<String> = Vec::new();
@@ -1734,11 +1688,9 @@ pub async fn pick_ids(
 }
 
 /// A mouse key, by name: a click, a release, a drag, a wheel notch, with
-/// or without a modifier prefix. Never text, and never forwarded to a
-/// pane - `send_key` would take the name, but a mouse key without its
-/// event is a key the pane cannot make sense of.
+/// or without a modifier prefix.
 fn is_mouse_key(key: &str) -> bool {
-    key.contains("Mouse") || key.contains("Wheel") || key.contains("Click")
+    listkit::engine::is_mouse_key(key)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1753,52 +1705,64 @@ fn dispatch_key(
     client: Option<u64>,
 ) {
     let mut after = PickAfter::None;
-    // A row to acknowledge (mark read) after the borrow drops: the cursor
-    // landed on an unread waiting row, or the user jumped to it.
+    // A row to acknowledge (mark read) after the borrow drops: the user
+    // jumped to it or started typing into it.
     let mut ack: Option<(String, String)> = None;
     {
         let mut b = picker.borrow_mut();
         let Some(p) = b.as_mut() else { return };
-        if mode_id != Some(p.mode.0 as i64) {
+        if mode_id != Some(p.engine.mode.0 as i64) {
             return;
         }
         if busy.get() {
             return;
         }
-        p.status = None;
-        let k = &p.keys.clone();
-        // A pending `g` is consumed by this key; only a second `g`
-        // keeps it (see the `g` branch).
-        let g_pending = p.pending_g;
-        p.pending_g = false;
+        p.engine.status = None;
         // Any key that is not the kill key again cancels a pending kill.
         let kill_pending = p.pending_kill.take();
-        // Arrows and their control aliases move the selection in both
-        // modes; they are never text.
         let is_down = matches!(key.as_str(), "Down" | "C-n" | "C-j");
         let is_up = matches!(key.as_str(), "Up" | "C-p" | "C-k");
-        if is_mouse_key(&key) {
-            // The mouse means the same thing whatever has the keyboard:
-            // a click lands where it lands. Without a cell (a mouse key
+        let outcome = if is_mouse_key(&key) {
+            // The mouse means the same thing whatever has the keyboard: a
+            // click lands where it lands. Without a cell (a mouse key
             // typed by name) there is nowhere for it to land.
-            if let Some((x, y)) = mouse {
-                mouse_key(p, &key, x, y, &mut after, &mut ack);
-            }
-        } else if p.preview_focus {
-            // The preview has the keyboard: every key goes to the pane
-            // it shows, except the one that takes the keyboard back.
-            if key == k.unfocus {
-                p.preview_focus = false;
-                pick_render(p);
-            } else {
-                match live_pane_of_selection(p) {
-                    Some(pane) => after = PickAfter::Type(pane, key.clone()),
-                    None => {
-                        // The pane went away under the prompt: say so,
-                        // rather than typing into nothing.
-                        p.preview_focus = false;
-                        p.status = Some(unreachable_reason(p));
-                        pick_render(p);
+            match mouse {
+                None => Outcome::Nothing,
+                Some((x, _y)) => {
+                    let list_w = p.engine.list_w();
+                    let base = key.rsplit('-').next().unwrap_or(&key).to_string();
+                    let on_preview = x as usize > list_w;
+                    if on_preview && transcript_drawn(p) {
+                        // Over the conversation: a click takes the keyboard
+                        // to it, the wheel scrolls it.
+                        match base.as_str() {
+                            "MouseDown1Pane" | "DoubleClick1Pane" => {
+                                p.transcript_focus = true;
+                                ensure_transcript_rendered(p);
+                                Outcome::Redraw
+                            }
+                            "WheelUpPane" | "WheelDownPane" => {
+                                ensure_transcript_rendered(p);
+                                scroll_transcript(p, if base == "WheelUpPane" { -3 } else { 3 });
+                                Outcome::Redraw
+                            }
+                            _ => Outcome::Nothing,
+                        }
+                    } else if on_preview && matches!(base.as_str(), "MouseDown1Pane" | "DoubleClick1Pane") && !p.show_info && !p.engine.show_help {
+                        // A click on the pane: start typing into it.
+                        ack = focus_preview(p);
+                        Outcome::Redraw
+                    } else {
+                        let o = p.engine.handle_key(&key, mouse);
+                        if x as usize <= list_w && matches!(o, Outcome::Redraw | Outcome::Activate(_)) {
+                            // The user took the cursor: stop pulling it
+                            // back to the here row, and the conversation
+                            // loses the keyboard.
+                            p.seek_here = false;
+                            p.transcript_focus = false;
+                            p.sync_focus();
+                        }
+                        o
                     }
                 }
             }
@@ -1806,378 +1770,253 @@ fn dispatch_key(
             // The conversation has the keyboard: scroll it, step through
             // its matches, or hand the keyboard back.
             transcript_key(p, &key, is_up, is_down);
-        } else if p.composing {
-            // Compose mode: keys are text, except accept / cancel.
-            if key == k.close {
-                p.composing = false;
-                p.msg_buf.clear();
-                pick_render(p);
-            } else if key == "Enter" {
-                if let Some(a) = p.selected() {
-                    let text = p.msg_buf.trim().to_string();
-                    if !text.is_empty() {
-                        after = PickAfter::Message(a.server.clone(), a.id.clone(), text);
-                    }
-                }
-                p.composing = false;
-                p.msg_buf.clear();
-            } else if key == "BSpace" {
-                p.msg_buf.pop();
-                pick_render(p);
-            } else if key == "C-u" {
-                p.msg_buf.clear();
-                pick_render(p);
-            } else if key == "Space" {
-                p.msg_buf.push(' ');
-                pick_render(p);
-            } else if key.chars().count() == 1
-                && !key.chars().next().unwrap().is_control()
-            {
-                p.msg_buf.push_str(&key);
-                pick_render(p);
-            }
-        } else if p.renaming {
-            // Rename mode: keys are text, except accept / cancel.
-            if key == k.close {
-                p.renaming = false;
-                p.rename_buf.clear();
-                pick_render(p);
-            } else if key == "Enter" {
-                if let Some(a) = p.selected() {
-                    after = PickAfter::Rename(
-                        a.server.clone(),
-                        a.id.clone(),
-                        p.rename_buf.trim().to_string(),
-                    );
-                }
-                p.renaming = false;
-            } else if key == "BSpace" {
-                p.rename_buf.pop();
-                pick_render(p);
-            } else if key == "C-u" {
-                p.rename_buf.clear();
-                pick_render(p);
-            } else if key == "Space" {
-                p.rename_buf.push(' ');
-                pick_render(p);
-            } else if key.chars().count() == 1
-                && !key.chars().next().unwrap().is_control()
-            {
-                p.rename_buf.push_str(&key);
-                pick_render(p);
-            }
-        } else if p.filtering {
-            // The search box is focused: keys are text, except the ones
-            // that unfocus it or move the selection. Esc (or Enter)
-            // unfocuses and KEEPS the query, fzf-style; it never closes
-            // the picker from here (close is q, or Esc from the list).
-            // With the dropdown open, Tab/Down and BTab/Up walk it, Enter
-            // takes the value, Esc puts it away for this token.
-            let dropdown = !p.completions.is_empty();
-            if dropdown && (key == "Tab" || is_down) {
-                p.completion_idx = (p.completion_idx + 1) % p.completions.len();
-                pick_render(p);
-            } else if dropdown && (key == "BTab" || is_up) {
-                p.completion_idx =
-                    (p.completion_idx + p.completions.len() - 1) % p.completions.len();
-                pick_render(p);
-            } else if dropdown && key == "Enter" {
-                accept_completion(p);
-                pick_render(p);
-            } else if dropdown && key == k.close {
-                p.completion_hidden = true;
-                p.completions.clear();
-                pick_render(p);
-            } else if key == k.close || key == "Enter" {
-                p.filtering = false;
-                p.completions.clear();
-                pick_render(p);
-            } else if is_down {
-                move_sel(p, 1);
-            } else if is_up {
-                move_sel(p, -1);
-            } else if key == "BSpace" {
-                p.filter.pop();
-                filter_edited(p);
-            } else if key == "C-u" {
-                p.filter.clear();
-                filter_edited(p);
-            } else if key == "Space" {
-                p.filter.push(' ');
-                filter_edited(p);
-            } else if key == k.content {
-                toggle_content(p);
-            } else if key == "\\\\" {
-                // A backslash: tmux names the key with two.
-                p.filter.push('\\');
-                filter_edited(p);
-            } else if key.chars().count() == 1
-                && !key.chars().next().unwrap().is_control()
-            {
-                p.filter.push_str(&key);
-                filter_edited(p);
-            }
-        } else if key == k.close || key == "q" {
-            // Esc or q puts the info card away first, then cancels a
-            // pending selection; with neither, it closes the picker.
-            if p.show_help {
-                p.show_help = false;
-                pick_render(p);
-            } else if p.show_info {
-                p.show_info = false;
-                pick_render(p);
-            } else if p.marked.is_empty() {
-                after = PickAfter::Close(p.mode);
-            } else {
-                p.marked.clear();
-                p.status = Some("selection cleared".into());
-                pick_render(p);
-            }
-        } else if key == k.filter {
-            // `/` focuses the search box, and is the only way in.
-            p.filtering = true;
-            p.completion_hidden = false;
-            update_completions(p);
-            pick_render(p);
-        } else if key == "s" || key == "S" || key == "d" {
-            // Narrow to the highlighted row's session (s), server (S) or
-            // folder (d), as a token in the search box; the same key
-            // again takes the token out.
-            if let Some(tok) = narrow_token(p, &key) {
-                toggle_token(p, &tok);
-            }
-        } else if key == "g" {
-            // Vim `gg`: the first `g` waits, the second goes to the top.
-            if g_pending {
-                let n = p.view.len() as i32;
-                move_sel(p, -n);
-            } else {
-                p.pending_g = true;
-            }
-        } else if key == "G" {
-            // Vim `G`: go to the bottom.
-            let n = p.view.len() as i32;
-            move_sel(p, n);
-        } else if key == k.interrupt {
-            // Interrupt, do not kill: send C-c and let the agent decide
-            // what that means. Claude with work in flight answers with its
-            // own "are you sure?", and the live preview shows it, so the
-            // second press is an informed one rather than a guess.
-            match live_pane_of_selection(p) {
-                Some(pane) => {
-                    after = PickAfter::Interrupt(pane);
-                    p.status = Some(format!("interrupt sent to %{pane}"));
-                }
-                None => {
-                    p.status = Some(unreachable_reason(p));
-                }
-            }
-            pick_render(p);
-        } else if key == k.kill {
-            // Killing the pane takes the agent's process and its scrollback
-            // with it, so it asks first. The second press must be on the
-            // same pane the first one named.
-            match live_pane_of_selection(p) {
-                Some(pane) => {
-                    if kill_pending == Some(pane) {
-                        after = PickAfter::KillPane(pane);
-                        p.status = Some(format!("killing %{pane}"));
-                    } else {
-                        p.pending_kill = Some(pane);
-                        p.status = Some(format!(
-                            "kill %{pane}? {} again to confirm",
-                            pretty_key(&k.kill)
-                        ));
-                    }
-                }
-                None => {
-                    p.status = Some(unreachable_reason(p));
-                }
-            }
-            pick_render(p);
-        } else if key == k.content {
-            toggle_content(p);
-        } else if key == "i" {
-            // The info card in place of the preview, and back.
-            p.show_info = !p.show_info;
-            p.show_help = false;
-            pick_render(p);
-        } else if key == "?" {
-            // The quick reference in place of the preview, and back.
-            p.show_help = !p.show_help;
-            p.show_info = false;
-            pick_render(p);
-        } else if key == "y" && p.show_info {
-            // Copy the working directory, the way c copies the id.
-            let cwd = p
-                .info
-                .as_ref()
-                .and_then(|c| c.live_cwd.clone())
-                .or_else(|| p.selected().and_then(|a| a.cwd.clone()));
-            match cwd {
-                Some(d) if !d.contains('\'') => after = PickAfter::Copy(d),
-                Some(_) => p.status = Some("that path has a quote I will not paste".into()),
-                None => p.status = Some("no working directory known".into()),
-            }
-            pick_render(p);
-        } else if key == "Tab" {
-            // The highlighted live row's conversation in place of its
-            // pane, and back. A row with no pane shows it anyway.
-            p.show_transcript = !p.show_transcript;
-            p.status = Some(if p.show_transcript {
-                "preview: conversation".into()
-            } else {
-                "preview: pane".into()
-            });
-            pick_render(p);
-        } else if key == "[" || key == "]" {
-            if transcript_shown(p) {
-                let step = (p.height as usize).saturating_sub(2).max(2) / 2;
-                if let Some(tv) = p.transcript.as_mut() {
-                    tv.top = if key == "[" {
-                        tv.top.saturating_sub(step)
-                    } else {
-                        tv.top.saturating_add(step)
-                    };
-                }
-                pick_render(p);
-            }
-        } else if key == k.rename {
-            if let Some(a) = p.selected() {
-                p.rename_buf = a.user_name.clone().unwrap_or_default();
-                p.renaming = true;
-                pick_render(p);
-            }
-        } else if key == "m" {
-            // Message the selected agent: its mailbox holds it until the
-            // agent reads it, on this server or the agent's own.
-            if p.selected().is_some() {
-                p.msg_buf.clear();
-                p.composing = true;
-                pick_render(p);
-            }
-        } else if key == k.jump {
-            after = jump_after(p, &mut ack);
-        } else if key == k.focus || key == "Right" {
+            Outcome::Nothing
+        } else if p.engine.preview_focus || p.engine.prompt().is_some() || p.engine.filtering {
+            p.engine.handle_key(&key, mouse)
+        } else if key == p.key("focus") || key == "Right" {
             // Right, into the preview: the keyboard goes with it. To the
             // conversation when that is what the preview shows (a finished
             // agent, or Tab on a live one); else to the pane.
             if transcript_shown(p) {
                 p.transcript_focus = true;
                 ensure_transcript_rendered(p);
-                pick_render(p);
             } else {
                 ack = focus_preview(p);
             }
-        } else if key == "h" || key == "Left" {
-            // Left of the list is nothing; the key is spent so that it
-            // is never mistaken for text. (`h` used to fold in history.)
-        } else if key == k.archive {
-            after = archive_after(p);
-        } else if key == k.menu {
-            if p.selected().is_some() {
-                after = PickAfter::Menu;
+            Outcome::Redraw
+        } else if (key == p.key("close") || key == "q") && p.show_info && !p.engine.show_help {
+            // Esc puts the info card away first.
+            p.show_info = false;
+            Outcome::Redraw
+        } else {
+            let o = p.engine.handle_key(&key, mouse);
+            if matches!(o, Outcome::Redraw) && (is_up || is_down || matches!(key.as_str(), "j" | "k" | "g" | "G" | "J" | "K")) {
+                p.seek_here = false;
             }
-        } else if key == k.new {
-            // Start another agent: the form prefills from the row under
-            // the cursor, or from the pressing client's pane when the
-            // list is empty.
-            after = PickAfter::NewAgent(false);
-        } else if key == "f" {
-            // Fork the row's agent: the form, prefilled to resume its
-            // session as a copy with a name of its own.
-            match p.selected() {
-                Some(a) if crate::newagent::resumable_id(&a.id).is_some() => {
-                    after = PickAfter::NewAgent(true);
-                }
-                Some(_) => {
-                    p.status = Some("nothing to fork: this agent has no session id yet".into());
-                    pick_render(p);
-                }
-                None => {}
-            }
-        } else if key == k.copy {
-            match copy_after(p) {
-                Ok(a) => after = a,
-                Err(why) => {
-                    p.status = Some(why);
-                    pick_render(p);
-                }
-            }
-        } else if key == k.attention {
-            match attention_after(p) {
-                Ok(a) => after = a,
-                Err(why) => {
-                    p.status = Some(why);
-                    pick_render(p);
-                }
-            }
-        } else if key == k.history {
-            p.show_history = !p.show_history;
-            // Leaving history leaves the archive view too: it lives there.
-            if !p.show_history {
-                p.archived_only = false;
-            }
-            after = PickAfter::Reload;
-        } else if key == k.archived {
-            // The archive as a list of its own. It is a history view, so
-            // entering it turns history on; leaving it puts history back
-            // the way it was before.
-            p.archived_only = !p.archived_only;
-            if p.archived_only {
-                p.history_before_archive = p.show_history;
-                p.show_history = true;
-            } else {
-                p.show_history = p.history_before_archive;
-            }
-            p.status = Some(if p.archived_only {
-                "archive only: on".into()
-            } else {
-                "archive only: off".into()
-            });
-            after = PickAfter::Reload;
-        } else if key == "J" {
-            mark_and_move(p, 1);
-        } else if key == "K" {
-            mark_and_move(p, -1);
-        } else if key == k.sessions {
-            // The sessions chooser, on the pane under the cursor: the
-            // same tree seen by session rather than by agent.
-            after = PickAfter::Sessions(live_pane_of_selection(p));
-        } else if key == k.read || key == k.unread {
-            // Read and unread by hand: the cursor passing over a row is
-            // not reading it, so these are the way to say you have (or
-            // have not) dealt with what it stopped for.
-            let read = key == k.read;
-            let ids: Vec<(String, String)> = action_targets(p)
-                .iter()
-                .filter(|a| a.live())
-                .map(|a| (a.server.clone(), a.id.clone()))
-                .collect();
-            if ids.is_empty() {
-                p.status = Some("no live agent to mark".into());
+            o
+        };
+        match outcome {
+            Outcome::Nothing => {}
+            Outcome::Redraw | Outcome::Expanded(..) | Outcome::PreviewHeaderClick(..) => pick_render(p),
+            Outcome::FilterChanged => {
+                pick_refilter(p);
                 pick_render(p);
-            } else {
-                after = PickAfter::Read(ids, read);
             }
-        } else if key == "+" || key == "=" {
-            let w = (p.width + RESIZE_STEP_W).min(MAX_WIDTH);
-            let h = (p.height + RESIZE_STEP_H).min(MAX_HEIGHT);
-            p.width = w;
-            p.height = h;
-            pick_render(p);
-            after = PickAfter::Resize(p.mode, w, h);
-        } else if key == "-" || key == "_" {
-            let w = p.width.saturating_sub(RESIZE_STEP_W).max(MIN_WIDTH);
-            let h = p.height.saturating_sub(RESIZE_STEP_H).max(MIN_HEIGHT);
-            p.width = w;
-            p.height = h;
-            pick_render(p);
-            after = PickAfter::Resize(p.mode, w, h);
-        } else if is_down || key == "j" {
-            move_sel(p, 1);
-        } else if is_up || key == "k" {
-            move_sel(p, -1);
+            Outcome::Close => after = PickAfter::Close(p.engine.mode),
+            Outcome::Activate(_) => after = jump_after(p, &mut ack),
+            Outcome::Resize(w, h) => {
+                p.engine.resize(w, h);
+                pick_render(p);
+                after = PickAfter::Resize(p.engine.mode, w, h);
+            }
+            Outcome::PreviewKey(pane, k) => {
+                after = match k.strip_prefix("\u{0}paste:") {
+                    Some(text) => PickAfter::Paste(pane.0, text.to_string()),
+                    None => PickAfter::Type(pane.0, k),
+                };
+            }
+            Outcome::PreviewWheel(pane, k, x, y) => after = PickAfter::Wheel(pane.0, k, x, y),
+            Outcome::Prompt(tag, text) => {
+                if let Some(a) = p.selected() {
+                    let (server, id) = (a.server.clone(), a.id.clone());
+                    match tag {
+                        TAG_RENAME => after = PickAfter::Rename(server, id, text),
+                        TAG_MESSAGE if !text.is_empty() => after = PickAfter::Message(server, id, text),
+                        _ => {}
+                    }
+                }
+                pick_render(p);
+            }
+            Outcome::Key(k) => match k.as_str() {
+                "[" | "]" if transcript_shown(p) => {
+                    let step = (p.engine.height as usize).saturating_sub(2).max(2) as i64 / 2;
+                    ensure_transcript_rendered(p);
+                    scroll_transcript(p, if k == "[" { -step } else { step });
+                    pick_render(p);
+                }
+                "WheelUpPane" | "WheelDownPane" if transcript_shown(p) => {
+                    ensure_transcript_rendered(p);
+                    scroll_transcript(p, if k == "WheelUpPane" { -3 } else { 3 });
+                    pick_render(p);
+                }
+                _ => {}
+            },
+            Outcome::Action(name, _) => match name {
+                "archive" => after = archive_after(p),
+                "attention" => match attention_after(p) {
+                    Ok(a) => after = a,
+                    Err(why) => {
+                        p.status(why);
+                        pick_render(p);
+                    }
+                },
+                "copy" => match copy_after(p) {
+                    Ok(a) => after = a,
+                    Err(why) => {
+                        p.status(why);
+                        pick_render(p);
+                    }
+                },
+                "menu" => {
+                    if p.selected().is_some() {
+                        after = PickAfter::Menu;
+                    }
+                }
+                "history" => {
+                    p.show_history = !p.show_history;
+                    // Leaving history leaves the archive view too: it
+                    // lives there.
+                    if !p.show_history {
+                        p.archived_only = false;
+                    }
+                    after = PickAfter::Reload;
+                }
+                "archived" => {
+                    // The archive as a list of its own. It is a history
+                    // view, so entering it turns history on; leaving it
+                    // puts history back the way it was before.
+                    p.archived_only = !p.archived_only;
+                    if p.archived_only {
+                        p.history_before_archive = p.show_history;
+                        p.show_history = true;
+                    } else {
+                        p.show_history = p.history_before_archive;
+                    }
+                    p.status(if p.archived_only { "archive only: on" } else { "archive only: off" });
+                    after = PickAfter::Reload;
+                }
+                "content" => toggle_content(p),
+                "rename" => {
+                    if let Some(a) = p.selected() {
+                        let init = a.user_name.clone().unwrap_or_default();
+                        p.engine.open_prompt("rename", &init, TAG_RENAME);
+                        pick_render(p);
+                    }
+                }
+                "message" => {
+                    // Message the selected agent: its mailbox holds it
+                    // until the agent reads it, on this server or the
+                    // agent's own.
+                    if let Some(a) = p.selected() {
+                        let to = clip(&display_name(a), 16);
+                        p.engine.open_prompt(&format!("msg {to}"), "", TAG_MESSAGE);
+                        pick_render(p);
+                    }
+                }
+                "interrupt" => {
+                    // Interrupt, do not kill: send C-c and let the agent
+                    // decide what that means. Claude with work in flight
+                    // answers with its own "are you sure?", and the live
+                    // preview shows it, so the second press is an
+                    // informed one rather than a guess.
+                    match live_pane_of_selection(p) {
+                        Some(pane) => {
+                            after = PickAfter::Interrupt(pane);
+                            p.status(format!("interrupt sent to %{pane}"));
+                        }
+                        None => {
+                            let why = unreachable_reason(p);
+                            p.status(why);
+                        }
+                    }
+                    pick_render(p);
+                }
+                "kill" => {
+                    // Killing the pane takes the agent's process and its
+                    // scrollback with it, so it asks first. The second
+                    // press must be on the same pane the first one named.
+                    match live_pane_of_selection(p) {
+                        Some(pane) => {
+                            if kill_pending == Some(pane) {
+                                after = PickAfter::KillPane(pane);
+                                p.status(format!("killing %{pane}"));
+                            } else {
+                                p.pending_kill = Some(pane);
+                                let k = pretty_key(p.key("kill"));
+                                p.status(format!("kill %{pane}? {k} again to confirm"));
+                            }
+                        }
+                        None => {
+                            let why = unreachable_reason(p);
+                            p.status(why);
+                        }
+                    }
+                    pick_render(p);
+                }
+                "new" => {
+                    // Start another agent: the form prefills from the row
+                    // under the cursor, or from the pressing client's pane
+                    // when the list is empty.
+                    after = PickAfter::NewAgent(false);
+                }
+                "fork" => {
+                    // Fork the row's agent: the form, prefilled to resume
+                    // its session as a copy with a name of its own.
+                    match p.selected() {
+                        Some(a) if crate::newagent::resumable_id(&a.id).is_some() => {
+                            after = PickAfter::NewAgent(true);
+                        }
+                        Some(_) => {
+                            p.status("nothing to fork: this agent has no session id yet");
+                            pick_render(p);
+                        }
+                        None => {}
+                    }
+                }
+                "info" => {
+                    // The info card in place of the preview, and back.
+                    p.show_info = !p.show_info;
+                    p.engine.show_help = false;
+                    pick_render(p);
+                }
+                "copy_cwd" => {
+                    if p.show_info {
+                        // Copy the working directory, the way c copies the id.
+                        let cwd = p
+                            .info
+                            .as_ref()
+                            .and_then(|c| c.live_cwd.clone())
+                            .or_else(|| p.selected().and_then(|a| a.cwd.clone()));
+                        match cwd {
+                            Some(d) if !d.contains('\'') => after = PickAfter::Copy(d),
+                            Some(_) => p.status("that path has a quote I will not paste"),
+                            None => p.status("no working directory known"),
+                        }
+                        pick_render(p);
+                    }
+                }
+                "transcript" => {
+                    // The highlighted live row's conversation in place of
+                    // its pane, and back. A row with no pane shows it anyway.
+                    p.show_transcript = !p.show_transcript;
+                    p.status(if p.show_transcript { "preview: conversation" } else { "preview: pane" });
+                    pick_render(p);
+                }
+                "read" | "unread" => {
+                    // Read and unread by hand: the cursor passing over a
+                    // row is not reading it, so these are the way to say
+                    // you have (or have not) dealt with what it stopped for.
+                    let read = name == "read";
+                    let ids: Vec<(String, String)> = p
+                        .targets()
+                        .iter()
+                        .filter(|a| a.live())
+                        .map(|a| (a.server.clone(), a.id.clone()))
+                        .collect();
+                    if ids.is_empty() {
+                        p.status("no live agent to mark");
+                        pick_render(p);
+                    } else {
+                        after = PickAfter::Read(ids, read);
+                    }
+                }
+                "sessions" => {
+                    // The sessions chooser, on the pane under the cursor:
+                    // the same tree seen by session rather than by agent.
+                    after = PickAfter::Sessions(live_pane_of_selection(p));
+                }
+                _ => {}
+            },
         }
         // The cursor landing on a row does not acknowledge it: scrolling
         // past an unread agent is not reading it. Jumping to it, typing
@@ -2197,11 +2036,21 @@ fn dispatch_key(
                 Ok(()) => poke_preview(picker, true),
                 Err(e) => {
                     if let Some(p) = picker.borrow_mut().as_mut() {
-                        p.preview_focus = false;
-                        p.status = Some(format!("typing failed: {}", e.message));
+                        p.engine.preview_focus = false;
+                        p.status(format!("typing failed: {}", e.message));
                         pick_render(p);
                     }
                 }
+            }
+        }
+        PickAfter::Paste(pane, text) => {
+            if let Err(e) = send_text(PaneId(pane), &text) {
+                if let Some(p) = picker.borrow_mut().as_mut() {
+                    p.status(format!("paste failed: {}", e.message));
+                    pick_render(p);
+                }
+            } else {
+                poke_preview(picker, true);
             }
         }
         PickAfter::Wheel(pane, key, x, y) => {
@@ -2211,7 +2060,7 @@ fn dispatch_key(
                 Ok(()) => poke_preview(picker, false),
                 Err(e) => {
                     if let Some(p) = picker.borrow_mut().as_mut() {
-                        p.status = Some(format!("wheel: {}", e.message));
+                        p.status(format!("wheel: {}", e.message));
                         pick_render(p);
                     }
                 }
@@ -2222,12 +2071,12 @@ fn dispatch_key(
         }
         PickAfter::Sessions(pane) => {
             // Close first: the chooser floats over the same window, and
-            // its `g` comes back here the same way.
+            // its `t` comes back here the same way.
             if let Some(old) = picker.borrow_mut().take() {
                 if let Some(t) = old.timer {
                     cancel(t);
                 }
-                let _ = mode_close(old.mode);
+                let _ = mode_close(old.engine.mode);
             }
             ctx.spawn(async move {
                 let target = pane.map(|p| format!("-t '%{p}' ")).unwrap_or_default();
@@ -2304,7 +2153,7 @@ fn dispatch_key(
             // agent's answer to the interrupt shows up.
             if let Err(e) = send_key(PaneId(pane), "C-c") {
                 if let Some(p) = picker.borrow_mut().as_mut() {
-                    p.status = Some(format!("interrupt failed: {}", e.message));
+                    p.status(format!("interrupt failed: {}", e.message));
                     pick_render(p);
                 }
             }
@@ -2318,7 +2167,7 @@ fn dispatch_key(
                 // the pane dying retires the row through pane-destroyed.
                 let r = run_command(&format!("kill-pane -t %{pane}")).await;
                 if let Some(p) = picker.borrow_mut().as_mut() {
-                    p.status = Some(match &r {
+                    p.status(match &r {
                         Ok(_) => format!("killed %{pane}"),
                         Err(e) => format!("kill failed: {}", e.message),
                     });
@@ -2338,7 +2187,7 @@ fn dispatch_key(
             ctx.spawn(async move {
                 let ok = message_agent(&server, &id, &sender, &text).await;
                 if let Some(p) = picker.borrow_mut().as_mut() {
-                    p.status = Some(match ok {
+                    p.status(match ok {
                         Ok(()) => format!("sent to {id}"),
                         Err(e) => format!("send failed: {e}"),
                     });
@@ -2441,7 +2290,7 @@ fn fetch_unread(picker: Rc<RefCell<Option<Picker>>>) {
             .filter(|s| linked.contains(s))
             .collect();
         servers.insert(LOCAL.to_string());
-        (p.mode, servers)
+        (p.engine.mode, servers)
     };
     for server in servers {
         let picker = Rc::clone(&picker);
@@ -2459,7 +2308,7 @@ fn fetch_unread(picker: Rc<RefCell<Option<Picker>>>) {
             };
             let mut b = picker.borrow_mut();
             let Some(p) = b.as_mut() else { return };
-            if p.mode.0 != mode.0 {
+            if p.engine.mode.0 != mode.0 {
                 return;
             }
             p.unread.retain(|(s, _), _| *s != server);
@@ -2468,6 +2317,8 @@ fn fetch_unread(picker: Rc<RefCell<Option<Picker>>>) {
                     p.unread.insert((server.clone(), bc.box_), bc.unread);
                 }
             }
+            let keep = p.keep();
+            pick_reshow(p, keep, false);
             pick_render(p);
         });
     }
@@ -2484,9 +2335,9 @@ struct MailboxCount {
 }
 
 /// The jump key: to the highlighted row's pane, or the reason it cannot.
-/// Jumping acknowledges the agent (`ack`), like landing the cursor on it.
+/// Jumping acknowledges the agent (`ack`), like typing into it.
 fn jump_after(p: &mut Picker, ack: &mut Option<(String, String)>) -> PickAfter {
-    let Some(i) = p.view.get(p.sel).copied() else {
+    let Some(i) = p.selected_index() else {
         return PickAfter::None;
     };
     let a = &p.rows[i];
@@ -2495,10 +2346,11 @@ fn jump_after(p: &mut Picker, ack: &mut Option<(String, String)>) -> PickAfter {
         (Some(_), Some(local)) => {
             p.rows[i].acked_ms = Some(p.now_ms as i64);
             *ack = Some((p.rows[i].server.clone(), p.rows[i].id.clone()));
-            PickAfter::Jump(local, p.mode)
+            PickAfter::Jump(local, p.engine.mode)
         }
         (Some(_), None) => {
-            p.status = Some(format!("not mirrored here: remote-attach {}", a.server));
+            let server = a.server.clone();
+            p.status(format!("not mirrored here: remote-attach {server}"));
             pick_render(p);
             PickAfter::None
         }
@@ -2508,11 +2360,11 @@ fn jump_after(p: &mut Picker, ack: &mut Option<(String, String)>) -> PickAfter {
             // is the question - Esc says no. A row with nothing to resume
             // (a provisional id) only says so.
             if crate::newagent::resumable_id(&a.id).is_some() {
-                p.status = Some("gone: the form brings it back (Esc: no)".into());
+                p.status("gone: the form brings it back (Esc: no)");
                 pick_render(p);
                 PickAfter::NewAgent(false)
             } else {
-                p.status = Some("no live pane to jump to".into());
+                p.status("no live pane to jump to");
                 pick_render(p);
                 PickAfter::None
             }
@@ -2527,20 +2379,19 @@ fn jump_after(p: &mut Picker, ack: &mut Option<(String, String)>) -> PickAfter {
 /// are about to talk to it. Returns the row to acknowledge.
 fn focus_preview(p: &mut Picker) -> Option<(String, String)> {
     if live_pane_of_selection(p).is_none() {
-        p.status = Some(unreachable_reason(p));
+        let why = unreachable_reason(p);
+        p.status(why);
         pick_render(p);
         return None;
     }
     // Whatever was being typed into the picker itself is abandoned; the
     // keyboard cannot be in two places.
-    p.filtering = false;
-    p.composing = false;
-    p.msg_buf.clear();
-    p.renaming = false;
-    p.rename_buf.clear();
-    p.preview_focus = true;
+    p.engine.filtering = false;
+    p.engine.close_prompt();
+    p.engine.preview_focus = true;
+    p.transcript_focus = false;
     let mut ack = None;
-    if let Some(&i) = p.view.get(p.sel) {
+    if let Some(i) = p.selected_index() {
         if p.rows[i].unread() {
             p.rows[i].acked_ms = Some(p.now_ms as i64);
             ack = Some((p.rows[i].server.clone(), p.rows[i].id.clone()));
@@ -2548,106 +2399,6 @@ fn focus_preview(p: &mut Picker) -> Option<(String, String)> {
     }
     pick_render(p);
     ack
-}
-
-/// A mouse key at cell (x, y) of the mode screen, 0-based. The screen is
-/// the list on the left (its rows from screen row 3, scrolled by `top`),
-/// the separator column at `list_w`, the preview to the right. Returns
-/// whether the selection moved. A click takes the keyboard to the side it
-/// lands on: on the preview it starts typing, on the list it stops.
-fn mouse_key(
-    p: &mut Picker,
-    key: &str,
-    x: u32,
-    y: u32,
-    after: &mut PickAfter,
-    ack: &mut Option<(String, String)>,
-) -> bool {
-    let list_w = p.list_w();
-    let (x, y) = (x as usize, y as usize);
-    // A modifier prefix does not change where a click lands.
-    let base = key.rsplit('-').next().unwrap_or(key);
-    let in_list = x < list_w;
-    match base {
-        "MouseDown1Pane" | "DoubleClick1Pane" => {
-            if !in_list {
-                if x > list_w {
-                    if transcript_shown(p) {
-                        p.transcript_focus = true;
-                        ensure_transcript_rendered(p);
-                        pick_render(p);
-                    } else {
-                        *ack = focus_preview(p);
-                    }
-                }
-                return false;
-            }
-            if p.preview_focus {
-                p.preview_focus = false;
-            }
-            p.transcript_focus = false;
-            // The search line: a click there focuses the box, as `/`.
-            if y == 1 {
-                p.filtering = true;
-                pick_render(p);
-                return false;
-            }
-            let Some(off) = y.checked_sub(3) else {
-                pick_render(p);
-                return false;
-            };
-            if off >= p.list_h() {
-                pick_render(p);
-                return false;
-            }
-            let Some(Line::Item(v)) = p.lines.get(p.top + off).cloned() else {
-                pick_render(p);
-                return false;
-            };
-            p.sel = v;
-            // The user took the cursor: stop pulling it back to the
-            // here row.
-            p.seek_here = false;
-            p.scroll_to_selection();
-            if base == "DoubleClick1Pane" {
-                *after = jump_after(p, ack);
-            }
-            pick_render(p);
-            true
-        }
-        "WheelUpPane" | "WheelDownPane" if in_list => {
-            // The wheel moves the cursor, so it must take the keyboard
-            // back first: a cursor that moves while the preview types
-            // would send the rest of the prompt to another agent.
-            p.preview_focus = false;
-            p.transcript_focus = false;
-            move_sel(p, if base == "WheelUpPane" { -1 } else { 1 });
-            true
-        }
-        "WheelUpPane" | "WheelDownPane" if transcript_shown(p) => {
-            // Over the conversation: scroll it.
-            ensure_transcript_rendered(p);
-            scroll_transcript(p, if base == "WheelUpPane" { -3 } else { 3 });
-            pick_render(p);
-            false
-        }
-        "WheelUpPane" | "WheelDownPane" if !p.show_info => {
-            // Over the live pane: the notch goes to that pane, as if the
-            // pointer were over it. Its own bindings decide what a wheel
-            // does there - copy mode, or the application's scrolling when
-            // it takes the mouse - and the blit shows the result. The
-            // picture itself is never scrolled.
-            if let (Some(pane), Some(rect)) =
-                (live_pane_of_selection(p), preview_rect(p, list_w))
-            {
-                let rx = (x as u32).saturating_sub(rect.x);
-                let ry = (y as u32).saturating_sub(rect.y);
-                *after = PickAfter::Wheel(pane, base.to_string(), rx, ry);
-            }
-            false
-        }
-        _ => false,
-    }
 }
 
 /// How soon after a typed key the preview is re-blitted, twice: once for
@@ -2664,7 +2415,7 @@ fn poke_preview(picker: &Rc<RefCell<Option<Picker>>>, typing: bool) {
     let (mode, rect) = {
         let b = picker.borrow();
         let Some(p) = b.as_ref() else { return };
-        (p.mode, preview_rect(p, p.list_w()))
+        (p.engine.mode, p.engine.preview_rect())
     };
     let Some(rect) = rect else { return };
     let picker = Rc::clone(picker);
@@ -2676,8 +2427,8 @@ fn poke_preview(picker: &Rc<RefCell<Option<Picker>>>, typing: bool) {
             // Still the same picker, same pane in the preview (and, for
             // a typed key, still typing into it).
             let same = picker.borrow().as_ref().is_some_and(|p| {
-                p.mode.0 == mode.0
-                    && (!typing || p.preview_focus)
+                p.engine.mode.0 == mode.0
+                    && (!typing || p.engine.preview_focus)
                     && live_pane_of_selection(p) == Some(rect.pane.0)
             });
             if !same {
@@ -2688,30 +2439,6 @@ fn poke_preview(picker: &Rc<RefCell<Option<Picker>>>, typing: bool) {
     });
 }
 
-/// Move the selection by `delta` rows, clamped, then scroll and redraw.
-fn move_sel(p: &mut Picker, delta: i32) {
-    if p.view.is_empty() {
-        return;
-    }
-    let last = (p.view.len() - 1) as i32;
-    p.sel = (p.sel as i32 + delta).clamp(0, last) as usize;
-    // The user took the cursor: stop pulling it back to the here row.
-    p.seek_here = false;
-    p.scroll_to_selection();
-    pick_render(p);
-}
-
-/// Mark the current row into the selection, then move by `delta`. `J`/`K`
-/// build a multi-row selection this way: each press ropes in the row under
-/// the cursor and steps on, so N presses select N rows and leave the cursor
-/// just past them.
-fn mark_and_move(p: &mut Picker, delta: i32) {
-    if let Some(key) = p.selected().map(Agent::key) {
-        p.marked.insert(key);
-    }
-    move_sel(p, delta);
-}
-
 /// Flip content search on or off, then re-filter. Turning it off drops
 /// the cached snippets. Turning it on makes the next `pick_refilter` grep
 /// the live panes.
@@ -2720,11 +2447,7 @@ fn toggle_content(p: &mut Picker) {
     if !p.content_search {
         p.content_hits.clear();
     }
-    p.status = Some(if p.content_search {
-        "search pane contents: on".into()
-    } else {
-        "search pane contents: off".into()
-    });
+    p.status(if p.content_search { "search pane contents: on" } else { "search pane contents: off" });
     pick_refilter(p);
     pick_render(p);
 }
@@ -2760,22 +2483,6 @@ fn copy_after(p: &Picker) -> Result<PickAfter, String> {
     Ok(PickAfter::Copy(id.to_string()))
 }
 
-/// What a bulk key acts on: the marked rows if there are any, else the
-/// row under the cursor.
-fn action_targets(p: &Picker) -> Vec<&Agent> {
-    let marked: Vec<&Agent> = p
-        .view
-        .iter()
-        .filter_map(|&i| p.rows.get(i))
-        .filter(|a| p.marked.contains(&a.key()))
-        .collect();
-    if marked.is_empty() {
-        p.selected().into_iter().collect()
-    } else {
-        marked
-    }
-}
-
 /// The attention key moves a row between the top band and `waiting` by
 /// hand. It toggles on what the targets already are: anything still in
 /// `needs_input` drops to `waiting` (the common direction - the roster
@@ -2789,7 +2496,7 @@ fn action_targets(p: &Picker) -> Vec<&Agent> {
 /// is the whole point of the picker, and a key that does nothing on the
 /// row under the cursor looks like the picker is wedged.
 fn attention_after(p: &Picker) -> Result<PickAfter, String> {
-    let targets = action_targets(p);
+    let targets = p.targets();
     if targets.is_empty() {
         return Ok(PickAfter::None);
     }
@@ -2826,7 +2533,7 @@ fn attention_after(p: &Picker) -> Result<PickAfter, String> {
 /// history view). Targets are the marked selection, else the highlighted
 /// row.
 fn archive_after(p: &Picker) -> PickAfter {
-    let targets = action_targets(p);
+    let targets = p.targets();
     if targets.is_empty() {
         return PickAfter::None;
     }
@@ -2969,7 +2676,6 @@ fn unadorned(s: &str) -> &str {
     }
 }
 
-
 fn haystack(a: &Agent) -> String {
     format!(
         "{} {} {} {} {} {} {} {} {} {} {}",
@@ -3009,25 +2715,25 @@ fn unreachable_reason(p: &Picker) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// the rows as nodes
+// ---------------------------------------------------------------------------
+
 /// Keep the band order of `p.rows`; the filter only includes or excludes.
 fn pick_refilter(p: &mut Picker) {
-    // The currently-selected agent, resolved against the CURRENT rows.
-    // `.get` on both sides: a stale index (rows just replaced under us)
-    // must never index out of bounds.
-    let keep = p.selected().map(|a| (a.key(), a.server.clone(), a.pane));
+    let keep = p.keep();
     pick_refilter_keep(p, keep, true);
 }
 
-/// Rebuild `view`/`sel`/`lines`, restoring the highlight to `keep`'s agent
-/// if it survived the filter. Callers that replace `rows` pass the key
-/// they captured from the OLD rows, since the internal `view`/`sel` no
-/// longer index the new set.
+/// Run the searches the query needs, then rebuild the list, restoring the
+/// highlight to `keep`'s agent if it survived. Callers that replace
+/// `rows` pass the key they captured from the OLD rows.
 fn pick_refilter_keep(
     p: &mut Picker,
     keep: Option<(String, String, Option<i64>)>,
     reset_scroll: bool,
 ) {
-    let query = parse_query(&p.filter, &SIGILS);
+    let query = p.engine.query();
     let needle = query.words.clone();
     // Refresh the content-match set when content search is on. The local
     // grep runs in tmux over the live grids (`panes_search`); only the
@@ -3077,34 +2783,59 @@ fn pick_refilter_keep(
     pick_reshow(p, keep, reset_scroll);
 }
 
-/// Rebuild the visible list from `rows` and the hits in hand, without
-/// searching again: the tail of a refilter, and what a late reply (rows
-/// for the hits, a remote server's answer) re-runs.
+/// Rebuild the list from `rows` and the hits in hand, without searching
+/// again: the tail of a refilter, and what a late reply (rows for the
+/// hits, a remote server's answer, the mailbox counts) re-runs.
 fn pick_reshow(
     p: &mut Picker,
     keep: Option<(String, String, Option<i64>)>,
     reset_scroll: bool,
 ) {
-    let query = parse_query(&p.filter, &SIGILS);
-    let needle = query.words.clone();
     merge_hit_rows(p);
-    p.view = p
-        .rows
-        .iter()
-        .enumerate()
-        .filter(|(_, a)| row_shown(p, a, &query))
-        .map(|(i, _)| i)
+    let nodes = build_nodes(p);
+    p.engine.set_nodes(nodes);
+    // The engine kept the highlight by key; fall back to the pane on the
+    // same server, which survives an id migration (prov -> durable) that
+    // the key would miss.
+    if let Some((key, server, pane)) = keep {
+        if p.engine.selected_key().as_deref() != Some(key.as_str()) {
+            if let Some(pn) = pane {
+                let fallback = p.rows.iter().find(|a| a.pane == Some(pn) && a.server == server).map(Agent::key);
+                if let Some(k) = fallback {
+                    p.engine.select_key(&k);
+                }
+            }
+        }
+    }
+    // Filter typing snaps to the top; a refresh keeps the scroll where it
+    // is (then just nudges to keep the selection visible).
+    if reset_scroll {
+        p.engine.reset_scroll();
+    }
+    p.sync_focus();
+}
+
+/// The rows as the engine's nodes: a server header (when rows come from
+/// more than one server), a band header under it, then the rows of that
+/// band, in `rows` order - or by relevance inside their band while a
+/// query is typed. Headers are groups the cursor cannot land on; the
+/// engine drops a header whose rows the filter took.
+fn build_nodes(p: &mut Picker) -> Vec<Node> {
+    p.by_key = p.rows.iter().enumerate().map(|(i, a)| (a.key(), i)).collect();
+    let query = p.engine.query();
+    let needle = query.words.clone();
+    let mut idx: Vec<usize> = (0..p.rows.len())
+        .filter(|&i| !p.archived_only || p.rows[i].life == "archived")
         .collect();
     if !needle.is_empty() {
         // With a query, rows sort by relevance inside their band: a name
         // that starts with the query, then one that contains it, then the
         // conversation hits by score. Stable, so ties keep their order.
-        let mut keyed: Vec<(usize, (bool, String), u8, f32)> = p
-            .view
+        let mut keyed: Vec<(usize, (bool, String), u8, f32)> = idx
             .iter()
             .map(|&i| {
                 let a = &p.rows[i];
-                let tier = match rank(&haystack(a), &needle) {
+                let tier = match listkit::query::rank(&haystack(a), &needle) {
                     Some(0) => 2.0e6,
                     Some(1) => 1.0e6,
                     _ => 0.0,
@@ -3118,173 +2849,186 @@ fn pick_reshow(
                 .then(x.2.cmp(&y.2))
                 .then(y.3.partial_cmp(&x.3).unwrap_or(std::cmp::Ordering::Equal))
         });
-        p.view = keyed.into_iter().map(|k| k.0).collect();
+        idx = keyed.into_iter().map(|k| k.0).collect();
     }
-    p.sel = keep
-        .and_then(|(key, server, pane)| {
-            // Prefer the key; fall back to the pane on the same server,
-            // which survives an id migration (prov -> durable) that the
-            // key would miss.
-            p.view
+    let mut nodes: Vec<Node> = Vec::new();
+    let mut prev_server: Option<String> = None;
+    let mut prev_band: Option<u8> = None;
+    let item_depth = if p.multi { 2 } else { 1 };
+    for i in idx {
+        let a = &p.rows[i];
+        if p.multi && prev_server.as_deref() != Some(a.server.as_str()) {
+            nodes.push(server_node(p, &a.server));
+            prev_server = Some(a.server.clone());
+            prev_band = None;
+        }
+        let b = band(a);
+        if prev_band != Some(b) {
+            let mut n = Node::group(format!("band\u{1}{}\u{1}{b}", a.server), item_depth - 1, true, false);
+            n.left = plain_cells(band_label(b), ST_DIM | ST_BOLD);
+            n.header_glyph = None;
+            n.indent = Some(1);
+            n.tokens = vec![('@', a.server.clone())];
+            nodes.push(n);
+            prev_band = Some(b);
+        }
+        nodes.push(row_node(p, a, item_depth));
+    }
+    // A server whose copy this side rejects has no rows, and nor does
+    // one being fetched for the first time; give both a line anyway, so
+    // the reason (or the spinner) is on screen. A fetch still inside its
+    // grace is not one of them: a line that appears and vanishes within
+    // 500ms is worse than no line.
+    let now = p.now_ms;
+    let mut odd: Vec<&String> = p
+        .mismatch
+        .keys()
+        .chain(
+            p.fetching
                 .iter()
-                .position(|&i| p.rows[i].key() == key)
-                .or_else(|| {
-                    pane.and_then(|pn| {
-                        p.view.iter().position(|&i| {
-                            p.rows[i].pane == Some(pn) && p.rows[i].server == server
-                        })
-                    })
-                })
-        })
-        .unwrap_or(0);
-    if p.sel >= p.view.len() {
-        p.sel = p.view.len().saturating_sub(1);
+                .filter(|(_, t)| now.saturating_sub(**t) >= SPIN_GRACE_MS)
+                .map(|(k, _)| k),
+        )
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .filter(|s| !p.rows.iter().any(|a| a.server == **s))
+        .collect();
+    odd.sort();
+    for s in odd {
+        nodes.push(server_node(p, s));
     }
-    p.rebuild_lines();
-    // Filter typing snaps to the top; a refresh keeps the scroll where it
-    // is (then just nudges to keep the selection visible).
-    if reset_scroll {
-        p.top = 0;
-    } else if p.top >= p.lines.len() {
-        p.top = p.lines.len().saturating_sub(1);
-    }
-    p.scroll_to_selection();
-    p.sync_focus();
+    nodes
 }
 
-/// Whether a row is in the view: it belongs to the view's set (every row,
-/// or only the archived ones), and the filter matches its metadata, a
-/// content hit landed on it, or its conversation matched.
-fn row_shown(p: &Picker, a: &Agent, q: &Query) -> bool {
-    if p.archived_only && a.life != "archived" {
-        return false;
+/// A server header: bold, with the link state when down, the reason when
+/// its copy is rejected, and a spinner while its roster is still in
+/// flight. A healthy remote barely flashes; one that keeps the call
+/// hanging says for how long, which is the whole point (the alternative
+/// is a stale group with no reason).
+fn server_node(p: &Picker, server: &str) -> Node {
+    let (label, style) = match (
+        p.down.get(server),
+        p.mismatch.get(server),
+        spin_since(&p.fetching, server, p.now_ms),
+    ) {
+        (Some(since), _, _) => (
+            format!("{server}  (disconnected {})", fmt_age(p.now_ms.saturating_sub(*since) / 1000)),
+            ST_RED,
+        ),
+        (None, Some(why), _) => (format!("{server}  ({why})"), ST_CODE),
+        (None, None, Some(since)) => {
+            let waited = p.now_ms.saturating_sub(since);
+            let frame = SPIN_FRAMES[(p.now_ms / SPIN_MS) as usize % SPIN_FRAMES.len()];
+            if waited >= FETCH_STUCK_MS {
+                (format!("{server}  {frame} (fetching {})", fmt_age(waited / 1000)), ST_CODE)
+            } else {
+                (format!("{server}  {frame}"), ST_CYAN)
+            }
+        }
+        (None, None, None) => (server.to_string(), ST_CYAN),
+    };
+    let mut n = Node::group(format!("srv\u{1}{server}"), 0, true, false);
+    n.left = plain_cells(&label, style);
+    n.haystack = server.to_string();
+    n.tokens = vec![('@', server.to_string())];
+    n
+}
+
+/// The badge: the agent's state as one coloured glyph. Magenta for an
+/// archived agent, dim for a finished one; an unread stopped agent gets
+/// a block behind its glyph, the one coloured background in the list,
+/// so it cannot be missed at a glance.
+fn badge_cells(a: &Agent) -> Styled {
+    if a.life == "archived" {
+        return ('◆', ST_MAGENTA);
     }
-    if !filters_pass(p, q, a) {
-        return false;
+    if !a.live() {
+        return ('·', ST_DIM);
     }
+    match a.status.as_str() {
+        "needs_input" if a.unread() => ('!', ST_HIT),
+        "needs_input" => ('!', ST_BOLD | ST_CODE),
+        "working" => ('●', ST_GREEN),
+        "waiting" if a.unread() => ('◉', ST_BOLD | ST_CYAN | ST_BRIGHT | ST_INVERT),
+        "waiting" => ('◍', ST_CYAN),
+        "done" => ('·', ST_DIM),
+        _ => ('?', 0),
+    }
+}
+
+/// One agent as a row: the badge, the unread count, the name (bold while
+/// unread), then the reason the row is here - a content or conversation
+/// hit's line, "archived", or the note or task - dim; the session, kind
+/// and age at the right.
+fn row_node(p: &Picker, a: &Agent, depth: u8) -> Node {
     let key = a.key();
-    rank(&haystack(a), &q.words).is_some()
-        || p.content_hits.contains_key(&key)
-        || p.transcript_hits.contains_key(&key)
-}
-
-// ---------------------------------------------------------------------------
-// filter tokens: @server #session ~dir
-// ---------------------------------------------------------------------------
-
-/// The sigils that start a filter token in the search box.
-pub const SIGILS: [char; 3] = ['@', '#', '~'];
-
-
-
-/// Does the row pass the query's filter tokens? Server and session by
-/// prefix, so `@dm` is dmatrix and `#tm` is tmux2; the directory by
-/// substring of its `~` form, so `~tmux2` takes both tmux2 trees.
-fn filters_pass(p: &Picker, q: &Query, a: &Agent) -> bool {
-    if !query::passes(&q.values('@'), &a.server, false) {
-        return false;
+    let mut left: Vec<Styled> = vec![badge_cells(a), (' ', 0)];
+    let unread = p
+        .unread
+        .get(&(a.server.clone(), a.id.clone()))
+        .copied()
+        .unwrap_or(0);
+    let name = if unread > 0 {
+        format!("\u{2709}{unread} {}", display_name(a))
+    } else {
+        display_name(a)
+    };
+    // An unread row's name is bold too: the badge is one cell, the name
+    // is what the eye reads.
+    left.extend(plain_cells(&name, if a.unread() { ST_BOLD } else { 0 }));
+    // A content-search hit shows the matching line: it is why the row is
+    // here. Otherwise an archived row (only in the history views) says
+    // so, so the `a` un-archive is obvious; else the note (the reason
+    // the row is at the top, only while the agent is blocked on the
+    // user) or the task.
+    let snip = p
+        .content_hits
+        .get(&key)
+        .filter(|_| p.content_search)
+        .or_else(|| {
+            p.transcript_hits
+                .get(&key)
+                .map(|h| &h.snippet)
+                .filter(|s| !s.is_empty())
+        });
+    let note = a.note.as_deref().filter(|s| !s.is_empty());
+    let task = a.task.as_deref().filter(|s| !s.is_empty());
+    let tail = if let Some(sn) = snip {
+        Some(sn.trim().to_string())
+    } else if a.life == "archived" {
+        Some("archived".to_string())
+    } else {
+        note.or(task).map(one_line)
+    };
+    if let Some(t) = tail {
+        left.extend(plain_cells(&format!("  ·  {t}"), ST_DIM));
     }
-    if !query::passes(&q.values('#'), a.session.as_deref().unwrap_or(""), false) {
-        return false;
+    // session + kind + age are fixed columns at the right edge - the
+    // session is where the pane lives, which the name does not say.
+    let right = format!(
+        "{:<12} {:<8} {:>6}",
+        clip(a.session.as_deref().unwrap_or(""), 12),
+        clip(&a.kind, 8),
+        fmt_age(p.age_ms(a) / 1000)
+    );
+    let mut n = Node::item(key.clone(), depth);
+    n.indent = Some(0);
+    n.left = left;
+    n.right = plain_cells(&right, 0);
+    n.haystack = haystack(a);
+    n.tokens = vec![('@', a.server.clone())];
+    if let Some(s) = a.session.as_deref().filter(|s| !s.is_empty()) {
+        n.tokens.push(('#', s.to_string()));
     }
-    let dirs = q.values('~');
-    if !dirs.is_empty() {
-        let dir = a.cwd.as_deref().map(|c| tilde_of(&p.home, c)).unwrap_or_default();
-        if !query::passes(&dirs, &dir, true) {
-            return false;
-        }
+    if let Some(c) = a.cwd.as_deref() {
+        n.tokens.push(('~', tilde_of(&p.home, c)));
     }
-    true
-}
-
-/// The search text changed under the cursor: refilter, and offer the
-/// values that complete a token being typed.
-fn filter_edited(p: &mut Picker) {
-    p.completion_hidden = false;
-    pick_refilter(p);
-    update_completions(p);
-    pick_render(p);
-}
-
-/// Rebuild the dropdown for the token being typed, from the values the
-/// roster holds: servers, sessions, or `~` directories, with how many
-/// rows have each. Prefix for servers and sessions, substring for
-/// directories; most rows first.
-fn update_completions(p: &mut Picker) {
-    p.completions.clear();
-    p.completion_idx = 0;
-    if !p.filtering || p.completion_hidden {
-        return;
-    }
-    let Some((sigil, partial)) = typing_token(&p.filter, &SIGILS) else { return };
-    let values = p.rows.iter().filter_map(|a| match sigil {
-        '@' => Some(a.server.clone()),
-        '#' => a.session.clone(),
-        // The `~` form without its own tilde: the sigil is one, so
-        // the token reads `~/Code/x` and matches the path's tail.
-        _ => a.cwd.as_deref().map(|c| {
-            let t = tilde_of(&p.home, c);
-            t.strip_prefix('~').map(str::to_string).unwrap_or(t)
-        }),
-    });
-    p.completions = query::complete_values(values, partial, sigil == '~');
-}
-
-/// Replace the token being typed with the highlighted value, and a space
-/// so the next word starts fresh.
-fn accept_completion(p: &mut Picker) {
-    let Some((v, _)) = p.completions.get(p.completion_idx).cloned() else { return };
-    if !query::replace_typing_token(&mut p.filter, &SIGILS, &v) {
-        return;
-    }
-    p.completions.clear();
-    pick_refilter(p);
-}
-
-/// The token that narrows to the highlighted row: `s` its session, `S`
-/// its server, `d` the last folder of its directory.
-fn narrow_token(p: &Picker, key: &str) -> Option<String> {
-    let a = p.selected()?;
-    match key {
-        "s" => a.session.as_deref().filter(|s| !s.is_empty()).map(|s| format!("#{s}")),
-        "S" => Some(format!("@{}", a.server)),
-        _ => a.cwd.as_deref().map(|c| {
-            let t = tilde_of(&p.home, c);
-            let base = t.trim_end_matches('/').rsplit('/').next().unwrap_or(&t).to_string();
-            format!("~{base}")
-        }),
-    }
-}
-
-/// Add the token to the search box, or take it out if it is there.
-fn toggle_token(p: &mut Picker, tok: &str) {
-    let removed = query::toggle_word(&mut p.filter, tok);
-    p.status = Some(if removed { format!("{tok} off") } else { format!("{tok} on") });
-    pick_refilter(p);
-    pick_render(p);
-}
-
-/// The dropdown: under the search box, aligned with the token being
-/// typed, one line per value with its row count; the highlighted one in
-/// reverse. Drawn last, over the top of the list.
-fn draw_completions(p: &Picker, out: &mut String, list_w: usize) {
-    if !p.filtering || p.completions.is_empty() {
-        return;
-    }
-    let Some((sigil, partial)) = typing_token(&p.filter, &SIGILS) else { return };
-    // "  search " is nine cells; the sigil sits where the token starts.
-    let col = query::dropdown_col(&p.filter, partial, 10);
-    let wmax = p.completions.iter().map(|(v, _)| v.chars().count()).max().unwrap_or(0);
-    let width = (wmax + 8).min(list_w.saturating_sub(col + 1)).max(4);
-    for (i, (v, n)) in p.completions.iter().enumerate() {
-        let row = 3 + i;
-        if row >= p.height as usize - 1 {
-            break;
-        }
-        let line = clip(&format!(" {sigil}{v}  {n}"), width);
-        let sgr = if i == p.completion_idx { "7" } else { "48;5;238" };
-        out.push_str(&format!("\x1b[{row};{col}H\x1b[{sgr}m{line:<width$}\x1b[0m"));
-    }
+    n.force_match = p.content_hits.contains_key(&key) || p.transcript_hits.contains_key(&key);
+    // A row of a disconnected server is dimmed: what it shows is what
+    // the provider last said.
+    n.dim = p.down.contains_key(&a.server);
+    n.here = p.is_here(a);
+    n
 }
 
 /// The rows the hits brought in follow the roster's own in `rows`, once
@@ -3369,7 +3113,7 @@ fn local_hit_details(needle: String, missing: Vec<String>, windows: Vec<(String,
                     h.snippet = transcript::snippet_for(&turns, id, *seq, &terms);
                 }
             }
-            let keep = p.selected().map(|a| (a.key(), a.server.clone(), a.pane));
+            let keep = p.keep();
             pick_reshow(p, keep, false);
             pick_render(p);
         });
@@ -3406,7 +3150,7 @@ fn remote_search(p: &mut Picker, needle: &str) {
     if servers.is_empty() {
         return;
     }
-    let mode = p.mode;
+    let mode = p.engine.mode;
     let needle = needle.to_string();
     for server in servers {
         let needle = needle.clone();
@@ -3423,7 +3167,7 @@ fn remote_search(p: &mut Picker, needle: &str) {
                 let Some(picker) = cell.borrow().clone() else { return };
                 let mut b = picker.borrow_mut();
                 let Some(p) = b.as_mut() else { return };
-                if p.mode.0 != mode.0 {
+                if p.engine.mode.0 != mode.0 {
                     return;
                 }
                 let mut changed = false;
@@ -3451,9 +3195,9 @@ fn remote_search(p: &mut Picker, needle: &str) {
                 if !changed {
                     return;
                 }
-                let keep = p.selected().map(|a| (a.key(), a.server.clone(), a.pane));
                 // Rebuild the view with the new hits, without re-running
                 // the search (the query is unchanged).
+                let keep = p.keep();
                 pick_reshow(p, keep, false);
                 pick_render(p);
             });
@@ -3469,51 +3213,78 @@ thread_local! {
         const { RefCell::new(None) };
 }
 
+// ---------------------------------------------------------------------------
+// render
+// ---------------------------------------------------------------------------
 
-/// Coloured status glyph. Magenta for an archived agent, dim for a
-/// finished one.
-fn badge(a: &Agent) -> String {
-    if a.life == "archived" {
-        return "\x1b[35m◆\x1b[0m".into();
+/// Is the conversation what the preview shows for the highlighted row:
+/// it has arrived, and the row has no live pane here (or asked for it
+/// with Tab), and no card or typing is over it.
+fn transcript_drawn(p: &Picker) -> bool {
+    if p.show_info || p.engine.show_help || p.engine.preview_focus {
+        return false;
     }
-    if !a.live() {
-        return "\x1b[2m·\x1b[0m".into();
+    if !transcript_shown(p) {
+        return false;
     }
-    match a.status.as_str() {
-        // Unread needs-input: the bang on a bright yellow block; read: the
-        // bang alone.
-        "needs_input" if a.unread() => "\x1b[1;30;103m!\x1b[0m".into(),
-        "needs_input" => "\x1b[1;33m!\x1b[0m".into(),
-        "working" => "\x1b[32m●\x1b[0m".into(),
-        // Unread waiting: a filled badge on a bright cyan block, the one
-        // coloured background in the list, so it cannot be missed at a
-        // glance. Read waiting: hollow, no block.
-        "waiting" if a.unread() => "\x1b[1;30;106m◉\x1b[0m".into(),
-        "waiting" => "\x1b[36m◍\x1b[0m".into(),
-        "done" => "\x1b[2m·\x1b[0m".into(),
-        _ => "?".into(),
-    }
+    p.show_transcript || p.selected().and_then(|a| p.local_pane_of(a)).is_none()
+}
+
+/// What the preview column shows for the highlighted row, set on its
+/// node: the info card; the conversation (drawn by this module, so the
+/// node says `None`); the live pane; a remote row's captured text.
+fn refresh_preview(p: &mut Picker) {
+    let Some(a) = p.selected() else { return };
+    let key = a.key();
+    let pw = p.preview_w();
+    let preview = if p.show_info {
+        Preview::Text(info_lines(p, a, pw))
+    } else if transcript_drawn(p) {
+        Preview::None
+    } else if let Some(pane) = p.local_pane_of(a) {
+        Preview::Pane(PaneId(pane))
+    } else if let Some(lines) = remote_preview_lines(p) {
+        let ph = (p.engine.height as usize).saturating_sub(1);
+        Preview::Text(
+            lines
+                .iter()
+                .rev()
+                .take(ph)
+                .rev()
+                .map(|l| plain_cells(&strip_sgr(l), 0))
+                .collect(),
+        )
+    } else {
+        Preview::None
+    };
+    p.engine.set_preview(&key, preview);
 }
 
 pub fn pick_render(p: &mut Picker) {
-    let w = p.width as usize;
-    let h = p.height as usize;
-    let list_w = p.list_w();
-    let mut out = String::from("\x1b[2J\x1b[H");
+    refresh_preview(p);
+    let w = p.engine.width as usize;
+    let h = p.engine.height as usize;
+    let list_w = p.engine.list_w();
 
-    let live = p.rows.iter().filter(|a| a.live()).count();
-    let query = parse_query(&p.filter, &SIGILS);
+    // The header: how many live, narrowed how, which view.
+    let live_total = p.rows.iter().filter(|a| a.live()).count();
+    let query = p.engine.query();
     // Narrowed by a filter token, the count says so: "9 of 22 live".
     let live = if query.has_filters() {
-        let shown = p.view.iter().filter(|&&i| p.rows[i].live()).count();
-        format!("{shown} of {live}")
+        let shown = p
+            .engine
+            .visible_matched()
+            .filter_map(|n| p.by_key.get(&n.key))
+            .filter(|&&i| p.rows[i].live())
+            .count();
+        format!("{shown} of {live_total}")
     } else {
-        live.to_string()
+        live_total.to_string()
     };
-    let selected = if p.marked.is_empty() {
+    let selected = if p.engine.marked().is_empty() {
         String::new()
     } else {
-        format!(", {} selected", p.marked.len())
+        format!(", {} selected", p.engine.marked().len())
     };
     let content_tag = if p.content_search {
         format!(", {}", mode_label(p.content_mode))
@@ -3521,375 +3292,74 @@ pub fn pick_render(p: &mut Picker) {
         String::new()
     };
     let unread = p.rows.iter().filter(|a| a.unread()).count();
-    let unread_tag = if unread > 0 {
-        format!(", {unread} unread")
-    } else {
-        String::new()
-    };
+    let unread_tag = if unread > 0 { format!(", {unread} unread") } else { String::new() };
     let servers_tag = if p.multi {
-        let n = p
-            .rows
-            .iter()
-            .map(|a| a.server.as_str())
-            .collect::<HashSet<_>>()
-            .len();
+        let n = p.rows.iter().map(|a| a.server.as_str()).collect::<HashSet<_>>().len();
         format!(", {n} servers")
     } else {
         String::new()
     };
-    out.push_str(&format!(
-        "\x1b[1;1H\x1b[1m agents\x1b[0m \x1b[2m({live} live{}{unread_tag}{servers_tag}{content_tag}{selected})\x1b[0m",
-        if p.archived_only {
-            ", archive"
-        } else if p.show_history {
-            ", +history"
-        } else {
-            ""
-        },
-    ));
-    if query.has_filters() {
-        // The active tokens, at the right edge of the header, so a
-        // narrowed list never passes for the whole roster.
-        let t = query.tokens();
-        let col = list_w.saturating_sub(t.chars().count() + 1).max(1);
-        out.push_str(&format!("\x1b[1;{col}H\x1b[33m{}\x1b[0m", clip(&t, list_w.saturating_sub(col))));
-    }
-    if p.composing {
-        // Compose mode takes over the prompt line, with a block cursor.
-        let to = p.selected().map(display_name).unwrap_or_default();
-        out.push_str(&format!(
-            "\x1b[2;1H  \x1b[2mmsg {}\x1b[0m {}\x1b[7m \x1b[0m",
-            clip(&to, 16),
-            p.msg_buf
-        ));
-    } else if p.renaming {
-        // Rename mode takes over the prompt line, with a block cursor.
-        out.push_str(&format!(
-            "\x1b[2;1H  \x1b[2mrename\x1b[0m {}\x1b[7m \x1b[0m",
-            p.rename_buf
-        ));
-    } else if p.filtering {
-        // Focused: show the query with a block cursor.
-        out.push_str(&format!(
-            "\x1b[2;1H  \x1b[2msearch\x1b[0m {}\x1b[7m \x1b[0m",
-            p.filter
-        ));
-    } else if p.filter.is_empty() {
-        // Idle, no query: a hint. The box is reached by navigating up.
-        out.push_str(
-            "\x1b[2;1H  \x1b[2msearch\x1b[0m \x1b[2m(/ to search)\x1b[0m",
-        );
+    let view_tag = if p.archived_only {
+        ", archive"
+    } else if p.show_history {
+        ", +history"
     } else {
-        // Idle, query applied: show it, no cursor.
-        out.push_str(&format!(
-            "\x1b[2;1H  \x1b[2msearch\x1b[0m {}",
-            p.filter
-        ));
-    }
-    out.push_str(&format!(
-        "\x1b[3;1H  \x1b[2m{}\x1b[0m",
-        "─".repeat(list_w.saturating_sub(2))
-    ));
-
-    let list_h = p.list_h();
-    if p.view.is_empty() {
-        // An empty archive says so; an empty search result does not
-        // change its words for the view it ran in.
-        let what = if p.archived_only && p.filter.trim().is_empty() {
-            "(nothing archived)"
-        } else {
-            "(no agents)"
-        };
-        out.push_str(&format!("\x1b[4;1H  \x1b[2m{what}\x1b[0m"));
-    } else {
-        for (line_i, li) in
-            (p.top..(p.top + list_h).min(p.lines.len())).enumerate()
-        {
-            let row = 4 + line_i;
-            match &p.lines[li] {
-                Line::Spacer => {}
-                Line::Header { level: 0, id } => {
-                    let server = &p.line_servers[*id];
-                    // A server line: bold, with the link state when down,
-                    // the reason when its copy is rejected, and a spinner
-                    // while its roster is still in flight. A healthy
-                    // remote barely flashes; one that keeps the call
-                    // hanging says for how long, which is the whole point
-                    // (the alternative is a stale group with no reason).
-                    let (label, colour) = match (
-                        p.down.get(server),
-                        p.mismatch.get(server),
-                        spin_since(&p.fetching, server, p.now_ms),
-                    ) {
-                        (Some(since), _, _) => (
-                            format!(
-                                "{server}  (disconnected {})",
-                                fmt_age(p.now_ms.saturating_sub(*since) / 1000)
-                            ),
-                            "1;31",
-                        ),
-                        (None, Some(why), _) => (format!("{server}  ({why})"), "1;33"),
-                        (None, None, Some(since)) => {
-                            let waited = p.now_ms.saturating_sub(since);
-                            let frame = SPIN_FRAMES
-                                [(p.now_ms / SPIN_MS) as usize % SPIN_FRAMES.len()];
-                            if waited >= FETCH_STUCK_MS {
-                                (
-                                    format!(
-                                        "{server}  {frame} (fetching {})",
-                                        fmt_age(waited / 1000)
-                                    ),
-                                    "1;33",
-                                )
-                            } else {
-                                (format!("{server}  {frame}"), "1;34")
-                            }
-                        }
-                        (None, None, None) => (server.clone(), "1;34"),
-                    };
-                    out.push_str(&format!(
-                        "\x1b[{row};1H\x1b[{colour}m▪ {}\x1b[0m",
-                        clip(&label, list_w.saturating_sub(3)),
-                    ));
-                }
-                Line::Header { id, .. } => {
-                    out.push_str(&format!(
-                        "\x1b[{row};1H \x1b[1;2m{}\x1b[0m",
-                        clip(band_label(*id as u8), list_w.saturating_sub(2)),
-                    ));
-                }
-                Line::Item(vpos) => {
-                    let vpos = *vpos;
-                    let a = &p.rows[p.view[vpos]];
-                    let cur = vpos == p.sel;
-                    let marked = p.marked.contains(&a.key());
-                    let marker = if cur { "▸" } else { " " };
-                    let age = fmt_age(p.age_ms(a) / 1000);
-                    // session + kind + age are fixed columns at the right
-                    // edge - the session is where the pane lives, which
-                    // the name does not say; the name (with the task, when
-                    // there is one) fills all the width that is left.
-                    let right = format!(
-                        "{:<12} {:<8} {:>6}",
-                        clip(a.session.as_deref().unwrap_or(""), 12),
-                        clip(&a.kind, 8),
-                        age
-                    );
-                    // prefix = "▸ ● " (marker + badge), gap = 2 before right.
-                    let label_w = list_w
-                        .saturating_sub(1)
-                        .saturating_sub(4 + 2 + right.chars().count())
-                        .max(8);
-                    let unread = p
-                        .unread
-                        .get(&(a.server.clone(), a.id.clone()))
-                        .copied()
-                        .unwrap_or(0);
-                    let mut label = if unread > 0 {
-                        format!("\u{2709}{unread} {}", display_name(a))
-                    } else {
-                        display_name(a)
-                    };
-                    // A content-search hit shows the matching line: it is
-                    // why the row is here. Otherwise an archived row (only
-                    // in the history views) says so, so the `a` un-archive
-                    // is obvious; else the reported task.
-                    let key = a.key();
-                    let snip = p
-                        .content_hits
-                        .get(&key)
-                        .filter(|_| p.content_search)
-                        .or_else(|| {
-                            p.transcript_hits
-                                .get(&key)
-                                .map(|h| &h.snippet)
-                                .filter(|s| !s.is_empty())
-                        });
-                    // The note wins over the task: it is the reason this
-                    // row is at the top of the list, and it only exists
-                    // while the agent is blocked on the user.
-                    let note = a.note.as_deref().filter(|s| !s.is_empty());
-                    let task = a.task.as_deref().filter(|s| !s.is_empty());
-                    if let Some(sn) = snip {
-                        label = format!("{label}  ·  {}", sn.trim());
-                    } else if a.life == "archived" {
-                        label = format!("{label}  ·  archived");
-                    } else if let Some(t) = note.or(task) {
-                        label = format!("{label}  ·  {}", one_line(t));
-                    }
-                    let label = clip(&label, label_w);
-                    // The badge carries its own colour codes; keep it out
-                    // of the width budget by composing plain text first,
-                    // then splicing the badge over the marker's gap.
-                    let plain =
-                        format!("{marker}   {label:<label_w$}  {right}");
-                    let plain = clip(&plain, list_w.saturating_sub(1));
-                    // Splice the coloured badge back in over the two
-                    // spaces after the marker.
-                    let shown =
-                        plain.replacen("   ", &format!(" {} ", badge(a)), 1);
-                    let pad = list_w.saturating_sub(1);
-                    // A row of a disconnected server is dimmed: what it
-                    // shows is what the provider last said.
-                    let stale = p.down.contains_key(&a.server);
-                    if cur {
-                        // The cursor row: reverse video across the width.
-                        // Dimmed while the preview has the keyboard, so
-                        // the bright thing on screen is where keys go.
-                        let sgr = if p.preview_focus { "2;7" } else { "7" };
-                        out.push_str(&format!(
-                            "\x1b[{row};1H\x1b[{sgr}m{:<pad$}\x1b[0m",
-                            strip_sgr(&shown),
-                        ));
-                    } else if marked {
-                        // A marked row: a full-width highlight band, distinct
-                        // from the cursor's reverse. Explicit fg+bg so it
-                        // reads on any theme; strip the badge colours so they
-                        // do not reset the band mid-row.
-                        out.push_str(&format!(
-                            "\x1b[{row};1H\x1b[97;44m{:<pad$}\x1b[0m",
-                            strip_sgr(&shown),
-                        ));
-                    } else if stale {
-                        out.push_str(&format!(
-                            "\x1b[{row};1H\x1b[2m{}\x1b[0m",
-                            strip_sgr(&shown)
-                        ));
-                    } else if a.unread() {
-                        // An unread row's name is bold too: the badge is
-                        // one cell, the name is what the eye reads.
-                        let bold = shown.replacen(
-                            label.as_str(),
-                            &format!("\x1b[1m{label}\x1b[0m"),
-                            1,
-                        );
-                        out.push_str(&format!("\x1b[{row};1H{bold}"));
-                    } else {
-                        out.push_str(&format!("\x1b[{row};1H{shown}"));
-                    }
-                    // "You are here": the pane the picker was opened from
-                    // gets a bright left border, drawn last so it shows over
-                    // any row state (cursor, marked, or plain). The pane we
-                    // sit in is always local, so a remote row has to be
-                    // compared through its shadow: `a.pane` there is an id on
-                    // the REMOTE server and would never match (and could
-                    // collide with an unrelated local pane's id). `None`
-                    // never matches - an unmirrored remote row and a picker
-                    // opened from nowhere must not agree.
-                    let here = p.is_here(a);
-                    if here {
-                        let g = if cur { "▸" } else { "▎" };
-                        out.push_str(&format!("\x1b[{row};1H\x1b[1;94m{g}\x1b[0m"));
-                    }
-                }
-            }
-        }
-    }
-
-    // Vertical separator between the list and the preview. It lights up
-    // while the preview has the keyboard: the one mark on screen that
-    // says which side your keys are going to.
-    let sep = if p.preview_focus || p.transcript_focus { "\x1b[1;36m┃" } else { "\x1b[2m│" };
-    for r in 1..=h {
-        out.push_str(&format!("\x1b[{r};{c}H{sep}\x1b[0m", c = list_w + 1));
-    }
-
-    if let Some(s) = &p.status {
-        out.push_str(&format!(
-            "\x1b[{r};1H\x1b[36m  {}\x1b[0m",
-            clip(s, list_w.saturating_sub(4)),
-            r = h.saturating_sub(1)
-        ));
-    }
-    let k = &p.keys;
-    let ctok = if p.content_search {
-        format!("{} {}", pretty_key(&k.content), mode_label(p.content_mode))
-    } else {
-        format!("{} contents", pretty_key(&k.content))
+        ""
     };
-    let footer = if p.show_help {
-        "? back · Esc back".to_string()
-    } else if p.show_info {
-        format!("i back · {} jump · {} copy id · y copy cwd · Esc back", keyname(&k.jump), keyname(&k.copy))
+    p.engine.header_tag = format!("({live} live{view_tag}{unread_tag}{servers_tag}{content_tag}{selected})");
+    p.engine.empty_text = if p.archived_only && p.engine.filter.trim().is_empty() {
+        "(nothing archived)".into()
+    } else {
+        "(no agents)".into()
+    };
+    p.engine.separator_lit = p.transcript_focus;
+
+    // The footer. The engine writes its own for the search box, a
+    // prompt, typing into the pane and the help card; the list's and the
+    // conversation's are this module's. Six hints, not twelve: everything
+    // else lives in the action menu, which names each one in full.
+    let k = |action: &str| keyname(p.engine.keys.key_of(action)).to_string();
+    let ctok = if p.content_search {
+        format!("{} {}", pretty_key(p.engine.keys.key_of("content")), mode_label(p.content_mode))
+    } else {
+        format!("{} contents", pretty_key(p.engine.keys.key_of("content")))
+    };
+    let footer = if p.show_info {
+        format!("{} back · {} jump · {} copy id · {} copy cwd · Esc back", k("info"), k("activate"), k("copy"), k("copy_cwd"))
     } else if p.transcript_focus {
         "j/k scroll · n/N match · g/G top/end · Space/b page · Tab pane · Esc back to list".to_string()
-    } else if p.preview_focus {
-        // Every key goes to the pane, so the footer can promise only one
-        // thing about the keyboard: how to get it back.
-        // The prefix route is named too, since it is the one that costs
-        // the agent nothing: tmux hands a directional select-pane on the
-        // float to the picker (mode-nav), and `prefix h` is select-pane
-        // -L in the common config.
-        let to = p.selected().map(display_name).unwrap_or_default();
-        format!(
-            "typing into {} · keys go to its pane · {} back to list (or select-pane -L)",
-            clip(&to, 16),
-            pretty_key(&k.unfocus)
-        )
-    } else if p.composing {
-        "type a message · Enter send · Esc cancel".to_string()
-    } else if p.renaming {
-        "type a name · Enter accept · Esc cancel".to_string()
-    } else if p.filtering {
-        format!("type to search · @server #session ~dir · {ctok} · Esc unfocus")
     } else {
-        // Six hints, not twelve. Everything else - archive, rename,
-        // copy, the band, interrupt, kill - lives in the action menu,
-        // which names each one in full and says which apply to the row
-        // under the cursor. A footer that lists every key fits none of
-        // them at a usable width.
         format!(
             "j/k move · {} type · {} jump · {} new · {} actions · {} search · {ctok} · {} history · ? help · q/{} close",
-            keyname(&k.focus),
-            keyname(&k.jump),
-            keyname(&k.new),
-            keyname(&k.menu),
-            keyname(&k.filter),
-            keyname(&k.history),
-            keyname(&k.close),
+            k("focus"),
+            k("activate"),
+            k("new"),
+            k("menu"),
+            k("filter"),
+            k("history"),
+            k("close"),
         )
     };
-    let footer = clip(&footer, list_w.saturating_sub(4));
     // Light up the content-search hotkey while it is on.
-    let footer = if p.content_search {
+    p.engine.footer = if p.content_search {
         footer.replacen(&ctok, &format!("\x1b[0;7m{ctok}\x1b[0;2m"), 1)
     } else {
         footer
     };
-    out.push_str(&format!("\x1b[{h};1H  \x1b[2m{}\x1b[0m", footer));
-    draw_completions(p, &mut out, list_w);
 
-    // The preview: a live blit of the local (or mirrored) pane; else the
-    // row's conversation (a finished agent, or a live one with Tab); else
-    // the provider's captured text for a remote row with no mirror here.
-    let rect = preview_rect(p, list_w);
-    if rect.is_none() {
+    let (mut out, rect) = p.engine.render();
+    if transcript_drawn(p) {
         let x = list_w + 2;
         let pw = w.saturating_sub(list_w + 2);
         let ph = h.saturating_sub(1);
-        if p.show_help {
-            draw_help(p, &mut out, x, pw, ph);
-        } else if p.show_info {
-            draw_info(p, &mut out, x, pw, ph);
-        } else if transcript_shown(p) {
-            draw_transcript(p, &mut out, x, pw, ph);
-        } else if let Some(text) = remote_preview_lines(p) {
-            for (i, line) in text.iter().rev().take(ph).rev().enumerate() {
-                out.push_str(&format!(
-                    "\x1b[{};{x}H{}",
-                    i + 1,
-                    clip(&strip_sgr(line), pw)
-                ));
-            }
-        }
+        draw_transcript(p, &mut out, x, pw, ph);
     }
-
-    let _ = mode_write(p.mode, out.as_bytes());
-    let _ = mode_preview(p.mode, rect.as_ref());
+    let _ = mode_write(p.engine.mode, out.as_bytes());
+    let _ = mode_preview(p.engine.mode, rect.as_ref());
 }
 
-/// Does the preview show the highlighted row's conversation? Only once
-/// its turns (or a stand-in capture) have arrived for that row.
+/// Does the highlighted row have a conversation to show? Only once its
+/// turns (or a stand-in capture) have arrived for that row.
 fn transcript_shown(p: &Picker) -> bool {
     let Some(a) = p.selected() else { return false };
     p.transcript
@@ -3900,95 +3370,7 @@ fn transcript_shown(p: &Picker) -> bool {
 /// The info card: everything the roster knows about the highlighted
 /// agent, as labelled lines. The row's own facts draw at once; the
 /// fetched half (`InfoCard`) fills in when it lands.
-/// The quick reference, in the preview column: every key by area, and
-/// the search box's syntax. Configured keys are shown as configured.
-fn draw_help(p: &Picker, out: &mut String, x: usize, pw: usize, ph: usize) {
-    let k = &p.keys;
-    let n = |s: &str| keyname(s).to_string();
-    let mut lines: Vec<(String, String)> = Vec::new();
-    let section = |title: &str, rows: &[(String, &str)], lines: &mut Vec<(String, String)>| {
-        if !lines.is_empty() {
-            lines.push((String::new(), String::new()));
-        }
-        lines.push((format!("\x00{title}"), String::new()));
-        for (key, what) in rows {
-            lines.push((key.clone(), what.to_string()));
-        }
-    };
-    section("moving", &[
-        ("j/k ↑/↓".into(), "move the cursor"),
-        ("gg / G".into(), "first / last row"),
-        (n(&k.jump), "jump to the pane"),
-        ("Tab".into(), "conversation / pane in the preview"),
-        (format!("{} click", n(&k.focus)), "type into the pane; keys go there"),
-        (n(&k.unfocus), "take the keyboard back"),
-        ("wheel".into(), "over the preview: scrolls the pane itself"),
-    ], &mut lines);
-    section("search box", &[
-        (n(&k.filter), "focus the box; words match names, tasks, conversations"),
-        ("@server".into(), "narrow to a server (prefix)"),
-        ("#session".into(), "narrow to a session (prefix)"),
-        ("~dir".into(), "narrow to a directory (part of its ~ path)"),
-        ("dropdown".into(), "a sigil opens it: Tab/↓ BTab/↑ walk, Enter takes, Esc hides"),
-        ("\\@ \\# \\~".into(), "the character as a plain word"),
-        ("s / S / d".into(), "narrow to this row's session / server / folder; again widens"),
-        (n(&k.content), "also grep the panes' contents"),
-        ("C-u".into(), "clear the box"),
-        ("Esc Enter".into(), "leave the box, keep the query"),
-    ], &mut lines);
-    section("rows", &[
-        (n(&k.archive), "archive / un-archive"),
-        (n(&k.archived), "the archive view"),
-        (n(&k.history), "show finished agents too"),
-        (n(&k.attention), "move between attention and waiting"),
-        (format!("{} / {}", n(&k.read), n(&k.unread)), "mark read / unread"),
-        (n(&k.rename), "rename"),
-        (n(&k.copy), "copy the agent id"),
-        ("m".into(), "message the agent"),
-        (n(&k.interrupt), "interrupt (C-c) the agent"),
-        (n(&k.kill), "kill its pane (asks)"),
-        (n(&k.new), "new agent, prefilled from the row"),
-        ("f".into(), "fork this agent (a copy of its session, its own name)"),
-        ("J / K".into(), "mark the row and move"),
-        (n(&k.menu), "the action menu"),
-        ("i".into(), "info card (y copies its cwd)"),
-        (n(&k.sessions), "the sessions chooser, on this row's pane"),
-    ], &mut lines);
-    section("conversation (Tab)", &[
-        ("j/k".into(), "scroll"),
-        ("n / N".into(), "next / previous match"),
-        ("g / G".into(), "top / end"),
-        ("Space / b".into(), "page down / up"),
-        ("Esc".into(), "back to the list"),
-    ], &mut lines);
-    section("picker", &[
-        ("+ / -".into(), "resize"),
-        ("?".into(), "this card"),
-        (format!("q / {}", n(&k.close)), "close (Esc first puts a card or the marks away)"),
-    ], &mut lines);
-    out.push_str(&format!("\x1b[1;{x}H\x1b[1;36m{}\x1b[0m", clip("quick reference · ? or Esc back", pw)));
-    let key_w = 12;
-    let body_w = pw.saturating_sub(key_w + 1).max(8);
-    let mut row = 2;
-    for (key, what) in &lines {
-        if row > ph {
-            break;
-        }
-        if let Some(title) = key.strip_prefix('\x00') {
-            out.push_str(&format!("\x1b[{row};{x}H\x1b[1;2m{}\x1b[0m", clip(title, pw)));
-        } else if !key.is_empty() {
-            out.push_str(&format!(
-                "\x1b[{row};{x}H\x1b[33m{:<key_w$}\x1b[0m {}",
-                clip(key, key_w),
-                clip(what, body_w)
-            ));
-        }
-        row += 1;
-    }
-}
-
-fn draw_info(p: &Picker, out: &mut String, x: usize, pw: usize, ph: usize) {
-    let Some(a) = p.selected() else { return };
+fn info_lines(p: &Picker, a: &Agent, pw: usize) -> Vec<Vec<Styled>> {
     let card = p.info.as_ref().filter(|c| c.key == a.key());
     let home = home_dir().ok().filter(|h| !h.is_empty());
     let tilde = |path: &str| -> String {
@@ -4103,29 +3485,20 @@ fn draw_info(p: &Picker, out: &mut String, x: usize, pw: usize, ph: usize) {
         };
         rows.push(("resume", resume));
     }
-    // Draw: the id on the first line, then the rows, each wrapped to the
+    // The id on the first line, then the rows, each wrapped to the
     // column with the label's width hanging.
-    let mut y = 1usize;
-    out.push_str(&format!("\x1b[{y};{x}H\x1b[1;36m{}\x1b[0m", clip(&a.id, pw)));
-    y += 2;
+    let mut out: Vec<Vec<Styled>> = vec![plain_cells(&clip(&a.id, pw), ST_BOLD | ST_CYAN), Vec::new()];
     let label_w = 11;
+    let body_w = pw.saturating_sub(label_w).max(8);
     for (label, value) in rows {
-        if y > ph {
-            break;
-        }
-        let body_w = pw.saturating_sub(label_w).max(8);
         for (i, piece) in wrap_cells(&plain_cells(&value, 0), body_w).into_iter().enumerate() {
-            if y > ph {
-                break;
-            }
             let lead = if i == 0 { format!("{label:<label_w$}") } else { " ".repeat(label_w) };
-            out.push_str(&format!(
-                "\x1b[{y};{x}H\x1b[2m{lead}\x1b[0m{}",
-                emit_cells(&piece, false)
-            ));
-            y += 1;
+            let mut line = plain_cells(&lead, ST_DIM);
+            line.extend(piece);
+            out.push(line);
         }
     }
+    out
 }
 
 /// Draw the conversation into the preview area: a header line, then the
@@ -4170,7 +3543,7 @@ fn draw_transcript(p: &mut Picker, out: &mut String, x: usize, pw: usize, ph: us
 /// Render the conversation for the preview's current width, if it is
 /// not already.
 fn ensure_transcript_rendered(p: &mut Picker) {
-    let pw = (p.width as usize).saturating_sub(p.list_w() + 2);
+    let pw = p.preview_w();
     ensure_transcript_rendered_for(p, pw);
 }
 
@@ -4185,7 +3558,7 @@ fn ensure_transcript_rendered_for(p: &mut Picker, pw: usize) {
 
 /// Scroll the conversation by `delta` rendered lines, clamped.
 fn scroll_transcript(p: &mut Picker, delta: i64) {
-    let body = (p.height as usize).saturating_sub(2).max(1);
+    let body = (p.engine.height as usize).saturating_sub(2).max(1);
     if let Some(tv) = p.transcript.as_mut() {
         let max_top = tv.lines.len().saturating_sub(body);
         let t = (tv.top as i64 + delta).clamp(0, max_top as i64);
@@ -4195,7 +3568,7 @@ fn scroll_transcript(p: &mut Picker, delta: i64) {
 
 /// A key while the conversation has the keyboard.
 fn transcript_key(p: &mut Picker, key: &str, is_up: bool, is_down: bool) {
-    let page = (p.height as usize).saturating_sub(2).max(2) as i64;
+    let page = (p.engine.height as usize).saturating_sub(2).max(2) as i64;
     ensure_transcript_rendered(p);
     match key {
         "Escape" | "q" | "h" | "Left" => {
@@ -4243,7 +3616,7 @@ fn transcript_key(p: &mut Picker, key: &str, is_up: bool, is_down: bool) {
                 }
             }
             if p.transcript.as_ref().is_some_and(|tv| tv.matches.is_empty()) {
-                p.status = Some("no matches in this conversation".into());
+                p.status("no matches in this conversation");
             }
         }
         _ => {
@@ -4253,11 +3626,6 @@ fn transcript_key(p: &mut Picker, key: &str, is_up: bool, is_down: bool) {
     }
     pick_render(p);
 }
-
-// ---------------------------------------------------------------------------
-// the conversation, rendered: light Markdown to styled cells
-// ---------------------------------------------------------------------------
-
 
 /// Lay the turns out for `width`: a prompt with a `❯` in front, in bold;
 /// the agent's text with its Markdown rendered (headings, emphasis,
@@ -4340,29 +3708,6 @@ fn render_transcript(tv: &mut TranscriptView, width: usize, terms: &[String]) {
     };
 }
 
-
-/// The live pane of the highlighted row (local, or a mirror of a remote
-/// one), shown to the right of the list.
-fn preview_rect(p: &Picker, list_w: usize) -> Option<PreviewRect> {
-    if p.show_info || p.show_help {
-        return None;
-    }
-    let a = p.selected()?;
-    let pane = p.local_pane_of(a)?;
-    // Tab: the conversation instead of the pane, once it has arrived (a
-    // blank preview while it loads would be worse than the pane).
-    if p.show_transcript && transcript_shown(p) {
-        return None;
-    }
-    let x = (list_w + 1) as u32;
-    let w = (p.width as usize).saturating_sub(list_w + 1) as u32;
-    let h = p.height.saturating_sub(1);
-    if w == 0 || h == 0 {
-        return None;
-    }
-    Some(PreviewRect { pane: PaneId(pane), x, y: 0, w, h })
-}
-
 /// The captured text for the highlighted remote row, when the provider
 /// answered for it.
 fn remote_preview_lines(p: &Picker) -> Option<&Vec<String>> {
@@ -4376,8 +3721,6 @@ fn remote_preview_lines(p: &Picker) -> Option<&Vec<String>> {
     }
     Some(lines)
 }
-
-
 
 #[cfg(test)]
 mod query_tests {
@@ -4399,4 +3742,3 @@ mod query_tests {
         );
     }
 }
-

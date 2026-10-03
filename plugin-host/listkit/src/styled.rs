@@ -7,17 +7,23 @@
 
 use crate::text::clip;
 
-pub const ST_BOLD: u8 = 1;
-pub const ST_ITALIC: u8 = 2;
-pub const ST_CODE: u8 = 4;
-pub const ST_UNDER: u8 = 8;
-pub const ST_DIM: u8 = 16;
-pub const ST_HIT: u8 = 32;
-pub const ST_CYAN: u8 = 64;
-pub const ST_RED: u8 = 128;
+pub const ST_BOLD: u16 = 1;
+pub const ST_ITALIC: u16 = 2;
+pub const ST_CODE: u16 = 4;
+pub const ST_UNDER: u16 = 8;
+pub const ST_DIM: u16 = 16;
+pub const ST_HIT: u16 = 32;
+pub const ST_CYAN: u16 = 64;
+pub const ST_RED: u16 = 128;
+pub const ST_GREEN: u16 = 256;
+pub const ST_MAGENTA: u16 = 512;
+/// Reverse video: the cell's colour as its background.
+pub const ST_INVERT: u16 = 1024;
+/// The bright ANSI variant of the colour.
+pub const ST_BRIGHT: u16 = 2048;
 
 /// One cell of a rendered line: a character and its style bits.
-pub type Styled = (char, u8);
+pub type Styled = (char, u16);
 
 /// The visible text of a line.
 pub fn cells_text(cells: &[Styled]) -> String {
@@ -38,12 +44,12 @@ pub fn fit_cells(cells: &[Styled], width: usize) -> Vec<Styled> {
 }
 
 /// Plain text as cells, one style throughout.
-pub fn plain_cells(text: &str, style: u8) -> Vec<Styled> {
+pub fn plain_cells(text: &str, style: u16) -> Vec<Styled> {
     text.chars().filter(|c| !c.is_control() || *c == '\n').map(|c| (c, style)).collect()
 }
 
 /// `text` clipped to `width` as plain cells: a one-line convenience.
-pub fn clipped_cells(text: &str, width: usize, style: u8) -> Vec<Styled> {
+pub fn clipped_cells(text: &str, width: usize, style: u16) -> Vec<Styled> {
     plain_cells(&clip(text, width), style)
 }
 
@@ -52,7 +58,7 @@ pub fn clipped_cells(text: &str, width: usize, style: u8) -> Vec<Styled> {
 /// fenced code blocks, `-`/`*`/`1.` lists, `>` quotes, `---` rules and
 /// `[text](url)` links (the text, underlined). `base` is OR'd into every
 /// cell (a prompt is bold throughout).
-pub fn markdown_lines(text: &str, width: usize, base: u8) -> Vec<Vec<Styled>> {
+pub fn markdown_lines(text: &str, width: usize, base: u16) -> Vec<Vec<Styled>> {
     let width = width.max(4);
     let mut out: Vec<Vec<Styled>> = Vec::new();
     let mut in_fence = false;
@@ -212,7 +218,7 @@ enum Align {
 /// rows, columns padded to the widest cell and aligned as the separator
 /// says. Wider than the preview, the widest columns give way first and
 /// their cells are cut with an ellipsis; a table never wraps.
-fn table_lines(rows: &[&str], sep: &str, width: usize, base: u8) -> Vec<Vec<Styled>> {
+fn table_lines(rows: &[&str], sep: &str, width: usize, base: u16) -> Vec<Vec<Styled>> {
     let aligns: Vec<Align> = split_row(sep)
         .iter()
         .map(|c| {
@@ -290,7 +296,7 @@ fn table_lines(rows: &[&str], sep: &str, width: usize, base: u8) -> Vec<Vec<Styl
 
 /// Inline Markdown to cells: `**bold**`, `*italic*` / `_italic_`,
 /// `` `code` ``, `[text](url)`. Unmatched markers stay as text.
-pub fn inline_cells(text: &str, base: u8) -> Vec<Styled> {
+pub fn inline_cells(text: &str, base: u16) -> Vec<Styled> {
     let chars: Vec<char> = text.chars().filter(|c| !c.is_control()).collect();
     let mut out: Vec<Styled> = Vec::with_capacity(chars.len());
     let mut i = 0;
@@ -434,7 +440,7 @@ pub fn mark_hits(line: &mut [Styled], lower_terms: &[String]) -> bool {
 /// `n`/`N` show where they landed.
 pub fn emit_cells(line: &[Styled], current: bool) -> String {
     let mut out = String::with_capacity(line.len() + 16);
-    let mut cur: Option<u8> = None;
+    let mut cur: Option<u16> = None;
     for &(c, st) in line {
         if cur != Some(st) {
             out.push_str("\x1b[0");
@@ -450,14 +456,22 @@ pub fn emit_cells(line: &[Styled], current: bool) -> String {
             if st & ST_UNDER != 0 {
                 out.push_str(";4");
             }
+            if st & ST_INVERT != 0 {
+                out.push_str(";7");
+            }
+            let bright = st & ST_BRIGHT != 0;
             if st & ST_HIT != 0 {
                 out.push_str(if current { ";1;30;103" } else { ";30;43" });
             } else if st & ST_CODE != 0 {
-                out.push_str(";33");
+                out.push_str(if bright { ";93" } else { ";33" });
             } else if st & ST_CYAN != 0 {
-                out.push_str(";36");
+                out.push_str(if bright { ";96" } else { ";36" });
             } else if st & ST_RED != 0 {
-                out.push_str(";31");
+                out.push_str(if bright { ";91" } else { ";31" });
+            } else if st & ST_GREEN != 0 {
+                out.push_str(if bright { ";92" } else { ";32" });
+            } else if st & ST_MAGENTA != 0 {
+                out.push_str(if bright { ";95" } else { ";35" });
             }
             out.push('m');
             cur = Some(st);

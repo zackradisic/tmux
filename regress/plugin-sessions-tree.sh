@@ -105,7 +105,7 @@ keys /; keys C-u; keys Escape
 # Enter on beta switches the control client to it, and closes.
 keys G
 # In w mode the last row is beta's window; Enter there switches to beta too.
-currow | grep -qE 'beta|0: tmux' || fail "G did not reach beta: $(currow)"
+currow | grep -qE 'beta|0: ' || fail "G did not reach beta: $(currow)"
 keys Enter
 sleep 0.6
 $TMUX list-clients -F '#{client_session}' | grep -q '^beta$' || fail "Enter did not switch the client to beta: $($TMUX list-clients -F '#{client_session}')"

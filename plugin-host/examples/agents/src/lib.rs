@@ -614,21 +614,18 @@ impl Plugin for Agents {
             "mode-resize" => {
                 let mut b = self.picker.borrow_mut();
                 let Some(p) = b.as_mut() else { return };
-                if event.get_i64("mode") != Some(p.mode.0 as i64) {
+                if event.get_i64("mode") != Some(p.engine.mode.0 as i64) {
                     return;
                 }
-                if let Some(w) = event.get_i64("width") {
-                    p.width = w as u32;
-                }
-                if let Some(h) = event.get_i64("height") {
-                    p.height = h as u32;
-                }
+                let w = event.get_i64("width").map(|v| v as u32).unwrap_or(p.engine.width);
+                let h = event.get_i64("height").map(|v| v as u32).unwrap_or(p.engine.height);
+                p.engine.resize(w, h);
                 view::pick_render(p);
             }
             "mode-closed" => {
                 let mut b = self.picker.borrow_mut();
                 if b.as_ref().is_some_and(|p| {
-                    event.get_i64("mode") == Some(p.mode.0 as i64)
+                    event.get_i64("mode") == Some(p.engine.mode.0 as i64)
                 }) {
                     if let Some(t) = b.as_ref().and_then(|p| p.timer) {
                         cancel(t);
@@ -676,7 +673,7 @@ impl Plugin for Agents {
                 if let Some(t) = old.timer {
                     cancel(t);
                 }
-                let _ = mode_close(old.mode);
+                let _ = mode_close(old.engine.mode);
             }
             let cfg = Rc::clone(&self.cfg);
             let picker = Rc::clone(&self.picker);
@@ -716,7 +713,7 @@ impl Agents {
                 if let Some(t) = old.timer {
                     cancel(t);
                 }
-                let _ = mode_close(old.mode);
+                let _ = mode_close(old.engine.mode);
             }
             let cfg = Rc::clone(&self.cfg);
             let picker = Rc::clone(&self.picker);
@@ -800,7 +797,7 @@ impl Agents {
                 if let Some(t) = old.timer {
                     cancel(t);
                 }
-                let _ = mode_close(old.mode);
+                let _ = mode_close(old.engine.mode);
             }
             let cfg = Rc::clone(&self.cfg);
             let picker = Rc::clone(&self.picker);

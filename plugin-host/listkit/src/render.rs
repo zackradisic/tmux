@@ -60,8 +60,12 @@ impl Engine {
                     Line::Spacer => {}
                     Line::Header { id, .. } => {
                         let n = &self.nodes[self.view[*id]];
-                        let mut cells: Vec<Styled> = vec![('▪', ST_BOLD), (' ', 0)];
-                        cells.extend(n.left.iter().map(|&(c, s)| (c, s | ST_BOLD)));
+                        let mut cells: Vec<Styled> = match n.header_glyph {
+                            Some(g) => vec![(g, ST_BOLD), (' ', 0)],
+                            None => std::iter::repeat((' ', 0)).take(n.indent_cells()).collect(),
+                        };
+                        let bold = if n.header_glyph.is_some() { ST_BOLD } else { 0 };
+                        cells.extend(n.left.iter().map(|&(c, s)| (c, s | bold)));
                         if !n.right.is_empty() {
                             cells.push((' ', 0));
                             cells.push((' ', 0));
@@ -79,7 +83,7 @@ impl Engine {
                         // prefix: marker, a space, the indent, a glyph
                         // for a group.
                         let mut cells: Vec<Styled> = vec![(if cur { '▸' } else { ' ' }, 0), (' ', 0)];
-                        cells.extend(std::iter::repeat((' ', 0)).take(n.depth as usize * 2));
+                        cells.extend(std::iter::repeat((' ', 0)).take(n.indent_cells()));
                         if let NodeKind::Group { .. } = n.kind {
                             let g = if self.is_expanded(n) { OPEN } else { CLOSED };
                             cells.push((g, ST_DIM));
@@ -119,7 +123,7 @@ impl Engine {
         }
 
         // The separator lights up while the preview has the keyboard.
-        let sep = if self.preview_focus { "\x1b[1;36m┃" } else { "\x1b[2m│" };
+        let sep = if self.preview_focus || self.separator_lit { "\x1b[1;36m┃" } else { "\x1b[2m│" };
         for r in 1..=h {
             out.push_str(&format!("\x1b[{r};{c}H{sep}\x1b[0m", c = list_w + 1));
         }
@@ -139,7 +143,7 @@ impl Engine {
         } else if self.prompt.is_some() {
             "type · Enter accept · Esc cancel".to_string()
         } else if self.filtering {
-            let sig: Vec<String> = self.sigils.iter().map(|s| format!("{}{}", s.ch, s.help.split(' ').next().unwrap_or(""))).collect();
+            let sig: Vec<String> = self.sigils.iter().map(|s| format!("{}{}", s.ch, s.noun)).collect();
             format!("type to search · {} · Esc unfocus", sig.join(" "))
         } else if self.footer.is_empty() {
             format!(
@@ -221,16 +225,31 @@ impl Engine {
     fn draw_help(&self, out: &mut String, x: usize, pw: usize, ph: usize) {
         let mut lines = self.keys.help();
         if !self.sigils.is_empty() {
-            lines.push((String::new(), String::new()));
-            lines.push(("\0search box tokens".into(), String::new()));
+            // The tokens go with the search box's own keys, right after
+            // its title, so a long key list does not push them below the
+            // card's bottom; a table with no such section gets them as a
+            // section of their own.
+            let mut toks: Vec<(String, String)> = Vec::new();
             for s in &self.sigils {
-                let mut k = format!("{}value", s.ch);
+                let mut k = format!("{}{}", s.ch, s.noun);
                 if let Some(nk) = s.narrow_key {
                     k = format!("{k} / {nk}");
                 }
-                lines.push((k, s.help.to_string()));
+                toks.push((k, s.help.to_string()));
             }
-            lines.push(("\\sigil".into(), "the character as a plain word".into()));
+            toks.push(("\\sigil".into(), "the character as a plain word".into()));
+            match lines.iter().position(|(k, _)| k == "\0search box") {
+                Some(at) => {
+                    for (i, t) in toks.into_iter().enumerate() {
+                        lines.insert(at + 1 + i, t);
+                    }
+                }
+                None => {
+                    lines.push((String::new(), String::new()));
+                    lines.push(("\0search box tokens".into(), String::new()));
+                    lines.extend(toks);
+                }
+            }
         }
         out.push_str(&format!("\x1b[1;{x}H\x1b[1;36m{}\x1b[0m", clip("quick reference · ? or Esc back", pw)));
         let key_w = 12;
@@ -251,6 +270,6 @@ impl Engine {
 }
 
 /// A styled one-liner for a node's text: a convenience for consumers.
-pub fn cells(text: &str, style: u8) -> Vec<Styled> {
+pub fn cells(text: &str, style: u16) -> Vec<Styled> {
     plain_cells(text, style)
 }
