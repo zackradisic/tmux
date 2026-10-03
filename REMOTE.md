@@ -218,9 +218,12 @@ The sessions live on the remote. The local objects are a view.
    first sync there are no shadow panes, so the reason goes into the
    placeholder window's name (`connecting to host: reason`) and its
    pane, once into `show-messages`, and into `#{remote_error}`.
-2. The link retries with backoff (1, 2, 4 .. 60 s). On success it runs
-   `list-windows -F` and reconciles the tree: new windows are built, gone
-   windows killed, the rest get the `%layout-change` treatment.
+2. The link retries with backoff (1, 2, 4 .. 60 s). `remote-attach -R
+   host` skips the wait: it drops a running ssh job, forgets the backoff
+   and connects at once (`remote_link_reconnect`), for when the user
+   knows the host is back. On success it runs `list-windows -F` and
+   reconciles the tree: new windows are built, gone windows killed, the
+   rest get the `%layout-change` treatment.
 3. For each pane it runs `capture-pane -p -e -J -S -` followed by a cursor
    query, clears the grid and writes the result through the local parser.
    Output for the pane is dropped until the cursor reply, which is exact

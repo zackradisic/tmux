@@ -1612,7 +1612,7 @@ See the
 option.
 .Tg remote
 .It Xo Ic remote\-attach
-.Op Fl kL
+.Op Fl kLR
 .Op Fl c Ar working\-directory
 .Op Fl t Ar remote\-session
 .Ar host
@@ -1676,6 +1676,13 @@ lists the sessions on
 one name per line, through the same
 .Ic remote\-ssh\-command ,
 and makes no link.
+.Fl R
+reconnects the link (or all links to
+.Ar host
+without
+.Fl t )
+now: a running ssh command is dropped and a new one started at once, instead
+of waiting out the retry backoff (up to 60 seconds) after a drop.
 .Tg rename
 .It Xo Ic rename\-session
 .Op Fl t Ar target\-session
