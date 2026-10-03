@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use tmux_plugin_abi::PeerGrant;
 use tmux_plugin_abi::{
     parse_list, service_fields, service_flags, ErrorCode, HostError,
     ServerInfo, LOCAL_SERVER,
@@ -40,6 +41,17 @@ use crate::strings::AsTmuxStr;
 pub fn servers() -> Result<Vec<ServerInfo>, HostError> {
     let buf = call_owned(|out| unsafe { raw::servers(out) })?;
     parse_list(&buf, ServerInfo::parse).map_err(|_| wire_err())
+}
+
+/// The peer grant table: which linked server may call which plugin
+/// here (`allow`), may not (`deny`), or has asked and waits for the
+/// user (`pending`). What `plugin-peers list` prints; `plugin-peers
+/// allow|deny <server> [plugin]` through `run_command` changes it, and
+/// a `peer-changed` event (`server`, `plugin`, `state`) follows every
+/// change. An old host fails this with `Unsupported`.
+pub fn peers() -> Result<Vec<PeerGrant>, HostError> {
+    let buf = call_owned(|out| unsafe { raw::peers_list(out) })?;
+    parse_list(&buf, PeerGrant::parse).map_err(|_| wire_err())
 }
 
 /// The local server's record. The version field stays empty here; the

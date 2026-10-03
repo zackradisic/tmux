@@ -1234,5 +1234,9 @@ fn register_imports(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
         ret_i32(with_mem(&mut c, |mem| dispatch::servers(mem, owned_out)))
     })?;
 
+    linker.func_wrap(m, im::PEERS_LIST, |mut c: Caller<'_, StoreData>, owned_out: i32| -> i32 {
+        ret_i32(with_mem(&mut c, |mem| dispatch::peers_list(mem, owned_out)))
+    })?;
+
     Ok(())
 }

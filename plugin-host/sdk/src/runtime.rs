@@ -144,6 +144,7 @@ pub(crate) mod raw {
             target_ptr: i32, target_len: i32, topic_ptr: i32, topic_len: i32,
         ) -> i32;
         pub fn servers(owned_out: i32) -> i32;
+        pub fn peers_list(owned_out: i32) -> i32;
     }
 }
 
@@ -209,6 +210,7 @@ pub(crate) mod raw {
     pub unsafe fn service_emit(topic_ptr: i32, topic_len: i32, payload_ptr: i32, payload_len: i32) -> i32 { -7 }
     pub unsafe fn service_subscribe(target_ptr: i32, target_len: i32, topic_ptr: i32, topic_len: i32) -> i32 { -7 }
     pub unsafe fn servers(owned_out: i32) -> i32 { -7 }
+    pub unsafe fn peers_list(owned_out: i32) -> i32 { -7 }
 }
 
 /// ABI allocator: 8-aligned, size echoed back on free.

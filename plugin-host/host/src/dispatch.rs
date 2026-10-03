@@ -1896,3 +1896,13 @@ pub fn servers(mem: &mut GuestMem<'_, '_>, owned_out: i32) -> Result<(), HostErr
     let buf = crate::bridge::servers_record(&own);
     mem.give_owned(&buf, owned_out)
 }
+
+/// The peer grant table (`plugin-peers list`), as a `u32 count` list of
+/// grant records: which linked server may call which plugin here, and
+/// which pairs are still pending. Grants are not secret, so read-state
+/// is enough; changing one goes through `plugin-peers` with run-command.
+pub fn peers_list(mem: &mut GuestMem<'_, '_>, owned_out: i32) -> Result<(), HostError> {
+    check_cap(mem, crate::caps::READ_STATE)?;
+    let buf = crate::peers::list_record();
+    mem.give_owned(&buf, owned_out)
+}

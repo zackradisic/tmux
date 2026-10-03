@@ -349,6 +349,7 @@ pub mod imports {
     pub const SERVICE_EMIT: &str = "service_emit";
     pub const SERVICE_SUBSCRIBE: &str = "service_subscribe";
     pub const SERVERS: &str = "servers";
+    pub const PEERS_LIST: &str = "peers_list";
 }
 
 /// Flag bits of a service reply page (`service_reply` flags, and `v1` of
@@ -1572,5 +1573,34 @@ mod tests {
         ] {
             assert_eq!(ErrorCode::from_num(code.as_num()), code);
         }
+    }
+}
+
+/// One row of the peer grant table (`peers_list`): may `server` call
+/// `plugin` here? `plugin = "*"` is every plugin; `state` is `allow`,
+/// `deny` or `pending`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerGrant {
+    pub server: String,
+    pub plugin: String,
+    pub state: String,
+    /// When the pair was first seen (unix ms).
+    pub first_seen: i64,
+}
+
+impl PeerGrant {
+    pub fn parse(c: &mut Cursor<'_>) -> Result<Self, WireError> {
+        let server = c.str()?.to_string();
+        let plugin = c.str()?.to_string();
+        let state = c.str()?.to_string();
+        let first_seen = c.i64()?;
+        Ok(Self { server, plugin, state, first_seen })
+    }
+
+    pub fn emit(&self, out: &mut Vec<u8>) {
+        emit_str(out, &self.server);
+        emit_str(out, &self.plugin);
+        emit_str(out, &self.state);
+        out.extend_from_slice(&self.first_seen.to_le_bytes());
     }
 }

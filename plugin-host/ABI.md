@@ -328,6 +328,7 @@ an inbound peer's calls are always allowed).
 | `resolve` | `(kind, id, owned_out) -> i32` — one object record | read-state |
 | `self_info` | `(out) -> i32` — 24-byte `{scope_kind: i32, scope_id: u32, generation: u64, role: u32, pad: u32}`; a guest that reads 16 bytes gets the first three, an old host writes 16 and the guest reads role 0 = both | read-state |
 | `servers` | `(owned_out) -> i32` — `u32 count` list of `{u32 id, str name, u32 flags(1 up \| 2 local \| 4 accepted), str version}`: the local server (id 0, "local") and every linked server; `version` is that server's service version of the calling plugin ("" = no copy or unversioned), `accepted` this side's verdict on it | read-state |
+| `peers_list` | `(owned_out) -> i32` — `u32 count` list of `{str server, str plugin, str state, i64 first_seen}`: the peer grant table (`plugin-peers list`): which linked server may call which plugin here (`allow`), may not (`deny`) or still asks (`pending`); `plugin = "*"` is every plugin. Changing a row is `plugin-peers allow\|deny` through `run_command`; a `peer-changed` event follows | read-state |
 | `service_register` | `(method Str) -> i32` — answer `method` for this plugin; calls arrive as `service-request` events | service-serve |
 | `service_reply` | `(call: i64, payload Bytes, flags) -> i32` — one page of the answer; flags bit 0 MORE (another page follows), bit 1 ERROR (the payload is the message) | service-serve |
 | `service_emit` | `(topic Str, payload Bytes) -> i32` — publish on a topic of this plugin; the host stamps a sequence per (plugin, topic) | service-serve |
@@ -504,7 +505,11 @@ registered the method, and `service-event` (`plugin`, `topic`, `seq` i64,
 `call` is always the first field, so a guest that reads the raw buffer
 finds it at a fixed offset. `link-up` and `link-down` (`server`, `id`,
 `plugins` json list of the peer's providers) fire when a linked server's
-plugin bridge comes up or goes down; they need `subscribe`.
+plugin bridge comes up or goes down; they need `subscribe`. `peer-changed`
+(`server`, `plugin`, `state`: `pending`, `allow`, `deny`, or `revoked`
+when the row was deleted) fires when the peer grant table changes - a
+handshake that asks, or `plugin-peers allow|deny|revoke`; it needs
+`subscribe`, and `peers_list` reads the table.
 
 Config (`pgh_init` / `pgh_on_config_changed`) is a bare field block with
 inline string keys; scalar values map directly, nested values (arrays /
