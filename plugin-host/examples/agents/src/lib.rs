@@ -269,6 +269,7 @@ struct AgentsConfig {
     pick_new: Option<String>,
     pick_read: Option<String>,
     pick_unread: Option<String>,
+    pick_sessions: Option<String>,
 }
 
 #[derive(Clone)]
@@ -305,6 +306,8 @@ pub(crate) struct PickKeys {
     pub read: String,
     /// Mark it unread again.
     pub unread: String,
+    /// Flip to the sessions chooser, on the highlighted row's pane.
+    pub sessions: String,
 }
 
 impl Default for PickKeys {
@@ -331,6 +334,8 @@ impl Default for PickKeys {
             new: "n".into(),
             read: "r".into(),
             unread: "u".into(),
+            // `t` for the tree: the sessions chooser flips back with `g`.
+            sessions: "t".into(),
         }
     }
 }
@@ -439,6 +444,7 @@ impl Config {
                 new: pick(&c.pick_new, d.new),
                 read: pick(&c.pick_read, d.read),
                 unread: pick(&c.pick_unread, d.unread),
+                sessions: pick(&c.pick_sessions, d.sessions),
             },
         })
     }
@@ -683,7 +689,7 @@ impl Plugin for Agents {
             return;
         }
         let Ok(snap) = event.json::<provider::Snapshot>() else { return };
-        self.remotes.borrow_mut().apply(&event.server, snap);
+        view::apply_snapshot(&mut self.remotes.borrow_mut(), &event.server, snap);
         let picker = Rc::clone(&self.picker);
         let remotes = Rc::clone(&self.remotes);
         ctx.spawn(async move {

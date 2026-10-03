@@ -16,6 +16,7 @@ name = "agents"
 version = "0.1.0"
 dependencies = [
  "formkit",
+ "listkit",
  "serde",
  "serde_json",
  "tmux-plugin-sdk",
@@ -746,6 +747,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
+name = "listkit"
+version = "0.1.0"
+dependencies = [
+ "tmux-plugin-sdk",
+]
+
+[[package]]
 name = "log"
 version = "0.4.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1100,6 +1108,16 @@ name = "session_creator"
 version = "0.1.0"
 dependencies = [
  "formkit",
+ "serde",
+ "serde_json",
+ "tmux-plugin-sdk",
+]
+
+[[package]]
+name = "sessions"
+version = "0.1.0"
+dependencies = [
+ "listkit",
  "serde",
  "serde_json",
  "tmux-plugin-sdk",

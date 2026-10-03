@@ -12,12 +12,13 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::future::Future;
-use std::pin::Pin;
 use std::rc::Rc;
-use std::task::{Context, Poll};
 
-use tmux_plugin_sdk::abi::ErrorCode;
+use listkit::lines::{clamp_dim, default_size, scroll_window, Line, SizeBox};
+use listkit::query::{self, parse_query, rank, typing_token, Query};
+use listkit::remotes::{spin_since, FETCH_STALE_MS, FETCH_STUCK_MS, SPIN_FRAMES, SPIN_GRACE_MS, SPIN_MS};
+use listkit::styled::*;
+use listkit::text::{clip, fmt_age, keyname, menu_item, menu_safe, one_line, pretty_key, strip_sgr, tilde_of};
 use tmux_plugin_sdk::prelude::*;
 
 use crate::index;
@@ -34,6 +35,13 @@ const MIN_WIDTH: u32 = 72;
 const MIN_HEIGHT: u32 = 16;
 /// Fraction of the window the default size fills (in tenths).
 const FILL_TENTHS: u32 = 9;
+const SIZE: SizeBox = SizeBox {
+    min_w: MIN_WIDTH,
+    min_h: MIN_HEIGHT,
+    max_w: MAX_WIDTH,
+    max_h: MAX_HEIGHT,
+    fill_tenths: FILL_TENTHS,
+};
 /// The step a single +/- resize moves the width and height.
 const RESIZE_STEP_W: u32 = 12;
 const RESIZE_STEP_H: u32 = 4;
@@ -42,10 +50,6 @@ const LIST_MAX: usize = 60;
 /// While the picker stays open, re-read the harness session files (and
 /// the remote rosters) on this cadence.
 const REFRESH_MS: u64 = 2000;
-/// While at least one remote fetch is outstanding, repaint on this
-/// cadence so the per-server spinner turns. It runs ONLY while something
-/// is in flight, so an idle picker never repaints on it.
-const SPIN_MS: u64 = 100;
 /// A server that answered this recently is not fetched again: the refresh
 /// tick and a link-up event can land on the same server at once.
 const FETCH_DEBOUNCE_MS: u64 = 300;
@@ -58,151 +62,27 @@ const OPEN_FRESH_MS: u64 = REFRESH_MS;
 /// past a handful of servers that stops being true (each hop is an ssh
 /// process on this machine), so the rest queue behind these.
 const MAX_INFLIGHT: usize = 4;
-/// A fetch stays invisible until it has been outstanding this long. The
-/// 2s tick refetches every server, and a healthy remote answers well
-/// inside this, so the spinner does not blink at you twice a second for
-/// nothing - it appears only when a server is actually being slow.
-const SPIN_GRACE_MS: u64 = 500;
-/// A fetch outstanding this long has stopped being a blink; the header
-/// says how long it has been waiting instead of only spinning.
-const FETCH_STUCK_MS: u64 = 3000;
-/// An in-flight mark older than this is not believed (the host fails a
-/// service call at 30s), so a lost task cannot wedge a server forever.
-const FETCH_STALE_MS: u64 = 35_000;
-/// Spinner frames, one per [`SPIN_MS`].
-const SPIN_FRAMES: [&str; 10] =
-    ["\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}", "\u{2807}", "\u{280f}"];
 
 // ---------------------------------------------------------------------------
 // remote rosters
 // ---------------------------------------------------------------------------
 
-/// What a provider on another server last reported.
-#[derive(Debug, Clone, Default)]
-pub struct RemoteRows {
-    pub agents: Vec<Agent>,
-    /// local clock - provider clock, at the last snapshot.
-    pub skew_ms: i64,
-    /// When the last snapshot arrived (local clock).
-    pub fetched_ms: u64,
-    /// When the server's link went down (local clock); None while up.
-    pub down_since: Option<u64>,
-    /// When the fetch now in flight started (local clock); None when
-    /// nothing is outstanding. Doubles as the in-flight flag the
-    /// debounce reads and as the spinner's clock for this server.
-    pub fetching_since: Option<u64>,
-}
+/// The remote rosters: what each linked server's provider last reported,
+/// as [`listkit::remotes::Remotes`] over agent rows.
+pub type Remotes = listkit::remotes::Remotes<Agent>;
 
-/// The remote rosters, by server name. Shared between the plugin (which
-/// feeds it from events) and the picker (which reads it).
-#[derive(Debug, Default)]
-pub struct Remotes {
-    pub servers: HashMap<String, RemoteRows>,
-    /// Servers whose copy of this plugin this side does not accept, with
-    /// the reason to show ("agents 0.2.0 there, 0.1.0 here").
-    pub mismatch: HashMap<String, String>,
-    /// A spinner task is turning; one is enough for every server.
-    pub spinning: bool,
-    /// When the fetch round a picker-open started began (local clock).
-    /// Opening again while one is outstanding starts nothing new.
-    pub open_round_since: Option<u64>,
-}
-
-impl Remotes {
-    /// Take a provider's snapshot for a server.
-    pub fn apply(&mut self, server: &str, snap: Snapshot) {
-        let now = now_ms();
-        let e = self.servers.entry(server.to_string()).or_default();
-        e.skew_ms = now as i64 - snap.now_ms;
-        e.fetched_ms = now;
-        e.down_since = None;
-        self.mismatch.remove(server);
-        e.agents = snap
-            .agents
-            .into_iter()
-            .map(|mut a| {
-                a.server = server.to_string();
-                a
-            })
-            .collect();
-    }
-
-    pub fn mark_down(&mut self, server: &str) {
-        let e = self.servers.entry(server.to_string()).or_default();
-        if e.down_since.is_none() {
-            e.down_since = Some(now_ms());
-        }
-    }
-
-    pub fn mark_up(&mut self, server: &str) {
-        if let Some(e) = self.servers.get_mut(server) {
-            e.down_since = None;
-        }
-    }
-
-    /// The server's copy runs a service version this side rejects: no
-    /// rows from it, one line that says why.
-    pub fn mark_mismatch(&mut self, server: &str, why: String) {
-        if let Some(e) = self.servers.get_mut(server) {
-            e.agents.clear();
-        }
-        self.mismatch.insert(server.to_string(), why);
-    }
-
-    /// Claim a server for a fetch, or refuse it. Refused when one is
-    /// already in flight, or when the last snapshot landed less than
-    /// `min_age_ms` ago: the open, the 2s tick and a link-up event all
-    /// reach for the same servers, and a second claim would mean a
-    /// second ssh hop for a roster we are already holding or already
-    /// waiting on. A mark older than [`FETCH_STALE_MS`] outlived any
-    /// call the host would still be holding, so it is not believed.
-    fn begin_fetch(&mut self, server: &str, min_age_ms: u64) -> bool {
-        let now = now_ms();
-        let e = self.servers.entry(server.to_string()).or_default();
-        if e.fetching_since
-            .is_some_and(|t| now.saturating_sub(t) < FETCH_STALE_MS)
-        {
-            return false;
-        }
-        if now.saturating_sub(e.fetched_ms) < min_age_ms {
-            return false;
-        }
-        e.fetching_since = Some(now);
-        true
-    }
-
-    /// A claimed server's call is starting now: restart its clock, so a
-    /// server that waited for a slot does not show the wait as if the
-    /// remote were slow to answer.
-    fn start_fetch(&mut self, server: &str) {
-        if let Some(e) = self.servers.get_mut(server) {
-            e.fetching_since = Some(now_ms());
-        }
-    }
-
-    fn end_fetch(&mut self, server: &str) {
-        if let Some(e) = self.servers.get_mut(server) {
-            e.fetching_since = None;
-        }
-    }
-
-    /// Per server with a fetch in flight: when it started.
-    fn fetching(&self) -> HashMap<String, u64> {
-        self.servers
-            .iter()
-            .filter_map(|(k, v)| v.fetching_since.map(|t| (k.clone(), t)))
-            .collect()
-    }
-
-    /// Every remote row, in server-name order.
-    fn rows(&self) -> Vec<Agent> {
-        let mut names: Vec<&String> = self.servers.keys().collect();
-        names.sort();
-        names
-            .into_iter()
-            .flat_map(|n| self.servers[n].agents.iter().cloned())
-            .collect()
-    }
+/// Take a provider's snapshot for a server. Its rows carry the server
+/// name from here on: ids are unique per server only.
+pub fn apply_snapshot(remotes: &mut Remotes, server: &str, snap: Snapshot) {
+    let rows = snap
+        .agents
+        .into_iter()
+        .map(|mut a| {
+            a.server = server.to_string();
+            a
+        })
+        .collect();
+    remotes.apply(server, rows, snap.now_ms);
 }
 
 /// Fetch the roster of every connected remote server. `req` says what to
@@ -287,22 +167,9 @@ async fn fetch_all(
         .find(|s| s.local)
         .map(|s| s.version.clone())
         .unwrap_or_default();
-    let mut queue: Vec<String> = Vec::new();
-    // Only servers this side linked to: never fetch a roster from an
-    // inbound peer (it would be a gated remote -> initiator call).
-    for s in list.into_iter().filter(|s| !s.local && s.up && s.linked) {
-        if !s.accepted {
-            remotes.borrow_mut().mark_mismatch(
-                &s.name,
-                format!("agents {} there, {} here; run tmux update", s.version, mine),
-            );
-            continue;
-        }
-        if !remotes.borrow_mut().begin_fetch(&s.name, min_age_ms) {
-            continue;
-        }
-        queue.push(s.name);
-    }
+    let queue = remotes.borrow_mut().claim(&list, min_age_ms, |s| {
+        format!("agents {} there, {} here; run tmux update", s.version, mine)
+    });
     // Even with nothing to start, a fetch from another task may still be
     // outstanding and want a spinner; the task exits on its own when
     // none is.
@@ -310,139 +177,54 @@ async fn fetch_all(
     if queue.is_empty() {
         return;
     }
-    // Oldest roster first, so the group most out of date comes back
-    // first when there are more servers than slots.
-    queue.sort_by_key(|n| {
-        remotes.borrow().servers.get(n).map(|e| e.fetched_ms).unwrap_or(0)
-    });
-    queue.reverse(); // workers pop from the end
-    let n = MAX_INFLIGHT.min(queue.len());
-    let queue = Rc::new(RefCell::new(queue));
-    let futs: Vec<Pin<Box<dyn Future<Output = ()>>>> = (0..n)
-        .map(|_| {
-            Box::pin(fetch_worker(
-                Rc::clone(&picker),
-                Rc::clone(&remotes),
-                Rc::clone(&queue),
-                req,
-            )) as Pin<Box<dyn Future<Output = ()>>>
-        })
-        .collect();
-    JoinAll { futs }.await;
-}
-
-/// One slot on the wire: take the next claimed server, fetch it, repeat
-/// until the queue is empty.
-async fn fetch_worker(
-    picker: Rc<RefCell<Option<Picker>>>,
-    remotes: Rc<RefCell<Remotes>>,
-    queue: Rc<RefCell<Vec<String>>>,
-    req: ListReq,
-) {
-    loop {
-        let next = queue.borrow_mut().pop();
-        let Some(server) = next else { return };
-        fetch_one(Rc::clone(&picker), Rc::clone(&remotes), server, req).await;
-    }
-}
-
-/// One server's roster, applied and repainted as it lands.
-async fn fetch_one(
-    picker: Rc<RefCell<Option<Picker>>>,
-    remotes: Rc<RefCell<Remotes>>,
-    server: String,
-    req: ListReq,
-) {
-    remotes.borrow_mut().start_fetch(&server);
-    let target = format!("@{server}");
-    let res = service::call_json::<_, Snapshot>(&target, "list", &req)
+    let landed_picker = Rc::clone(&picker);
+    let landed_remotes = Rc::clone(&remotes);
+    listkit::remotes::fetch_all(
+        Rc::clone(&remotes),
+        queue,
+        MAX_INFLIGHT,
+        move |server| {
+            Box::pin(async move {
+                let target = format!("@{server}");
+                let snap = service::call_json::<_, Snapshot>(&target, "list", &req).await?;
+                let rows = snap
+                    .agents
+                    .into_iter()
+                    .map(|mut a| {
+                        a.server = server.clone();
+                        a
+                    })
+                    .collect();
+                Ok((rows, snap.now_ms))
+            })
+        },
+        move |_server| {
+            let picker = Rc::clone(&landed_picker);
+            let remotes = Rc::clone(&landed_remotes);
+            Box::pin(async move { refresh_if_open(&picker, &remotes).await })
+        },
+    )
     .await;
-    {
-        let mut r = remotes.borrow_mut();
-        r.end_fetch(&server);
-        match res {
-            Ok(snap) => r.apply(&server, snap),
-            Err(e) => {
-                // Not linked for plugins (an old remote, or no provider
-                // yet): nothing to show, but nothing to break either.
-                if e.code == ErrorCode::Unreachable {
-                    r.mark_down(&server);
-                } else if e.code == ErrorCode::Version {
-                    r.mark_mismatch(&server, e.message.clone());
-                }
-            }
-        }
-    }
-    refresh_if_open(&picker, &remotes).await;
 }
 
-/// Poll a handful of futures together to completion. The guest carries no
-/// futures crate; this is the whole of it - re-poll whatever is still
-/// pending on each wake, finish when nothing is.
-struct JoinAll {
-    futs: Vec<Pin<Box<dyn Future<Output = ()>>>>,
-}
-
-impl Future for JoinAll {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let futs = &mut self.get_mut().futs;
-        futs.retain_mut(|f| f.as_mut().poll(cx).is_pending());
-        if futs.is_empty() {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
-        }
-    }
-}
-
-/// Turn the per-server spinner while any fetch is outstanding. One task
-/// at a time (the `spinning` flag), and it ends the moment nothing is in
-/// flight, so an idle picker is not repainting forever on a 100ms tick.
+/// Turn the per-server spinner while any fetch is outstanding. Only the
+/// frame and the server headers move, so each tick re-renders off the
+/// rows already in hand: no DB read, no file scan, and no refilter (a
+/// content search would re-grep every tick).
 fn start_spinner(picker: &Rc<RefCell<Option<Picker>>>, remotes: &Rc<RefCell<Remotes>>) {
     if picker.borrow().is_none() {
         return;
     }
-    {
-        let mut r = remotes.borrow_mut();
-        if r.spinning {
-            return;
-        }
-        r.spinning = true;
-    }
     let picker = Rc::clone(picker);
-    let remotes = Rc::clone(remotes);
-    spawn(async move {
-        loop {
-            if sleep_ms(SPIN_MS).await.is_err() {
-                break;
-            }
-            let fetching = remotes.borrow().fetching();
-            if fetching.is_empty() {
-                break;
-            }
-            let now = now_ms();
-            // Nothing has been outstanding long enough to draw yet: keep
-            // ticking (one of these may get slow) but do not repaint. A
-            // fetch that finishes inside the grace costs no renders at
-            // all, which is the whole point - the 2s tick refetches
-            // every server and must not blink a spinner each time.
-            if !fetching.values().any(|t| now.saturating_sub(*t) >= SPIN_GRACE_MS) {
-                continue;
-            }
-            let mut b = picker.borrow_mut();
-            let Some(p) = b.as_mut() else { break };
-            // Only the frame and the server headers move: re-render off
-            // the rows already in hand - no DB read, no file scan, and
-            // no refilter (content search would re-grep every tick).
-            p.now_ms = now;
-            p.fetching = fetching;
-            p.multi = is_multi(&p.rows, &p.fetching, now);
-            p.rebuild_lines();
-            pick_render(p);
-        }
-        remotes.borrow_mut().spinning = false;
+    listkit::remotes::start_spinner(remotes, move |fetching, now| {
+        let mut b = picker.borrow_mut();
+        let Some(p) = b.as_mut() else { return false };
+        p.now_ms = now;
+        p.fetching = fetching;
+        p.multi = is_multi(&p.rows, &p.fetching, now);
+        p.rebuild_lines();
+        pick_render(p);
+        true
     });
 }
 
@@ -535,18 +317,11 @@ pub enum PickAfter {
     NewAgent(bool),
     /// Mark these (server, id) rows read (true) or unread (false).
     Read(Vec<(String, String)>, bool),
+    /// Close, and open the sessions chooser on this local pane (the
+    /// highlighted row's, when it has one here).
+    Sessions(Option<u32>),
 }
 
-/// One rendered line: a server header (only when rows come from more than
-/// one server), a band header, or a selectable row (by its position in
-/// `view`). Headers make the list scroll in "display space", so the
-/// selected row stays visible even with headers between the bands.
-#[derive(Clone)]
-pub enum Line {
-    Server(String),
-    Header(u8),
-    Item(usize),
-}
 
 pub struct Picker {
     pub mode: ModeId,
@@ -555,6 +330,8 @@ pub struct Picker {
     pub rows: Vec<Agent>,
     pub view: Vec<usize>,
     pub lines: Vec<Line>,
+    /// The server a `Line::Header { level: 0 }` names, by its id.
+    pub line_servers: Vec<String>,
     pub sel: usize,
     pub top: usize,
     /// Row keys (server + id) marked for a bulk action, so they survive a
@@ -764,18 +541,20 @@ impl Picker {
     /// whenever the band changes.
     fn rebuild_lines(&mut self) {
         self.lines.clear();
+        self.line_servers.clear();
         let mut prev_server: Option<&str> = None;
         let mut prev: Option<u8> = None;
         for (vpos, &ri) in self.view.iter().enumerate() {
             let a = &self.rows[ri];
             if self.multi && prev_server != Some(a.server.as_str()) {
-                self.lines.push(Line::Server(a.server.clone()));
+                self.lines.push(Line::Header { level: 0, id: self.line_servers.len() });
+                self.line_servers.push(a.server.clone());
                 prev_server = Some(a.server.as_str());
                 prev = None;
             }
             let b = band(a);
             if prev != Some(b) {
-                self.lines.push(Line::Header(b));
+                self.lines.push(Line::Header { level: 1, id: b as usize });
                 prev = Some(b);
             }
             self.lines.push(Line::Item(vpos));
@@ -801,7 +580,8 @@ impl Picker {
             .collect();
         odd.sort();
         for s in odd {
-            self.lines.push(Line::Server(s.clone()));
+            self.lines.push(Line::Header { level: 0, id: self.line_servers.len() });
+            self.line_servers.push(s.clone());
         }
     }
 
@@ -877,44 +657,6 @@ impl Picker {
     }
 }
 
-/// Keep a dimension within the window (2 cells spare for the border) and
-/// at or above `min`.
-fn clamp_dim(v: u32, min: u32, avail: u32) -> u32 {
-    v.min(avail.saturating_sub(2).max(min)).max(min)
-}
-
-/// The first display line of a list window `h` lines tall that shows
-/// `sel_line`, starting from `top`: scroll only as far as it takes to bring
-/// the selection in. A header (or server line) directly above the window
-/// wastes a line, so it is pulled in too, but never so far that the
-/// selection drops out the bottom again: with the cursor on the last row
-/// of a window whose top lands right under a band header, pulling the
-/// header in used to push the cursor one line below the screen, and the
-/// next `j` looked like it did nothing.
-fn scroll_window(mut top: usize, sel_line: usize, h: usize, lines: &[Line]) -> usize {
-    let h = h.max(1);
-    if sel_line < top {
-        top = sel_line;
-    } else if sel_line >= top + h {
-        top = sel_line + 1 - h;
-    }
-    while top > 0
-        && sel_line < top - 1 + h
-        && matches!(lines.get(top), Some(Line::Item(_)) | Some(Line::Header(_)))
-        && matches!(lines.get(top - 1), Some(Line::Header(_)) | Some(Line::Server(_)))
-    {
-        top -= 1;
-    }
-    top
-}
-
-/// The default picker size for a window: a fraction of it, clamped to the
-/// MIN/MAX box.
-fn default_size(ww: u32, wh: u32) -> (u32, u32) {
-    let w = (ww * FILL_TENTHS / 10).min(MAX_WIDTH);
-    let h = (wh * FILL_TENTHS / 10).min(MAX_HEIGHT);
-    (clamp_dim(w, MIN_WIDTH, ww), clamp_dim(h, MIN_HEIGHT, wh))
-}
 
 /// The shadow panes this server holds for panes elsewhere:
 /// (host, remote pane id) -> local pane id.
@@ -1004,17 +746,6 @@ fn is_multi(rows: &[Agent], fetching: &HashMap<String, u64>, now: u64) -> bool {
         || fetching.values().any(|t| now.saturating_sub(*t) >= SPIN_GRACE_MS)
 }
 
-/// When a server's outstanding fetch started, once it has been
-/// outstanding long enough to be worth showing (see [`SPIN_GRACE_MS`]).
-/// `fetching` holds every call in flight; this is the subset the picker
-/// admits to, so a fetch that finishes quickly is never drawn at all.
-fn spin_since(fetching: &HashMap<String, u64>, server: &str, now: u64) -> Option<u64> {
-    fetching
-        .get(server)
-        .copied()
-        .filter(|t| now.saturating_sub(*t) >= SPIN_GRACE_MS)
-}
-
 pub async fn pick_open(
     picker: Rc<RefCell<Option<Picker>>>,
     cfg: Rc<Config>,
@@ -1056,15 +787,15 @@ pub async fn pick_open(
     let (ww, wh) = resolve_window(WindowId(window))
         .map(|wi| (wi.width, wi.height))
         .unwrap_or((MAX_WIDTH, MAX_HEIGHT));
-    let (mut width, mut height) = default_size(ww, wh);
+    let (mut width, mut height) = default_size(ww, wh, &SIZE);
     if let Ok(Some(v)) = store::get_setting("pick_w").await {
         if let Ok(n) = v.parse::<u32>() {
-            width = clamp_dim(n, MIN_WIDTH, ww);
+            width = clamp_dim(n, SIZE.min_w, ww);
         }
     }
     if let Ok(Some(v)) = store::get_setting("pick_h").await {
         if let Ok(n) = v.parse::<u32>() {
-            height = clamp_dim(n, MIN_HEIGHT, wh);
+            height = clamp_dim(n, SIZE.min_h, wh);
         }
     }
     // Open the window BEFORE touching the remotes. Waiting for every
@@ -1146,6 +877,7 @@ pub async fn pick_open(
         rows,
         view: Vec::new(),
         lines: Vec::new(),
+        line_servers: Vec::new(),
         sel: 0,
         top: 0,
         marked: HashSet::new(),
@@ -1635,34 +1367,6 @@ pub async fn apply_status(
     reload_picker(picker, remotes, false).await;
 }
 
-/// Text that is safe to drop into a tmux command string as a
-/// single-quoted argument. tmux's single quotes take no escapes, so a
-/// quote inside one cannot be escaped - it can only be removed. `#` goes
-/// too: a menu name is format-expanded, and `#{...}` from an agent's own
-/// title is not something to hand to the format parser.
-fn menu_safe(s: &str, max: usize) -> String {
-    let cleaned: String = s
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .filter(|c| !matches!(c, '\'' | '"' | '#' | '\\' | ';' | '$'))
-        .collect();
-    clip(cleaned.trim(), max)
-}
-
-/// One row of the action menu: a label, the picker key it stands for,
-/// and whether it applies to the selected agent right now. A name
-/// starting with `-` is what tmux draws dimmed and refuses to select, so
-/// an action that does not apply is still SHOWN - the menu is the place
-/// you go to find out what you can do, and a silently missing line
-/// answers nothing.
-fn menu_item(label: &str, key: &str, enabled: bool) -> String {
-    let name = if enabled {
-        label.to_string()
-    } else {
-        format!("-{label}")
-    };
-    format!(" '{}' '{}' \"plugin-command agents 'menu-key {}'\"", name, key, key)
-}
 
 /// The action menu for the selected row: every picker action, with the
 /// ones that do not apply dimmed, opened on the client that asked for it.
@@ -1682,27 +1386,28 @@ async fn open_menu(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>) {
             let movable =
                 a.live() && matches!(a.status.as_str(), "needs_input" | "waiting");
             let mut items = String::new();
-            items.push_str(&menu_item("jump to pane", &k.jump, live));
-            items.push_str(&menu_item("type into pane", &k.focus, live));
-            items.push_str(&menu_item("new agent here", &k.new, true));
-            items.push_str(&menu_item("fork this agent", "f", true));
-            items.push_str(&menu_item("message", "m", true));
+            items.push_str(&menu_item("agents", "jump to pane", &k.jump, live));
+            items.push_str(&menu_item("agents", "type into pane", &k.focus, live));
+            items.push_str(&menu_item("agents", "new agent here", &k.new, true));
+            items.push_str(&menu_item("agents", "fork this agent", "f", true));
+            items.push_str(&menu_item("agents", "message", "m", true));
             let stopped =
                 a.live() && matches!(a.status.as_str(), "needs_input" | "waiting");
-            items.push_str(&menu_item("mark read", &k.read, stopped && a.unread()));
-            items.push_str(&menu_item("mark unread", &k.unread, stopped && !a.unread()));
-            items.push_str(&menu_item("copy id", &k.copy, durable_id(a).is_some()));
-            items.push_str(&menu_item("info", "i", true));
-            items.push_str(&menu_item("help", "?", true));
-            items.push_str(&menu_item("rename", &k.rename, true));
+            items.push_str(&menu_item("agents", "mark read", &k.read, stopped && a.unread()));
+            items.push_str(&menu_item("agents", "mark unread", &k.unread, stopped && !a.unread()));
+            items.push_str(&menu_item("agents", "sessions chooser here", &k.sessions, true));
+            items.push_str(&menu_item("agents", "copy id", &k.copy, durable_id(a).is_some()));
+            items.push_str(&menu_item("agents", "info", "i", true));
+            items.push_str(&menu_item("agents", "help", "?", true));
+            items.push_str(&menu_item("agents", "rename", &k.rename, true));
             items.push_str(" ''");
             let band = if flagged { "move to waiting" } else { "flag: needs input" };
-            items.push_str(&menu_item(band, &k.attention, movable));
+            items.push_str(&menu_item("agents", band, &k.attention, movable));
             let arch = if a.life == "archived" { "un-archive" } else { "archive" };
-            items.push_str(&menu_item(arch, &k.archive, true));
+            items.push_str(&menu_item("agents", arch, &k.archive, true));
             items.push_str(" ''");
-            items.push_str(&menu_item("interrupt (C-c)", &k.interrupt, live));
-            items.push_str(&menu_item("kill pane", &k.kill, live));
+            items.push_str(&menu_item("agents", "interrupt (C-c)", &k.interrupt, live));
+            items.push_str(&menu_item("agents", "kill pane", &k.kill, live));
             // The one view toggle in a menu of row actions: a key that
             // is not in the footer has to be findable somewhere.
             items.push_str(" ''");
@@ -1711,7 +1416,7 @@ async fn open_menu(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>) {
             } else {
                 "show finished (history)"
             };
-            items.push_str(&menu_item(hist, &k.history, true));
+            items.push_str(&menu_item("agents", hist, &k.history, true));
             Some((menu_safe(&display_name(a), 30), items))
         })
     }) else {
@@ -2435,6 +2140,10 @@ fn dispatch_key(
             mark_and_move(p, 1);
         } else if key == "K" {
             mark_and_move(p, -1);
+        } else if key == k.sessions {
+            // The sessions chooser, on the pane under the cursor: the
+            // same tree seen by session rather than by agent.
+            after = PickAfter::Sessions(live_pane_of_selection(p));
         } else if key == k.read || key == k.unread {
             // Read and unread by hand: the cursor passing over a row is
             // not reading it, so these are the way to say you have (or
@@ -2510,6 +2219,20 @@ fn dispatch_key(
         }
         PickAfter::Close(mode) => {
             let _ = mode_close(mode);
+        }
+        PickAfter::Sessions(pane) => {
+            // Close first: the chooser floats over the same window, and
+            // its `g` comes back here the same way.
+            if let Some(old) = picker.borrow_mut().take() {
+                if let Some(t) = old.timer {
+                    cancel(t);
+                }
+                let _ = mode_close(old.mode);
+            }
+            ctx.spawn(async move {
+                let target = pane.map(|p| format!("-t '%{p}' ")).unwrap_or_default();
+                let _ = run_command(&format!("plugin-command {target}sessions 'pick pane'")).await;
+            });
         }
         PickAfter::Jump(pane, mode) => {
             ctx.spawn(async move {
@@ -2635,7 +2358,7 @@ fn server_of(remotes: &Rc<RefCell<Remotes>>, id: &str) -> Option<String> {
         .borrow()
         .servers
         .iter()
-        .find(|(_, rows)| rows.agents.iter().any(|a| a.id == id))
+        .find(|(_, rows)| rows.rows.iter().any(|a| a.id == id))
         .map(|(name, _)| name.clone())
 }
 
@@ -3246,24 +2969,6 @@ fn unadorned(s: &str) -> &str {
     }
 }
 
-/// session_creator's ranking: prefix beats substring beats subsequence.
-fn rank(hay: &str, needle: &str) -> Option<u8> {
-    if needle.is_empty() {
-        return Some(4);
-    }
-    let h = hay.to_lowercase();
-    let n = needle.to_lowercase();
-    if h.starts_with(&n) {
-        return Some(0);
-    }
-    if h.contains(&n) {
-        return Some(1);
-    }
-    // No fuzzy subsequence tier: the haystack joins the name with the
-    // kind/status/session words, whose common letters make a subsequence
-    // match almost everything. Substring is the right strictness here.
-    None
-}
 
 fn haystack(a: &Agent) -> String {
     format!(
@@ -3322,7 +3027,7 @@ fn pick_refilter_keep(
     keep: Option<(String, String, Option<i64>)>,
     reset_scroll: bool,
 ) {
-    let query = parse_query(&p.filter);
+    let query = parse_query(&p.filter, &SIGILS);
     let needle = query.words.clone();
     // Refresh the content-match set when content search is on. The local
     // grep runs in tmux over the live grids (`panes_search`); only the
@@ -3380,7 +3085,7 @@ fn pick_reshow(
     keep: Option<(String, String, Option<i64>)>,
     reset_scroll: bool,
 ) {
-    let query = parse_query(&p.filter);
+    let query = parse_query(&p.filter, &SIGILS);
     let needle = query.words.clone();
     merge_hit_rows(p);
     p.view = p
@@ -3470,112 +3175,26 @@ fn row_shown(p: &Picker, a: &Agent, q: &Query) -> bool {
 /// The sigils that start a filter token in the search box.
 pub const SIGILS: [char; 3] = ['@', '#', '~'];
 
-/// How many values the dropdown offers at most.
-const COMPLETIONS_MAX: usize = 8;
 
-/// A parsed search box: the free words that search names, tasks and
-/// transcripts, and the filter tokens - `@server`, `#session`, `~dir` -
-/// that narrow the roster. Several of one kind are alternatives; the
-/// kinds combine. A backslash escapes a sigil into an ordinary word:
-/// `\@foo` is the word `@foo`.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct Query {
-    pub words: String,
-    pub servers: Vec<String>,
-    pub sessions: Vec<String>,
-    pub dirs: Vec<String>,
-}
-
-impl Query {
-    pub fn has_filters(&self) -> bool {
-        !(self.servers.is_empty() && self.sessions.is_empty() && self.dirs.is_empty())
-    }
-
-    /// The active tokens, spelled as typed.
-    pub fn tokens(&self) -> String {
-        let mut t: Vec<String> = Vec::new();
-        t.extend(self.servers.iter().map(|v| format!("@{v}")));
-        t.extend(self.sessions.iter().map(|v| format!("#{v}")));
-        t.extend(self.dirs.iter().map(|v| format!("~{v}")));
-        t.join(" ")
-    }
-}
-
-pub fn parse_query(filter: &str) -> Query {
-    let mut q = Query::default();
-    let mut words: Vec<&str> = Vec::new();
-    for w in filter.split_whitespace() {
-        let Some(c) = w.chars().next() else { continue };
-        if c == '\\' {
-            let rest = &w[1..];
-            words.push(if rest.starts_with(SIGILS) { rest } else { w });
-        } else if SIGILS.contains(&c) {
-            let v = &w[c.len_utf8()..];
-            if v.is_empty() {
-                // A bare sigil is a token being typed, not a filter yet.
-                continue;
-            }
-            match c {
-                '@' => q.servers.push(v.to_string()),
-                '#' => q.sessions.push(v.to_string()),
-                _ => q.dirs.push(v.to_string()),
-            }
-        } else {
-            words.push(w);
-        }
-    }
-    q.words = words.join(" ");
-    q
-}
-
-/// `~/...` for a path under the home directory.
-fn tilde_of(home: &Option<String>, path: &str) -> String {
-    match home {
-        Some(h) if path.starts_with(h.as_str()) => format!("~{}", &path[h.len()..]),
-        _ => path.to_string(),
-    }
-}
 
 /// Does the row pass the query's filter tokens? Server and session by
 /// prefix, so `@dm` is dmatrix and `#tm` is tmux2; the directory by
 /// substring of its `~` form, so `~tmux2` takes both tmux2 trees.
 fn filters_pass(p: &Picker, q: &Query, a: &Agent) -> bool {
-    fn prefix(vals: &[String], target: &str) -> bool {
-        let t = target.to_lowercase();
-        vals.is_empty() || vals.iter().any(|v| t.starts_with(&v.to_lowercase()))
-    }
-    if !prefix(&q.servers, &a.server) {
+    if !query::passes(&q.values('@'), &a.server, false) {
         return false;
     }
-    if !prefix(&q.sessions, a.session.as_deref().unwrap_or("")) {
+    if !query::passes(&q.values('#'), a.session.as_deref().unwrap_or(""), false) {
         return false;
     }
-    if !q.dirs.is_empty() {
-        let dir = a
-            .cwd
-            .as_deref()
-            .map(|c| tilde_of(&p.home, c))
-            .unwrap_or_default()
-            .to_lowercase();
-        if !q.dirs.iter().any(|v| dir.contains(&v.to_lowercase())) {
+    let dirs = q.values('~');
+    if !dirs.is_empty() {
+        let dir = a.cwd.as_deref().map(|c| tilde_of(&p.home, c)).unwrap_or_default();
+        if !query::passes(&dirs, &dir, true) {
             return false;
         }
     }
     true
-}
-
-/// The token under the cursor: the search box ends in a word that starts
-/// with a sigil. Its sigil and what is typed after it.
-fn typing_token(filter: &str) -> Option<(char, &str)> {
-    if filter.ends_with(char::is_whitespace) {
-        return None;
-    }
-    let last = filter.split_whitespace().last()?;
-    let c = last.chars().next()?;
-    if !SIGILS.contains(&c) {
-        return None;
-    }
-    Some((c, &last[c.len_utf8()..]))
 }
 
 /// The search text changed under the cursor: refilter, and offer the
@@ -3597,49 +3216,27 @@ fn update_completions(p: &mut Picker) {
     if !p.filtering || p.completion_hidden {
         return;
     }
-    let Some((sigil, partial)) = typing_token(&p.filter) else { return };
-    let partial = partial.to_lowercase();
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for a in &p.rows {
-        let v = match sigil {
-            '@' => Some(a.server.clone()),
-            '#' => a.session.clone(),
-            // The `~` form without its own tilde: the sigil is one, so
-            // the token reads `~/Code/x` and matches the path's tail.
-            _ => a.cwd.as_deref().map(|c| {
-                let t = tilde_of(&p.home, c);
-                t.strip_prefix('~').map(str::to_string).unwrap_or(t)
-            }),
-        };
-        let Some(v) = v.filter(|v| !v.is_empty()) else { continue };
-        let lv = v.to_lowercase();
-        let ok = if sigil == '~' { lv.contains(&partial) } else { lv.starts_with(&partial) };
-        if ok {
-            *counts.entry(v).or_insert(0) += 1;
-        }
-    }
-    let mut list: Vec<(String, usize)> = counts.into_iter().collect();
-    list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    list.truncate(COMPLETIONS_MAX);
-    // The one value left is what is typed already: nothing to offer.
-    if list.len() == 1 && list[0].0.to_lowercase() == partial {
-        list.clear();
-    }
-    p.completions = list;
+    let Some((sigil, partial)) = typing_token(&p.filter, &SIGILS) else { return };
+    let values = p.rows.iter().filter_map(|a| match sigil {
+        '@' => Some(a.server.clone()),
+        '#' => a.session.clone(),
+        // The `~` form without its own tilde: the sigil is one, so
+        // the token reads `~/Code/x` and matches the path's tail.
+        _ => a.cwd.as_deref().map(|c| {
+            let t = tilde_of(&p.home, c);
+            t.strip_prefix('~').map(str::to_string).unwrap_or(t)
+        }),
+    });
+    p.completions = query::complete_values(values, partial, sigil == '~');
 }
 
 /// Replace the token being typed with the highlighted value, and a space
 /// so the next word starts fresh.
 fn accept_completion(p: &mut Picker) {
     let Some((v, _)) = p.completions.get(p.completion_idx).cloned() else { return };
-    let Some((sigil, plen)) = typing_token(&p.filter).map(|(s, t)| (s, t.len())) else {
+    if !query::replace_typing_token(&mut p.filter, &SIGILS, &v) {
         return;
-    };
-    let cut = p.filter.len() - sigil.len_utf8() - plen;
-    p.filter.truncate(cut);
-    p.filter.push(sigil);
-    p.filter.push_str(&v);
-    p.filter.push(' ');
+    }
     p.completions.clear();
     pick_refilter(p);
 }
@@ -3661,17 +3258,7 @@ fn narrow_token(p: &Picker, key: &str) -> Option<String> {
 
 /// Add the token to the search box, or take it out if it is there.
 fn toggle_token(p: &mut Picker, tok: &str) {
-    let mut words: Vec<String> = p.filter.split_whitespace().map(str::to_string).collect();
-    let before = words.len();
-    words.retain(|w| !w.eq_ignore_ascii_case(tok));
-    let removed = words.len() != before;
-    if !removed {
-        words.push(tok.to_string());
-    }
-    p.filter = words.join(" ");
-    if !p.filter.is_empty() {
-        p.filter.push(' ');
-    }
+    let removed = query::toggle_word(&mut p.filter, tok);
     p.status = Some(if removed { format!("{tok} off") } else { format!("{tok} on") });
     pick_refilter(p);
     pick_render(p);
@@ -3684,9 +3271,9 @@ fn draw_completions(p: &Picker, out: &mut String, list_w: usize) {
     if !p.filtering || p.completions.is_empty() {
         return;
     }
-    let Some((sigil, partial)) = typing_token(&p.filter) else { return };
+    let Some((sigil, partial)) = typing_token(&p.filter, &SIGILS) else { return };
     // "  search " is nine cells; the sigil sits where the token starts.
-    let col = 10 + p.filter.chars().count() - 1 - partial.chars().count();
+    let col = query::dropdown_col(&p.filter, partial, 10);
     let wmax = p.completions.iter().map(|(v, _)| v.chars().count()).max().unwrap_or(0);
     let width = (wmax + 8).min(list_w.saturating_sub(col + 1)).max(4);
     for (i, (v, n)) in p.completions.iter().enumerate() {
@@ -3882,64 +3469,6 @@ thread_local! {
         const { RefCell::new(None) };
 }
 
-fn clip(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let head: String = s.chars().take(max.saturating_sub(1)).collect();
-        format!("{head}…")
-    }
-}
-
-/// Flatten text that came from outside onto one line. A harness writes
-/// its own words into a note (the Claude `Notification` message is a
-/// sentence, sometimes two), and a newline or a stray control character
-/// inside a row would tear the list apart.
-fn one_line(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut gap = false;
-    for c in s.chars() {
-        if c.is_control() {
-            gap = !out.is_empty();
-        } else {
-            if gap {
-                out.push(' ');
-                gap = false;
-            }
-            out.push(c);
-        }
-    }
-    out
-}
-
-fn keyname(k: &str) -> &str {
-    match k {
-        "Escape" => "Esc",
-        "Enter" => "Enter",
-        other => other,
-    }
-}
-
-/// A short, readable key label: `C-f` shows as `^F`.
-fn pretty_key(k: &str) -> String {
-    if let Some(rest) = k.strip_prefix("C-") {
-        format!("^{}", rest.to_uppercase())
-    } else {
-        keyname(k).to_string()
-    }
-}
-
-fn fmt_age(secs: u64) -> String {
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m", secs / 60)
-    } else if secs < 86400 {
-        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
-    } else {
-        format!("{}d", secs / 86400)
-    }
-}
 
 /// Coloured status glyph. Magenta for an archived agent, dim for a
 /// finished one.
@@ -3973,7 +3502,7 @@ pub fn pick_render(p: &mut Picker) {
     let mut out = String::from("\x1b[2J\x1b[H");
 
     let live = p.rows.iter().filter(|a| a.live()).count();
-    let query = parse_query(&p.filter);
+    let query = parse_query(&p.filter, &SIGILS);
     // Narrowed by a filter token, the count says so: "9 of 22 live".
     let live = if query.has_filters() {
         let shown = p.view.iter().filter(|&&i| p.rows[i].live()).count();
@@ -4078,7 +3607,9 @@ pub fn pick_render(p: &mut Picker) {
         {
             let row = 4 + line_i;
             match &p.lines[li] {
-                Line::Server(server) => {
+                Line::Spacer => {}
+                Line::Header { level: 0, id } => {
+                    let server = &p.line_servers[*id];
                     // A server line: bold, with the link state when down,
                     // the reason when its copy is rejected, and a spinner
                     // while its roster is still in flight. A healthy
@@ -4121,10 +3652,10 @@ pub fn pick_render(p: &mut Picker) {
                         clip(&label, list_w.saturating_sub(3)),
                     ));
                 }
-                Line::Header(b) => {
+                Line::Header { id, .. } => {
                     out.push_str(&format!(
                         "\x1b[{row};1H \x1b[1;2m{}\x1b[0m",
-                        clip(band_label(*b), list_w.saturating_sub(2)),
+                        clip(band_label(*id as u8), list_w.saturating_sub(2)),
                     ));
                 }
                 Line::Item(vpos) => {
@@ -4421,6 +3952,7 @@ fn draw_help(p: &Picker, out: &mut String, x: usize, pw: usize, ph: usize) {
         ("J / K".into(), "mark the row and move"),
         (n(&k.menu), "the action menu"),
         ("i".into(), "info card (y copies its cwd)"),
+        (n(&k.sessions), "the sessions chooser, on this row's pane"),
     ], &mut lines);
     section("conversation (Tab)", &[
         ("j/k".into(), "scroll"),
@@ -4726,16 +4258,6 @@ fn transcript_key(p: &mut Picker, key: &str, is_up: bool, is_down: bool) {
 // the conversation, rendered: light Markdown to styled cells
 // ---------------------------------------------------------------------------
 
-const ST_BOLD: u8 = 1;
-const ST_ITALIC: u8 = 2;
-const ST_CODE: u8 = 4;
-const ST_UNDER: u8 = 8;
-const ST_DIM: u8 = 16;
-const ST_HIT: u8 = 32;
-const ST_CYAN: u8 = 64;
-
-/// One cell of a rendered line: a character and its style bits.
-type Styled = (char, u8);
 
 /// Lay the turns out for `width`: a prompt with a `❯` in front, in bold;
 /// the agent's text with its Markdown rendered (headings, emphasis,
@@ -4818,431 +4340,6 @@ fn render_transcript(tv: &mut TranscriptView, width: usize, terms: &[String]) {
     };
 }
 
-/// Plain text as cells, one style throughout.
-fn plain_cells(text: &str, style: u8) -> Vec<Styled> {
-    text.chars().filter(|c| !c.is_control() || *c == '\n').map(|c| (c, style)).collect()
-}
-
-/// A block of Markdown as wrapped, styled lines. Handles what agents
-/// actually write: `#` headings, `**bold**`, `*italic*`, `` `code` ``,
-/// fenced code blocks, `-`/`*`/`1.` lists, `>` quotes, `---` rules and
-/// `[text](url)` links (the text, underlined). `base` is OR'd into every
-/// cell (a prompt is bold throughout).
-fn markdown_lines(text: &str, width: usize, base: u8) -> Vec<Vec<Styled>> {
-    let width = width.max(4);
-    let mut out: Vec<Vec<Styled>> = Vec::new();
-    let mut in_fence = false;
-    let src: Vec<&str> = text.lines().collect();
-    let mut i = 0usize;
-    while i < src.len() {
-        let raw = src[i];
-        i += 1;
-        let line = raw.trim_end();
-        // A pipe table: a header row, a separator row of dashes (with
-        // optional colons for alignment), then body rows, all with `|`.
-        if !in_fence && line.contains('|') && i < src.len() && is_table_separator(src[i]) {
-            let sep = src[i];
-            i += 1; // the separator
-            let mut rows: Vec<&str> = vec![line];
-            while i < src.len() && src[i].contains('|') && !src[i].trim().is_empty() {
-                rows.push(src[i].trim_end());
-                i += 1;
-            }
-            out.extend(table_lines(&rows, sep, width, base));
-            continue;
-        }
-        if let Some(rest) = line.trim_start().strip_prefix("```") {
-            in_fence = !in_fence;
-            let lang = rest.trim();
-            let mut l: Vec<Styled> = vec![(if in_fence { '┌' } else { '└' }, ST_DIM | base), ('─', ST_DIM | base)];
-            if in_fence && !lang.is_empty() {
-                l.push((' ', 0));
-                l.extend(lang.chars().map(|c| (c, ST_DIM | base)));
-            }
-            out.push(l);
-            continue;
-        }
-        if in_fence {
-            // Code: no inline markup, hard-wrapped, a bar down the side.
-            let body: Vec<Styled> = line.chars().filter(|c| !c.is_control()).map(|c| (c, ST_CODE | base)).collect();
-            let mut first = true;
-            for piece in hard_wrap(&body, width.saturating_sub(2)) {
-                let mut l: Vec<Styled> = vec![('│', ST_DIM | base), (' ', 0)];
-                if !first {
-                    l[0] = (' ', 0);
-                }
-                first = false;
-                l.extend(piece);
-                out.push(l);
-            }
-            if body.is_empty() {
-                out.push(vec![('│', ST_DIM | base)]);
-            }
-            continue;
-        }
-        let trimmed = line.trim_start();
-        let indent = line.len() - trimmed.len();
-        if trimmed.is_empty() {
-            out.push(Vec::new());
-            continue;
-        }
-        // Horizontal rule.
-        if trimmed.len() >= 3 && trimmed.chars().all(|c| c == '-' || c == '*' || c == '_') {
-            out.push(std::iter::repeat(('─', ST_DIM | base)).take(width.min(40)).collect());
-            continue;
-        }
-        // Heading.
-        if let Some(rest) = trimmed.strip_prefix('#') {
-            let level = 1 + rest.chars().take_while(|&c| c == '#').count();
-            let body = rest.trim_start_matches('#');
-            if body.starts_with(' ') && level <= 6 {
-                let style = base | ST_BOLD | if level == 1 { ST_UNDER } else { 0 };
-                let cells = inline_cells(body.trim(), style);
-                out.extend(wrap_cells(&cells, width));
-                continue;
-            }
-        }
-        // Quote.
-        if let Some(rest) = trimmed.strip_prefix('>') {
-            let cells = inline_cells(rest.trim_start(), base | ST_DIM);
-            for piece in wrap_cells(&cells, width.saturating_sub(2)) {
-                let mut l: Vec<Styled> = vec![('▎', ST_DIM | base), (' ', 0)];
-                l.extend(piece);
-                out.push(l);
-            }
-            continue;
-        }
-        // List item: a bullet, or a number.
-        let (lead, rest): (String, &str) = if let Some(r) = trimmed
-            .strip_prefix("- ")
-            .or_else(|| trimmed.strip_prefix("* "))
-            .or_else(|| trimmed.strip_prefix("+ "))
-        {
-            (format!("{}• ", " ".repeat(indent.min(8))), r)
-        } else if let Some(pos) = trimmed.find(". ").filter(|&pos| pos > 0 && pos <= 3 && trimmed[..pos].bytes().all(|b| b.is_ascii_digit())) {
-            (format!("{}{} ", " ".repeat(indent.min(8)), &trimmed[..pos + 1]), &trimmed[pos + 2..])
-        } else {
-            (String::new(), trimmed)
-        };
-        let cells = inline_cells(rest, base);
-        let hang = lead.chars().count();
-        for (i, piece) in wrap_cells(&cells, width.saturating_sub(hang)).into_iter().enumerate() {
-            let mut l: Vec<Styled> = if i == 0 {
-                lead.chars().map(|c| (c, base)).collect()
-            } else {
-                std::iter::repeat((' ', 0)).take(hang).collect()
-            };
-            l.extend(piece);
-            out.push(l);
-        }
-    }
-    out
-}
-
-/// A pipe table's separator row: cells of dashes, each with an optional
-/// colon at either end, between pipes.
-fn is_table_separator(line: &str) -> bool {
-    let t = line.trim();
-    if !t.contains('-') || !t.contains('|') {
-        return false;
-    }
-    split_row(t).into_iter().all(|c| {
-        let c = c.trim();
-        let body = c.trim_start_matches(':').trim_end_matches(':');
-        !body.is_empty() && body.chars().all(|ch| ch == '-')
-    })
-}
-
-/// The cells of a table row: split on `|` (an escaped `\|` stays), with
-/// the outer pipes and surrounding spaces dropped.
-fn split_row(line: &str) -> Vec<String> {
-    let t = line.trim();
-    let t = t.strip_prefix('|').unwrap_or(t);
-    let t = t.strip_suffix('|').unwrap_or(t);
-    let mut cells = Vec::new();
-    let mut cur = String::new();
-    let mut chars = t.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\\' && chars.peek() == Some(&'|') {
-            cur.push('|');
-            chars.next();
-        } else if c == '|' {
-            cells.push(cur.trim().to_string());
-            cur = String::new();
-        } else {
-            cur.push(c);
-        }
-    }
-    cells.push(cur.trim().to_string());
-    cells
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum Align {
-    Left,
-    Center,
-    Right,
-}
-
-/// A pipe table as lines: the header row bold, a rule under it, the body
-/// rows, columns padded to the widest cell and aligned as the separator
-/// says. Wider than the preview, the widest columns give way first and
-/// their cells are cut with an ellipsis; a table never wraps.
-fn table_lines(rows: &[&str], sep: &str, width: usize, base: u8) -> Vec<Vec<Styled>> {
-    let aligns: Vec<Align> = split_row(sep)
-        .iter()
-        .map(|c| {
-            let c = c.trim();
-            match (c.starts_with(':'), c.ends_with(':')) {
-                (true, true) => Align::Center,
-                (false, true) => Align::Right,
-                _ => Align::Left,
-            }
-        })
-        .collect();
-    let ncols = aligns.len().max(1);
-    let cells: Vec<Vec<Vec<Styled>>> = rows
-        .iter()
-        .enumerate()
-        .map(|(r, row)| {
-            let style = if r == 0 { base | ST_BOLD } else { base };
-            let mut cs: Vec<Vec<Styled>> = split_row(row).iter().map(|c| inline_cells(c, style)).collect();
-            cs.resize(ncols, Vec::new());
-            cs
-        })
-        .collect();
-    let mut widths: Vec<usize> = (0..ncols)
-        .map(|c| cells.iter().map(|r| r[c].len()).max().unwrap_or(0).max(1))
-        .collect();
-    // Fit: 3 cells between columns (" │ "), none outside.
-    let fits = |w: &[usize]| w.iter().sum::<usize>() + 3 * (ncols - 1);
-    while fits(&widths) > width {
-        let (widest, _) = widths.iter().enumerate().max_by_key(|(_, w)| **w).unwrap();
-        if widths[widest] <= 3 {
-            break;
-        }
-        widths[widest] -= 1;
-    }
-    let mut out: Vec<Vec<Styled>> = Vec::new();
-    let pad = |cell: &[Styled], w: usize, align: Align| -> Vec<Styled> {
-        let mut c: Vec<Styled> = cell.to_vec();
-        if c.len() > w {
-            c.truncate(w.saturating_sub(1));
-            c.push(('…', cell.last().map(|s| s.1).unwrap_or(0)));
-        }
-        let gap = w.saturating_sub(c.len());
-        let (left, right) = match align {
-            Align::Left => (0, gap),
-            Align::Right => (gap, 0),
-            Align::Center => (gap / 2, gap - gap / 2),
-        };
-        let mut line: Vec<Styled> = std::iter::repeat((' ', 0)).take(left).collect();
-        line.extend(c);
-        line.extend(std::iter::repeat((' ', 0)).take(right));
-        line
-    };
-    for (r, row) in cells.iter().enumerate() {
-        let mut line: Vec<Styled> = Vec::new();
-        for (c, cell) in row.iter().enumerate() {
-            if c > 0 {
-                line.extend([(' ', 0), ('│', base | ST_DIM), (' ', 0)]);
-            }
-            line.extend(pad(cell, widths[c], aligns.get(c).copied().unwrap_or(Align::Left)));
-        }
-        out.push(line);
-        if r == 0 {
-            let mut rule: Vec<Styled> = Vec::new();
-            for (c, w) in widths.iter().enumerate() {
-                if c > 0 {
-                    rule.extend([('─', base | ST_DIM), ('┼', base | ST_DIM), ('─', base | ST_DIM)]);
-                }
-                rule.extend(std::iter::repeat(('─', base | ST_DIM)).take(*w));
-            }
-            out.push(rule);
-        }
-    }
-    out
-}
-
-/// Inline Markdown to cells: `**bold**`, `*italic*` / `_italic_`,
-/// `` `code` ``, `[text](url)`. Unmatched markers stay as text.
-fn inline_cells(text: &str, base: u8) -> Vec<Styled> {
-    let chars: Vec<char> = text.chars().filter(|c| !c.is_control()).collect();
-    let mut out: Vec<Styled> = Vec::with_capacity(chars.len());
-    let mut i = 0;
-    let n = chars.len();
-    let find = |from: usize, pat: &[char]| -> Option<usize> {
-        (from..n.saturating_sub(pat.len() - 1)).find(|&k| chars[k..k + pat.len()] == *pat)
-    };
-    while i < n {
-        let c = chars[i];
-        // Inline code: up to the next backtick.
-        if c == '`' {
-            if let Some(end) = find(i + 1, &['`']) {
-                if end > i + 1 {
-                    out.extend(chars[i + 1..end].iter().map(|&ch| (ch, base | ST_CODE)));
-                    i = end + 1;
-                    continue;
-                }
-            }
-        }
-        // Bold.
-        if c == '*' && i + 1 < n && chars[i + 1] == '*' {
-            if let Some(end) = find(i + 2, &['*', '*']) {
-                if end > i + 2 {
-                    out.extend(inline_cells(&chars[i + 2..end].iter().collect::<String>(), base | ST_BOLD));
-                    i = end + 2;
-                    continue;
-                }
-            }
-        }
-        // Italic: a single marker with a word right after it and a
-        // matching one before a non-word, so `2 * 3 * 4` stays as is.
-        if (c == '*' || c == '_') && i + 1 < n && !chars[i + 1].is_whitespace() && chars[i + 1] != c {
-            if let Some(end) = (i + 2..n).find(|&k| chars[k] == c && !chars[k - 1].is_whitespace()) {
-                let after_ok = end + 1 >= n || !chars[end + 1].is_alphanumeric();
-                let before_ok = i == 0 || !chars[i - 1].is_alphanumeric() || c == '*';
-                if after_ok && before_ok {
-                    out.extend(inline_cells(&chars[i + 1..end].iter().collect::<String>(), base | ST_ITALIC));
-                    i = end + 1;
-                    continue;
-                }
-            }
-        }
-        // Link: [text](url) -> text, underlined.
-        if c == '[' {
-            if let Some(close) = find(i + 1, &[']', '(']) {
-                if let Some(end) = find(close + 2, &[')']) {
-                    out.extend(inline_cells(&chars[i + 1..close].iter().collect::<String>(), base | ST_UNDER));
-                    i = end + 1;
-                    continue;
-                }
-            }
-        }
-        out.push((c, base));
-        i += 1;
-    }
-    out
-}
-
-/// Greedy word wrap over cells; a word wider than the line is split.
-fn wrap_cells(cells: &[Styled], width: usize) -> Vec<Vec<Styled>> {
-    let width = width.max(1);
-    let mut out: Vec<Vec<Styled>> = Vec::new();
-    let mut line: Vec<Styled> = Vec::new();
-    let mut word: Vec<Styled> = Vec::new();
-    let flush_word = |line: &mut Vec<Styled>, word: &mut Vec<Styled>, out: &mut Vec<Vec<Styled>>| {
-        if word.is_empty() {
-            return;
-        }
-        if !line.is_empty() && line.len() + 1 + word.len() > width {
-            out.push(std::mem::take(line));
-        }
-        if word.len() > width {
-            for piece in hard_wrap(word, width) {
-                if !line.is_empty() {
-                    out.push(std::mem::take(line));
-                }
-                *line = piece;
-            }
-            word.clear();
-            return;
-        }
-        if !line.is_empty() {
-            line.push((' ', 0));
-        }
-        line.append(word);
-    };
-    for &cell in cells {
-        if cell.0 == ' ' {
-            flush_word(&mut line, &mut word, &mut out);
-        } else {
-            word.push(cell);
-        }
-    }
-    flush_word(&mut line, &mut word, &mut out);
-    if !line.is_empty() || out.is_empty() {
-        out.push(line);
-    }
-    out
-}
-
-fn hard_wrap(cells: &[Styled], width: usize) -> Vec<Vec<Styled>> {
-    let width = width.max(1);
-    if cells.is_empty() {
-        return vec![Vec::new()];
-    }
-    cells.chunks(width).map(|c| c.to_vec()).collect()
-}
-
-/// Mark every occurrence of a term in the line (case-insensitively, on
-/// the visible text) with the hit bit. Returns whether any was marked.
-fn mark_hits(line: &mut [Styled], lower_terms: &[String]) -> bool {
-    if lower_terms.is_empty() || line.is_empty() {
-        return false;
-    }
-    let lower: Vec<char> = line.iter().map(|(c, _)| c.to_lowercase().next().unwrap_or(*c)).collect();
-    let mut any = false;
-    for t in lower_terms {
-        let tc: Vec<char> = t.chars().collect();
-        if tc.is_empty() || tc.len() > lower.len() {
-            continue;
-        }
-        let mut i = 0;
-        while i + tc.len() <= lower.len() {
-            if lower[i..i + tc.len()] == tc[..] {
-                for cell in &mut line[i..i + tc.len()] {
-                    cell.1 |= ST_HIT;
-                }
-                any = true;
-                i += tc.len();
-            } else {
-                i += 1;
-            }
-        }
-    }
-    any
-}
-
-/// Cells to a terminal line: one SGR per run of equal style. A match
-/// is black on yellow, as copy mode's `mode-style` draws one; on the
-/// line the cursor is on (`current`) it is bold on bright yellow, so
-/// `n`/`N` show where they landed.
-fn emit_cells(line: &[Styled], current: bool) -> String {
-    let mut out = String::with_capacity(line.len() + 16);
-    let mut cur: Option<u8> = None;
-    for &(c, st) in line {
-        if cur != Some(st) {
-            out.push_str("\x1b[0");
-            if st & ST_BOLD != 0 {
-                out.push_str(";1");
-            }
-            if st & ST_DIM != 0 && st & ST_HIT == 0 {
-                out.push_str(";2");
-            }
-            if st & ST_ITALIC != 0 {
-                out.push_str(";3");
-            }
-            if st & ST_UNDER != 0 {
-                out.push_str(";4");
-            }
-            if st & ST_HIT != 0 {
-                out.push_str(if current { ";1;30;103" } else { ";30;43" });
-            } else if st & ST_CODE != 0 {
-                out.push_str(";33");
-            } else if st & ST_CYAN != 0 {
-                out.push_str(";36");
-            }
-            out.push('m');
-            cur = Some(st);
-        }
-        out.push(c);
-    }
-    if cur.is_some() {
-        out.push_str("\x1b[0m");
-    }
-    out
-}
 
 /// The live pane of the highlighted row (local, or a mirror of a remote
 /// one), shown to the right of the list.
@@ -5280,110 +4377,11 @@ fn remote_preview_lines(p: &Picker) -> Option<&Vec<String>> {
     Some(lines)
 }
 
-/// Drop SGR escape sequences so the reverse-video selection line does not
-/// carry a colour that would reset the inversion mid-row.
-fn strip_sgr(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            while let Some(&n) = chars.peek() {
-                chars.next();
-                if n == 'm' {
-                    break;
-                }
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
 
-#[cfg(test)]
-mod scroll_tests {
-    use super::*;
-
-    /// Two servers, two bands each, five rows a band.
-    fn lines() -> Vec<Line> {
-        let mut v = Vec::new();
-        let mut item = 0;
-        for s in ["alpha", "beta"] {
-            v.push(Line::Server(s.into()));
-            for band in 0..2u8 {
-                v.push(Line::Header(band));
-                for _ in 0..5 {
-                    v.push(Line::Item(item));
-                    item += 1;
-                }
-            }
-        }
-        v
-    }
-
-    fn sel_line(lines: &[Line], sel: usize) -> usize {
-        lines.iter().position(|l| matches!(l, Line::Item(v) if *v == sel)).unwrap()
-    }
-
-    #[test]
-    fn selection_never_leaves_the_window() {
-        let lines = lines();
-        for h in 1..=lines.len() + 2 {
-            let mut top = 0;
-            let mut order: Vec<usize> = (0..20).collect();
-            order.extend((0..20).rev());
-            for sel in order {
-                let sl = sel_line(&lines, sel);
-                top = scroll_window(top, sl, h, &lines);
-                assert!(sl >= top && sl < top + h, "h={h} sel={sel} line={sl} top={top}");
-            }
-        }
-    }
-
-    #[test]
-    fn headers_pulled_in_only_when_there_is_room() {
-        let lines = lines();
-        // Line 0 is alpha's server line, 1 its first header, 2..6 items
-        // 0-4, 7 the second header, 8..12 items 5-9, 13 beta's server line.
-        // A header (and the server line above it) right above the window
-        // comes in when the cursor has room to spare.
-        assert_eq!(scroll_window(8, sel_line(&lines, 6), 10, &lines), 7);
-        assert_eq!(scroll_window(2, sel_line(&lines, 0), 10, &lines), 0);
-        // The case that used to lose the cursor: stepping down with the
-        // cursor on the window's last line, the top lands on the first item
-        // of a band (line 8, under the header at 7). The old code pulled
-        // the header in and left the cursor one line below the screen.
-        let sl = sel_line(&lines, 9);
-        let top = scroll_window(3, sl, 5, &lines);
-        assert_eq!(top, 8);
-        assert!(sl < top + 5);
-    }
-}
 
 #[cfg(test)]
 mod query_tests {
     use super::*;
-
-    #[test]
-    fn tokens_and_words() {
-        let q = parse_query("dflash @dm #tmux2 ~cfb bench");
-        assert_eq!(q.words, "dflash bench");
-        assert_eq!(q.servers, vec!["dm"]);
-        assert_eq!(q.sessions, vec!["tmux2"]);
-        assert_eq!(q.dirs, vec!["cfb"]);
-        assert_eq!(q.tokens(), "@dm #tmux2 ~cfb");
-        assert!(q.has_filters());
-    }
-
-    #[test]
-    fn bare_sigil_and_escape() {
-        let q = parse_query("@ foo");
-        assert_eq!(q.words, "foo");
-        assert!(!q.has_filters());
-        let q = parse_query("\\@alpha \\x");
-        assert_eq!(q.words, "@alpha \\x");
-        assert!(!q.has_filters());
-    }
 
     #[test]
     fn ids_found_bottom_first_once() {
@@ -5400,95 +4398,5 @@ mod query_tests {
             ]
         );
     }
-
-    #[test]
-    fn typing() {
-        assert_eq!(typing_token("foo #al"), Some(('#', "al")));
-        assert_eq!(typing_token("foo #al "), None);
-        assert_eq!(typing_token("foo \\#al"), None);
-        assert_eq!(typing_token("@"), Some(('@', "")));
-    }
 }
 
-#[cfg(test)]
-mod render_tests {
-    use super::*;
-
-    fn text(cells: &[Styled]) -> String {
-        cells.iter().map(|c| c.0).collect()
-    }
-
-    #[test]
-    fn inline_markup() {
-        let c = inline_cells("say **hi** and *there* with `code` [link](http://x)", 0);
-        assert_eq!(text(&c), "say hi and there with code link");
-        let bold: String = c.iter().filter(|c| c.1 & ST_BOLD != 0).map(|c| c.0).collect();
-        assert_eq!(bold, "hi");
-        let italic: String = c.iter().filter(|c| c.1 & ST_ITALIC != 0).map(|c| c.0).collect();
-        assert_eq!(italic, "there");
-        let code: String = c.iter().filter(|c| c.1 & ST_CODE != 0).map(|c| c.0).collect();
-        assert_eq!(code, "code");
-        let under: String = c.iter().filter(|c| c.1 & ST_UNDER != 0).map(|c| c.0).collect();
-        assert_eq!(under, "link");
-        // Arithmetic is not emphasis; an unmatched marker stays.
-        assert_eq!(text(&inline_cells("2 * 3 * 4 and a*b", 0)), "2 * 3 * 4 and a*b");
-        assert_eq!(text(&inline_cells("lone ` tick", 0)), "lone ` tick");
-    }
-
-    #[test]
-    fn blocks() {
-        let md = "# Title\n\n- one\n- two **b**\n\n```rust\nfn main() {}\n```\n\n> quoted\n\n1. first\n---\nplain para";
-        let lines: Vec<String> = markdown_lines(md, 40, 0).iter().map(|l| text(l)).collect();
-        assert_eq!(lines[0], "Title");
-        assert_eq!(lines[1], "");
-        assert_eq!(lines[2], "• one");
-        assert_eq!(lines[3], "• two b");
-        assert_eq!(lines[5], "┌─ rust");
-        assert_eq!(lines[6], "│ fn main() {}");
-        assert_eq!(lines[7], "└─");
-        assert_eq!(lines[9], "▎ quoted");
-        assert_eq!(lines[11], "1. first");
-        assert!(lines[12].starts_with("────"));
-        assert_eq!(lines[13], "plain para");
-        let title = &markdown_lines(md, 40, 0)[0];
-        assert!(title.iter().all(|c| c.1 & ST_BOLD != 0 && c.1 & ST_UNDER != 0));
-    }
-
-    #[test]
-    fn tables() {
-        let md = "| k | AL | note |\n|---:|:---:|------|\n| 4 | 3.1 | the **baseline** |\n| 16 | 3.9 | wide |";
-        let lines: Vec<String> = markdown_lines(md, 60, 0).iter().map(|l| text(l)).collect();
-        assert_eq!(lines[0], " k │ AL  │ note        ");
-        assert_eq!(lines[1], "───┼─────┼─────────────");
-        assert_eq!(lines[2], " 4 │ 3.1 │ the baseline");
-        assert_eq!(lines[3], "16 │ 3.9 │ wide        ");
-        // The header is bold; a wide table gives up width in its widest column.
-        assert!(markdown_lines(md, 60, 0)[0].iter().filter(|c| c.0 != ' ' && c.0 != '│').all(|c| c.1 & ST_BOLD != 0));
-        let narrow: Vec<String> = markdown_lines(md, 16, 0).iter().map(|l| text(l)).collect();
-        assert!(narrow.iter().all(|l| l.chars().count() <= 16), "{narrow:?}");
-        assert!(narrow[2].ends_with('…'));
-        // Not a table without a separator row.
-        let plain = markdown_lines("a | b\nc | d", 60, 0);
-        assert_eq!(text(&plain[0]), "a | b");
-    }
-
-    #[test]
-    fn wrapping_and_hits() {
-        let cells = inline_cells("alpha beta gamma delta", 0);
-        let lines = wrap_cells(&cells, 11);
-        let t: Vec<String> = lines.iter().map(|l| text(l)).collect();
-        assert_eq!(t, vec!["alpha beta", "gamma delta"]);
-        let long = inline_cells("abcdefghijkl", 0);
-        assert_eq!(wrap_cells(&long, 5).len(), 3);
-        let mut line = inline_cells("The DFlash2 bench and dflash2 again", 0);
-        assert!(mark_hits(&mut line, &["dflash2".to_string()]));
-        let hit: String = line.iter().filter(|c| c.1 & ST_HIT != 0).map(|c| c.0).collect();
-        assert_eq!(hit, "DFlash2dflash2");
-        assert!(!mark_hits(&mut line, &["zzz".to_string()]));
-        // Matches are black on yellow; on the current line, bold on bright yellow.
-        let out = emit_cells(&line, false);
-        assert!(out.contains("\x1b[0;30;43m") && out.ends_with("\x1b[0m"));
-        assert!(emit_cells(&line, true).contains("\x1b[0;1;30;103m"));
-        assert_eq!(strip_sgr(&out), "The DFlash2 bench and dflash2 again");
-    }
-}
