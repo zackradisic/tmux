@@ -113,6 +113,8 @@ pub struct Engine {
     pub separator_lit: bool,
     /// Scroll position of a text or Markdown preview.
     pub(crate) preview_top: usize,
+    /// The last rebuild had a filter on (folds are ignored then).
+    filtered: bool,
     pending_g: bool,
     pub status: Option<String>,
     pub(crate) prompt: Option<Prompt>,
@@ -152,6 +154,7 @@ impl Engine {
             show_help: false,
             separator_lit: false,
             preview_top: 0,
+            filtered: false,
             pending_g: false,
             status: None,
             prompt: None,
@@ -311,6 +314,7 @@ impl Engine {
     pub fn rebuild(&mut self) {
         let q = self.query();
         let filtering = !q.words.is_empty() || q.has_filters();
+        self.filtered = filtering;
         let n = self.nodes.len();
         let mut show = vec![false; n];
         let mut matched = vec![false; n];
@@ -369,7 +373,7 @@ impl Engine {
             let vpos = self.view.len();
             self.view.push(i);
             self.matched.push(matched[i]);
-            if self.nodes[i].selectable() {
+            if self.can_select(i) {
                 self.lines.push(Line::Item(vpos));
             } else {
                 if self.spacers && !filtering && !self.lines.is_empty() {
@@ -391,9 +395,9 @@ impl Engine {
         }
         // Never rest on a header: slide to the next selectable row, else
         // the previous one.
-        if !self.nodes[self.view[self.sel]].selectable() {
-            let next = (self.sel..=last).find(|&v| self.nodes[self.view[v]].selectable());
-            let prev = (0..self.sel).rev().find(|&v| self.nodes[self.view[v]].selectable());
+        if !self.can_select(self.view[self.sel]) {
+            let next = (self.sel..=last).find(|&v| self.can_select(self.view[v]));
+            let prev = (0..self.sel).rev().find(|&v| self.can_select(self.view[v]));
             self.sel = next.or(prev).unwrap_or(0);
         }
     }
@@ -403,7 +407,7 @@ impl Engine {
         let Some(pos) = self.view.iter().position(|&i| self.nodes[i].key == key) else {
             return false;
         };
-        if !self.nodes[self.view[pos]].selectable() {
+        if !self.can_select(self.view[pos]) {
             return false;
         }
         self.sel = pos;
@@ -504,7 +508,7 @@ impl Engine {
         if self.view.is_empty() {
             return;
         }
-        let selectable: Vec<usize> = (0..self.view.len()).filter(|&v| self.nodes[self.view[v]].selectable()).collect();
+        let selectable: Vec<usize> = (0..self.view.len()).filter(|&v| self.can_select(self.view[v])).collect();
         if selectable.is_empty() {
             return;
         }
@@ -574,39 +578,64 @@ impl Engine {
         let Some(&i) = self.view.get(self.sel) else { return Outcome::Nothing };
         if self.nodes[i].is_group() && self.is_expanded(&self.nodes[i]) {
             let k = self.nodes[i].key.clone();
-            self.expanded.insert(k.clone(), false);
-            self.rebuild();
-            self.clamp_sel();
-            self.scroll_to_selection();
-            return Outcome::Expanded(k, false);
+            return self.set_fold(&k, false);
         }
-        // On an item (or a collapsed group): go to the parent.
+        // On an item (or a folded group): the parent. One the cursor can
+        // land on is selected; a header the cursor skips folds instead,
+        // which lands the cursor on it.
         if let Some(j) = self.parent_of(i) {
+            let k = self.nodes[j].key.clone();
             if self.nodes[j].selectable() {
-                let k = self.nodes[j].key.clone();
                 self.select_key(&k);
                 return Outcome::Redraw;
             }
+            return self.set_fold(&k, false);
         }
         Outcome::Nothing
+    }
+
+    /// Fold or unfold the group with this key, then put the cursor on
+    /// it when folded (a folded header is a row), else on its first row.
+    fn set_fold(&mut self, key: &str, open: bool) -> Outcome {
+        self.expanded.insert(key.to_string(), open);
+        self.rebuild();
+        if !self.select_key(key) {
+            // Unfolded, and a header the cursor skips: its first row.
+            if let Some(i) = self.nodes.iter().position(|n| n.key == key) {
+                let first = self.view.iter().position(|&v| v > i && self.can_select(v));
+                if let Some(pos) = first {
+                    self.sel = pos;
+                }
+            }
+        }
+        self.clamp_sel();
+        self.scroll_to_selection();
+        Outcome::Expanded(key.to_string(), open)
     }
 
     /// Toggle the group under the cursor; on an item, fold its parent
     /// and land on it.
     fn toggle_fold(&mut self) -> Outcome {
         let Some(&i) = self.view.get(self.sel) else { return Outcome::Nothing };
-        let target = if self.nodes[i].is_group() { Some(i) } else { self.parent_of(i).filter(|&j| self.nodes[j].selectable()) };
+        let target = if self.nodes[i].is_group() { Some(i) } else { self.parent_of(i) };
         let Some(j) = target else { return Outcome::Nothing };
         let open = !self.is_expanded(&self.nodes[j]);
         let k = self.nodes[j].key.clone();
-        self.expanded.insert(k.clone(), open);
-        self.rebuild();
-        if !open {
-            self.select_key(&k);
-        }
-        self.clamp_sel();
-        self.scroll_to_selection();
-        Outcome::Expanded(k, open)
+        self.set_fold(&k, open)
+    }
+
+    /// Can the cursor land on node `i`? A selectable node always; a
+    /// header the cursor skips only while it is folded (so it can be
+    /// unfolded), and not while a filter shows everything anyway.
+    fn can_select(&self, i: usize) -> bool {
+        let n = &self.nodes[i];
+        n.selectable() || (!self.filtered && n.is_group() && !self.is_expanded(n))
+    }
+
+    /// How many rows (not groups) a group holds, folded or not.
+    pub fn descendants(&self, i: usize) -> usize {
+        let d = self.nodes[i].depth;
+        self.nodes[i + 1..].iter().take_while(|n| n.depth > d).filter(|n| !n.is_group()).count()
     }
 
     /// Fold every group at the cursor's level if any of them is open,
@@ -618,7 +647,7 @@ impl Engine {
         let depth = self.nodes[j].depth;
         let keep = self.nodes[j].key.clone();
         let groups: Vec<usize> = (0..self.nodes.len())
-            .filter(|&n| self.nodes[n].depth == depth && self.nodes[n].is_group() && self.nodes[n].selectable())
+            .filter(|&n| self.nodes[n].depth == depth && self.nodes[n].is_group())
             .collect();
         let any_open = groups.iter().any(|&n| self.is_expanded(&self.nodes[n]));
         for n in groups {
@@ -638,10 +667,7 @@ impl Engine {
         let &i = self.view.get(self.sel)?;
         if self.nodes[i].is_group() && !self.is_expanded(&self.nodes[i]) {
             let k = self.nodes[i].key.clone();
-            self.expanded.insert(k.clone(), true);
-            self.rebuild();
-            self.scroll_to_selection();
-            return Some(Outcome::Expanded(k, true));
+            return Some(self.set_fold(&k, true));
         }
         None
     }
@@ -665,7 +691,7 @@ impl Engine {
                 // Lost to the filter: the first row that matched itself,
                 // not an ancestor shown for context.
                 self.sel = (0..self.view.len())
-                    .find(|&v| self.matched[v] && self.nodes[self.view[v]].selectable())
+                    .find(|&v| self.matched[v] && self.can_select(self.view[v]))
                     .unwrap_or(0);
                 self.clamp_sel();
             }
@@ -863,8 +889,16 @@ impl Engine {
             return self.fold_all();
         }
         if key == self.keys.key_of("activate") {
-            // Enter on a collapsed group opens it; on an open group or an
-            // item it activates.
+            // Enter on a folded header (a group the cursor only lands on
+            // while folded) opens it; a selectable group or an item
+            // activates - a folded session still switches to it.
+            if let Some(&i) = self.view.get(self.sel) {
+                if !self.nodes[i].selectable() {
+                    if let Some(o) = self.expand_here() {
+                        return o;
+                    }
+                }
+            }
             return match self.selected_key() {
                 Some(k) => Outcome::Activate(k),
                 None => Outcome::Nothing,
@@ -1321,6 +1355,45 @@ mod tests {
         assert_eq!(e.handle_key("WheelUpPane", Some((80, 10))), Outcome::PreviewWheel(PaneId(7), "WheelUpPane".into(), 80 - 73, 10));
         assert_eq!(e.handle_key("C-]", None), Outcome::Redraw);
         assert!(!e.preview_focus);
+    }
+
+    #[test]
+    fn headers_fold_and_become_rows() {
+        // Two servers (headers the cursor skips) with sessions under them.
+        let mut e = engine();
+        e.keys = Engine::base_keys().with("fold", "z", "moving", "fold").with("fold_all", "Z", "moving", "fold all");
+        e.select_key("a/s1");
+        // h on an open group folds it; h on a folded row under a header
+        // folds the header, which becomes a row the cursor lands on,
+        // with its count.
+        assert_eq!(e.handle_key("h", None), Outcome::Expanded("a/s1".into(), false));
+        assert_eq!(e.handle_key("h", None), Outcome::Expanded("srv:alpha".into(), false));
+        assert_eq!(e.selected_key().as_deref(), Some("srv:alpha"));
+        assert_eq!(keys(&e), vec!["srv:alpha", "srv:beta", "b/s1", "b/s1/w1"]);
+        assert_eq!(e.descendants(0), 3);
+        // Enter (or l) on the folded header opens it; the cursor goes to
+        // its first row, since the header is skipped again.
+        assert_eq!(e.handle_key("Enter", None), Outcome::Expanded("srv:alpha".into(), true));
+        assert_eq!(e.selected_key().as_deref(), Some("a/s1"));
+        // Z on a header's level folds every header; Z again unfolds them.
+        e.select_key("b/s1");
+        e.handle_key("h", None);
+        e.handle_key("h", None);
+        assert_eq!(e.selected_key().as_deref(), Some("srv:beta"));
+        assert_eq!(e.handle_key("Z", None), Outcome::Redraw);
+        assert_eq!(keys(&e), vec!["srv:alpha", "srv:beta"]);
+        e.handle_key("Z", None);
+        // Both servers open again; the sessions stay folded as they were.
+        assert_eq!(keys(&e), vec!["srv:alpha", "a/s1", "a/s2", "srv:beta", "b/s1"]);
+        // A filter shows everything whatever is folded, and headers are
+        // not rows while it is on.
+        e.handle_key("/", None);
+        for c in "edit".chars() {
+            e.handle_key(&c.to_string(), None);
+        }
+        assert_eq!(keys(&e), vec!["srv:alpha", "a/s1", "a/s1/w1"]);
+        // The header is context, not a row: the cursor is not on it.
+        assert_ne!(e.selected_key().as_deref(), Some("srv:alpha"));
     }
 
     #[test]

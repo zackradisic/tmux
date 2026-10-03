@@ -89,6 +89,15 @@ keys g; keys g
 BACK=$(curline)
 [ "$BACK" = "$TOP" ] || fail "gg did not return to the top ($BOT -> $BACK, want $TOP)"
 
+# z folds the band under the cursor: its rows go and the band header
+# becomes the row, with how many it holds; z again unfolds it.
+keys z
+[ -z "$(firstrow)" ] || fail "z did not fold the band: $(screen)"
+screen | grep -q 'working (3)' || fail "the folded band shows no count: $(screen)"
+keys z
+[ -n "$(firstrow)" ] || fail "z did not unfold the band: $(screen)"
+keys g; keys g
+
 # Up at the top row stays at the top. Navigating up used to fall into the
 # search box; it does not any more, `/` is the only way in.
 keys Up

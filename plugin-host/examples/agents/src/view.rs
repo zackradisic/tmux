@@ -494,6 +494,8 @@ fn key_table(k: &PickKeys) -> KeyTable {
         .note("moving", "j/k ↑/↓", "move the cursor")
         .note("moving", "gg / G", "first / last row")
         .note("moving", "J / K", "mark the row and move")
+        .with("fold", "z", "moving", "fold / unfold this row's band (h folds too)")
+        .with("fold_all", "Z", "moving", "fold or unfold every band (or server)")
         .note("moving", "wheel", "over the preview: scrolls the pane itself")
         .with("filter", "/", "search box", "focus the box; words match names, tasks, conversations")
         .with("content", "C-f", "search box", "also grep the panes' contents")
@@ -855,6 +857,13 @@ pub async fn pick_open(
     let multi = is_multi(&rows, &fetching, now_ms());
     let mut engine = Engine::new(mode, width, height, "agents", key_table(&cfg.keys), sigils());
     engine.size = SIZE;
+    // The bands and servers folded last time stay folded: the fold keys
+    // are a statement about what you want to see, not about this open.
+    if let Ok(Some(v)) = store::get_setting("pick_folds").await {
+        if let Ok(folds) = serde_json::from_str::<HashMap<String, bool>>(&v) {
+            engine.restore_expanded(folds);
+        }
+    }
     let mut p = Picker {
         engine,
         rows,
@@ -1795,6 +1804,14 @@ fn dispatch_key(
             }
             o
         };
+        // A fold changed: remember them all (the fold-all key folds many
+        // in one Redraw, so the key is the signal there).
+        if matches!(outcome, Outcome::Expanded(..)) || key == p.key("fold_all") {
+            let folds = serde_json::to_string(p.engine.expanded_overrides()).unwrap_or_default();
+            spawn(async move {
+                let _ = store::set_setting("pick_folds", &folds).await;
+            });
+        }
         match outcome {
             Outcome::Nothing => {}
             Outcome::Redraw | Outcome::Expanded(..) | Outcome::PreviewHeaderClick(..) => pick_render(p),

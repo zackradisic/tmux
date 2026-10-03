@@ -84,15 +84,24 @@ impl Engine {
                         // for a group.
                         let mut cells: Vec<Styled> = vec![(if cur { '▸' } else { ' ' }, 0), (' ', 0)];
                         cells.extend(std::iter::repeat((' ', 0)).take(n.indent_cells()));
+                        let mut folded_count: Vec<Styled> = Vec::new();
                         if let NodeKind::Group { .. } = n.kind {
-                            let g = if self.is_expanded(n) { OPEN } else { CLOSED };
+                            let open = self.is_expanded(n);
+                            let g = if open { OPEN } else { CLOSED };
                             cells.push((g, ST_DIM));
                             cells.push((' ', 0));
+                            if !open {
+                                // A folded group says how much it holds.
+                                let count = self.descendants(self.view[vpos]);
+                                folded_count = plain_cells(&format!(" ({count})"), ST_DIM);
+                            }
                         }
                         let prefix = cells.len();
                         let right_w = n.right.len();
                         let label_w = list_w.saturating_sub(1).saturating_sub(prefix + 2 + right_w).max(8);
-                        let left = fit_cells(&n.left, label_w);
+                        let mut left_cells = n.left.clone();
+                        left_cells.extend(folded_count);
+                        let left = fit_cells(&left_cells, label_w);
                         let pad = label_w.saturating_sub(left.len());
                         cells.extend(left);
                         cells.extend(std::iter::repeat((' ', 0)).take(pad + 2));

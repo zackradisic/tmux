@@ -93,6 +93,21 @@ screen | grep -q '1: editor' || fail "l did not unfold alpha"
 keys j; keys j; keys l
 screen | grep -q '1: sleep' || fail "l on the window did not show its panes"
 
+# Z folds every group at the cursor's level: on the session row, every
+# session; the windows go. Z again brings them back. z folds one. (h on
+# the open window folds it; h again goes to its session.)
+keys h; keys h
+currow | grep -q 'alpha' || fail "cursor not back on alpha: $(currow)"
+keys Z
+screen | grep -q '1: editor' && fail "Z did not fold the sessions"
+screen | grep -q 'beta' || fail "Z lost the beta row"
+keys Z
+screen | grep -q '1: editor' || fail "Z did not unfold the sessions"
+keys z
+screen | grep -q '1: editor' && fail "z did not fold alpha"
+keys z
+screen | grep -q '1: editor' || fail "z did not unfold alpha"
+
 # The search box narrows: `#be` keeps beta only.
 keys /
 $TMUX send-keys -t "$FORM" '#be'; sleep 0.4
@@ -138,7 +153,7 @@ AFTER=$($TMUX list-panes -t alpha:editor | wc -l | tr -d ' ')
 keys Escape
 $TMUX set -g @sessions-key-T "rename-window -t '#{window_id}' tagged"
 open_picker w
-keys j
+keys g; keys g; keys j
 currow | grep -q '0:' || fail "cursor not on a window row: $(currow)"
 keys T
 sleep 0.6
