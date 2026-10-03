@@ -290,7 +290,7 @@ FORM=$(modes | head -1)
 keys .
 keys / '#' b e t a Enter
 sleep 0.6
-keys f
+keys o
 i=0
 while [ "$i" -lt 20 ]; do
 	NEWF=$(modes | grep -v "^$FORM\$" | head -1)

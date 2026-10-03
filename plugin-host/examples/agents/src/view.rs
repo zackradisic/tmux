@@ -494,7 +494,7 @@ fn key_table(k: &PickKeys) -> KeyTable {
         .note("moving", "j/k ↑/↓", "move the cursor")
         .note("moving", "gg / G", "first / last row")
         .note("moving", "J / K", "mark the row and move")
-        .with("fold", "z", "moving", "fold / unfold this row's band (h folds too)")
+        .with("fold", "f", "moving", "fold / unfold the band (or server) the cursor is in")
         .with("fold_all", "Z", "moving", "fold or unfold every band (or server)")
         .note("moving", "wheel", "over the preview: scrolls the pane itself")
         .with("filter", "/", "search box", "focus the box; words match names, tasks, conversations")
@@ -514,7 +514,7 @@ fn key_table(k: &PickKeys) -> KeyTable {
         .with("interrupt", "x", "rows", "interrupt (C-c) the agent")
         .with("kill", "X", "rows", "kill its pane (asks)")
         .with("new", "n", "rows", "new agent, prefilled from the row")
-        .with("fork", "f", "rows", "fork this agent (a copy of its session, its own name)")
+        .with("fork", "o", "rows", "fork this agent (a copy of its session, its own name)")
         .with("menu", "Space", "rows", "the action menu")
         .with("info", "i", "rows", "info card (y copies its cwd)")
         .with("copy_cwd", "y", "rows", "copy the info card's directory")
@@ -1782,10 +1782,11 @@ fn dispatch_key(
             Outcome::Nothing
         } else if p.engine.preview_focus || p.engine.prompt().is_some() || p.engine.filtering {
             p.engine.handle_key(&key, mouse)
-        } else if key == p.key("focus") || key == "Right" {
-            // Right, into the preview: the keyboard goes with it. To the
-            // conversation when that is what the preview shows (a finished
-            // agent, or Tab on a live one); else to the pane.
+        } else if (key == p.key("focus") || key == "Right") && !p.engine.selected().is_some_and(|n| n.is_group()) {
+            // Right on a row, into the preview: the keyboard goes with it.
+            // To the conversation when that is what the preview shows (a
+            // finished agent, or Tab on a live one); else to the pane. On
+            // a header the engine takes it: down a level.
             if transcript_shown(p) {
                 p.transcript_focus = true;
                 ensure_transcript_rendered(p);

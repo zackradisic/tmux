@@ -59,20 +59,43 @@ impl Engine {
                 match &self.lines[li] {
                     Line::Spacer => {}
                     Line::Header { id, .. } => {
+                        // A header is a place the cursor can be (h goes up
+                        // to it, j/k walk its level); folded, it says how
+                        // many rows it hides.
                         let n = &self.nodes[self.view[*id]];
+                        let cur = *id == self.sel;
+                        let open = self.is_expanded(n);
                         let mut cells: Vec<Styled> = match n.header_glyph {
                             Some(g) => vec![(g, ST_BOLD), (' ', 0)],
                             None => std::iter::repeat((' ', 0)).take(n.indent_cells()).collect(),
                         };
+                        if !open {
+                            cells.push((CLOSED, ST_DIM));
+                            cells.push((' ', 0));
+                        }
                         let bold = if n.header_glyph.is_some() { ST_BOLD } else { 0 };
                         cells.extend(n.left.iter().map(|&(c, s)| (c, s | bold)));
+                        if !open {
+                            let count = self.descendants(self.view[*id]);
+                            cells.extend(plain_cells(&format!(" ({count})"), ST_DIM));
+                        }
                         if !n.right.is_empty() {
                             cells.push((' ', 0));
                             cells.push((' ', 0));
                             cells.extend(n.right.iter().cloned());
                         }
                         let cells = fit_cells(&cells, list_w.saturating_sub(1));
-                        out.push_str(&format!("\x1b[{row};1H{}", emit_cells(&cells, false)));
+                        if cur {
+                            // The cursor takes the first cell (the glyph
+                            // or the indent) and keeps a space after it.
+                            let width = list_w.saturating_sub(1);
+                            let sgr = if self.preview_focus { "2;7" } else { "7" };
+                            let rest: String = cells_text(&cells).chars().skip(1).collect();
+                            let rest = if rest.starts_with(' ') { rest } else { format!(" {rest}") };
+                            out.push_str(&format!("\x1b[{row};1H\x1b[{sgr}m▸{rest:<width$}\x1b[0m"));
+                        } else {
+                            out.push_str(&format!("\x1b[{row};1H{}", emit_cells(&cells, false)));
+                        }
                     }
                     Line::Item(vpos) => {
                         let vpos = *vpos;

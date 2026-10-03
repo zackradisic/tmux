@@ -171,10 +171,10 @@ impl Engine {
             .with("unfocus", "C-]", "moving", "take the keyboard back")
             .with("filter", "/", "search box", "focus the box; words match names")
             .with("close", "Escape", "picker", "close (Esc first puts a card or the marks away)")
-            .note("moving", "j/k ↑/↓", "move the cursor")
-            .note("moving", "gg / G", "first / last row")
-            .note("moving", "h / Left", "collapse (or go to the parent)")
-            .note("moving", "Right", "expand, or into the preview")
+            .note("moving", "j/k ↑/↓", "move along the cursor's level")
+            .note("moving", "gg / G", "first / last at that level")
+            .note("moving", "h / Left", "up a level (the group this is in)")
+            .note("moving", "Right", "down a level, or into the preview")
             .note("moving", "J / K", "mark the row and move")
             .note("moving", "wheel", "over the preview: scrolls the pane itself")
             .note("search box", "dropdown", "a sigil opens it: Tab/↓ BTab/↑ walk, Enter takes, Esc hides")
@@ -402,14 +402,13 @@ impl Engine {
         }
     }
 
-    /// Put the cursor on the node with this key, if it is visible.
+    /// Put the cursor on the node with this key, if it is visible: a row,
+    /// or a header (the cursor reaches those with h, and stays on one
+    /// across a refresh).
     pub fn select_key(&mut self, key: &str) -> bool {
         let Some(pos) = self.view.iter().position(|&i| self.nodes[i].key == key) else {
             return false;
         };
-        if !self.can_select(self.view[pos]) {
-            return false;
-        }
         self.sel = pos;
         self.scroll_to_selection();
         true
@@ -503,19 +502,59 @@ impl Engine {
         self.top = lines::scroll_window(self.top, self.sel_line(), self.list_h(), &self.lines);
     }
 
-    /// Move the selection by `delta` selectable rows, clamped.
+    /// Move the selection by `delta` nodes AT THE CURSOR'S LEVEL, clamped:
+    /// on an agent j/k walk the agents, on a band the bands, on a server
+    /// the servers; h and l change the level. A row at the cursor's depth
+    /// counts whichever group it is under.
     pub fn move_sel(&mut self, delta: i32) {
         if self.view.is_empty() {
             return;
         }
-        let selectable: Vec<usize> = (0..self.view.len()).filter(|&v| self.can_select(self.view[v])).collect();
-        if selectable.is_empty() {
+        let Some(&cur_i) = self.view.get(self.sel) else {
+            self.clamp_sel();
             return;
-        }
-        let cur = selectable.iter().position(|&v| v == self.sel).unwrap_or(0) as i32;
-        let last = (selectable.len() - 1) as i32;
-        self.sel = selectable[(cur + delta).clamp(0, last) as usize];
+        };
+        let depth = self.nodes[cur_i].depth;
+        let level: Vec<usize> = (0..self.view.len())
+            .filter(|&v| self.nodes[self.view[v]].depth == depth)
+            .collect();
+        let cur = level.iter().position(|&v| v == self.sel).unwrap_or(0) as i32;
+        let last = (level.len() - 1) as i32;
+        self.sel = level[(cur + delta).clamp(0, last) as usize];
         self.scroll_to_selection();
+    }
+
+    /// Up a level: the cursor goes to the group the node is in, header
+    /// or not. Nothing at the top level.
+    fn go_up(&mut self) -> Outcome {
+        let Some(&i) = self.view.get(self.sel) else { return Outcome::Nothing };
+        let Some(j) = self.parent_of(i) else { return Outcome::Nothing };
+        let k = self.nodes[j].key.clone();
+        self.select_key(&k);
+        Outcome::Redraw
+    }
+
+    /// Down a level: into the group under the cursor, unfolding it if it
+    /// is folded, onto its first node. `None` on a row (nothing below).
+    fn go_down(&mut self) -> Option<Outcome> {
+        let &i = self.view.get(self.sel)?;
+        if !self.nodes[i].is_group() {
+            return None;
+        }
+        let k = self.nodes[i].key.clone();
+        let opened = !self.is_expanded(&self.nodes[i]);
+        if opened {
+            self.expanded.insert(k.clone(), true);
+            self.rebuild();
+            self.select_key(&k);
+        }
+        // The first node below it, if the group has any.
+        let Some(&gi) = self.view.get(self.sel) else { return Some(Outcome::Redraw) };
+        if let Some(pos) = self.view.iter().position(|&v| v > gi && self.nodes[v].depth > self.nodes[gi].depth) {
+            self.sel = pos;
+        }
+        self.scroll_to_selection();
+        Some(if opened { Outcome::Expanded(k, true) } else { Outcome::Redraw })
     }
 
     fn mark_and_move(&mut self, delta: i32) {
@@ -572,49 +611,20 @@ impl Engine {
 
     // -- expand / collapse ------------------------------------------------
 
-    /// Toggle the highlighted group, or collapse the parent of an item.
-    /// Returns the outcome to report.
-    fn collapse_here(&mut self) -> Outcome {
-        let Some(&i) = self.view.get(self.sel) else { return Outcome::Nothing };
-        if self.nodes[i].is_group() && self.is_expanded(&self.nodes[i]) {
-            let k = self.nodes[i].key.clone();
-            return self.set_fold(&k, false);
-        }
-        // On an item (or a folded group): the parent. One the cursor can
-        // land on is selected; a header the cursor skips folds instead,
-        // which lands the cursor on it.
-        if let Some(j) = self.parent_of(i) {
-            let k = self.nodes[j].key.clone();
-            if self.nodes[j].selectable() {
-                self.select_key(&k);
-                return Outcome::Redraw;
-            }
-            return self.set_fold(&k, false);
-        }
-        Outcome::Nothing
-    }
-
-    /// Fold or unfold the group with this key, then put the cursor on
-    /// it when folded (a folded header is a row), else on its first row.
+    /// Fold or unfold the group with this key; the cursor stays on the
+    /// group (a header is a place the cursor can be, at its level).
     fn set_fold(&mut self, key: &str, open: bool) -> Outcome {
         self.expanded.insert(key.to_string(), open);
         self.rebuild();
         if !self.select_key(key) {
-            // Unfolded, and a header the cursor skips: its first row.
-            if let Some(i) = self.nodes.iter().position(|n| n.key == key) {
-                let first = self.view.iter().position(|&v| v > i && self.can_select(v));
-                if let Some(pos) = first {
-                    self.sel = pos;
-                }
-            }
+            self.clamp_sel();
         }
-        self.clamp_sel();
         self.scroll_to_selection();
         Outcome::Expanded(key.to_string(), open)
     }
 
-    /// Toggle the group under the cursor; on an item, fold its parent
-    /// and land on it.
+    /// Toggle the group under the cursor; on a row, fold the group it is
+    /// in and land on it.
     fn toggle_fold(&mut self) -> Outcome {
         let Some(&i) = self.view.get(self.sel) else { return Outcome::Nothing };
         let target = if self.nodes[i].is_group() { Some(i) } else { self.parent_of(i) };
@@ -661,15 +671,6 @@ impl Engine {
         self.scroll_to_selection();
         self.status = Some(if any_open { "folded".into() } else { "unfolded".into() });
         Outcome::Redraw
-    }
-
-    fn expand_here(&mut self) -> Option<Outcome> {
-        let &i = self.view.get(self.sel)?;
-        if self.nodes[i].is_group() && !self.is_expanded(&self.nodes[i]) {
-            let k = self.nodes[i].key.clone();
-            return Some(self.set_fold(&k, true));
-        }
-        None
     }
 
     // -- the search box ---------------------------------------------------
@@ -849,10 +850,11 @@ impl Engine {
             return Outcome::Redraw;
         }
         if key == "h" || key == "Left" {
-            return self.collapse_here();
+            return self.go_up();
         }
         if key == "Right" || key == self.keys.key_of("focus") {
-            if let Some(o) = self.expand_here() {
+            // Down a level on a group; on a row, into the preview.
+            if let Some(o) = self.go_down() {
                 return o;
             }
             self.focus_preview();
@@ -889,14 +891,12 @@ impl Engine {
             return self.fold_all();
         }
         if key == self.keys.key_of("activate") {
-            // Enter on a folded header (a group the cursor only lands on
-            // while folded) opens it; a selectable group or an item
-            // activates - a folded session still switches to it.
+            // Enter on a header (a group that is only a label) toggles
+            // its fold; a selectable group or a row activates - a folded
+            // session still switches to it.
             if let Some(&i) = self.view.get(self.sel) {
                 if !self.nodes[i].selectable() {
-                    if let Some(o) = self.expand_here() {
-                        return o;
-                    }
+                    return self.toggle_fold();
                 }
             }
             return match self.selected_key() {
@@ -1089,8 +1089,9 @@ impl Engine {
                 if off >= self.list_h() {
                     return Outcome::Redraw;
                 }
-                let Some(Line::Item(v)) = self.lines.get(self.top + off).cloned() else {
-                    return Outcome::Redraw;
+                let v = match self.lines.get(self.top + off).cloned() {
+                    Some(Line::Item(v)) | Some(Line::Header { id: v, .. }) => v,
+                    _ => return Outcome::Redraw,
                 };
                 self.sel = v;
                 self.scroll_to_selection();
@@ -1246,21 +1247,42 @@ mod tests {
     }
 
     #[test]
-    fn expand_collapse_and_parent() {
+    fn levels_h_l_and_fold() {
         let mut e = engine();
-        e.select_key("a/s2");
-        assert_eq!(e.handle_key("Right", None), Outcome::Expanded("a/s2".into(), true));
-        assert!(keys(&e).contains(&"a/s2/w1".to_string()));
-        e.select_key("a/s2/w1");
-        // h on an item goes to the parent; h on the open parent folds it.
-        assert_eq!(e.handle_key("h", None), Outcome::Redraw);
+        e.keys = Engine::base_keys().with("fold", "f", "moving", "fold").with("fold_all", "Z", "moving", "fold all");
+        // j/k walk the cursor's level: from a session, the sessions.
+        e.select_key("a/s1");
+        e.handle_key("j", None);
         assert_eq!(e.selected_key().as_deref(), Some("a/s2"));
-        assert_eq!(e.handle_key("h", None), Outcome::Expanded("a/s2".into(), false));
+        e.handle_key("j", None);
+        assert_eq!(e.selected_key().as_deref(), Some("b/s1"));
+        // h goes up to the header; j/k then walk the servers.
+        assert_eq!(e.handle_key("h", None), Outcome::Redraw);
+        assert_eq!(e.selected_key().as_deref(), Some("srv:beta"));
+        e.handle_key("k", None);
+        assert_eq!(e.selected_key().as_deref(), Some("srv:alpha"));
+        // l goes down a level, onto the first node under it.
+        assert_eq!(e.handle_key("l", None), Outcome::Redraw);
+        assert_eq!(e.selected_key().as_deref(), Some("a/s1"));
+        // l on a folded group opens it and goes in.
+        e.select_key("a/s2");
+        assert_eq!(e.handle_key("l", None), Outcome::Expanded("a/s2".into(), true));
+        assert_eq!(e.selected_key().as_deref(), Some("a/s2/w1"));
+        // j at the window level walks windows across sessions.
+        e.select_key("a/s1/w2");
+        e.handle_key("j", None);
+        assert_eq!(e.selected_key().as_deref(), Some("a/s2/w1"));
+        // f on a row folds the group it is in and lands on it; f again
+        // unfolds, the cursor staying on the group.
+        assert_eq!(e.handle_key("f", None), Outcome::Expanded("a/s2".into(), false));
+        assert_eq!(e.selected_key().as_deref(), Some("a/s2"));
         assert!(!keys(&e).contains(&"a/s2/w1".to_string()));
+        assert_eq!(e.handle_key("f", None), Outcome::Expanded("a/s2".into(), true));
+        assert_eq!(e.selected_key().as_deref(), Some("a/s2"));
         // The toggle survives a refresh.
+        e.handle_key("f", None);
         e.set_nodes(tree());
-        assert!(!keys(&e).contains(&"a/s1/w1".to_string()) || true);
-        assert_eq!(e.is_expanded(e.node("a/s2").unwrap()), false);
+        assert!(!e.is_expanded(e.node("a/s2").unwrap()));
     }
 
     #[test]
@@ -1279,7 +1301,8 @@ mod tests {
         re.extend(t2);
         drop(t);
         e.set_nodes(re);
-        assert_eq!(e.selected_key().as_deref(), Some("a/s2"));
+        // J moved along the window level, to the next window.
+        assert_eq!(e.selected_key().as_deref(), Some("b/s1/w1"));
         assert!(e.marked.contains("a/s1/w2"));
         assert_eq!(e.targets(), vec!["a/s1/w2".to_string()]);
         // A gone node drops its mark.
@@ -1358,61 +1381,50 @@ mod tests {
     }
 
     #[test]
-    fn headers_fold_and_become_rows() {
-        // Two servers (headers the cursor skips) with sessions under them.
+    fn headers_fold_too() {
         let mut e = engine();
-        e.keys = Engine::base_keys().with("fold", "z", "moving", "fold").with("fold_all", "Z", "moving", "fold all");
+        e.keys = Engine::base_keys().with("fold", "f", "moving", "fold").with("fold_all", "Z", "moving", "fold all");
+        // h from a session reaches the server header; f folds it, the
+        // cursor stays on it, and it shows how many rows it hides.
         e.select_key("a/s1");
-        // h on an open group folds it; h on a folded row under a header
-        // folds the header, which becomes a row the cursor lands on,
-        // with its count.
-        assert_eq!(e.handle_key("h", None), Outcome::Expanded("a/s1".into(), false));
-        assert_eq!(e.handle_key("h", None), Outcome::Expanded("srv:alpha".into(), false));
+        e.handle_key("h", None);
+        assert_eq!(e.handle_key("f", None), Outcome::Expanded("srv:alpha".into(), false));
         assert_eq!(e.selected_key().as_deref(), Some("srv:alpha"));
         assert_eq!(keys(&e), vec!["srv:alpha", "srv:beta", "b/s1", "b/s1/w1"]);
         assert_eq!(e.descendants(0), 3);
-        // Enter (or l) on the folded header opens it; the cursor goes to
-        // its first row, since the header is skipped again.
+        // Enter on a header toggles it too.
         assert_eq!(e.handle_key("Enter", None), Outcome::Expanded("srv:alpha".into(), true));
-        assert_eq!(e.selected_key().as_deref(), Some("a/s1"));
-        // Z on a header's level folds every header; Z again unfolds them.
-        e.select_key("b/s1");
-        e.handle_key("h", None);
-        e.handle_key("h", None);
-        assert_eq!(e.selected_key().as_deref(), Some("srv:beta"));
+        assert_eq!(e.selected_key().as_deref(), Some("srv:alpha"));
+        // Z at the server level folds every server; Z again unfolds.
         assert_eq!(e.handle_key("Z", None), Outcome::Redraw);
         assert_eq!(keys(&e), vec!["srv:alpha", "srv:beta"]);
         e.handle_key("Z", None);
-        // Both servers open again; the sessions stay folded as they were.
+        assert_eq!(keys(&e).len(), 8);
+        // Z at the session level folds the sessions, not the servers.
+        e.handle_key("l", None);
+        e.handle_key("Z", None);
         assert_eq!(keys(&e), vec!["srv:alpha", "a/s1", "a/s2", "srv:beta", "b/s1"]);
-        // A filter shows everything whatever is folded, and headers are
-        // not rows while it is on.
+        // A filter shows everything whatever is folded.
         e.handle_key("/", None);
         for c in "edit".chars() {
             e.handle_key(&c.to_string(), None);
         }
         assert_eq!(keys(&e), vec!["srv:alpha", "a/s1", "a/s1/w1"]);
-        // The header is context, not a row: the cursor is not on it.
-        assert_ne!(e.selected_key().as_deref(), Some("srv:alpha"));
     }
 
     #[test]
-    fn fold_keys() {
+    fn landing_after_a_rebuild() {
         let mut e = engine();
-        e.keys = Engine::base_keys().with("fold", "f", "moving", "fold").with("fold_all", "F", "moving", "fold all");
-        // f on an item folds its parent and lands on it.
+        // A rebuild keeps the cursor on a header it was on.
+        e.select_key("a/s1");
+        e.handle_key("h", None);
+        e.set_nodes(tree());
+        assert_eq!(e.selected_key().as_deref(), Some("srv:alpha"));
+        // A gone node lands the cursor on a row, never a header.
         e.select_key("a/s1/w2");
-        assert_eq!(e.handle_key("f", None), Outcome::Expanded("a/s1".into(), false));
-        assert_eq!(e.selected_key().as_deref(), Some("a/s1"));
-        assert!(!keys(&e).contains(&"a/s1/w1".to_string()));
-        // f on the folded group opens it again.
-        assert_eq!(e.handle_key("f", None), Outcome::Expanded("a/s1".into(), true));
-        // F folds every session (a/s1 was open), F again opens them all.
-        assert_eq!(e.handle_key("F", None), Outcome::Redraw);
-        assert_eq!(keys(&e), vec!["srv:alpha", "a/s1", "a/s2", "srv:beta", "b/s1"]);
-        e.handle_key("F", None);
-        assert!(keys(&e).contains(&"a/s2/w1".to_string()));
-        assert_eq!(e.selected_key().as_deref(), Some("a/s1"));
+        let t: Vec<Node> = tree().into_iter().filter(|n| n.key != "a/s1/w2").collect();
+        e.set_nodes(t);
+        assert!(e.selected().is_some_and(|n| n.selectable()));
     }
 
     #[test]

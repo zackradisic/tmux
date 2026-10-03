@@ -82,20 +82,26 @@ screen | grep -q '1: editor' || fail "windows not shown in w mode"
 screen | grep -q '2 sessions' || fail "header does not count 2 sessions"
 currow | grep -q 'editor' || fail "cursor not on the current window: $(currow)"
 
-# h on a window goes to its session; h again folds it.
+# h goes up a level, to the session; f folds the group under the cursor
+# and f again unfolds it, the cursor staying on it.
 keys h
-currow | grep -q 'alpha' || fail "h did not go to the parent: $(currow)"
-keys h
-screen | grep -q '1: editor' && fail "h did not fold alpha"
-# l unfolds it again; a pane row appears under the window when unfolded.
+currow | grep -q 'alpha' || fail "h did not go up to the session: $(currow)"
+keys f
+screen | grep -q '1: editor' && fail "f did not fold alpha"
+keys f
+screen | grep -q '1: editor' || fail "f did not unfold alpha"
+# l goes down into the first window; j walks the windows; l again shows
+# the window's panes as rows and lands on the first.
 keys l
-screen | grep -q '1: editor' || fail "l did not unfold alpha"
-keys j; keys j; keys l
+currow | grep -q '0:' || fail "l did not go down to the first window: $(currow)"
+keys j
+currow | grep -q '1: editor' || fail "j did not walk to the next window: $(currow)"
+keys l
 screen | grep -q '1: sleep' || fail "l on the window did not show its panes"
+currow | grep -q '0: sleep' || fail "l did not land on the first pane: $(currow)"
 
-# Z folds every group at the cursor's level: on the session row, every
-# session; the windows go. Z again brings them back. z folds one. (h on
-# the open window folds it; h again goes to its session.)
+# Z folds every group at the cursor's level: on a session, every
+# session; the windows go. Z again brings them back.
 keys h; keys h
 currow | grep -q 'alpha' || fail "cursor not back on alpha: $(currow)"
 keys Z
@@ -103,10 +109,6 @@ screen | grep -q '1: editor' && fail "Z did not fold the sessions"
 screen | grep -q 'beta' || fail "Z lost the beta row"
 keys Z
 screen | grep -q '1: editor' || fail "Z did not unfold the sessions"
-keys z
-screen | grep -q '1: editor' && fail "z did not fold alpha"
-keys z
-screen | grep -q '1: editor' || fail "z did not unfold alpha"
 
 # The search box narrows: `#be` keeps beta only.
 keys /
@@ -139,7 +141,7 @@ $TMUX list-sessions -F '#{session_name}' | grep -q '^gamma$' || fail "rename did
 screen | grep -q 'gamma' || fail "renamed row not shown"
 
 # x asks, x again kills the pane under the cursor.
-keys g; keys g; keys l; keys j; keys j; keys l; keys j
+keys g; keys g; keys l; keys j; keys l; keys j
 currow | grep -q 'sleep' || fail "cursor not on a pane row: $(currow)"
 BEFORE=$($TMUX list-panes -t alpha:editor | wc -l | tr -d ' ')
 keys x
@@ -153,7 +155,7 @@ AFTER=$($TMUX list-panes -t alpha:editor | wc -l | tr -d ' ')
 keys Escape
 $TMUX set -g @sessions-key-T "rename-window -t '#{window_id}' tagged"
 open_picker w
-keys g; keys g; keys j
+keys g; keys g; keys l
 currow | grep -q '0:' || fail "cursor not on a window row: $(currow)"
 keys T
 sleep 0.6

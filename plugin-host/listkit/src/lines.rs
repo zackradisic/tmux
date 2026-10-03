@@ -25,11 +25,12 @@ impl Line {
     }
 }
 
-/// The display line of the item at visible position `sel`, or 0.
+/// The display line of the node at visible position `sel` (a row or a
+/// header the cursor moved onto), or 0.
 pub fn sel_line(lines: &[Line], sel: usize) -> usize {
     lines
         .iter()
-        .position(|l| matches!(l, Line::Item(v) if *v == sel))
+        .position(|l| matches!(l, Line::Item(v) if *v == sel) || matches!(l, Line::Header { id, .. } if *id == sel))
         .unwrap_or(0)
 }
 
