@@ -272,29 +272,64 @@ fn provisional_id(kind: &str, pane: u32) -> String {
 }
 
 /// The pane's title, when it is a useful name (non-empty and not just the
-/// running command). Used as the provisional display name until a
-/// resolver supplies the harness's own name.
+/// running command or the directory). Used as the provisional display
+/// name until a resolver supplies the harness's own name, and preferred
+/// over it while the pane lives (see `enrich_live`).
 pub fn pane_title(pane: u32, kind: &str) -> Option<String> {
-    // The default pane title is the host name (an OSC title the shell
-    // never set), which is no better than the kind. Reject it, as
-    // notify-toast does, so only a title an agent actually wrote survives.
     let expanded = format_expand(
         OptionTarget::Pane(PaneId(pane)),
-        "#{pane_title}\t#{host_short}\t#{host}",
+        "#{pane_title}\t#{host_short}\t#{host}\t#{pane_current_path}",
     )
     .ok()?;
-    let mut parts = expanded.splitn(3, '\t');
-    let title = parts.next().unwrap_or("").trim();
+    let mut parts = expanded.splitn(4, '\t');
+    let title = parts.next().unwrap_or("");
     let host_short = parts.next().unwrap_or("");
     let host = parts.next().unwrap_or("");
+    let cwd = parts.next().unwrap_or("");
+    clean_title(title, kind, host_short, host, cwd).map(str::to_string)
+}
+
+/// The useful part of a pane title, or nothing.
+///
+/// The default pane title is the host name (an OSC title the shell never
+/// set), which is no better than the kind. Codex titles its pane
+/// `<topic> | <dir>` once the thread has a topic and plain `<dir>` (the
+/// working directory's last component) before that, so the directory is
+/// peeled off and a title that is only the directory - or the cwd itself
+/// - is no name either. What survives is a title an agent actually
+/// wrote about its work.
+fn clean_title<'a>(
+    title: &'a str,
+    kind: &str,
+    host_short: &str,
+    host: &str,
+    cwd: &str,
+) -> Option<&'a str> {
+    let cwd = cwd.trim().trim_end_matches('/');
+    let dir = cwd.rsplit('/').next().unwrap_or("");
+    let mut title = title.trim();
+    if !dir.is_empty() {
+        if let Some((head, tail)) = title.rsplit_once(" | ") {
+            if tail.trim() == dir {
+                title = head.trim();
+            }
+        }
+    }
+    let is_dir = !dir.is_empty()
+        && (title == dir
+            || title == cwd
+            // `~/Code/tab`: a path spelled another way. A topic has spaces;
+            // a path, as a rule, has none.
+            || (!title.contains(' ') && title.ends_with(&format!("/{dir}"))));
     if title.is_empty()
         || title.eq_ignore_ascii_case(kind)
         || title == host_short
         || title == host
+        || is_dir
     {
         return None;
     }
-    Some(title.to_string())
+    Some(title)
 }
 
 /// Session and window names for a pane, best effort.
@@ -421,15 +456,11 @@ pub async fn enrich_live(rows: &mut [Agent]) {
         }
         .unwrap_or_default();
         // The live pane title tracks the conversation topic (Claude and
-        // its kin write it there), which beats the session file's slug.
-        // Prefer it; keep the harness name only as a fallback. Codex is the
-        // exception: its pane title is just the cwd, so prefer the
-        // resolver's nickname there.
-        let title = if a.kind == "codex" {
-            None
-        } else {
-            a.pane.and_then(|p| pane_title(p as u32, &a.kind))
-        };
+        // its kin write it there; Codex since 0.160 does too, behind a
+        // ` | <dir>` suffix that `pane_title` peels), which beats the
+        // session file's slug. Prefer it; keep the harness name (a Codex
+        // nickname) only as a fallback.
+        let title = a.pane.and_then(|p| pane_title(p as u32, &a.kind));
         r.name = title.or_else(|| r.name.take());
         apply(a, r).await;
     }
@@ -458,6 +489,11 @@ async fn apply(a: &mut Agent, mut r: Resolved) {
     }
     publish_id(a);
     let now = now_ms() as i64;
+    // Did the harness's file move on since the row last saw it? Decided
+    // before the row is updated below.
+    let grew = r
+        .last_active_ms
+        .is_some_and(|new| a.last_active_ms.map_or(true, |old| new > old));
     // One decision, taken before either write: a status the row keeps must
     // not be persisted away behind the render's back.
     let status =
@@ -498,6 +534,17 @@ async fn apply(a: &mut Agent, mut r: Resolved) {
         if a.transcript_path.as_deref() != Some(tp.as_str()) {
             let _ = store::set_transcript(&a.id, &tp).await;
             a.transcript_path = Some(tp);
+            // The conversation so far: a harness with no hooks (a Codex
+            // found by the scan) would otherwise be read only when it
+            // ends. Debounced, off this path.
+            transcript::request(a.id.clone(), false);
+        } else if a.kind == "codex" && grew && a.live() {
+            // Codex has no shim to say a turn ended; its rollout's mtime
+            // moving is the only word of new turns. The read is cursor-
+            // based, so a half-written turn is finished on the next one.
+            // Claude is left to its hooks: its file changes all through
+            // a turn, and its turn-end report already triggers the read.
+            transcript::request(a.id.clone(), false);
         }
     }
     if let Some(cwd) = r.cwd {
@@ -1070,4 +1117,44 @@ pub async fn handle(req: ServiceRequest, cfg: Rc<Config>) {
         }
     }
     let _ = cfg;
+}
+
+#[cfg(test)]
+mod title_tests {
+    use super::clean_title;
+
+    #[test]
+    fn codex_topic_loses_its_directory_suffix() {
+        assert_eq!(
+            clean_title("Inspect Docker image builds | tab", "codex", "mbp", "mbp.local", "/Users/z/Code/tab"),
+            Some("Inspect Docker image builds")
+        );
+    }
+
+    #[test]
+    fn a_bare_directory_is_no_name() {
+        let cwd = "/Users/z/Code/tab/";
+        assert_eq!(clean_title("tab", "codex", "mbp", "mbp.local", cwd), None);
+        assert_eq!(clean_title("/Users/z/Code/tab", "codex", "mbp", "mbp.local", cwd), None);
+        assert_eq!(clean_title("~/Code/tab", "codex", "mbp", "mbp.local", cwd), None);
+        assert_eq!(clean_title("codex | tab", "codex", "mbp", "mbp.local", cwd), None);
+        assert_eq!(clean_title("Codex", "codex", "mbp", "mbp.local", cwd), None);
+    }
+
+    #[test]
+    fn host_and_empty_titles_are_rejected() {
+        assert_eq!(clean_title("", "claude", "mbp", "mbp.local", "/x"), None);
+        assert_eq!(clean_title("mbp", "claude", "mbp", "mbp.local", "/x"), None);
+        assert_eq!(clean_title("mbp.local", "claude", "mbp", "mbp.local", "/x"), None);
+    }
+
+    #[test]
+    fn a_topic_that_mentions_the_directory_survives() {
+        assert_eq!(
+            clean_title("✳ fix the tab build", "claude", "mbp", "mbp.local", "/Users/z/Code/tab"),
+            Some("✳ fix the tab build")
+        );
+        assert_eq!(clean_title("tab | other", "codex", "mbp", "mbp.local", "/Users/z/Code/tab"), Some("tab | other"));
+        assert_eq!(clean_title("topic", "codex", "mbp", "mbp.local", ""), Some("topic"));
+    }
 }

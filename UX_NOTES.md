@@ -549,7 +549,33 @@ transcript.sh`.
   pane dies (and at server start). Its live pane is still grepped by
   `^F`, so what is on screen is findable; what scrolled off is not until
   it ends. A fallback off `pane-command-changed` plus a quiet period
-  would close this.
+  would close this. Codex is the exception since Oct 5 2026: it has no
+  shim, so a render that finds its rollout's mtime moved asks for a
+  read (`provider::apply`), and the read that lands its transcript path
+  takes the conversation so far.
+- **Codex 0.160 holds nothing open.** Up to the 0.15x line the TUI kept
+  its rollout open and `pane_fds` found it; 0.160 appends and closes, so
+  a Codex row stayed `prov-codex-<pane>` for its whole life, with no id
+  to copy, message or resume by, and its pane title (`<topic> | <dir>`,
+  a real topic since 0.160) was thrown away as "just the cwd". The
+  resolver now falls back to a scan of `~/.codex/sessions/<y>/<m>/<d>`
+  (days since the row appeared, files written since then, first line
+  read): the non-subagent rollout whose `cwd` is the pane's and whose
+  start is nearest the row's wins, newest file per session id, ids other
+  live panes hold excluded. The title's ` | <dir>` is peeled. Its band
+  comes from the rollout too: the turn-boundary events (`task_started`,
+  `task_complete`/`turn_aborted`, the approval and question requests)
+  are prefiltered on the fs worker from where the last render left off
+  (`resolve::codex_turn`), so a Codex no longer sits in `working` from
+  birth to death. Resolved at render, like every harness file: the band
+  is right when the picker is open, not pushed while it is closed.
+  Whether Codex persists its approval requests to the rollout is
+  unverified (`--yolo` never asks), so `needs input` for Codex is
+  best-effort. Limits: two
+  Codex panes started in one directory within seconds of each other can
+  pair wrong (an `identify` hook would settle it; Codex 0.160 has
+  Claude-style `hooks.json`, nothing installs one yet); a `codex resume`
+  of an old thread is found only once it writes again.
 - **The current turn is not searchable until it ends.** By design (the
   file holds a half-written turn), but a long turn is invisible to the
   conversation search for its whole duration.
