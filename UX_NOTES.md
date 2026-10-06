@@ -812,6 +812,47 @@ not generalise to arbitrary panes, so "one view" probably means one
 rendering engine with two configurations, not literally one picker. Worth
 sketching where the seam goes before building either.
 
+## Files and the clipboard
+
+### F1. The clipboard image: what the preview needs, and what it is not
+
+- **The image goes through the terminal, not tmux.** The scp plugin's
+  clipboard tab (`prefix+T`, or `C-v` from the files tab; `prefix+t`
+  switches to it by itself when an image is on the clipboard) draws its
+  preview with the kitty graphics protocol's Unicode placeholders: the
+  PNG is transmitted once through a `DCS tmux;` passthrough and the
+  block under the fields is `U+10EEEE` cells whose colour and diacritics
+  name the image and the cell. tmux stores and redraws those as text;
+  kitty and Ghostty paint the image over them, anything else shows a
+  blank block of the preview's size. There is no fallback rendering
+  (no sixel, no half-blocks): the block is the price of a terminal
+  without the protocol, and `C-v` hides it.
+- **It needs the passthrough seam (Oct 6 2026).** A plugin mode's
+  screen has no pane behind it, so before `input_set_passthrough` a
+  passthrough written into one went nowhere. A server built before that
+  commit shows the blank block and nothing else; the form still works.
+- **Reading the clipboard is a process, not a capability.** macOS
+  through `osascript` (PNG, else TIFF via `sips`), Wayland `wl-paste`,
+  X11 `xclip`; a machine with none of these gets "no image on the
+  clipboard". The image lands as a PNG in the plugin's data directory
+  (`~/.local/share/tmux/plugins/scp/clip-<ms>.png`, plus a 900px preview
+  copy), is moved or `scp`ed from there, and is removed on cancel. A
+  form closed from outside (its window killed) removes the files but
+  cannot tell the terminal to forget the image.
+- **The preview is a shape guess.** The block's columns come from the
+  window's cell size (`window_cell_width/height`), which is the attached
+  client's report or a default; a client with a very different font
+  aspect gets a slightly wrong box, and the terminal letterboxes the
+  image inside it.
+- **Destinations are remembered per tab, not per host.** `scp.json` in
+  the data directory keeps the last `to` path (files), and the last host
+  and path (clipboard). A path entered for one host is prefilled for the
+  next; a host-keyed memory would want a dropdown of its own.
+- **A clipboard read is a job per open.** The probe runs when the form
+  opens, whichever tab is up, so `prefix+t` pays for an `osascript` call
+  even when no image is wanted; it is a few hundred milliseconds and
+  does not block the form.
+
 ## Copy mode
 
 ### C1. Live copy mode: what it does not do yet
