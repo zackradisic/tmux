@@ -359,6 +359,9 @@ pub fn capture_tail(pane: u32) -> Option<String> {
 /// agent. A shadow pane (mirrored from another server) is never an agent
 /// here: its own server's provider owns it.
 pub async fn classify(pane: u32, cfg: Rc<Config>) {
+    if !owns_store() {
+        return;
+    }
     let now = now_ms() as i64;
     if is_shadow(pane) {
         let _ = store::end_by_pane(pane as i64, now, "closed").await;
@@ -655,6 +658,9 @@ pub async fn on_identify(
     source: Option<String>,
     cfg: Rc<Config>,
 ) {
+    if !owns_store() {
+        return;
+    }
     // The hook can beat detection (a fresh codex pane whose command has not
     // changed to `node` yet). Discover the pane first, so the id lands.
     if store::live_by_pane(pane as i64).await.ok().flatten().is_none() {
@@ -680,6 +686,9 @@ pub async fn on_identify(
 
 /// A shim's status report for a pane.
 pub async fn report(pane: u32, status: String, task: Option<String>, cfg: Rc<Config>) {
+    if !owns_store() {
+        return;
+    }
     let now = now_ms() as i64;
     if status == "done" {
         let live = store::live_by_pane(pane as i64).await.ok().flatten();
@@ -769,12 +778,72 @@ async fn end_pane(pane: u32, now: i64, reason: &str) {
 
 /// A pane went away: its agent is done.
 pub async fn pane_gone(pane: u32) {
+    if !owns_store() {
+        return;
+    }
     end_pane(pane, now_ms() as i64, "closed").await;
+}
+
+thread_local! {
+    /// The store belongs to another server: this instance must not
+    /// retire or create rows. See `claim_store`.
+    static FOREIGN_STORE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The setting that names the server a store belongs to.
+const SOCKET_KEY: &str = "server_socket";
+
+/// Is this store ours to write? The store lives in the plugin's data
+/// directory, which every tmux server of this user shares, while pane
+/// ids are per server: a second server (a scratch one started with the
+/// same config) would see none of the first's panes, retire its every
+/// live row, and then mint rows for its own panes under ids that
+/// collide. So the first server to use a store writes its socket path
+/// into it, and a server with a different socket leaves the store
+/// alone: no sweep, no rows, a line in the log. The claim moves only
+/// when the store is empty of live rows (the old server is gone).
+async fn claim_store() -> bool {
+    let socket = format_expand(OptionTarget::Server, "#{socket_path}")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let Some(socket) = socket else { return true };
+    let owner = store::get_setting(SOCKET_KEY).await.ok().flatten();
+    match owner {
+        Some(o) if o == socket => true,
+        Some(o) => {
+            let live = store::live_agents().await.map(|v| v.len()).unwrap_or(0);
+            if live == 0 {
+                let _ = store::set_setting(SOCKET_KEY, &socket).await;
+                true
+            } else {
+                log(&format!(
+                    "agents: the store belongs to the server at {o}; this one ({socket}) \
+                     leaves it alone - start scratch servers with -f /dev/null"
+                ));
+                FOREIGN_STORE.with(|f| f.set(true));
+                false
+            }
+        }
+        None => {
+            let _ = store::set_setting(SOCKET_KEY, &socket).await;
+            true
+        }
+    }
+}
+
+/// Does this instance own the store? False on a server that found the
+/// store claimed by another; every write path checks it.
+pub fn owns_store() -> bool {
+    !FOREIGN_STORE.with(|f| f.get())
 }
 
 /// On start (including after restart-server): rediscover agents in live
 /// panes, retire live rows whose pane is gone, and prune old history.
 pub async fn reconcile(cfg: Rc<Config>) {
+    if !claim_store().await {
+        return;
+    }
     // The index first, so nothing ingested below is missed by it.
     transcript::load().await;
     let panes = list_panes().unwrap_or_default();
@@ -800,7 +869,12 @@ pub async fn reconcile(cfg: Rc<Config>) {
 /// classify awaits, after the liveness check), so this also runs on a
 /// timer; see `SWEEP_MS`.
 pub async fn sweep_gone() -> usize {
-    let panes = list_panes().unwrap_or_default();
+    if !owns_store() {
+        return 0;
+    }
+    // A failed listing is not an empty server: nothing is known to be
+    // gone, so nothing goes.
+    let Ok(panes) = list_panes() else { return 0 };
     let live = store::unended().await.unwrap_or_default();
     let now = now_ms() as i64;
     let mut gone = 0;

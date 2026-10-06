@@ -230,16 +230,31 @@ fn is_rollout(name: &str) -> bool {
 
 /// How much of a rollout holds its first line. The `session_meta` record
 /// carries the base instructions, so it runs to several KB.
-const META_BYTES: usize = 64 * 1024;
+const META_BYTES: usize = 24 * 1024;
 
-/// A rollout written before the row appeared, by more than this, is not
-/// the row's: the file is created when the session starts. The slack
-/// covers a Codex that wrote its meta a moment before detection landed.
-const SCAN_SLACK_S: i64 = 120;
+/// A rollout not written since this long before the row appeared is not
+/// the row's. The file is created when the session starts, so a fresh
+/// Codex needs only seconds of slack; a week covers a Codex that was
+/// running before its row was (the plugin reloaded, the row swept and
+/// made again) and has sat idle since. Dead sessions in the same
+/// directory from the same days are candidates too, which is what the
+/// nearest-start rule below is for.
+const SCAN_SLACK_S: i64 = 7 * 86_400;
 
 /// Candidate files read per scan, newest first. A bound on the cost of a
-/// busy day in a shared directory, not a limit anyone should reach.
-const SCAN_MAX_FILES: usize = 48;
+/// busy week in a shared directory, not a limit anyone should reach.
+const SCAN_MAX_FILES: usize = 200;
+
+/// A scan that found nothing is not repeated for this long: a Codex
+/// with no rollout yet (nothing typed) is rendered many times before
+/// the file appears.
+const SCAN_RETRY_MS: i64 = 10_000;
+
+thread_local! {
+    /// Per pane: when the last empty scan ran.
+    static SCAN_MISSED: std::cell::RefCell<std::collections::HashMap<u32, i64>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
 
 /// What the first line of a rollout says.
 #[derive(Debug, Default, PartialEq)]
@@ -431,6 +446,26 @@ async fn codex_turn(path: &str) -> Turn {
 /// file, which is the one Codex appends to now.
 async fn codex_scan(a: &Agent) -> Option<Resolved> {
     let pane = a.pane? as u32;
+    let now = now_ms() as i64;
+    let recent_miss = SCAN_MISSED
+        .with(|m| m.borrow().get(&pane).copied())
+        .is_some_and(|t| now - t < SCAN_RETRY_MS);
+    if recent_miss {
+        return None;
+    }
+    let found = codex_scan_now(a, pane).await;
+    if found.is_none() {
+        let first = SCAN_MISSED.with(|m| m.borrow_mut().insert(pane, now).is_none());
+        if first {
+            log(&format!("agents: no rollout found for the codex in pane %{pane} yet"));
+        }
+    } else {
+        SCAN_MISSED.with(|m| m.borrow_mut().remove(&pane));
+    }
+    found
+}
+
+async fn codex_scan_now(a: &Agent, pane: u32) -> Option<Resolved> {
     let cwd = format_expand(OptionTarget::Pane(PaneId(pane)), "#{pane_current_path}")
         .ok()?
         .trim()
@@ -443,9 +478,10 @@ async fn codex_scan(a: &Agent) -> Option<Resolved> {
     let root = format!("{home}/.codex/sessions");
     let since_s = a.first_seen_ms / 1000 - SCAN_SLACK_S;
     // The tree is laid out by LOCAL date; the row's time is epoch. The
-    // UTC date one day back is on or before the local date everywhere,
-    // so every day since then is listed, a day too many at worst.
-    let floor = utc_date_floor(a.first_seen_ms - 86_400_000);
+    // UTC date one day before the slack's start is on or before the
+    // local date everywhere, so every day that can hold a candidate is
+    // listed, a day too many at worst.
+    let floor = utc_date_floor(a.first_seen_ms - (SCAN_SLACK_S + 86_400) * 1000);
 
     let mut files: Vec<(String, i64)> = Vec::new();
     for day in days_since(&root, &floor).await {
