@@ -614,38 +614,68 @@ fn no_formats(s: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Read the clipboard image to `$1` as PNG and a downscaled copy to
-/// `$2`. macOS through AppleScript (PNG, else TIFF converted by sips);
-/// Wayland through wl-paste; X11 through xclip. Exit 1 with a reason
-/// on stdout when there is no image, 2 when it could not be read.
-const PROBE_SCRIPT: &str = r#"f="$1"; p="$2"
+/// `$2`, the longest side at most `$3` pixels. macOS in ONE process:
+/// an `osascript` JavaScript that takes the PNG (or TIFF, re-encoded)
+/// straight off the pasteboard as bytes and makes the preview with
+/// ImageIO - the AppleScript way (`the clipboard as «class PNGf»`,
+/// then `sips`) is two more processes and a hex round trip of the
+/// whole image, three times slower on a screenshot. Wayland through
+/// wl-paste, X11 through xclip, the preview with ImageMagick when it is
+/// there. Exit 1 with a reason on stdout when there is no image, 2 when
+/// it could not be read.
+const PROBE_SCRIPT: &str = r#"f="$1"; p="$2"; px="$3"
 mkdir -p "$(dirname "$f")" 2>/dev/null
 if command -v osascript >/dev/null 2>&1; then
-  info=$(osascript -e 'clipboard info' 2>/dev/null) || { echo "the clipboard could not be read"; exit 2; }
-  case "$info" in
-    *PNGf*)
-      osascript -e "set f to open for access POSIX file \"$f\" with write permission" \
-        -e 'set eof f to 0' -e 'write (the clipboard as «class PNGf») to f' -e 'close access f' \
-        >/dev/null 2>&1 || { echo "the clipboard image could not be read"; exit 2; } ;;
-    *TIFF*)
-      osascript -e "set f to open for access POSIX file \"$f.tiff\" with write permission" \
-        -e 'set eof f to 0' -e 'write (the clipboard as TIFF picture) to f' -e 'close access f' \
-        >/dev/null 2>&1 && sips -s format png "$f.tiff" --out "$f" >/dev/null 2>&1 \
-        || { rm -f "$f.tiff"; echo "the clipboard image could not be read"; exit 2; }
-      rm -f "$f.tiff" ;;
-    *) echo "no image on the clipboard"; exit 1 ;;
+  r=$(osascript -l JavaScript -e "$JXA" "$f" "$p" "$px" 2>/dev/null) || { echo "the clipboard could not be read"; exit 2; }
+  case "$r" in
+    ok*) ;;
+    none) echo "no image on the clipboard"; exit 1 ;;
+    *) echo "the clipboard image could not be read"; exit 2 ;;
   esac
-  sips -Z PREVIEW_PX "$f" --out "$p" >/dev/null 2>&1 || cp "$f" "$p"
 elif command -v wl-paste >/dev/null 2>&1 && wl-paste --list-types 2>/dev/null | grep -q '^image/png'; then
   wl-paste -t image/png > "$f" 2>/dev/null || { echo "the clipboard image could not be read"; exit 2; }
-  { command -v magick >/dev/null 2>&1 && magick "$f" -resize PREVIEW_PXxPREVIEW_PX "$p"; } >/dev/null 2>&1 || cp "$f" "$p"
+  { command -v magick >/dev/null 2>&1 && magick "$f" -resize "${px}x${px}>" "$p"; } >/dev/null 2>&1 || cp "$f" "$p"
 elif command -v xclip >/dev/null 2>&1 && xclip -selection clipboard -t TARGETS -o 2>/dev/null | grep -q '^image/png'; then
   xclip -selection clipboard -t image/png -o > "$f" 2>/dev/null || { echo "the clipboard image could not be read"; exit 2; }
-  { command -v magick >/dev/null 2>&1 && magick "$f" -resize PREVIEW_PXxPREVIEW_PX "$p"; } >/dev/null 2>&1 || cp "$f" "$p"
+  { command -v magick >/dev/null 2>&1 && magick "$f" -resize "${px}x${px}>" "$p"; } >/dev/null 2>&1 || cp "$f" "$p"
 else
   echo "no image on the clipboard"; exit 1
 fi
 echo ok
 "#;
+
+/// The macOS half of the probe (JavaScript for Automation). Prints
+/// `ok`, `none` or `unreadable`. The preview is ImageIO's thumbnail:
+/// decoded once, scaled, re-encoded as PNG; a small image comes out as
+/// is.
+const JXA_SCRIPT: &str = r#"ObjC.import('AppKit'); ObjC.import('ImageIO');
+function run(argv) {
+  const out = argv[0], prev = argv[1], maxpx = parseInt(argv[2], 10) || 900;
+  const pb = $.NSPasteboard.generalPasteboard;
+  let data = pb.dataForType('public.png');
+  if (data.isNil()) {
+    const t = pb.dataForType('public.tiff');
+    if (t.isNil()) return 'none';
+    const rep = $.NSBitmapImageRep.imageRepWithData(t);
+    if (rep.isNil()) return 'unreadable';
+    data = rep.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $());
+  }
+  if (data.isNil()) return 'unreadable';
+  if (!data.writeToFileAtomically(out, true)) return 'unwritable';
+  const src = $.CGImageSourceCreateWithData(data, $());
+  // The option keys by their string values: the ImageIO constants do
+  // not bridge into JavaScript, and a dictionary keyed by undefined
+  // yields a full-size "thumbnail".
+  const opts = $.NSDictionary.dictionaryWithObjectsForKeys(
+    $([$(true), $(maxpx), $(true)]),
+    $(['kCGImageSourceCreateThumbnailFromImageAlways', 'kCGImageSourceThumbnailMaxPixelSize',
+       'kCGImageSourceCreateThumbnailWithTransform']));
+  const thumb = $.CGImageSourceCreateThumbnailAtIndex(src, 0, opts);
+  const trep = $.NSBitmapImageRep.alloc.initWithCGImage(thumb);
+  const png = trep.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $());
+  if (png.isNil() || !png.writeToFileAtomically(prev, true)) data.writeToFileAtomically(prev, true);
+  return 'ok';
+}"#;
 
 /// A PNG's pixel size, from its IHDR (the first chunk, by the spec).
 fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
@@ -689,13 +719,17 @@ async fn probe_clipboard(state: State, mode: ModeId, auto_switch: bool) {
         width: 0,
         height: 0,
     };
-    let script = PROBE_SCRIPT.replace("PREVIEW_PX", &PREVIEW_PX.to_string());
+    // The JavaScript rides in the environment: no quoting of a quoted
+    // script inside a quoted script.
     let cmd = format!(
-        "sh -c {} sh {} {}",
-        quote(&script),
+        "JXA={} sh -c {} sh {} {} {}",
+        quote(JXA_SCRIPT),
+        quote(PROBE_SCRIPT),
         quote(&written.path()),
-        quote(&written.preview())
+        quote(&written.preview()),
+        PREVIEW_PX
     );
+    let t0 = now_ms();
     let found = match run_job(&cmd, None).await {
         Ok(out) if out.status == 0 => {
             match fs_read(&written.name, 0, 64).await {
@@ -719,6 +753,7 @@ async fn probe_clipboard(state: State, mode: ModeId, auto_switch: bool) {
         Err(e) => Err(format!("the clipboard could not be read: {}", e.message)),
     };
 
+    let read_ms = now_ms().saturating_sub(t0);
     let image = {
         let mut st = state.borrow_mut();
         let Some(form) = st.as_mut().filter(|f| f.mode.0 == mode.0) else {
@@ -752,7 +787,17 @@ async fn probe_clipboard(state: State, mode: ModeId, auto_switch: bool) {
     };
     if let Some((clip, id, cols, rows)) = image {
         form::start_scan(&state, mode, false);
-        transmit_preview(state, mode, clip.preview_name.clone(), id, cols, rows).await;
+        let t1 = now_ms();
+        let bytes = transmit_preview(state, mode, clip.preview_name.clone(), id, cols, rows).await;
+        log(&format!(
+            "scp: clipboard {}x{} read in {read_ms} ms; preview {} KB sent in {} ms as {cols}x{rows} cells",
+            clip.width,
+            clip.height,
+            bytes / 1024,
+            now_ms().saturating_sub(t1)
+        ));
+    } else {
+        log(&format!("scp: clipboard probe took {read_ms} ms: no image"));
     }
 }
 
@@ -834,31 +879,40 @@ fn kitty_delete(id: u32) -> String {
 const WRITE_MAX: usize = 200 * 1024;
 
 /// Send the preview PNG (`name`, in the data directory) to the terminal
-/// through the mode, then draw the block.
-async fn transmit_preview(state: State, mode: ModeId, name: String, id: u32, cols: u32, rows: u32) {
-    let Ok((png, _)) = fs_read(&name, 0, 8 * 1024 * 1024).await else { return };
+/// through the mode, then draw the block. Returns the PNG's size.
+async fn transmit_preview(
+    state: State,
+    mode: ModeId,
+    name: String,
+    id: u32,
+    cols: u32,
+    rows: u32,
+) -> usize {
+    let Ok((png, _)) = fs_read(&name, 0, 8 * 1024 * 1024).await else { return 0 };
     if png.is_empty() {
-        return;
+        return 0;
     }
+    let size = png.len();
     let mut batch = String::new();
     for seq in kitty_transmit(id, &png, cols, rows) {
         if batch.len() + seq.len() > WRITE_MAX {
             if mode_write(mode, batch.as_bytes()).is_err() {
-                return;
+                return size;
             }
             batch.clear();
         }
         batch.push_str(&seq);
     }
     if !batch.is_empty() && mode_write(mode, batch.as_bytes()).is_err() {
-        return;
+        return size;
     }
     let mut st = state.borrow_mut();
-    let Some(form) = st.as_mut().filter(|f| f.mode.0 == mode.0) else { return };
+    let Some(form) = st.as_mut().filter(|f| f.mode.0 == mode.0) else { return size };
     if let Some(p) = form.model.preview.as_mut().filter(|p| p.id == id) {
         p.sent = true;
     }
     form::render(form);
+    size
 }
 
 /// Leave the terminal and the data directory as they were: the image
