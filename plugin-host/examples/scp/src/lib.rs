@@ -1417,8 +1417,8 @@ fn ocr_draw(form: &mut Form<Copier>) {
 /// What a key in the view asks of the plugin, decided under the borrow.
 enum OcrAct {
     None,
-    /// Back to the form: the form's own preview to place again, if any.
-    Left(Option<(Clip, u32, u32, u32)>),
+    /// The form is done (a run still going finishes into the clipboard).
+    Close,
     /// The text to the clipboard (and into the pane).
     Copy { paste: bool },
     Rerun,
@@ -1453,15 +1453,17 @@ async fn enter_ocr(state: State, mode: ModeId) {
         view.preview = Some(Preview { id, cols, rows, sent: false });
         let gen = view.gen;
         let correction = view.correction;
+        let share = Rc::clone(&view.share);
+        let client = form.model.client_name.clone();
         form.model.ocr = Some(view);
         form.error = None;
         form.list = None;
         redraw(form);
-        (clip, id, cols, rows, gen, correction)
+        (clip, id, cols, rows, gen, correction, share, client)
     };
-    let (clip, id, cols, rows, gen, correction) = started;
+    let (clip, id, cols, rows, gen, correction, share, client) = started;
     spawn(ocr_slow_hint(Rc::clone(&state), mode, gen));
-    spawn(run_ocr(Rc::clone(&state), mode, clip.clone(), correction, gen));
+    spawn(run_ocr(Rc::clone(&state), mode, clip.clone(), correction, gen, share, client));
     transmit_preview(state, mode, &clip, id, cols, rows).await;
 }
 
@@ -1481,7 +1483,15 @@ async fn ocr_slow_hint(state: State, mode: ModeId, gen: u64) {
 
 /// `tmux ocr` on the image, then the lines into the view and the text
 /// into the data directory.
-async fn run_ocr(state: State, mode: ModeId, clip: Clip, correction: bool, gen: u64) {
+async fn run_ocr(
+    state: State,
+    mode: ModeId,
+    clip: Clip,
+    correction: bool,
+    gen: u64,
+    share: Rc<ocr::Share>,
+    client: Option<String>,
+) {
     let bin = format_expand(OptionTarget::Server, "#{tmux_binary}")
         .ok()
         .map(|s| s.trim().to_string())
@@ -1502,9 +1512,13 @@ async fn run_ocr(state: State, mode: ModeId, clip: Clip, correction: bool, gen: 
         Ok(lines) => Some(lines.join("\n") + "\n"),
         Err(_) => None,
     };
-    // The view may have been left, or run again, while the job ran.
+    // The view may have been left, or run again, while the job ran. A
+    // view closed on a run still going lets it finish into the clipboard.
     let still = state.borrow().as_ref().filter(|f| f.mode.0 == mode.0).and_then(|f| f.model.ocr.as_ref()).is_some_and(|v| v.gen == gen);
     if !still {
+        if share.detached.get() && share.latest_gen.get() == gen {
+            finish_detached(clip, result, ms, client).await;
+        }
         return;
     }
     let written = match text {
@@ -1529,6 +1543,36 @@ async fn run_ocr(state: State, mode: ModeId, clip: Clip, correction: bool, gen: 
     redraw(form);
 }
 
+/// A run whose view is gone: the text to the clipboard (a tmux buffer,
+/// `-w` sends it on to the terminal), a word in the status line, the
+/// files gone.
+async fn finish_detached(clip: Clip, result: Result<Vec<String>, String>, ms: u64, client: Option<String>) {
+    match result {
+        Ok(lines) => {
+            let text_name = format!("{}.ocr.txt", clip.name.trim_end_matches(".png"));
+            let n = lines.len();
+            let text = lines.join("\n") + "\n";
+            let copied = fs_write(&text_name, text.into_bytes(), false).await.is_ok() && {
+                let target = client.as_deref().map(|c| format!(" -t {}", quote(c))).unwrap_or_default();
+                let path = format!("{}/{text_name}", clip.root);
+                run_command(&format!("load-buffer -w{target} {}", quote(&path))).await.is_ok()
+            };
+            log(&format!("scp: ocr of {}x{} finished after the view closed: {n} lines in {ms} ms", clip.width, clip.height));
+            let _ = display_message(&if copied {
+                format!("OCR done: {n} line{} copied to the clipboard", if n == 1 { "" } else { "s" })
+            } else {
+                "OCR done, but the text could not be copied".to_string()
+            });
+            let _ = fs_remove(&text_name).await;
+        }
+        Err(e) => {
+            log(&format!("scp: ocr failed after {ms} ms (view closed): {e}"));
+            let _ = display_message(&format!("OCR failed: {e}"));
+        }
+    }
+    remove_clip(clip).await;
+}
+
 /// `c`: the same image through the recogniser with correction flipped.
 async fn ocr_rerun(state: State, mode: ModeId) {
     let started = {
@@ -1541,6 +1585,7 @@ async fn ocr_rerun(state: State, mode: ModeId) {
         let Some(v) = form.model.ocr.as_mut() else { return };
         v.correction = !v.correction;
         v.gen += 1;
+        v.share.latest_gen.set(v.gen);
         v.state = ocr::State::Running;
         v.slow = false;
         v.started_ms = now_ms();
@@ -1549,13 +1594,13 @@ async fn ocr_rerun(state: State, mode: ModeId) {
                 let _ = fs_remove(&old).await;
             });
         }
-        let out = (clip, v.correction, v.gen);
+        let out = (clip, v.correction, v.gen, Rc::clone(&v.share), form.model.client_name.clone());
         redraw(form);
         out
     };
-    let (clip, correction, gen) = started;
+    let (clip, correction, gen, share, client) = started;
     spawn(ocr_slow_hint(Rc::clone(&state), mode, gen));
-    run_ocr(state, mode, clip, correction, gen).await;
+    run_ocr(state, mode, clip, correction, gen, share, client).await;
 }
 
 /// The view's keys. Scrolling and leaving happen here; a copy and a
@@ -1563,7 +1608,10 @@ async fn ocr_rerun(state: State, mode: ModeId) {
 fn ocr_key(form: &mut Form<Copier>, key: &str) -> OcrAct {
     let done = matches!(form.model.ocr.as_ref().map(|v| &v.state), Some(ocr::State::Done { .. }));
     match key {
-        "Escape" | "q" => OcrAct::Left(leave_ocr(form)),
+        "Escape" | "q" => {
+            detach_or_discard(form);
+            OcrAct::Close
+        }
         "Enter" | "y" if done => OcrAct::Copy { paste: false },
         "p" if done => OcrAct::Copy { paste: true },
         "s" if done => {
@@ -1601,25 +1649,15 @@ fn ocr_scroll(form: &mut Form<Copier>, delta: i64) {
     redraw(form);
 }
 
-/// Back to the form: the view's placement goes, the form's comes back
-/// (the caller places it: that is a write to the terminal).
-fn leave_ocr(form: &mut Form<Copier>) -> Option<(Clip, u32, u32, u32)> {
-    let Some(v) = form.model.ocr.take() else { return None };
-    if let Some(p) = v.preview.filter(|p| p.sent) {
-        let _ = mode_write(form.mode, kitty_delete(p.id).as_bytes());
+/// The form is going while the view is up: a run still recognising is
+/// let go to finish into the clipboard (its files stay for it), a
+/// finished one is cleaned up with the form.
+fn detach_or_discard(form: &mut Form<Copier>) {
+    let running = form.model.ocr.as_ref().is_some_and(|v| v.running());
+    if let Some(v) = form.model.ocr.as_ref().filter(|v| v.running()) {
+        v.share.detached.set(true);
     }
-    if let Some(name) = v.text_name {
-        spawn(async move {
-            let _ = fs_remove(&name).await;
-        });
-    }
-    // The form asks for its own size again.
-    form.sized = (0, 0);
-    redraw(form);
-    match (&form.model.clip, form.model.preview) {
-        (ClipState::Ready(c), Some(p)) if !c.is_text() => Some((c.clone(), p.id, p.cols, p.rows)),
-        _ => None,
-    }
+    discard(form, running);
 }
 
 async fn retransmit(state: State, mode: ModeId, clip: Clip, id: u32, cols: u32, rows: u32) {
@@ -1786,9 +1824,14 @@ impl Plugin for Scp {
                     Some("ocr") => (Kind::Clipboard, true),
                     _ => return,
                 };
-                if self.state.borrow().is_some() {
-                    let _ = display_message("scp: form already open");
-                    return;
+                // A form left open elsewhere (another window, after a
+                // switch) is closed and a fresh one opens where the key
+                // was pressed; an OCR still running finishes into the
+                // clipboard either way.
+                let old = self.state.borrow_mut().take();
+                if let Some(mut form) = old {
+                    detach_or_discard(&mut form);
+                    let _ = mode_close(form.mode);
                 }
                 let target_pane = event.scope.pane.map(u64::from);
                 let client = event.scope.client.map(u64::from);
@@ -1816,10 +1859,9 @@ impl Plugin for Scp {
                 if let Some((mode, act)) = in_ocr {
                     match act {
                         OcrAct::None => {}
-                        OcrAct::Left(Some((clip, id, cols, rows))) => {
-                            ctx.spawn(retransmit(Rc::clone(&self.state), mode, clip, id, cols, rows));
+                        OcrAct::Close => {
+                            let _ = mode_close(mode);
                         }
-                        OcrAct::Left(None) => {}
                         OcrAct::Copy { paste } => {
                             ctx.spawn(ocr_copy(Rc::clone(&self.state), mode, paste));
                         }

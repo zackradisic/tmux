@@ -11,9 +11,23 @@
 //! so it can go to a host, `c` runs again with language correction
 //! toggled, `j`/`k` scroll, Esc goes back to the form.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use tmux_plugin_sdk::prelude::*;
 
 use crate::Preview;
+
+/// What a run shares with the view it belongs to, so a run can outlive
+/// the view: Esc on a view still recognising (or the form reopened in
+/// another window) lets the run go on and, when it is done, the text
+/// goes to the clipboard with a message instead of into the view.
+#[derive(Debug)]
+pub struct Share {
+    pub detached: Cell<bool>,
+    /// The run whose result still counts; an older rerun's is dropped.
+    pub latest_gen: Cell<u64>,
+}
 
 /// One observation as `tmux ocr` prints it: a box normalised to the
 /// image with its origin at the bottom left, as Vision reports.
@@ -174,6 +188,7 @@ pub struct View {
     /// the window and answers with a resize event, and asking again on
     /// that event would never end.
     pub asked: Option<(u32, u32)>,
+    pub share: Rc<Share>,
 }
 
 #[derive(Debug)]
@@ -197,7 +212,12 @@ impl View {
             width,
             height,
             asked: None,
+            share: Rc::new(Share { detached: Cell::new(false), latest_gen: Cell::new(1) }),
         }
+    }
+
+    pub fn running(&self) -> bool {
+        matches!(self.state, State::Running)
     }
 
     pub fn lines(&self) -> &[String] {
@@ -262,7 +282,7 @@ pub fn screen(v: &View, image_label: &str, image: Option<(u32, u32, u32)>) -> St
     let h = v.height as usize;
     let mut out = String::from("\x1b[2J\x1b[H");
     let status = match &v.state {
-        State::Running if v.slow => "recognising… (the first run on a Mac can take a minute)".to_string(),
+        State::Running if v.slow => "recognising… (the model is being compiled: up to a minute on a loaded Mac)".to_string(),
         State::Running => "recognising…".to_string(),
         State::Done { lines, ms } => format!(
             "{} line{} · {} · correction {}",
@@ -307,7 +327,13 @@ pub fn screen(v: &View, image_label: &str, image: Option<(u32, u32, u32)>) -> St
     }
     let more = if lines.len() > v.scroll + rows { format!("{} more below · ", lines.len() - v.scroll - rows) } else { String::new() };
     let corr = if v.correction { "off" } else { "on" };
-    let hint = format!("{more}Enter copy · p paste into pane · s send as text · c correction {corr} · j/k scroll · Esc back");
+    let hint = match &v.state {
+        State::Running => "Esc close · the text is copied to the clipboard when it is done".to_string(),
+        State::Failed(_) => format!("c try again with correction {corr} · Esc close"),
+        State::Done { .. } => {
+            format!("{more}Enter copy · p paste into pane · s send as text · c correction {corr} · j/k scroll · Esc close")
+        }
+    };
     out.push_str(&format!("\x1b[{h};1H  \x1b[2m{}\x1b[0m", clip_line(&hint, w.saturating_sub(2))));
     out
 }
@@ -405,6 +431,9 @@ mod tests {
         assert!(s.contains("2 lines · 0.3 s · correction on"));
         assert!(s.contains("  hello"));
         assert!(s.contains('\u{10EEEE}'));
-        assert!(s.contains("Esc back"));
+        assert!(s.contains("Esc close"));
+        let mut r = View::new(true, 110, 12);
+        r.state = State::Running;
+        assert!(screen(&r, "Image (10x10)", None).contains("copied to the clipboard when it is done"));
     }
 }

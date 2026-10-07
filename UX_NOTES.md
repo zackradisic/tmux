@@ -877,8 +877,15 @@ again on the right, sized to that column. Enter copies the text
 (`load-buffer -w`, so the terminal's clipboard gets it too), `p` pastes
 it into the pane the palette was opened from, `s` makes it the clipboard
 tab's text so the ordinary to/path/Enter flow sends it to a host, `c`
-runs again with Vision's language correction flipped, Esc goes back to
-the form and places its small preview again.
+runs again with Vision's language correction flipped, Esc closes.
+
+The run is not tied to the view. Esc while it is still recognising
+closes the float and lets the run finish: the text lands on the
+clipboard and the status line says `OCR done: 36 lines copied`. Opening
+the form again from another window (the first version said "form
+already open" and showed nothing there) closes the old float and opens
+where the key was pressed, with the same rule for a run in flight. So a
+minute-long run costs nothing but the minute.
 
 What to know:
 
