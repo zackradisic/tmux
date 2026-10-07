@@ -125,6 +125,21 @@ pub trait Model: 'static {
     fn extra_hint(&self) -> Option<String> {
         None
     }
+
+    /// Lines of the model's own under the status line: an image preview,
+    /// a table. How many it wants; the closed form grows by as many.
+    /// Nothing by default.
+    fn footer_rows(&self, _fields: &[Field]) -> u32 {
+        0
+    }
+
+    /// The footer's lines, at most `rows` of them (the wanted count, or
+    /// fewer when the window is too short for all of it). Each is drawn
+    /// as given after a two-cell indent, so a line brings its own
+    /// colours and is already clipped to the width.
+    fn footer(&self, _fields: &[Field], _rows: u32) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 pub struct Form<M: Model> {
@@ -302,8 +317,10 @@ impl<M: Model> Form<M> {
 
     /// The closed height: header, fields, status, hint, but never under
     /// `min_height`.
+    /// The form with no list up: tag, rule, banner, the fields, a blank,
+    /// the status, the footer, a blank, the hint.
     fn closed_height(&self) -> u32 {
-        (8 + self.fields.len() as u32).max(self.min_height)
+        (8 + self.fields.len() as u32 + self.model.footer_rows(&self.fields)).max(self.min_height)
     }
 
     /// Wanted outer size: the closed form, plus a rule and the visible
@@ -606,6 +623,20 @@ pub fn render<M: Model>(form: &mut Form<M>) {
         out.push_str(&format!("  \x1b[33m{}\x1b[0m\r\n", clip(&s, w - 4)));
     } else {
         out.push_str("\r\n");
+    }
+    // The footer gets what the screen has left after everything else
+    // the form shows, so a short window clips the footer, never the hint.
+    let wanted = form.model.footer_rows(&form.fields);
+    if wanted > 0 {
+        let list_rows = match &form.list {
+            Some(p) if p.shown() => 1 + p.height().max(1) as u32,
+            _ => 0,
+        };
+        let taken = 8 + form.fields.len() as u32 + list_rows;
+        let rows = form.height.saturating_sub(taken).min(wanted);
+        for line in form.model.footer(&form.fields, rows).into_iter().take(rows as usize) {
+            out.push_str(&format!("  {line}\r\n"));
+        }
     }
     let verb = form.model.submit_label();
     let toggle = form.model.toggle_hint().map(|t| format!("C-t {t} · ")).unwrap_or_default();

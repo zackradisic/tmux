@@ -145,6 +145,16 @@ struct input_ctx {
 	 */
 	struct evbuffer			*since_ground;
 	struct event			 ground_timer;
+
+	/*
+	 * Where a DCS "tmux;" passthrough goes when set. A screen with no
+	 * pane behind it (a plugin mode's) has no clients of its own for
+	 * screen_write_rawstring to find, so its owner takes the bytes and
+	 * delivers them itself. Set, this also bypasses allow-passthrough:
+	 * the owner wrote the bytes, nothing untrusted did.
+	 */
+	input_passthrough_cb		 passthrough_cb;
+	void				*passthrough_arg;
 };
 
 /* Helper functions. */
@@ -901,6 +911,15 @@ input_init(struct window_pane *wp, struct bufferevent *bev,
 
 	input_reset(ictx, 0);
 	return (ictx);
+}
+
+/* Route DCS "tmux;" passthrough to a callback (see struct input_ctx). */
+void
+input_set_passthrough(struct input_ctx *ictx, input_passthrough_cb cb,
+    void *arg)
+{
+	ictx->passthrough_cb = cb;
+	ictx->passthrough_arg = arg;
 }
 
 /* Destroy input parser. */
@@ -2671,6 +2690,14 @@ input_dcs_dispatch(struct input_ctx *ictx)
 		 * leave other '$' DCS (if any appear in future) to existing
 		 * handlers.
 		 */
+	}
+
+	if (ictx->passthrough_cb != NULL) {
+		if (len >= prefixlen && strncmp(buf, prefix, prefixlen) == 0) {
+			ictx->passthrough_cb(ictx->passthrough_arg,
+			    buf + prefixlen, len - prefixlen);
+		}
+		return (0);
 	}
 
 	allow_passthrough = options_get_number(oo, "allow-passthrough");

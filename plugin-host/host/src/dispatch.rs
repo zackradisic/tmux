@@ -527,6 +527,46 @@ pub fn pane_fds(
     }
 }
 
+/// The system clipboard, written as a file into the plugin's data
+/// directory by the host (capability `clipboard`): an image as PNG, else
+/// text as UTF-8. The bytes never cross into the guest: a terminal with
+/// kitty graphics reads an image file itself, and a copy sends the file.
+/// The reply names the kind, the file, and its pixel size and byte count.
+pub fn clipboard_read(
+    mem: &mut GuestMem<'_, '_>,
+    out: i32,
+    cap: i32,
+    len_out: i32,
+) -> Result<(), HostError> {
+    check_cap(mem, crate::caps::CLIPBOARD)?;
+    let vt = vtable()?;
+    let root = fs_root_of(mem)?;
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let base = format!("clip-{ms}");
+    std::fs::create_dir_all(root.path()).map_err(|e| {
+        err(ErrorCode::Host, format!("cannot create {}: {e}", root.path().display()))
+    })?;
+    let path = root.path().join(&base);
+    let cpath = std::ffi::CString::new(path.to_string_lossy().as_bytes())
+        .map_err(|_| err(ErrorCode::BadRequest, "data directory path holds a NUL"))?;
+    let (mut kind, mut w, mut h, mut len) = (0i32, 0u32, 0u32, 0u64);
+    let rc = unsafe { (vt.clipboard_read)(cpath.as_ptr(), &mut kind, &mut w, &mut h, &mut len) };
+    match rc {
+        0 => {
+            let (word, ext) = if kind == 1 { ("image", "png") } else { ("text", "txt") };
+            let reply = format!("{word}\t{base}.{ext}\t{w}\t{h}\t{len}");
+            mem.write_out(reply.as_bytes(), out, cap, len_out)
+        }
+        -1 => Err(err(ErrorCode::NoSuchObject, "nothing usable on the clipboard")),
+        -2 => Err(err(ErrorCode::Host, "the clipboard image could not be read")),
+        -3 => Err(err(ErrorCode::Unsupported, "no clipboard on this platform")),
+        _ => Err(err(ErrorCode::Host, format!("cannot write {}", path.display()))),
+    }
+}
+
 /// Grep the grids of a set of panes for a pattern. The needle and the
 /// pane-id array cross the ABI; the pane contents never do - the search
 /// runs in C over the live grid. The result is a `u32 count`-prefixed

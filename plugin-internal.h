@@ -83,6 +83,8 @@ int	 plugin_vtable_pane_fds(u_int, pgh_sink, void *);
 int	 plugin_vtable_panes_search(const uint32_t *, uint32_t, const char *,
 	    uint32_t, uint32_t, pgh_sink, void *);
 int	 plugin_vtable_pane_pid(u_int);
+int	 plugin_vtable_clipboard_read(const char *, int32_t *, uint32_t *,
+	     uint32_t *, uint64_t *);
 int	 plugin_vtable_get_option(int, u_int, const char *, pgh_sink, void *);
 int	 plugin_vtable_set_option(int, u_int, const char *, const char *);
 int	 plugin_vtable_display_message(int, const char *, const char *);

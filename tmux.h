@@ -2949,6 +2949,7 @@ void	tty_putcode_ss(struct tty *, enum tty_code_code, const char *,
 void	tty_puts(struct tty *, const char *);
 void	tty_putc(struct tty *, u_char);
 void	tty_putn(struct tty *, const void *, size_t, u_int);
+void	tty_passthrough(struct tty *, const void *, size_t);
 void	tty_cell(struct tty *, const struct grid_cell *,
 	    const struct tty_style_ctx *);
 int	tty_init(struct tty *, struct client *);
@@ -3446,6 +3447,7 @@ void	 recalculate_sizes_now(int);
 
 /* input.c */
 #define INPUT_BUF_DEFAULT_SIZE 1048576
+typedef void (*input_passthrough_cb)(void *, const u_char *, size_t);
 struct input_ctx *input_init(struct window_pane *, struct bufferevent *,
 	     struct colour_palette *, struct client *);
 void	 input_free(struct input_ctx *);
@@ -3455,6 +3457,7 @@ void	 input_parse_pane(struct window_pane *);
 void	 input_parse_buffer(struct window_pane *, const u_char *, size_t);
 void	 input_parse_screen(struct input_ctx *, struct screen *,
 	     screen_write_init_ctx_cb, void *, const u_char *, size_t);
+void	 input_set_passthrough(struct input_ctx *, input_passthrough_cb, void *);
 void	 input_reply_clipboard(struct bufferevent *, const char *, size_t,
 	     const char *, char);
 void	 input_set_buffer_size(size_t);
@@ -4222,6 +4225,9 @@ char		*osdep_get_name(int, char *);
 char		*osdep_get_cwd(int);
 char		*osdep_get_env(int, const char *);
 char		*osdep_get_fds(int);
+
+/* clipboard-darwin.c */
+int		 clipboard_to_file(const char *, int *, u_int *, u_int *, uint64_t *);
 struct event_base *osdep_event_init(void);
 
 /* utf8-combined.c */

@@ -549,7 +549,33 @@ transcript.sh`.
   pane dies (and at server start). Its live pane is still grepped by
   `^F`, so what is on screen is findable; what scrolled off is not until
   it ends. A fallback off `pane-command-changed` plus a quiet period
-  would close this.
+  would close this. Codex is the exception since Oct 5 2026: it has no
+  shim, so a render that finds its rollout's mtime moved asks for a
+  read (`provider::apply`), and the read that lands its transcript path
+  takes the conversation so far.
+- **Codex 0.160 holds nothing open.** Up to the 0.15x line the TUI kept
+  its rollout open and `pane_fds` found it; 0.160 appends and closes, so
+  a Codex row stayed `prov-codex-<pane>` for its whole life, with no id
+  to copy, message or resume by, and its pane title (`<topic> | <dir>`,
+  a real topic since 0.160) was thrown away as "just the cwd". The
+  resolver now falls back to a scan of `~/.codex/sessions/<y>/<m>/<d>`
+  (days since the row appeared, files written since then, first line
+  read): the non-subagent rollout whose `cwd` is the pane's and whose
+  start is nearest the row's wins, newest file per session id, ids other
+  live panes hold excluded. The title's ` | <dir>` is peeled. Its band
+  comes from the rollout too: the turn-boundary events (`task_started`,
+  `task_complete`/`turn_aborted`, the approval and question requests)
+  are prefiltered on the fs worker from where the last render left off
+  (`resolve::codex_turn`), so a Codex no longer sits in `working` from
+  birth to death. Resolved at render, like every harness file: the band
+  is right when the picker is open, not pushed while it is closed.
+  Whether Codex persists its approval requests to the rollout is
+  unverified (`--yolo` never asks), so `needs input` for Codex is
+  best-effort. Limits: two
+  Codex panes started in one directory within seconds of each other can
+  pair wrong (an `identify` hook would settle it; Codex 0.160 has
+  Claude-style `hooks.json`, nothing installs one yet); a `codex resume`
+  of an old thread is found only once it writes again.
 - **The current turn is not searchable until it ends.** By design (the
   file holds a half-written turn), but a long turn is invisible to the
   conversation search for its whole duration.
@@ -785,6 +811,62 @@ picker's state (bands, unread, archive, marks) is agent-specific and does
 not generalise to arbitrary panes, so "one view" probably means one
 rendering engine with two configurations, not literally one picker. Worth
 sketching where the seam goes before building either.
+
+## Files and the clipboard
+
+### F1. The clipboard image: what the preview needs, and what it is not
+
+- **The image never passes through tmux.** The scp plugin's clipboard
+  tab (`prefix+T`, or `C-v` from the files tab; `prefix+t` switches to
+  it by itself when an image is on the clipboard) asks the host for the
+  clipboard (`clipboard_read`, capability `clipboard`): on macOS the
+  pasteboard is read natively (`clipboard-darwin.c`, AppKit through the
+  Objective-C runtime, loaded on first use - that first use costs about
+  130 ms once per server, every later read a few milliseconds) and the
+  PNG, or the text as UTF-8, written into the plugin's data directory
+  with nothing crossing into wasm. Text shows as `Text (1.2 KB)` with
+  its first eight lines under the form and goes to `/tmp/clipboard.txt`
+  by default; the two kinds remember their paths separately. An image
+  wins when the clipboard offers both (a browser copies alt text along). The preview is one kitty graphics sequence through the
+  `DCS tmux;` passthrough naming that file (`t=f`) and a virtual
+  placement; Ghostty reads and decodes the file itself, which it would
+  have had to do with the bytes anyway. The block under the fields is
+  `U+10EEEE` cells whose colour and diacritics name the image and the
+  cell: text to tmux, an image to kitty or Ghostty, a blank block of the
+  preview's size anywhere else. No downscaling: the terminal fits the
+  image to the block, and a PNG decode costs what it costs wherever it
+  happens.
+- **It needs the passthrough seam (Oct 6 2026).** A plugin mode's
+  screen has no pane behind it, so before `input_set_passthrough` a
+  passthrough written into one went nowhere. A server built before that
+  commit shows the blank block and nothing else; the form still works.
+- **Elsewhere the clipboard is a process, and the preview is data.** A
+  host without native clipboard access (Linux today) answers
+  `E_UNSUPPORTED` and the plugin runs a script: `wl-paste`, `xclip`, or
+  `osascript` as a last resort; the downscaled copy that script makes is
+  then sent as base64 data through the passthrough, since the terminal
+  may not be able to read the server's files. The script knows images
+  only: text on a Linux clipboard is not offered until the host there
+  learns to read it. A machine with none of these gets "no image on the
+  clipboard".
+- **The file is the handle.** `~/.local/share/tmux/plugins/scp/clip-<ms>
+  .png` is what the terminal previews and what `mv` or `scp` sends; it
+  is removed on cancel and consumed by the copy. A form closed from
+  outside (its window killed) removes the file but cannot tell the
+  terminal to forget the image.
+- **The preview is a shape guess.** The block's columns come from the
+  window's cell size (`window_cell_width/height`), which is the attached
+  client's report or a default; a client with a very different font
+  aspect gets a slightly wrong box, and the terminal letterboxes the
+  image inside it.
+- **Destinations are remembered per tab, not per host.** `scp.json` in
+  the data directory keeps the last `to` path (files), and the last host
+  and path (clipboard). A path entered for one host is prefilled for the
+  next; a host-keyed memory would want a dropdown of its own.
+- **The clipboard is read on every open.** Whichever tab is up, so
+  `prefix+t` pays the pasteboard read even when no image is wanted; a
+  few milliseconds natively, a few hundred through the script. The
+  plugin log says how long it took (`scp: clipboard WxH read in N ms`).
 
 ## Copy mode
 

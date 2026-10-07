@@ -983,6 +983,24 @@ plugin_vtable_pane_pid(u_int pane_id)
 	return ((int)pgrp);
 }
 
+/*
+ * Write the clipboard to base + ".png" or base + ".txt"; see
+ * clipboard_to_file for the kinds and return codes.
+ */
+int
+plugin_vtable_clipboard_read(const char *base, int32_t *kind,
+    uint32_t *width, uint32_t *height, uint64_t *len)
+{
+	u_int	w = 0, h = 0;
+	int	k = 0, rc;
+
+	rc = clipboard_to_file(base, &k, &w, &h, len);
+	*kind = k;
+	*width = w;
+	*height = h;
+	return (rc);
+}
+
 /* Return the open-file paths of a pane's foreground process, one per line. */
 int
 plugin_vtable_pane_fds(u_int pane_id, pgh_sink sink, void *ctx)

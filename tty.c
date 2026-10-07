@@ -708,6 +708,20 @@ tty_putn(struct tty *tty, const void *buf, size_t len, u_int width)
 		tty->cx += width;
 }
 
+/*
+ * Bytes for the terminal as they are, outside the cell model: a
+ * passthrough. What tty_cmd_rawstring does for a pane's passthrough, for
+ * a caller that has no tty_ctx. The cached cell and cursor are dropped
+ * since the bytes may have moved either.
+ */
+void
+tty_passthrough(struct tty *tty, const void *buf, size_t len)
+{
+	tty->flags |= TTY_NOBLOCK;
+	tty_add(tty, buf, len);
+	tty_invalidate(tty);
+}
+
 static void
 tty_set_italics(struct tty *tty)
 {

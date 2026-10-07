@@ -294,6 +294,14 @@ pub mod imports {
     ///                       // foreground process, one per line;
     ///                       // -2 = none
     pub const PANE_FDS: &str = "pane_fds";
+    /// clipboard_read(out, cap, len_out) -> i32
+    ///                       // the system clipboard written as a file into
+    ///                       // the plugin's data directory, an image as
+    ///                       // PNG or text as UTF-8:
+    ///                       // "image|text\tname\twidth\theight\tbytes";
+    ///                       // E_NO_SUCH_OBJECT when it holds neither,
+    ///                       // E_UNSUPPORTED on a platform without one
+    pub const CLIPBOARD_READ: &str = "clipboard_read";
     /// panes_search(ids_ptr, ids_len, pat_ptr, pat_len, flags,
     ///              max_lines, owned_out) -> i32
     ///                       // grep the grids of ids_len panes for a

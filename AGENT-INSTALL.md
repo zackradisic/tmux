@@ -92,12 +92,18 @@ caps = ["mode", "run-process", "run-command", "fs-list", "fs-read-any"]
 
 # Copy files to and from linked hosts with scp (a form: from / path /
 # to / path; host fields list local + every linked host, paths complete
-# here or over ssh). role = "view": nothing runs on the remote.
+# here or over ssh), or the image on the clipboard to a host or a local
+# path (a second tab, C-v; an image is previewed in a terminal with kitty
+# graphics, text shows its first lines), or the text on it to a file.
+# Destination paths are remembered. fs-read, fs-write: the clipboard
+# image and the remembered paths, in the plugin's data directory;
+# clipboard: the host reads the system clipboard, image or text (macOS natively).
+# role = "view": nothing runs on the remote.
 [plugins.scp]
 path = "~/.local/share/tmux2/plugins/scp.wasm"
 scope = "server"
 role = "view"
-caps = ["mode", "run-process", "run-command", "fs-list", "fs-read-any"]
+caps = ["mode", "run-process", "run-command", "fs-list", "fs-read-any", "fs-read", "fs-write", "clipboard"]
 
 # Save and restore sessions with scrollback; restart the server in place.
 [plugins.resurrect]
@@ -177,7 +183,8 @@ bind S   plugin-command session_creator new       # new session from a folder
 bind W   plugin-command session_creator worktree  # new session from a git worktree
 bind -T choose-tree S plugin-command session_creator new
 bind -T choose-tree W plugin-command session_creator worktree
-bind T   plugin-command scp copy                  # copy files to/from a linked host
+bind t   plugin-command scp copy                  # copy files to/from a linked host
+bind T   plugin-command scp clipboard             # the clipboard image to a host or a path
 bind C-r plugin-command resurrect pick            # save/restore picker
 bind U   confirm-before -p 'update tmux2? (y/n)' 'update -y canary'
 

@@ -242,6 +242,17 @@ pub struct pgh_host_vtable {
     /// before this returns. 0 ok, -1 no such peer or peer down.
     pub bridge_send:
         unsafe extern "C" fn(peer: u32, data: *const u8, len: usize) -> c_int,
+    /// Write the clipboard to `base` + ".png" (kind 1, an image with its
+    /// pixel size) or `base` + ".txt" (kind 2, text); the byte count
+    /// comes back too. 0 ok, -1 nothing usable, -2 an unreadable image,
+    /// -3 no clipboard on this platform, -4 unwritable.
+    pub clipboard_read: unsafe extern "C" fn(
+        base: *const c_char,
+        kind: *mut i32,
+        width: *mut u32,
+        height: *mut u32,
+        len: *mut u64,
+    ) -> c_int,
 }
 
 // Function pointers are Send + Sync; the vtable is stored in a OnceLock.

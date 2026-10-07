@@ -91,6 +91,35 @@ struct window_plugin_mode_data {
 	const char		*close_reason;
 };
 
+/*
+ * A DCS "tmux;" passthrough written into the mode screen - a kitty
+ * graphics transmit behind an image preview, say. The screen has no pane
+ * behind it, so screen_write_rawstring would find no client to send it
+ * to; send it to every terminal showing the float's window instead. The
+ * float is redrawn whole from its screen after every write, so nothing
+ * about the terminal's state is assumed: the bytes go as they are and
+ * the tty's cell cache is dropped in case they touched attributes.
+ * Control clients have no terminal to draw on and are skipped.
+ */
+static void
+window_plugin_passthrough(void *arg, const u_char *buf, size_t len)
+{
+	struct window_mode_entry	*wme = arg;
+	struct window_pane		*wp = wme->wp;
+	struct client			*c;
+
+	TAILQ_FOREACH(c, &clients, entry) {
+		if (c->session == NULL || c->tty.term == NULL)
+			continue;
+		if (c->flags & (CLIENT_CONTROL|CLIENT_SUSPENDED))
+			continue;
+		if (c->session->curw == NULL ||
+		    c->session->curw->window != wp->window)
+			continue;
+		tty_passthrough(&c->tty, buf, len);
+	}
+}
+
 static struct screen *
 window_plugin_init(struct window_mode_entry *wme,
     __unused struct cmdq_item *item, __unused struct cmd_find_state *fs,
@@ -125,6 +154,7 @@ window_plugin_init(struct window_mode_entry *wme,
 	 * input_reply_clipboard.
 	 */
 	data->ictx = input_init(NULL, NULL, &data->palette, NULL);
+	input_set_passthrough(data->ictx, window_plugin_passthrough, wme);
 
 	evtimer_set(&data->refresh, window_plugin_refresh_callback, wme);
 
