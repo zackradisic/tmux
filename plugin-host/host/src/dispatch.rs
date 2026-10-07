@@ -527,6 +527,45 @@ pub fn pane_fds(
     }
 }
 
+/// The image on the system clipboard, written as PNG into the plugin's
+/// data directory by the host (capability `clipboard`). The bytes never
+/// cross into the guest: a terminal with kitty graphics reads the file
+/// itself, and a copy sends the file. The reply names the file and its
+/// pixel size and byte count.
+pub fn clipboard_image(
+    mem: &mut GuestMem<'_, '_>,
+    out: i32,
+    cap: i32,
+    len_out: i32,
+) -> Result<(), HostError> {
+    check_cap(mem, crate::caps::CLIPBOARD)?;
+    let vt = vtable()?;
+    let root = fs_root_of(mem)?;
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let name = format!("clip-{ms}.png");
+    std::fs::create_dir_all(root.path()).map_err(|e| {
+        err(ErrorCode::Host, format!("cannot create {}: {e}", root.path().display()))
+    })?;
+    let path = root.path().join(&name);
+    let cpath = std::ffi::CString::new(path.to_string_lossy().as_bytes())
+        .map_err(|_| err(ErrorCode::BadRequest, "data directory path holds a NUL"))?;
+    let (mut w, mut h, mut len) = (0u32, 0u32, 0u64);
+    let rc = unsafe { (vt.clipboard_image)(cpath.as_ptr(), &mut w, &mut h, &mut len) };
+    match rc {
+        0 => {
+            let reply = format!("{name}\t{w}\t{h}\t{len}");
+            mem.write_out(reply.as_bytes(), out, cap, len_out)
+        }
+        -1 => Err(err(ErrorCode::NoSuchObject, "no image on the clipboard")),
+        -2 => Err(err(ErrorCode::Host, "the clipboard image could not be read")),
+        -3 => Err(err(ErrorCode::Unsupported, "no clipboard on this platform")),
+        _ => Err(err(ErrorCode::Host, format!("cannot write {}", path.display()))),
+    }
+}
+
 /// Grep the grids of a set of panes for a pattern. The needle and the
 /// pane-id array cross the ABI; the pane contents never do - the search
 /// runs in C over the live grid. The result is a `u32 count`-prefixed

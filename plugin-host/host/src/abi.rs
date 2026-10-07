@@ -999,6 +999,10 @@ fn register_imports(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
         }))
     })?;
 
+    linker.func_wrap(m, im::CLIPBOARD_IMAGE, |mut c: Caller<'_, StoreData>, out: i32, cap: i32, len_out: i32| -> i32 {
+        ret_i32(with_mem(&mut c, |mem| dispatch::clipboard_image(mem, out, cap, len_out)))
+    })?;
+
     linker.func_wrap(m, im::PANES_SEARCH, |mut c: Caller<'_, StoreData>, ids_ptr: i32, ids_len: i32, pat_ptr: i32, pat_len: i32, flags: i32, max_lines: i32, owned_out: i32| -> i32 {
         ret_i32(with_mem(&mut c, |mem| {
             dispatch::panes_search(

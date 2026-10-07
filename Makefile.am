@@ -282,6 +282,7 @@ dist_tmux_SOURCES += \
 	plugin-internal.h \
 	plugin-mode.c \
 	plugin-vtable.c \
+	clipboard-darwin.c \
 	plugin.c \
 	window-plugin-mode.c
 PLUGIN_HOST_LIB += plugin-host/target/@CARGO_TARGET_DIR@/libplugin_host.a

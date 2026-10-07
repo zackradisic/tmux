@@ -66,9 +66,13 @@ pub const SERVICE_SERVE: u32 = 1 << 22;
 /// the default grants for a pushed plugin: a remote must not be able to
 /// speak into this user's sessions.
 pub const CLAUDE_NOTIFY: u32 = 1 << 23;
+/// Read the image on the system clipboard, written as a PNG into the
+/// plugin's data directory (`clipboard_image`). The clipboard can hold
+/// anything the user copied, so a plugin asks for it by name.
+pub const CLIPBOARD: u32 = 1 << 24;
 
 /// Highest bit used above, for `describe`.
-const CAP_BITS: u32 = 24;
+const CAP_BITS: u32 = 25;
 
 /// Granted to every plugin without being asked for.
 pub const DEFAULT_CAPS: u32 = READ_STATE | DISPLAY_MESSAGE | TIMERS;
@@ -96,6 +100,7 @@ pub fn cap_from_name(name: &str) -> Option<u32> {
         "env-read" => ENV_READ,
         "env-read-any" => ENV_READ_ANY,
         "pane-fds" => PANE_FDS,
+        "clipboard" => CLIPBOARD,
         "service-call" => SERVICE_CALL,
         "service-serve" => SERVICE_SERVE,
         "claude-notify" => CLAUDE_NOTIFY,
@@ -126,6 +131,7 @@ pub fn cap_name(flag: u32) -> &'static str {
         ENV_READ => "env-read",
         ENV_READ_ANY => "env-read-any",
         PANE_FDS => "pane-fds",
+        CLIPBOARD => "clipboard",
         SERVICE_CALL => "service-call",
         SERVICE_SERVE => "service-serve",
         CLAUDE_NOTIFY => "claude-notify",

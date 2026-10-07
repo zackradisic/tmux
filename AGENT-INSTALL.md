@@ -95,13 +95,14 @@ caps = ["mode", "run-process", "run-command", "fs-list", "fs-read-any"]
 # here or over ssh), or the image on the clipboard to a host or a local
 # path (a second tab, C-v; previewed in a terminal with kitty graphics).
 # Destination paths are remembered. fs-read, fs-write: the clipboard
-# image and the remembered paths, in the plugin's data directory.
+# image and the remembered paths, in the plugin's data directory;
+# clipboard: the host reads the system clipboard (macOS natively).
 # role = "view": nothing runs on the remote.
 [plugins.scp]
 path = "~/.local/share/tmux2/plugins/scp.wasm"
 scope = "server"
 role = "view"
-caps = ["mode", "run-process", "run-command", "fs-list", "fs-read-any", "fs-read", "fs-write"]
+caps = ["mode", "run-process", "run-command", "fs-list", "fs-read-any", "fs-read", "fs-write", "clipboard"]
 
 # Save and restore sessions with scrollback; restart the server in place.
 [plugins.resurrect]

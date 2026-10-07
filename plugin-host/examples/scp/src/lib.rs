@@ -15,9 +15,12 @@
 //! sides.
 //!
 //! **clipboard** - the image on the clipboard (`Image (2050x1426)`), a
-//! `to` host and a path. The image is read into a PNG under the plugin's
-//! data directory when the form opens, previewed under the fields (see
-//! below), and on Enter moved to a local path or sent with `scp` to a
+//! `to` host and a path. The host writes the image as a PNG into the
+//! plugin's data directory when the form opens (`clipboard_image`: the
+//! macOS pasteboard read natively, a few milliseconds, nothing through
+//! the guest; elsewhere a script with wl-paste, xclip or osascript); it
+//! is previewed under the fields (see below), and on Enter moved to a
+//! local path or sent with `scp` to a
 //! host. A path ending in `/` gets `clipboard.png` appended.
 //!
 //! Enter runs `scp -r` (`-3` when both sides are hosts) in a popup on
@@ -35,9 +38,12 @@
 //! and the clipboard tab remembers its host too.
 //!
 //! The preview uses the kitty graphics protocol with Unicode
-//! placeholders: the PNG (downscaled) is transmitted once through a
-//! `DCS tmux;` passthrough, placed virtually, and drawn as a block of
-//! `U+10EEEE` cells whose colour and diacritics name the image and the
+//! placeholders: one sequence through a `DCS tmux;` passthrough names
+//! the PNG's path (`t=f`: the terminal, on this machine, reads the file
+//! itself, so the image never passes through tmux; the script fallback
+//! sends a downscaled copy as data instead) and places it virtually;
+//! the block under the fields is `U+10EEEE` cells whose colour and
+//! diacritics name the image and the
 //! cell - ordinary text cells to tmux, an image to a terminal that
 //! implements this part of the protocol (kitty, Ghostty). Elsewhere the
 //! block is blank. The passthrough needs a tmux that routes a plugin
@@ -53,7 +59,8 @@
 //! Load server-scoped with caps `mode`, `run-process`, `run-command`,
 //! `fs-list`, `fs-read-any` (the last three are `formkit::complete::CAPS`),
 //! `fs-read` and `fs-write` (the clipboard image and the remembered
-//! paths, in the data directory). Role `view`: nothing here needs to run on the
+//! paths, in the data directory) and `clipboard` (the host's read of
+//! it). Role `view`: nothing here needs to run on the
 //! remote, so the manifest entry says `role = "view"` and the link does
 //! not push it.
 //!
@@ -71,6 +78,7 @@ use formkit::complete::Source;
 use formkit::form::{self, field, Action, Field, Form, Model, Shared};
 use formkit::text::{expand_home, last_line, quote, scan_base};
 use tmux_plugin_sdk::prelude::*;
+use tmux_plugin_sdk::abi::ErrorCode;
 
 /// Form geometry (cells). The height is the closed form; an open list
 /// adds a rule and up to `LIST_MAX` rows through `mode_resize`, and a
@@ -183,17 +191,22 @@ fn is_local(v: &str) -> bool {
     v.is_empty() || v == LOCAL
 }
 
-/// The clipboard image, read to a file when the form opened. Both files
-/// live in the plugin's data directory: the host's file calls want them
-/// by name, relative to it; the shell wants the absolute path.
+/// The clipboard image, written to a file when the form opened. The
+/// files live in the plugin's data directory: the host's file calls want
+/// them by name, relative to it; the shell wants the absolute path.
 #[derive(Clone, Debug)]
 struct Clip {
     /// The data directory.
     root: String,
-    /// The PNG as it was on the clipboard: what gets copied.
+    /// The PNG as it was on the clipboard: what gets copied, and what the
+    /// terminal reads for the preview when it can (`local`).
     name: String,
-    /// A downscaled copy for the preview.
-    preview_name: String,
+    /// The host wrote the file (`clipboard_image`): the terminal is on
+    /// this machine and reads the file itself. `false` for the fallback
+    /// (wl-paste, xclip, osascript from a script), where a downscaled
+    /// copy in `preview_name` is sent as data instead.
+    local: bool,
+    preview_name: Option<String>,
     width: u32,
     height: u32,
 }
@@ -203,8 +216,8 @@ impl Clip {
         format!("{}/{}", self.root, self.name)
     }
 
-    fn preview(&self) -> String {
-        format!("{}/{}", self.root, self.preview_name)
+    fn preview(&self) -> Option<String> {
+        self.preview_name.as_ref().map(|n| format!("{}/{}", self.root, n))
     }
 }
 
@@ -706,53 +719,33 @@ fn preview_box(w: u32, h: u32, cell_aspect: f64) -> (u32, u32) {
 
 /// Read the clipboard off the form's path, then tell the form what was
 /// found. `auto_switch` brings the clipboard tab up on an image.
+///
+/// The host does the read (`clipboard_image`: the pasteboard to a PNG in
+/// the data directory, nothing through the guest); a host without a
+/// clipboard, or one that did not grant it, gets the script below.
 async fn probe_clipboard(state: State, mode: ModeId, auto_switch: bool) {
     let Ok(root) = fs_root() else {
         form::fail(&state, mode, "scp: no data directory for the clipboard image".into());
         return;
     };
+    let root = root.trim_end_matches('/').to_string();
     let stamp = now_ms();
-    let written = Clip {
-        root: root.trim_end_matches('/').to_string(),
-        name: format!("clip-{stamp}.png"),
-        preview_name: format!("clip-{stamp}.preview.png"),
-        width: 0,
-        height: 0,
-    };
-    // The JavaScript rides in the environment: no quoting of a quoted
-    // script inside a quoted script.
-    let cmd = format!(
-        "JXA={} sh -c {} sh {} {} {}",
-        quote(JXA_SCRIPT),
-        quote(PROBE_SCRIPT),
-        quote(&written.path()),
-        quote(&written.preview()),
-        PREVIEW_PX
-    );
-    let t0 = now_ms();
-    let found = match run_job(&cmd, None).await {
-        Ok(out) if out.status == 0 => {
-            match fs_read(&written.name, 0, 64).await {
-                Ok((head, _)) => match png_size(&head) {
-                    Some((width, height)) => Ok(Clip { width, height, ..written }),
-                    None => {
-                        spawn(remove_clip(written));
-                        Err("the clipboard image could not be read".to_string())
-                    }
-                },
-                Err(e) => {
-                    // The files are there but unreadable to us (a grant
-                    // missing): say so in the log, not just the form.
-                    log(&format!("scp: cannot read {}: {}", written.path(), e.message));
-                    spawn(remove_clip(written));
-                    Err("the clipboard image could not be read".to_string())
-                }
-            }
+    let t0 = stamp;
+    let found = match clipboard_image() {
+        Ok(Some(img)) => Ok(Clip {
+            root: root.clone(),
+            name: img.name,
+            local: true,
+            preview_name: None,
+            width: img.width,
+            height: img.height,
+        }),
+        Ok(None) => Err("no image on the clipboard".to_string()),
+        Err(e) if matches!(e.code, ErrorCode::Unsupported | ErrorCode::CapDenied) => {
+            probe_by_script(&root).await
         }
-        Ok(out) => Err(last_line(&out.output, "no image on the clipboard")),
         Err(e) => Err(format!("the clipboard could not be read: {}", e.message)),
     };
-
     let read_ms = now_ms().saturating_sub(t0);
     let image = {
         let mut st = state.borrow_mut();
@@ -788,16 +781,59 @@ async fn probe_clipboard(state: State, mode: ModeId, auto_switch: bool) {
     if let Some((clip, id, cols, rows)) = image {
         form::start_scan(&state, mode, false);
         let t1 = now_ms();
-        let bytes = transmit_preview(state, mode, clip.preview_name.clone(), id, cols, rows).await;
+        let how = transmit_preview(state, mode, &clip, id, cols, rows).await;
         log(&format!(
-            "scp: clipboard {}x{} read in {read_ms} ms; preview {} KB sent in {} ms as {cols}x{rows} cells",
+            "scp: clipboard {}x{} read in {read_ms} ms; preview {how} in {} ms as {cols}x{rows} cells",
             clip.width,
             clip.height,
-            bytes / 1024,
             now_ms().saturating_sub(t1)
         ));
     } else {
         log(&format!("scp: clipboard probe took {read_ms} ms: no image"));
+    }
+}
+
+/// The fallback read, as a shell job: the script writes the PNG and a
+/// downscaled copy into the data directory.
+async fn probe_by_script(root: &str) -> Result<Clip, String> {
+    let stamp = now_ms();
+    let written = Clip {
+        root: root.to_string(),
+        name: format!("clip-{stamp}.png"),
+        local: false,
+        preview_name: Some(format!("clip-{stamp}.preview.png")),
+        width: 0,
+        height: 0,
+    };
+    // The JavaScript rides in the environment: no quoting of a quoted
+    // script inside a quoted script.
+    let cmd = format!(
+        "JXA={} sh -c {} sh {} {} {}",
+        quote(JXA_SCRIPT),
+        quote(PROBE_SCRIPT),
+        quote(&written.path()),
+        quote(written.preview().as_deref().unwrap_or("")),
+        PREVIEW_PX
+    );
+    match run_job(&cmd, None).await {
+        Ok(out) if out.status == 0 => match fs_read(&written.name, 0, 64).await {
+            Ok((head, _)) => match png_size(&head) {
+                Some((width, height)) => Ok(Clip { width, height, ..written }),
+                None => {
+                    spawn(remove_clip(written));
+                    Err("the clipboard image could not be read".to_string())
+                }
+            },
+            Err(e) => {
+                // The files are there but unreadable to us (a grant
+                // missing): say so in the log, not just the form.
+                log(&format!("scp: cannot read {}: {}", written.path(), e.message));
+                spawn(remove_clip(written));
+                Err("the clipboard image could not be read".to_string())
+            }
+        },
+        Ok(out) => Err(last_line(&out.output, "no image on the clipboard")),
+        Err(e) => Err(format!("the clipboard could not be read: {}", e.message)),
     }
 }
 
@@ -806,7 +842,9 @@ async fn remove_clip(clip: Clip) {
     if let Err(e) = fs_remove(&clip.name).await {
         log(&format!("scp: cannot remove {}: {}", clip.path(), e.message));
     }
-    let _ = fs_remove(&clip.preview_name).await;
+    if let Some(p) = &clip.preview_name {
+        let _ = fs_remove(p).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -850,9 +888,19 @@ fn passthrough(seq: &str) -> String {
     format!("\x1bPtmux;{}\x1b\\", seq.replace('\x1b', "\x1b\x1b"))
 }
 
-/// The transmit: the PNG, base64, in chunks of 4096, the first carrying
-/// the image's keys and the last `m=0`; then a virtual placement of
+/// The transmit by file: the terminal is on this machine and reads the
+/// PNG itself (`t=f`), so the image never passes through tmux; one
+/// sequence carries the path (base64) and the virtual placement of
 /// `cols`×`rows` for the placeholders to show.
+fn kitty_transmit_file(id: u32, path: &str, cols: u32, rows: u32) -> String {
+    let p = base64::engine::general_purpose::STANDARD.encode(path.as_bytes());
+    passthrough(&format!("\x1b_Ga=T,t=f,f=100,i={id},U=1,c={cols},r={rows},q=2;{p}\x1b\\"))
+}
+
+/// The transmit by data: the PNG, base64, in chunks of 4096, the first
+/// carrying the image's keys and the last `m=0`; then a virtual
+/// placement of `cols`×`rows` for the placeholders to show. For a
+/// terminal that cannot read our files.
 fn kitty_transmit(id: u32, png: &[u8], cols: u32, rows: u32) -> Vec<String> {
     let b64 = base64::engine::general_purpose::STANDARD.encode(png);
     let chunks: Vec<&[u8]> = b64.as_bytes().chunks(4096).collect();
@@ -878,41 +926,53 @@ fn kitty_delete(id: u32) -> String {
 /// room to spare); a transmit goes in as many writes as it needs.
 const WRITE_MAX: usize = 200 * 1024;
 
-/// Send the preview PNG (`name`, in the data directory) to the terminal
-/// through the mode, then draw the block. Returns the PNG's size.
+/// Hand the preview to the terminal through the mode, then draw the
+/// block. By path when the file is local to the terminal (a hundred
+/// bytes), else the downscaled copy as data. Returns a word for the log.
 async fn transmit_preview(
     state: State,
     mode: ModeId,
-    name: String,
+    clip: &Clip,
     id: u32,
     cols: u32,
     rows: u32,
-) -> usize {
-    let Ok((png, _)) = fs_read(&name, 0, 8 * 1024 * 1024).await else { return 0 };
-    if png.is_empty() {
-        return 0;
-    }
-    let size = png.len();
-    let mut batch = String::new();
-    for seq in kitty_transmit(id, &png, cols, rows) {
-        if batch.len() + seq.len() > WRITE_MAX {
-            if mode_write(mode, batch.as_bytes()).is_err() {
-                return size;
-            }
-            batch.clear();
+) -> String {
+    let how = if clip.local {
+        let seq = kitty_transmit_file(id, &clip.path(), cols, rows);
+        if mode_write(mode, seq.as_bytes()).is_err() {
+            return "not sent".into();
         }
-        batch.push_str(&seq);
-    }
-    if !batch.is_empty() && mode_write(mode, batch.as_bytes()).is_err() {
-        return size;
-    }
+        "placed by path".to_string()
+    } else {
+        let Some(name) = clip.preview_name.as_deref() else { return "no preview file".into() };
+        let Ok((png, _)) = fs_read(name, 0, 8 * 1024 * 1024).await else {
+            return "preview unreadable".into();
+        };
+        if png.is_empty() {
+            return "preview empty".into();
+        }
+        let mut batch = String::new();
+        for seq in kitty_transmit(id, &png, cols, rows) {
+            if batch.len() + seq.len() > WRITE_MAX {
+                if mode_write(mode, batch.as_bytes()).is_err() {
+                    return "not sent".into();
+                }
+                batch.clear();
+            }
+            batch.push_str(&seq);
+        }
+        if !batch.is_empty() && mode_write(mode, batch.as_bytes()).is_err() {
+            return "not sent".into();
+        }
+        format!("{} KB sent as data", png.len() / 1024)
+    };
     let mut st = state.borrow_mut();
-    let Some(form) = st.as_mut().filter(|f| f.mode.0 == mode.0) else { return size };
+    let Some(form) = st.as_mut().filter(|f| f.mode.0 == mode.0) else { return how };
     if let Some(p) = form.model.preview.as_mut().filter(|p| p.id == id) {
         p.sent = true;
     }
     form::render(form);
-    size
+    how
 }
 
 /// Leave the terminal and the data directory as they were: the image
@@ -1083,15 +1143,17 @@ async fn submit_clipboard(state: State) {
         let home = form.home.clone();
         let dest = clip_dest(&path);
         let local = is_local(&to);
+        // The preview copy, when the fallback made one, goes with the copy.
+        let extra = clip.preview().map(|p| format!(" {}", quote(&p))).unwrap_or_default();
         let (cmd, what) = if local {
             let dest = expand_home(&dest, home.as_deref());
             (
                 format!(
-                    "mkdir -p {} && mv -f {} {} && rm -f {}",
+                    "mkdir -p {} && mv -f {} {}{}",
                     quote(&parent_dir(&dest)),
                     quote(&clip.path()),
                     quote(&dest),
-                    quote(&clip.preview())
+                    if extra.is_empty() { String::new() } else { format!(" && rm -f{extra}") }
                 ),
                 dest,
             )
@@ -1099,11 +1161,10 @@ async fn submit_clipboard(state: State) {
             let dst = endpoint(&to, &dest, home.as_deref());
             (
                 format!(
-                    "scp {} {} && rm -f {} {}",
+                    "scp {} {} && rm -f {}{extra}",
                     quote(&clip.path()),
                     dst,
-                    quote(&clip.path()),
-                    quote(&clip.preview())
+                    quote(&clip.path())
                 ),
                 format!("clipboard → {}", dst.trim_matches('\'')),
             )
@@ -1320,6 +1381,16 @@ mod tests {
         assert!(seqs[3].starts_with("\x1bPtmux;\x1b\x1b_Gm=0;"));
         assert!(seqs[4].contains("a=p,U=1,i=5,c=30,r=10"));
         assert!(kitty_delete(5).contains("a=d,d=I,i=5"));
+    }
+
+    #[test]
+    fn file_transmit_names_the_path() {
+        let seq = kitty_transmit_file(9, "/Users/z/.local/share/tmux/plugins/scp/clip-1.png", 40, 14);
+        assert!(seq.starts_with("\x1bPtmux;\x1b\x1b_Ga=T,t=f,f=100,i=9,U=1,c=40,r=14,q=2;"));
+        let b64 = base64::engine::general_purpose::STANDARD
+            .encode(b"/Users/z/.local/share/tmux/plugins/scp/clip-1.png");
+        assert!(seq.contains(&b64));
+        assert!(seq.ends_with("\x1b\x1b\\\x1b\\"));
     }
 
     #[test]

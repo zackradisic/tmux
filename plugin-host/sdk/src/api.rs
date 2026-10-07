@@ -400,6 +400,43 @@ pub fn pane_fds(pane: PaneId) -> Result<Option<Vec<String>>, HostError> {
     }
 }
 
+/// The image on the system clipboard, as the host wrote it: a PNG named
+/// `name` in the plugin's data directory (the host's file calls take the
+/// name; `fs_root()` plus the name is the path for a shell).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipboardImage {
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub bytes: u64,
+}
+
+/// Write the image on the system clipboard into the plugin's data
+/// directory as PNG (capability `clipboard`). Native on macOS, one
+/// pasteboard read and one file write, a few milliseconds. `Ok(None)`
+/// when the clipboard holds no image; `E_UNSUPPORTED` on a platform
+/// with no clipboard access, which a plugin may answer with wl-paste or
+/// xclip of its own.
+pub fn clipboard_image() -> Result<Option<ClipboardImage>, HostError> {
+    match call_out(128, |out, cap, len_out| unsafe { raw::clipboard_image(out, cap, len_out) }) {
+        Ok(buf) => {
+            let text = String::from_utf8_lossy(&buf);
+            let mut it = text.split('\t');
+            let name = it.next().unwrap_or("").to_string();
+            let num = |s: Option<&str>| s.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0);
+            let width = num(it.next()) as u32;
+            let height = num(it.next()) as u32;
+            let bytes = num(it.next());
+            if name.is_empty() {
+                return Err(HostError { code: ErrorCode::Host, message: "clipboard_image: empty reply".into() });
+            }
+            Ok(Some(ClipboardImage { name, width, height, bytes }))
+        }
+        Err(e) if e.code == ErrorCode::NoSuchObject => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// The matcher `panes_search` runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchMode {

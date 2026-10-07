@@ -816,29 +816,38 @@ sketching where the seam goes before building either.
 
 ### F1. The clipboard image: what the preview needs, and what it is not
 
-- **The image goes through the terminal, not tmux.** The scp plugin's
-  clipboard tab (`prefix+T`, or `C-v` from the files tab; `prefix+t`
-  switches to it by itself when an image is on the clipboard) draws its
-  preview with the kitty graphics protocol's Unicode placeholders: the
-  PNG is transmitted once through a `DCS tmux;` passthrough and the
-  block under the fields is `U+10EEEE` cells whose colour and diacritics
-  name the image and the cell. tmux stores and redraws those as text;
-  kitty and Ghostty paint the image over them, anything else shows a
-  blank block of the preview's size. There is no fallback rendering
-  (no sixel, no half-blocks): the block is the price of a terminal
-  without the protocol, and `C-v` hides it.
+- **The image never passes through tmux.** The scp plugin's clipboard
+  tab (`prefix+T`, or `C-v` from the files tab; `prefix+t` switches to
+  it by itself when an image is on the clipboard) asks the host for the
+  clipboard (`clipboard_image`, capability `clipboard`): on macOS the
+  pasteboard is read natively (`clipboard-darwin.c`, AppKit through the
+  Objective-C runtime, loaded on first use) and the PNG written into the
+  plugin's data directory in a few milliseconds, with nothing crossing
+  into wasm. The preview is one kitty graphics sequence through the
+  `DCS tmux;` passthrough naming that file (`t=f`) and a virtual
+  placement; Ghostty reads and decodes the file itself, which it would
+  have had to do with the bytes anyway. The block under the fields is
+  `U+10EEEE` cells whose colour and diacritics name the image and the
+  cell: text to tmux, an image to kitty or Ghostty, a blank block of the
+  preview's size anywhere else. No downscaling: the terminal fits the
+  image to the block, and a PNG decode costs what it costs wherever it
+  happens.
 - **It needs the passthrough seam (Oct 6 2026).** A plugin mode's
   screen has no pane behind it, so before `input_set_passthrough` a
   passthrough written into one went nowhere. A server built before that
   commit shows the blank block and nothing else; the form still works.
-- **Reading the clipboard is a process, not a capability.** macOS
-  through `osascript` (PNG, else TIFF via `sips`), Wayland `wl-paste`,
-  X11 `xclip`; a machine with none of these gets "no image on the
-  clipboard". The image lands as a PNG in the plugin's data directory
-  (`~/.local/share/tmux/plugins/scp/clip-<ms>.png`, plus a 900px preview
-  copy), is moved or `scp`ed from there, and is removed on cancel. A
-  form closed from outside (its window killed) removes the files but
-  cannot tell the terminal to forget the image.
+- **Elsewhere the clipboard is a process, and the preview is data.** A
+  host without native clipboard access (Linux today) answers
+  `E_UNSUPPORTED` and the plugin runs a script: `wl-paste`, `xclip`, or
+  `osascript` as a last resort; the downscaled copy that script makes is
+  then sent as base64 data through the passthrough, since the terminal
+  may not be able to read the server's files. A machine with none of
+  these gets "no image on the clipboard".
+- **The file is the handle.** `~/.local/share/tmux/plugins/scp/clip-<ms>
+  .png` is what the terminal previews and what `mv` or `scp` sends; it
+  is removed on cancel and consumed by the copy. A form closed from
+  outside (its window killed) removes the file but cannot tell the
+  terminal to forget the image.
 - **The preview is a shape guess.** The block's columns come from the
   window's cell size (`window_cell_width/height`), which is the attached
   client's report or a default; a client with a very different font
@@ -848,10 +857,10 @@ sketching where the seam goes before building either.
   the data directory keeps the last `to` path (files), and the last host
   and path (clipboard). A path entered for one host is prefilled for the
   next; a host-keyed memory would want a dropdown of its own.
-- **A clipboard read is a job per open.** The probe runs when the form
-  opens, whichever tab is up, so `prefix+t` pays for an `osascript` call
-  even when no image is wanted; it is a few hundred milliseconds and
-  does not block the form.
+- **The clipboard is read on every open.** Whichever tab is up, so
+  `prefix+t` pays the pasteboard read even when no image is wanted; a
+  few milliseconds natively, a few hundred through the script. The
+  plugin log says how long it took (`scp: clipboard WxH read in N ms`).
 
 ## Copy mode
 

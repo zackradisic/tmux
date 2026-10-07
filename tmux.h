@@ -4224,6 +4224,9 @@ char		*osdep_get_name(int, char *);
 char		*osdep_get_cwd(int);
 char		*osdep_get_env(int, const char *);
 char		*osdep_get_fds(int);
+
+/* clipboard-darwin.c */
+int		 clipboard_image_png(const char *, u_int *, u_int *, uint64_t *);
 struct event_base *osdep_event_init(void);
 
 /* utf8-combined.c */

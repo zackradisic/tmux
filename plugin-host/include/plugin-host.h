@@ -476,6 +476,14 @@ typedef struct {
    * before this returns. 0 ok, -1 no such peer or peer down.
    */
   int (*bridge_send)(uint32_t peer, const uint8_t *data, uintptr_t len);
+  /**
+   * Write the image on the system clipboard to `path` as PNG and report
+   * its pixel size and byte count. 0 ok, -1 no image on the clipboard,
+   * -2 the image could not be read or converted, -3 no clipboard on this
+   * platform, -4 the file could not be written.
+   */
+  int (*clipboard_image)(const char *path, uint32_t *width, uint32_t *height,
+                         uint64_t *len);
 } pgh_host_vtable;
 
 /**
