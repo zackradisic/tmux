@@ -15,6 +15,7 @@ members = [
     "examples/session_creator",
     "examples/scp",
     "examples/sessions",
+    "examples/palette",
     "examples/cron",
     "examples/agents",
     "examples/mailbox",

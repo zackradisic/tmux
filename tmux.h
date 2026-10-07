@@ -4228,6 +4228,9 @@ char		*osdep_get_fds(int);
 
 /* clipboard-darwin.c */
 int		 clipboard_to_file(const char *, int *, u_int *, u_int *, uint64_t *);
+
+/* ocr-darwin.c */
+int	 ocr_main(int, char **);
 struct event_base *osdep_event_init(void);
 
 /* utf8-combined.c */

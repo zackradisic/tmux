@@ -697,7 +697,10 @@ clipboard, an image or text, into the data directory with
 reply, emit topics), `service-call` (call methods and follow topics, on
 this server or a linked one; a `[caps.services] call = ["agents@*"]`
 sidecar list narrows the targets to `plugin`, `plugin@server` or
-`plugin@*` patterns), and reserved: `popup`, `menu`,
+`plugin@*` patterns; by convention a plugin that registers `palette`
+answers it with a JSON list of `{title, hint, key, text}` rows for the
+command palette, each run as `plugin-command <plugin> <text>`), and
+reserved: `popup`, `menu`,
 `db-read` (read-only access to
 other plugins' databases, to be named in a `[caps.db] read = [...]`
 sidecar list).

@@ -82,6 +82,8 @@ use formkit::text::{expand_home, last_line, quote, scan_base};
 use tmux_plugin_sdk::prelude::*;
 use tmux_plugin_sdk::abi::ErrorCode;
 
+mod ocr;
+
 /// Form geometry (cells). The height is the closed form; an open list
 /// adds a rule and up to `LIST_MAX` rows through `mode_resize`, and a
 /// preview adds its rows.
@@ -290,6 +292,14 @@ struct Copier {
     remembered: Remembered,
     /// The other tab's fields, kept as they were for the switch back.
     stash: Vec<Field>,
+    /// The window the float is in, and the pane the form was opened
+    /// from (where `p` in the OCR view pastes).
+    window: u32,
+    pane: Option<u64>,
+    /// The OCR view, while it is up in place of the form.
+    ocr: Option<ocr::View>,
+    /// Opened with `ocr`: go to the view as soon as the image is there.
+    ocr_wanted: bool,
 }
 
 impl Copier {
@@ -559,6 +569,7 @@ async fn open_form(
     target_pane: Option<u64>,
     client: Option<u64>,
     kind: Kind,
+    ocr_wanted: bool,
 ) {
     let pane = target_pane.and_then(|p| resolve_pane(PaneId(p as u32)).ok());
     let mut hosts = linked_hosts();
@@ -647,6 +658,10 @@ async fn open_form(
         cell_aspect: cell_aspect(window),
         remembered,
         stash,
+        window,
+        pane: target_pane,
+        ocr: None,
+        ocr_wanted,
     };
     let mut form = Form::new(mode, FORM_WIDTH, FORM_HEIGHT, fields, model);
     // The side is prefilled; the thing to copy is what is missing.
@@ -800,15 +815,20 @@ fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
 /// allowed, narrower when the image is tall; as wide as allowed, fewer
 /// rows when it is wide. `cell_aspect` is cell height over cell width.
 fn preview_box(w: u32, h: u32, cell_aspect: f64) -> (u32, u32) {
+    preview_fit(w, h, cell_aspect, PREVIEW_MAX_COLS, PREVIEW_MAX_ROWS)
+}
+
+/// The same for any box of `max_cols`×`max_rows` cells.
+fn preview_fit(w: u32, h: u32, cell_aspect: f64, max_cols: u32, max_rows: u32) -> (u32, u32) {
     if w == 0 || h == 0 {
         return (1, 1);
     }
     // Columns per row for the image's shape, in cells.
     let ratio = (w as f64 / h as f64) * cell_aspect;
-    let mut rows = PREVIEW_MAX_ROWS;
+    let mut rows = max_rows.max(1);
     let mut cols = (rows as f64 * ratio).round() as u32;
-    if cols > PREVIEW_MAX_COLS {
-        cols = PREVIEW_MAX_COLS;
+    if cols > max_cols.max(1) {
+        cols = max_cols.max(1);
         rows = (cols as f64 / ratio).round() as u32;
     }
     (cols.max(1), rows.max(1))
@@ -886,7 +906,7 @@ async fn probe_clipboard(state: State, mode: ModeId, auto_switch: bool) {
                 if image.is_some() && auto_switch && form.model.kind == Kind::Files {
                     switch_kind(form);
                 }
-                form::render(form);
+                redraw(form);
                 match image {
                     Some((id, cols, rows)) => Some((clip, id, cols, rows)),
                     None => {
@@ -901,7 +921,7 @@ async fn probe_clipboard(state: State, mode: ModeId, auto_switch: bool) {
             Err(why) => {
                 set_clip_label(form, "none".to_string());
                 form.model.clip = ClipState::Missing(why);
-                form::render(form);
+                redraw(form);
                 None
             }
         }
@@ -909,18 +929,27 @@ async fn probe_clipboard(state: State, mode: ModeId, auto_switch: bool) {
     if let Some((clip, id, cols, rows)) = image {
         form::start_scan(&state, mode, false);
         let t1 = now_ms();
-        let how = transmit_preview(state, mode, &clip, id, cols, rows).await;
+        let how = transmit_preview(Rc::clone(&state), mode, &clip, id, cols, rows).await;
         log(&format!(
             "scp: clipboard {}x{} read in {read_ms} ms; preview {how} in {} ms as {cols}x{rows} cells",
             clip.width,
             clip.height,
             now_ms().saturating_sub(t1)
         ));
-    } else if !matches!(
-        state.borrow().as_ref().map(|f| &f.model.clip),
-        Some(ClipState::Ready(_))
-    ) {
-        log(&format!("scp: clipboard probe took {read_ms} ms: nothing usable"));
+        let wanted = state.borrow().as_ref().filter(|f| f.mode.0 == mode.0).is_some_and(|f| f.model.ocr_wanted);
+        if wanted {
+            enter_ocr(state, mode).await;
+        }
+    } else {
+        if !matches!(state.borrow().as_ref().map(|f| &f.model.clip), Some(ClipState::Ready(_))) {
+            log(&format!("scp: clipboard probe took {read_ms} ms: nothing usable"));
+        }
+        let mut st = state.borrow_mut();
+        if let Some(form) = st.as_mut().filter(|f| f.mode.0 == mode.0 && f.model.ocr_wanted) {
+            form.model.ocr_wanted = false;
+            form.error = Some("OCR needs an image on the clipboard".to_string());
+            redraw(form);
+        }
     }
 }
 
@@ -1104,7 +1133,10 @@ async fn transmit_preview(
     if let Some(p) = form.model.preview.as_mut().filter(|p| p.id == id) {
         p.sent = true;
     }
-    form::render(form);
+    if let Some(p) = form.model.ocr.as_mut().and_then(|o| o.preview.as_mut()).filter(|p| p.id == id) {
+        p.sent = true;
+    }
+    redraw(form);
     how
 }
 
@@ -1116,6 +1148,18 @@ async fn transmit_preview(
 fn discard(form: &mut Form<Copier>, keep_files: bool) {
     if let Some(p) = form.model.preview.filter(|p| p.sent) {
         let _ = mode_write(form.mode, kitty_delete(p.id).as_bytes());
+    }
+    if let Some(o) = form.model.ocr.take() {
+        if let Some(p) = o.preview.filter(|p| p.sent) {
+            let _ = mode_write(form.mode, kitty_delete(p.id).as_bytes());
+        }
+        if let Some(name) = o.text_name {
+            if !keep_files {
+                spawn(async move {
+                    let _ = fs_remove(&name).await;
+                });
+            }
+        }
     }
     if let ClipState::Ready(clip) = &form.model.clip {
         if !keep_files {
@@ -1205,7 +1249,7 @@ async fn submit_files(state: State) {
         };
         if let Some(err) = err {
             form.error = Some(err);
-            form::render(form);
+            redraw(form);
             return;
         }
         let home = form.home.clone();
@@ -1223,7 +1267,7 @@ async fn submit_files(state: State) {
         form.busy = true;
         form.error = None;
         form.list = None;
-        form::render(form);
+        redraw(form);
         (form.mode, cmd, what)
     };
     run_copy(state, mode, cmd, what).await;
@@ -1269,7 +1313,7 @@ async fn submit_clipboard(state: State) {
         };
         if let Some(err) = err {
             form.error = Some(err);
-            form::render(form);
+            redraw(form);
             return;
         }
         let clip = clip.unwrap();
@@ -1312,7 +1356,7 @@ async fn submit_clipboard(state: State) {
         form.busy = true;
         form.error = None;
         form.list = None;
-        form::render(form);
+        redraw(form);
         (form.mode, cmd, what, local)
     };
     if local {
@@ -1334,6 +1378,362 @@ async fn submit_clipboard(state: State) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// the OCR view
+// ---------------------------------------------------------------------------
+
+/// Draw the form, or the OCR view when it is up.
+fn redraw(form: &mut Form<Copier>) {
+    if form.model.ocr.is_some() {
+        ocr_draw(form);
+    } else {
+        form::render(form);
+    }
+}
+
+/// The view's own render: ask for its size when the float has another,
+/// then the screen for the size it has.
+fn ocr_draw(form: &mut Form<Copier>) {
+    let (ww, wh) = resolve_window(WindowId(form.model.window)).map(|w| (w.width, w.height)).unwrap_or((120, 40));
+    let want = ocr::wanted_size(ww, wh);
+    let Some(v) = form.model.ocr.as_mut() else { return };
+    if want != form.sized && v.asked != Some(want) {
+        v.asked = Some(want);
+        if mode_resize(form.mode, want.0, want.1).is_ok() {
+            form.sized = want;
+        }
+    }
+    v.width = form.width;
+    v.height = form.height;
+    let label = match &form.model.clip {
+        ClipState::Ready(c) => c.label(),
+        _ => "no image".to_string(),
+    };
+    let image = v.preview.filter(|p| p.sent).map(|p| (p.id, p.cols, p.rows));
+    let out = ocr::screen(v, &label, image);
+    let _ = mode_write(form.mode, out.as_bytes());
+}
+
+/// What a key in the view asks of the plugin, decided under the borrow.
+enum OcrAct {
+    None,
+    /// Back to the form: the form's own preview to place again, if any.
+    Left(Option<(Clip, u32, u32, u32)>),
+    /// The text to the clipboard (and into the pane).
+    Copy { paste: bool },
+    Rerun,
+}
+
+/// Into the view: the form's placement goes, the image is placed again
+/// in the right column, the recogniser starts.
+async fn enter_ocr(state: State, mode: ModeId) {
+    let started = {
+        let mut st = state.borrow_mut();
+        let Some(form) = st.as_mut().filter(|f| f.mode.0 == mode.0) else { return };
+        form.model.ocr_wanted = false;
+        let clip = match &form.model.clip {
+            ClipState::Ready(c) if !c.is_text() => c.clone(),
+            _ => {
+                form.error = Some("OCR needs an image on the clipboard".to_string());
+                redraw(form);
+                return;
+            }
+        };
+        if let Some(p) = form.model.preview.filter(|p| p.sent) {
+            let _ = mode_write(form.mode, kitty_delete(p.id).as_bytes());
+        }
+        if let Some(p) = form.model.preview.as_mut() {
+            p.sent = false;
+        }
+        let (ww, wh) = resolve_window(WindowId(form.model.window)).map(|w| (w.width, w.height)).unwrap_or((120, 40));
+        let (w, h) = ocr::wanted_size(ww, wh);
+        let mut view = ocr::View::new(true, w, h);
+        let (cols, rows) = ocr::image_box(w, h, clip.width, clip.height, form.model.cell_aspect);
+        let id = form.model.preview.map(|p| (p.id + 1) & 0x00ff_ffff).unwrap_or(2).max(1);
+        view.preview = Some(Preview { id, cols, rows, sent: false });
+        let gen = view.gen;
+        let correction = view.correction;
+        form.model.ocr = Some(view);
+        form.error = None;
+        form.list = None;
+        redraw(form);
+        (clip, id, cols, rows, gen, correction)
+    };
+    let (clip, id, cols, rows, gen, correction) = started;
+    spawn(ocr_slow_hint(Rc::clone(&state), mode, gen));
+    spawn(run_ocr(Rc::clone(&state), mode, clip.clone(), correction, gen));
+    transmit_preview(state, mode, &clip, id, cols, rows).await;
+}
+
+/// Three seconds without a result: say why it may take a while.
+async fn ocr_slow_hint(state: State, mode: ModeId, gen: u64) {
+    if sleep_ms(3000).await.is_err() {
+        return;
+    }
+    let mut st = state.borrow_mut();
+    let Some(form) = st.as_mut().filter(|f| f.mode.0 == mode.0) else { return };
+    let Some(v) = form.model.ocr.as_mut().filter(|v| v.gen == gen) else { return };
+    if matches!(v.state, ocr::State::Running) {
+        v.slow = true;
+        redraw(form);
+    }
+}
+
+/// `tmux ocr` on the image, then the lines into the view and the text
+/// into the data directory.
+async fn run_ocr(state: State, mode: ModeId, clip: Clip, correction: bool, gen: u64) {
+    let bin = format_expand(OptionTarget::Server, "#{tmux_binary}")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "tmux".to_string());
+    let flag = if correction { "" } else { " -n" };
+    let cmd = format!("{} ocr{flag} {}", quote(&bin), quote(&clip.path()));
+    let t0 = now_ms();
+    let result = match run_job(&cmd, None).await {
+        Ok(out) if out.status == 0 => Ok(ocr::assemble(&ocr::parse_obs(&out.output), clip.width, clip.height)),
+        Ok(out) if out.status == 3 => Err("no text recogniser on this machine".to_string()),
+        Ok(out) => Err(last_line(&out.output, "the recogniser failed")),
+        Err(e) => Err(format!("could not run the recogniser: {}", e.message)),
+    };
+    let ms = now_ms().saturating_sub(t0);
+    let text_name = format!("{}.ocr.txt", clip.name.trim_end_matches(".png"));
+    let text = match &result {
+        Ok(lines) => Some(lines.join("\n") + "\n"),
+        Err(_) => None,
+    };
+    // The view may have been left, or run again, while the job ran.
+    let still = state.borrow().as_ref().filter(|f| f.mode.0 == mode.0).and_then(|f| f.model.ocr.as_ref()).is_some_and(|v| v.gen == gen);
+    if !still {
+        return;
+    }
+    let written = match text {
+        Some(t) => fs_write(&text_name, t.into_bytes(), false).await.is_ok(),
+        None => false,
+    };
+    let mut st = state.borrow_mut();
+    let Some(form) = st.as_mut().filter(|f| f.mode.0 == mode.0) else { return };
+    let Some(v) = form.model.ocr.as_mut().filter(|v| v.gen == gen) else { return };
+    match result {
+        Ok(lines) => {
+            log(&format!("scp: ocr of {}x{}: {} lines in {ms} ms", clip.width, clip.height, lines.len()));
+            v.state = ocr::State::Done { lines, ms };
+            v.text_name = written.then_some(text_name);
+        }
+        Err(e) => {
+            log(&format!("scp: ocr failed after {ms} ms: {e}"));
+            v.state = ocr::State::Failed(e);
+        }
+    }
+    v.scroll = 0;
+    redraw(form);
+}
+
+/// `c`: the same image through the recogniser with correction flipped.
+async fn ocr_rerun(state: State, mode: ModeId) {
+    let started = {
+        let mut st = state.borrow_mut();
+        let Some(form) = st.as_mut().filter(|f| f.mode.0 == mode.0) else { return };
+        let clip = match &form.model.clip {
+            ClipState::Ready(c) => c.clone(),
+            _ => return,
+        };
+        let Some(v) = form.model.ocr.as_mut() else { return };
+        v.correction = !v.correction;
+        v.gen += 1;
+        v.state = ocr::State::Running;
+        v.slow = false;
+        v.started_ms = now_ms();
+        if let Some(old) = v.text_name.take() {
+            spawn(async move {
+                let _ = fs_remove(&old).await;
+            });
+        }
+        let out = (clip, v.correction, v.gen);
+        redraw(form);
+        out
+    };
+    let (clip, correction, gen) = started;
+    spawn(ocr_slow_hint(Rc::clone(&state), mode, gen));
+    run_ocr(state, mode, clip, correction, gen).await;
+}
+
+/// The view's keys. Scrolling and leaving happen here; a copy and a
+/// rerun are async and handed back.
+fn ocr_key(form: &mut Form<Copier>, key: &str) -> OcrAct {
+    let done = matches!(form.model.ocr.as_ref().map(|v| &v.state), Some(ocr::State::Done { .. }));
+    match key {
+        "Escape" | "q" => OcrAct::Left(leave_ocr(form)),
+        "Enter" | "y" if done => OcrAct::Copy { paste: false },
+        "p" if done => OcrAct::Copy { paste: true },
+        "s" if done => {
+            ocr_as_text(form);
+            OcrAct::None
+        }
+        "c" => OcrAct::Rerun,
+        "j" | "Down" | "C-n" => {
+            ocr_scroll(form, 1);
+            OcrAct::None
+        }
+        "k" | "Up" | "C-p" => {
+            ocr_scroll(form, -1);
+            OcrAct::None
+        }
+        "C-d" | "PPage" | "NPage" | "C-u" | "g" | "G" => {
+            let rows = form.model.ocr.as_ref().map(|v| v.text_rows() as i64).unwrap_or(1);
+            let d = match key {
+                "C-d" | "NPage" => rows / 2,
+                "C-u" | "PPage" => -(rows / 2),
+                "g" => -1_000_000,
+                _ => 1_000_000,
+            };
+            ocr_scroll(form, d);
+            OcrAct::None
+        }
+        _ => OcrAct::None,
+    }
+}
+
+fn ocr_scroll(form: &mut Form<Copier>, delta: i64) {
+    if let Some(v) = form.model.ocr.as_mut() {
+        v.scroll_by(delta);
+    }
+    redraw(form);
+}
+
+/// Back to the form: the view's placement goes, the form's comes back
+/// (the caller places it: that is a write to the terminal).
+fn leave_ocr(form: &mut Form<Copier>) -> Option<(Clip, u32, u32, u32)> {
+    let Some(v) = form.model.ocr.take() else { return None };
+    if let Some(p) = v.preview.filter(|p| p.sent) {
+        let _ = mode_write(form.mode, kitty_delete(p.id).as_bytes());
+    }
+    if let Some(name) = v.text_name {
+        spawn(async move {
+            let _ = fs_remove(&name).await;
+        });
+    }
+    // The form asks for its own size again.
+    form.sized = (0, 0);
+    redraw(form);
+    match (&form.model.clip, form.model.preview) {
+        (ClipState::Ready(c), Some(p)) if !c.is_text() => Some((c.clone(), p.id, p.cols, p.rows)),
+        _ => None,
+    }
+}
+
+async fn retransmit(state: State, mode: ModeId, clip: Clip, id: u32, cols: u32, rows: u32) {
+    transmit_preview(state, mode, &clip, id, cols, rows).await;
+}
+
+/// The float changed size under the view: the image column is laid out
+/// again, and placed again when its block changed.
+fn ocr_resized(form: &mut Form<Copier>) -> Option<(Clip, u32, u32, u32)> {
+    let clip = match &form.model.clip {
+        ClipState::Ready(c) if !c.is_text() => c.clone(),
+        _ => return None,
+    };
+    let aspect = form.model.cell_aspect;
+    let (w, h) = (form.width, form.height);
+    let v = form.model.ocr.as_mut()?;
+    v.width = w;
+    v.height = h;
+    v.scroll_by(0);
+    let (cols, rows) = ocr::image_box(w, h, clip.width, clip.height, aspect);
+    let p = v.preview.as_mut()?;
+    if (p.cols, p.rows) == (cols, rows) {
+        return None;
+    }
+    if p.sent {
+        let _ = mode_write(form.mode, kitty_delete(p.id).as_bytes());
+    }
+    p.cols = cols;
+    p.rows = rows;
+    p.sent = false;
+    Some((clip, p.id, cols, rows))
+}
+
+/// Enter / p: the text to the clipboard through a tmux buffer (`-w`
+/// sends it on to the terminal), into the pane too for `p`; then the
+/// form is done.
+async fn ocr_copy(state: State, mode: ModeId, paste: bool) {
+    let (path, client, pane, lines) = {
+        let st = state.borrow();
+        let Some(form) = st.as_ref().filter(|f| f.mode.0 == mode.0) else { return };
+        let Some(v) = form.model.ocr.as_ref() else { return };
+        let Some(name) = v.text_name.as_ref() else { return };
+        let root = match &form.model.clip {
+            ClipState::Ready(c) => c.root.clone(),
+            _ => return,
+        };
+        (format!("{root}/{name}"), form.model.client_name.clone(), form.model.pane, v.lines().len())
+    };
+    let target = client.as_deref().map(|c| format!(" -t {}", quote(c))).unwrap_or_default();
+    let mut cmd = format!("load-buffer -w{target} {}", quote(&path));
+    if paste {
+        match pane {
+            Some(p) => cmd.push_str(&format!(" ; paste-buffer -p -t %{p}")),
+            None => {
+                form::fail(&state, mode, "no pane to paste into".to_string());
+                return;
+            }
+        }
+    }
+    if let Err(e) = run_command(&cmd).await {
+        form::fail(&state, mode, format!("could not load the buffer: {}", e.message));
+        return;
+    }
+    if let Some(form) = state.borrow_mut().as_mut().filter(|f| f.mode.0 == mode.0) {
+        discard(form, false);
+    }
+    let _ = mode_close(mode);
+    *state.borrow_mut() = None;
+    let what = if paste { "pasted" } else { "copied" };
+    let _ = display_message(&format!("OCR text {what}: {lines} line{}", if lines == 1 { "" } else { "s" }));
+}
+
+/// `s`: the text becomes the clipboard tab's item (the image is let
+/// go), so Enter on the form sends it to a host or a path.
+fn ocr_as_text(form: &mut Form<Copier>) {
+    let Some(v) = form.model.ocr.take() else { return };
+    let Some(name) = v.text_name else {
+        form.model.ocr = Some(v);
+        return;
+    };
+    if let Some(p) = v.preview.filter(|p| p.sent) {
+        let _ = mode_write(form.mode, kitty_delete(p.id).as_bytes());
+    }
+    let lines = match v.state {
+        ocr::State::Done { lines, .. } => lines,
+        _ => Vec::new(),
+    };
+    let text = lines.join("\n") + "\n";
+    let image = match &form.model.clip {
+        ClipState::Ready(c) => Some(c.clone()),
+        _ => None,
+    };
+    let Some(image) = image else { return };
+    // The form's own placement was deleted when the view opened.
+    form.model.preview = None;
+    spawn(remove_clip(image.clone()));
+    let clip = Clip {
+        root: image.root.clone(),
+        name,
+        local: true,
+        preview_name: None,
+        width: 0,
+        height: 0,
+        bytes: text.len() as u64,
+        text: Some(text_preview(text.as_bytes())),
+    };
+    set_clip_label(form, format!("{} from OCR", clip.label()));
+    form.model.clip = ClipState::Ready(clip);
+    prefill_clip_path(form, true);
+    form.focused = CLIP_PATH;
+    form.sized = (0, 0);
+    redraw(form);
+}
+
 impl Plugin for Scp {
     const NAME: &'static str = "scp";
     type Config = Config;
@@ -1353,15 +1753,37 @@ impl Plugin for Scp {
             .filter(|h| !h.is_empty())
             .map(str::to_string)
             .collect();
+        // The command palette asks for our rows; without `service-serve`
+        // the forms still open from their keys.
+        if let Err(e) = service::register("palette") {
+            log(&format!("scp: register palette: {}", e.message));
+        }
         Ok(Scp { state: Rc::new(RefCell::new(None)), run, args, extra_hosts })
+    }
+
+    fn on_service_request(&mut self, _ctx: &Ctx, req: ServiceRequest) {
+        match req.method.as_str() {
+            "palette" => {
+                let _ = req.reply_json(&serde_json::json!([
+                    { "title": "Copy files", "hint": "scp between here and a linked host", "text": "copy" },
+                    { "title": "Clipboard to a host", "hint": "the image or text on the clipboard, with a preview", "text": "clipboard" },
+                    { "title": "OCR the clipboard image", "hint": "the text in a screenshot, beside the image", "text": "ocr" },
+                ]));
+            }
+            _ => {
+                let _ = req.fail("unknown method");
+            }
+        }
     }
 
     fn on_event(&mut self, ctx: &Ctx, event: Event) {
         match event.name().as_str() {
             "plugin-command" => {
-                let kind = match event.get_str("text").map(str::trim) {
-                    Some("copy") | Some("") | None => Kind::Files,
-                    Some("clipboard") => Kind::Clipboard,
+                let (kind, ocr_wanted) = match event.get_str("text").map(str::trim) {
+                    Some("copy") | Some("") | None => (Kind::Files, false),
+                    Some("clipboard") => (Kind::Clipboard, false),
+                    // Straight to the text of the image, once it is read.
+                    Some("ocr") => (Kind::Clipboard, true),
                     _ => return,
                 };
                 if self.state.borrow().is_some() {
@@ -1378,10 +1800,35 @@ impl Plugin for Scp {
                     target_pane,
                     client,
                     kind,
+                    ocr_wanted,
                 ));
             }
             "mode-key" => {
                 let Some(key) = event.get_str("key") else { return };
+                let in_ocr = {
+                    let mut st = self.state.borrow_mut();
+                    let Some(form) = st.as_mut() else { return };
+                    if event.get_i64("mode") != Some(form.mode.0 as i64) {
+                        return;
+                    }
+                    form.model.ocr.is_some().then(|| (form.mode, ocr_key(form, key)))
+                };
+                if let Some((mode, act)) = in_ocr {
+                    match act {
+                        OcrAct::None => {}
+                        OcrAct::Left(Some((clip, id, cols, rows))) => {
+                            ctx.spawn(retransmit(Rc::clone(&self.state), mode, clip, id, cols, rows));
+                        }
+                        OcrAct::Left(None) => {}
+                        OcrAct::Copy { paste } => {
+                            ctx.spawn(ocr_copy(Rc::clone(&self.state), mode, paste));
+                        }
+                        OcrAct::Rerun => {
+                            ctx.spawn(ocr_rerun(Rc::clone(&self.state), mode));
+                        }
+                    }
+                    return;
+                }
                 // What the key did, decided inside the borrow and acted
                 // on after it: the form's own keys through formkit, the
                 // swap and the tab switch here.
@@ -1394,7 +1841,7 @@ impl Plugin for Scp {
                     let mode = form.mode;
                     let mut action = if key == KIND_KEY && !form.busy {
                         switch_kind(form);
-                        form::render(form);
+                        redraw(form);
                         Action::Rescan { reveal: false }
                     } else {
                         form.key(key, Some("C-t"))
@@ -1402,7 +1849,7 @@ impl Plugin for Scp {
                     if action == Action::Toggle {
                         action = if form.model.kind == Kind::Files {
                             swap(form);
-                            form::render(form);
+                            redraw(form);
                             Action::Rescan { reveal: false }
                         } else {
                             Action::None
@@ -1415,7 +1862,7 @@ impl Plugin for Scp {
                             "Up" | "C-k" | "BTab" | "C-p" => CLIP_PATH,
                             _ => CLIP_TO,
                         };
-                        form::render(form);
+                        redraw(form);
                     }
                     if action == Action::Close {
                         discard(form, false);
@@ -1441,7 +1888,11 @@ impl Plugin for Scp {
                     return;
                 }
                 form.resized(event.get_i64("width"), event.get_i64("height"));
-                form::render(form);
+                if let Some(again) = ocr_resized(form) {
+                    let (clip, id, cols, rows) = again;
+                    ctx.spawn(retransmit(Rc::clone(&self.state), form.mode, clip, id, cols, rows));
+                }
+                redraw(form);
             }
             "mode-closed" => {
                 let mut st = self.state.borrow_mut();
@@ -1451,6 +1902,11 @@ impl Plugin for Scp {
                     if let Some(form) = st.as_ref() {
                         if let ClipState::Ready(clip) = &form.model.clip {
                             spawn(remove_clip(clip.clone()));
+                        }
+                        if let Some(name) = form.model.ocr.as_ref().and_then(|o| o.text_name.clone()) {
+                            spawn(async move {
+                                let _ = fs_remove(&name).await;
+                            });
                         }
                     }
                     *st = None;

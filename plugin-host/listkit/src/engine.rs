@@ -103,6 +103,10 @@ pub struct Engine {
     pub(crate) marked: HashSet<String>,
     pub filter: String,
     pub filtering: bool,
+    /// A command palette: the search box has the keyboard from the
+    /// start and keeps it, Enter runs the highlighted row from the box,
+    /// Escape closes, Tab and BTab walk the rows.
+    pub quick: bool,
     pub(crate) completions: Vec<(String, usize)>,
     pub(crate) completion_idx: usize,
     completion_hidden: bool,
@@ -147,6 +151,7 @@ impl Engine {
             marked: HashSet::new(),
             filter: String::new(),
             filtering: false,
+            quick: false,
             completions: Vec::new(),
             completion_idx: 0,
             completion_hidden: false,
@@ -891,18 +896,7 @@ impl Engine {
             return self.fold_all();
         }
         if key == self.keys.key_of("activate") {
-            // Enter on a header (a group that is only a label) toggles
-            // its fold; a selectable group or a row activates - a folded
-            // session still switches to it.
-            if let Some(&i) = self.view.get(self.sel) {
-                if !self.nodes[i].selectable() {
-                    return self.toggle_fold();
-                }
-            }
-            return match self.selected_key() {
-                Some(k) => Outcome::Activate(k),
-                None => Outcome::Nothing,
-            };
+            return self.activate();
         }
         // A sigil's narrow key: the highlighted node's own value as a
         // token, and the same key again takes it out.
@@ -919,6 +913,21 @@ impl Engine {
             return Outcome::Action(action, self.targets());
         }
         Outcome::Key(key.to_string())
+    }
+
+    /// Enter on a header (a group that is only a label) toggles its
+    /// fold; a selectable group or a row activates - a folded session
+    /// still switches to it.
+    fn activate(&mut self) -> Outcome {
+        if let Some(&i) = self.view.get(self.sel) {
+            if !self.nodes[i].selectable() {
+                return self.toggle_fold();
+            }
+        }
+        match self.selected_key() {
+            Some(k) => Outcome::Activate(k),
+            None => Outcome::Nothing,
+        }
     }
 
     fn prompt_key(&mut self, key: &str) -> Outcome {
@@ -967,6 +976,24 @@ impl Engine {
             self.completion_hidden = true;
             self.completions.clear();
             return Outcome::Redraw;
+        }
+        if self.quick {
+            // The box never gives the keyboard up: Esc is the way out of
+            // the palette, Enter runs what is highlighted.
+            if key == close {
+                return Outcome::Close;
+            }
+            if key == "Enter" {
+                return self.activate();
+            }
+            if key == "Tab" {
+                self.move_sel(1);
+                return Outcome::Redraw;
+            }
+            if key == "BTab" {
+                self.move_sel(-1);
+                return Outcome::Redraw;
+            }
         }
         if key == close || key == "Enter" {
             self.filtering = false;
@@ -1309,6 +1336,28 @@ mod tests {
         let t3: Vec<Node> = tree().into_iter().filter(|n| n.key != "a/s1/w2").collect();
         e.set_nodes(t3);
         assert!(e.marked.is_empty());
+    }
+
+    #[test]
+    fn quick_mode_runs_the_row_from_the_box() {
+        let mut e = Engine::new(ModeId(1), 100, 30, "p", Engine::base_keys(), Vec::new());
+        e.quick = true;
+        e.filtering = true;
+        let mut g = Node::group("g/a", 0, true, false);
+        g.left = plain_cells("a", 0);
+        let mut n1 = Node::item("e/0", 1);
+        n1.left = plain_cells("Copy files", 0);
+        n1.haystack = "Copy files".into();
+        let mut n2 = Node::item("e/1", 1);
+        n2.left = plain_cells("OCR the clipboard image", 0);
+        n2.haystack = "OCR the clipboard image".into();
+        e.set_nodes(vec![g, n1, n2]);
+        assert_eq!(e.handle_key("o", None), Outcome::FilterChanged);
+        assert_eq!(e.handle_key("c", None), Outcome::FilterChanged);
+        assert_eq!(e.handle_key("r", None), Outcome::FilterChanged);
+        assert_eq!(e.handle_key("Enter", None), Outcome::Activate("e/1".into()));
+        assert!(e.filtering, "the box keeps the keyboard");
+        assert_eq!(e.handle_key("Escape", None), Outcome::Close);
     }
 
     #[test]

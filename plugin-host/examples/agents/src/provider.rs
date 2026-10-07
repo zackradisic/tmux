@@ -1066,7 +1066,7 @@ pub fn reply_mode(reply: &SearchReply) -> SearchMode {
 /// Register the methods a view calls. Needs `service-serve`; without it
 /// the plugin still works alone on its server.
 pub fn register_services() {
-    for m in ["list", "capture", "search", "turns", "stats", "act"] {
+    for m in ["list", "capture", "search", "turns", "stats", "act", "palette"] {
         if let Err(e) = service::register(m) {
             log(&format!("agents: register {m}: {}", e.message));
             return;
@@ -1104,6 +1104,14 @@ pub async fn handle(req: ServiceRequest, cfg: Rc<Config>) {
             let q: ListReq = req.json().unwrap_or_default();
             let snap = snapshot(q).await;
             let _ = req.reply_json(&snap);
+        }
+        // The command palette asks what this plugin offers.
+        "palette" => {
+            let _ = req.reply_json(&serde_json::json!([
+                { "title": "Agents", "hint": "the agents picker", "text": "pick" },
+                { "title": "Agent in this pane", "hint": "the picker opened on this pane's agent", "text": "pick here" },
+                { "title": "Agent ids on screen", "hint": "open on an id this pane shows", "text": "pick ids" },
+            ]));
         }
         "capture" => {
             let Ok(q) = req.json::<CaptureReq>() else {

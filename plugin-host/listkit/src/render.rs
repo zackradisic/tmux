@@ -174,7 +174,7 @@ impl Engine {
             )
         } else if self.prompt.is_some() {
             "type · Enter accept · Esc cancel".to_string()
-        } else if self.filtering {
+        } else if self.filtering && !self.quick {
             let sig: Vec<String> = self.sigils.iter().map(|s| format!("{}{}", s.ch, s.noun)).collect();
             format!("type to search · {} · Esc unfocus", sig.join(" "))
         } else if self.footer.is_empty() {

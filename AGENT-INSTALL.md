@@ -103,7 +103,26 @@ caps = ["mode", "run-process", "run-command", "fs-list", "fs-read-any"]
 path = "~/.local/share/tmux2/plugins/scp.wasm"
 scope = "server"
 role = "view"
-caps = ["mode", "run-process", "run-command", "fs-list", "fs-read-any", "fs-read", "fs-write", "clipboard"]
+caps = ["mode", "run-process", "run-command", "fs-list", "fs-read-any", "fs-read", "fs-write", "clipboard", "service-serve"]
+
+# The command palette (prefix+Space): a searchable list of what the
+# plugins offer (their `palette` service), the prefix bindings that
+# carry a -N note (tmux's own folded under "tmux"), and the items below.
+# Enter runs a row; the key column shows the direct key when there is one.
+[plugins.palette]
+path = "~/.local/share/tmux2/plugins/palette.wasm"
+scope = "server"
+caps = ["read-state", "run-command", "run-process", "mode", "service-call"]
+[plugins.palette.config]
+providers = ["scp", "agents", "sessions"]
+items = ["Jump to a pane (fzf)||display-popup -E \"tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index} #{window_name} #{pane_title} #{pane_current_command}' | fzf --preview 'tmux capture-pane -ep -t {1}' | awk '{print \\$1}' | xargs tmux switch-client -t\""]
+
+# The session / window / pane chooser in the agents picker's shape
+# (`plugin-command sessions pick s|w`); aware of remote links.
+[plugins.sessions]
+path = "~/.local/share/tmux2/plugins/sessions.wasm"
+scope = "server"
+caps = ["read-state", "run-command", "mode", "service-serve", "service-call", "send-keys"]
 
 # Save and restore sessions with scrollback; restart the server in place.
 [plugins.resurrect]
@@ -183,8 +202,11 @@ bind S   plugin-command session_creator new       # new session from a folder
 bind W   plugin-command session_creator worktree  # new session from a git worktree
 bind -T choose-tree S plugin-command session_creator new
 bind -T choose-tree W plugin-command session_creator worktree
-bind t   plugin-command scp copy                  # copy files to/from a linked host
-bind T   plugin-command scp clipboard             # the clipboard image to a host or a path
+bind -N 'Copy files with scp' t plugin-command scp copy
+bind -N 'Clipboard to a host' T plugin-command scp clipboard
+# The command palette. A -N note on a binding puts it in the palette;
+# the OCR view (scp ocr) has no key of its own and lives there.
+bind Space plugin-command palette open
 bind C-r plugin-command resurrect pick            # save/restore picker
 bind U   confirm-before -p 'update tmux2? (y/n)' 'update -y canary'
 
