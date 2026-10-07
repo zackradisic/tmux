@@ -341,7 +341,7 @@ an inbound peer's calls are always allowed).
 | `capture_pane` | `(pane, start, end, escapes, out, cap, len_out) -> i32` (≤2000 lines/call) | capture-pane |
 | `pane_env` | `(pane, name Str, out, cap, len_out) -> i32` — one env var of the pane's foreground process; -2 = unset | env-read |
 | `pane_fds` | `(pane, out, cap, len_out) -> i32` — the open-file paths of the pane's foreground process, one per line; -2 = none | pane-fds |
-| `clipboard_image` | `(out, cap, len_out) -> i32` — the image on the system clipboard written as PNG into the plugin's data directory: `name\twidth\theight\tbytes`; E_NO_SUCH_OBJECT = no image, E_UNSUPPORTED = no clipboard on this platform (macOS only today) | clipboard |
+| `clipboard_read` | `(out, cap, len_out) -> i32` — the system clipboard written as a file into the plugin's data directory, an image as PNG or text as UTF-8: `image\|text\tname\twidth\theight\tbytes`; E_NO_SUCH_OBJECT = neither, E_UNSUPPORTED = no clipboard on this platform (macOS only today) | clipboard |
 | `panes_search` | `(ids_ptr, ids_len, pat_ptr, pat_len, flags, max_lines, owned_out) -> i32` — grep the grids of `ids_len` panes for a pattern; result is a `u32 count`-prefixed list of `{pane:u32, line:u32, col:u32, score:u32, snippet Bytes}` records, one per matching pane (`score` ranks fuzzy hits; 0 for plain/regex). The search runs in tmux (each grid decoded once into a reusable buffer, SSE2 `memmem` for plain); only the needle in and the matches out cross the ABI. Soft-wrapped rows are joined, so a wrapped match is found. `flags`: low 2 bits = mode (0 plain, 1 regex, 2 fuzzy), bit2 case-sensitive, bit3 regex-multiline. `max_lines` bounds the lines searched per pane (0 = host default). Returns -1 on a bad regex | capture-pane |
 | `display_message` | `(client /* -1 = all */, msg Str) -> i32` | display-message |
 | `timer_cancel` | `(token: i64) -> i32` | timers |
@@ -685,8 +685,9 @@ reach), `db` (the plugin's own SQLite database, see Database), `env-read`
 to a `[caps.env-read] names = [...]` allowlist — an empty list, as under
 trust-the-user, is unrestricted, like `argv0`), `env-read-any` (lift that
 allowlist), `pane-fds` (read the open-file paths of a pane's
-foreground process with `pane_fds`), `clipboard` (write the image on the
-system clipboard into the data directory with `clipboard_image`),
+foreground process with `pane_fds`), `clipboard` (write the system
+clipboard, an image or text, into the data directory with
+`clipboard_read`),
 `service-serve` (register methods,
 reply, emit topics), `service-call` (call methods and follow topics, on
 this server or a linked one; a `[caps.services] call = ["agents@*"]`

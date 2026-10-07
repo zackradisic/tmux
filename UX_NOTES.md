@@ -819,11 +819,15 @@ sketching where the seam goes before building either.
 - **The image never passes through tmux.** The scp plugin's clipboard
   tab (`prefix+T`, or `C-v` from the files tab; `prefix+t` switches to
   it by itself when an image is on the clipboard) asks the host for the
-  clipboard (`clipboard_image`, capability `clipboard`): on macOS the
+  clipboard (`clipboard_read`, capability `clipboard`): on macOS the
   pasteboard is read natively (`clipboard-darwin.c`, AppKit through the
-  Objective-C runtime, loaded on first use) and the PNG written into the
-  plugin's data directory in a few milliseconds, with nothing crossing
-  into wasm. The preview is one kitty graphics sequence through the
+  Objective-C runtime, loaded on first use - that first use costs about
+  130 ms once per server, every later read a few milliseconds) and the
+  PNG, or the text as UTF-8, written into the plugin's data directory
+  with nothing crossing into wasm. Text shows as `Text (1.2 KB)` with
+  its first eight lines under the form and goes to `/tmp/clipboard.txt`
+  by default; the two kinds remember their paths separately. An image
+  wins when the clipboard offers both (a browser copies alt text along). The preview is one kitty graphics sequence through the
   `DCS tmux;` passthrough naming that file (`t=f`) and a virtual
   placement; Ghostty reads and decodes the file itself, which it would
   have had to do with the bytes anyway. The block under the fields is
@@ -841,8 +845,10 @@ sketching where the seam goes before building either.
   `E_UNSUPPORTED` and the plugin runs a script: `wl-paste`, `xclip`, or
   `osascript` as a last resort; the downscaled copy that script makes is
   then sent as base64 data through the passthrough, since the terminal
-  may not be able to read the server's files. A machine with none of
-  these gets "no image on the clipboard".
+  may not be able to read the server's files. The script knows images
+  only: text on a Linux clipboard is not offered until the host there
+  learns to read it. A machine with none of these gets "no image on the
+  clipboard".
 - **The file is the handle.** `~/.local/share/tmux/plugins/scp/clip-<ms>
   .png` is what the terminal previews and what `mv` or `scp` sends; it
   is removed on cancel and consumed by the copy. A form closed from

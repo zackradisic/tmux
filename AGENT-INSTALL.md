@@ -93,10 +93,11 @@ caps = ["mode", "run-process", "run-command", "fs-list", "fs-read-any"]
 # Copy files to and from linked hosts with scp (a form: from / path /
 # to / path; host fields list local + every linked host, paths complete
 # here or over ssh), or the image on the clipboard to a host or a local
-# path (a second tab, C-v; previewed in a terminal with kitty graphics).
+# path (a second tab, C-v; an image is previewed in a terminal with kitty
+# graphics, text shows its first lines), or the text on it to a file.
 # Destination paths are remembered. fs-read, fs-write: the clipboard
 # image and the remembered paths, in the plugin's data directory;
-# clipboard: the host reads the system clipboard (macOS natively).
+# clipboard: the host reads the system clipboard, image or text (macOS natively).
 # role = "view": nothing runs on the remote.
 [plugins.scp]
 path = "~/.local/share/tmux2/plugins/scp.wasm"

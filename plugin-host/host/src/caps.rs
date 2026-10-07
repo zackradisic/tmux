@@ -66,9 +66,10 @@ pub const SERVICE_SERVE: u32 = 1 << 22;
 /// the default grants for a pushed plugin: a remote must not be able to
 /// speak into this user's sessions.
 pub const CLAUDE_NOTIFY: u32 = 1 << 23;
-/// Read the image on the system clipboard, written as a PNG into the
-/// plugin's data directory (`clipboard_image`). The clipboard can hold
-/// anything the user copied, so a plugin asks for it by name.
+/// Read the system clipboard, written as a file (an image as PNG, text
+/// as UTF-8) into the plugin's data directory (`clipboard_read`). The
+/// clipboard can hold anything the user copied, so a plugin asks for it
+/// by name.
 pub const CLIPBOARD: u32 = 1 << 24;
 
 /// Highest bit used above, for `describe`.

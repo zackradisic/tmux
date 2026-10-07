@@ -26,13 +26,14 @@
 #include "tmux.h"
 
 /*
- * The image on the system clipboard, as a PNG file: what a plugin needs
- * to show it (a terminal with kitty graphics reads the file itself) and
- * to send it somewhere with scp. A pasteboard is a GUI thing with no
- * portable interface; this is the macOS one, in plain C through the
- * Objective-C runtime, with AppKit loaded on first use so a server that
- * never asks never pays for it. Other platforms report -3 and a plugin
- * falls back to wl-paste or xclip.
+ * What is on the system clipboard, as a file: an image as PNG, else text
+ * as UTF-8. What a plugin needs to show it (a terminal with kitty
+ * graphics reads an image file itself) and to send it somewhere with
+ * scp. A pasteboard is a GUI thing with no portable interface; this is
+ * the macOS one, in plain C through the Objective-C runtime, with AppKit
+ * loaded on first use so a server that never asks never pays for it.
+ * Other platforms report -3 and a plugin falls back to wl-paste or
+ * xclip.
  */
 
 #ifdef __APPLE__
@@ -162,31 +163,71 @@ clipboard_write(const char *path, const void *bytes, size_t n)
 	return (0);
 }
 
+/* The text on the pasteboard as UTF-8 bytes. An autoreleased NSData. */
+static cb_id
+clipboard_text_data(void)
+{
+	cb_id	pb;
+
+	pb = MSG(cb_msg_t)(cb.getclass("NSPasteboard"),
+	    cb.sel("generalPasteboard"));
+	if (pb == NULL)
+		return (NULL);
+	return (MSG(cb_msg_id_t)(pb, cb.sel("dataForType:"),
+	    clipboard_nsstring("public.utf8-plain-text")));
+}
+
+/*
+ * Write the clipboard to base + ".png" (an image: *kind = 1, *w and *h
+ * its pixel size) or base + ".txt" (text: *kind = 2). An image wins when
+ * both are offered, as when an image is copied from a browser along
+ * with its alt text. 0 ok, -1 nothing usable on the clipboard, -2 an
+ * image that could not be read, -3 no clipboard on this platform, -4 the
+ * file could not be written. `base` must leave room for the suffix.
+ */
 int
-clipboard_image_png(const char *path, u_int *w, u_int *h, uint64_t *len)
+clipboard_to_file(const char *base, int *kind, u_int *w, u_int *h,
+    uint64_t *len)
 {
 	cb_id		 pool, data;
 	const void	*bytes;
 	unsigned long	 n;
+	char		 path[PATH_MAX];
 	int		 rc;
 
 	if (clipboard_init() < 0)
 		return (-3);
+	*kind = 0;
+	*w = *h = 0;
 
 	/* Everything below is autoreleased: a pool, or a few MB leak per call. */
 	pool = MSG(cb_msg_t)(cb.getclass("NSAutoreleasePool"), cb.sel("alloc"));
 	pool = MSG(cb_msg_t)(pool, cb.sel("init"));
 
 	data = clipboard_png_data();
-	if (data == NULL) {
-		rc = -1;
-		goto out;
-	}
-	bytes = MSG(cb_msg_ptr_t)(data, cb.sel("bytes"));
-	n = MSG(cb_msg_ul_t)(data, cb.sel("length"));
-	if (bytes == NULL || clipboard_png_size(bytes, n, w, h) != 0) {
-		rc = -2;
-		goto out;
+	if (data != NULL) {
+		bytes = MSG(cb_msg_ptr_t)(data, cb.sel("bytes"));
+		n = MSG(cb_msg_ul_t)(data, cb.sel("length"));
+		if (bytes == NULL || clipboard_png_size(bytes, n, w, h) != 0) {
+			rc = -2;
+			goto out;
+		}
+		*kind = 1;
+		snprintf(path, sizeof path, "%s.png", base);
+	} else {
+		data = clipboard_text_data();
+		if (data == NULL) {
+			rc = -1;
+			goto out;
+		}
+		bytes = MSG(cb_msg_ptr_t)(data, cb.sel("bytes"));
+		n = MSG(cb_msg_ul_t)(data, cb.sel("length"));
+		if (bytes == NULL || n == 0) {
+			rc = -1;
+			goto out;
+		}
+		*kind = 2;
+		snprintf(path, sizeof path, "%s.txt", base);
 	}
 	if (clipboard_write(path, bytes, n) != 0) {
 		rc = -4;
@@ -203,8 +244,8 @@ out:
 #else /* !__APPLE__ */
 
 int
-clipboard_image_png(__unused const char *path, __unused u_int *w,
-    __unused u_int *h, __unused uint64_t *len)
+clipboard_to_file(__unused const char *base, __unused int *kind,
+    __unused u_int *w, __unused u_int *h, __unused uint64_t *len)
 {
 	return (-3);
 }

@@ -984,17 +984,18 @@ plugin_vtable_pane_pid(u_int pane_id)
 }
 
 /*
- * Write the clipboard image to path as PNG; see clipboard_image_png for
- * the return codes.
+ * Write the clipboard to base + ".png" or base + ".txt"; see
+ * clipboard_to_file for the kinds and return codes.
  */
 int
-plugin_vtable_clipboard_image(const char *path, uint32_t *width,
-    uint32_t *height, uint64_t *len)
+plugin_vtable_clipboard_read(const char *base, int32_t *kind,
+    uint32_t *width, uint32_t *height, uint64_t *len)
 {
 	u_int	w = 0, h = 0;
-	int	rc;
+	int	k = 0, rc;
 
-	rc = clipboard_image_png(path, &w, &h, len);
+	rc = clipboard_to_file(base, &k, &w, &h, len);
+	*kind = k;
 	*width = w;
 	*height = h;
 	return (rc);

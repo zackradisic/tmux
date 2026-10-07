@@ -477,13 +477,14 @@ typedef struct {
    */
   int (*bridge_send)(uint32_t peer, const uint8_t *data, uintptr_t len);
   /**
-   * Write the image on the system clipboard to `path` as PNG and report
-   * its pixel size and byte count. 0 ok, -1 no image on the clipboard,
-   * -2 the image could not be read or converted, -3 no clipboard on this
-   * platform, -4 the file could not be written.
+   * Write what is on the system clipboard to `base` + ".png" (an image,
+   * `kind` 1, `width`/`height` its pixel size) or `base` + ".txt" (text as
+   * UTF-8, `kind` 2), and report the byte count. 0 ok, -1 nothing usable
+   * on the clipboard, -2 an image that could not be read or converted,
+   * -3 no clipboard on this platform, -4 the file could not be written.
    */
-  int (*clipboard_image)(const char *path, uint32_t *width, uint32_t *height,
-                         uint64_t *len);
+  int (*clipboard_read)(const char *base, int32_t *kind, uint32_t *width,
+                        uint32_t *height, uint64_t *len);
 } pgh_host_vtable;
 
 /**

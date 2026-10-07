@@ -14,14 +14,16 @@
 //! taking it and pressing Tab again steps into it. `C-t` swaps the two
 //! sides.
 //!
-//! **clipboard** - the image on the clipboard (`Image (2050x1426)`), a
-//! `to` host and a path. The host writes the image as a PNG into the
-//! plugin's data directory when the form opens (`clipboard_image`: the
+//! **clipboard** - what is on the clipboard (`Image (2050x1426)`, or
+//! `Text (1.2 KB)` with its first lines shown under the form), a `to`
+//! host and a path. The host writes it as a file - a PNG, or UTF-8 text -
+//! into the plugin's data directory when the form opens (`clipboard_read`: the
 //! macOS pasteboard read natively, a few milliseconds, nothing through
 //! the guest; elsewhere a script with wl-paste, xclip or osascript); it
 //! is previewed under the fields (see below), and on Enter moved to a
 //! local path or sent with `scp` to a
-//! host. A path ending in `/` gets `clipboard.png` appended.
+//! host. A path ending in `/` gets `clipboard.png` or `clipboard.txt`
+//! appended; the two kinds remember their paths separately.
 //!
 //! Enter runs `scp -r` (`-3` when both sides are hosts) in a popup on
 //! the pressing client, so scp's own progress shows; a copy that fails
@@ -109,6 +111,13 @@ const KIND_KEY: &str = "C-v";
 /// name a directory path gets.
 const DEFAULT_CLIP_PATH: &str = "/tmp/clipboard.png";
 const CLIP_NAME: &str = "clipboard.png";
+/// The same for text on the clipboard.
+const DEFAULT_CLIP_TEXT_PATH: &str = "/tmp/clipboard.txt";
+const CLIP_TEXT_NAME: &str = "clipboard.txt";
+/// Lines of clipboard text shown under the form, and how much of the
+/// file is read for them.
+const TEXT_PREVIEW_ROWS: usize = 8;
+const TEXT_PREVIEW_BYTES: usize = 16 * 1024;
 
 /// Remembered destinations, in the data directory.
 const STATE_FILE: &str = "scp.json";
@@ -157,6 +166,8 @@ struct Remembered {
     clip_to: Option<String>,
     #[serde(default)]
     clip_path: Option<String>,
+    #[serde(default)]
+    clip_text_path: Option<String>,
 }
 
 impl Remembered {
@@ -207,13 +218,36 @@ struct Clip {
     /// copy in `preview_name` is sent as data instead.
     local: bool,
     preview_name: Option<String>,
+    /// An image's pixel size; zero for text.
     width: u32,
     height: u32,
+    bytes: u64,
+    /// Text: its first lines, ready to draw under the form. `None` for
+    /// an image.
+    text: Option<Vec<String>>,
 }
 
 impl Clip {
     fn path(&self) -> String {
         format!("{}/{}", self.root, self.name)
+    }
+
+    fn is_text(&self) -> bool {
+        self.text.is_some()
+    }
+
+    /// The clipboard field's text: what is there, and how big.
+    fn label(&self) -> String {
+        if self.is_text() {
+            format!("Text ({})", human_bytes(self.bytes))
+        } else {
+            format!("Image ({}x{})", self.width, self.height)
+        }
+    }
+
+    /// The file name a directory destination gets.
+    fn default_name(&self) -> &'static str {
+        if self.is_text() { CLIP_TEXT_NAME } else { CLIP_NAME }
     }
 
     fn preview(&self) -> Option<String> {
@@ -224,9 +258,9 @@ impl Clip {
 #[derive(Clone, Debug)]
 enum ClipState {
     Probing,
-    /// No image, or no way to read it: why.
+    /// Nothing usable, or no way to read it: why.
     Missing(String),
-    Image(Clip),
+    Ready(Clip),
 }
 
 /// The preview as the terminal knows it, once transmitted.
@@ -362,7 +396,7 @@ impl Model for Copier {
         }
         match (self.kind, &self.clip) {
             (Kind::Clipboard, ClipState::Probing) => Some("reading the clipboard…".to_string()),
-            (Kind::Clipboard, ClipState::Image(_)) => {
+            (Kind::Clipboard, ClipState::Ready(_)) => {
                 match self.preview {
                     Some(p) if !p.sent => Some("preparing the preview…".to_string()),
                     _ => None,
@@ -377,15 +411,78 @@ impl Model for Copier {
     }
 
     fn footer_rows(&self, _fields: &[Field]) -> u32 {
-        match (self.kind, self.preview) {
-            (Kind::Clipboard, Some(p)) if p.sent => p.rows,
+        if self.kind != Kind::Clipboard {
+            return 0;
+        }
+        if let ClipState::Ready(Clip { text: Some(lines), .. }) = &self.clip {
+            return lines.len() as u32;
+        }
+        match self.preview {
+            Some(p) if p.sent => p.rows,
             _ => 0,
         }
     }
 
     fn footer(&self, _fields: &[Field], rows: u32) -> Vec<String> {
+        if let ClipState::Ready(Clip { text: Some(lines), .. }) = &self.clip {
+            return lines.iter().take(rows as usize).map(|l| format!("\x1b[2m{l}\x1b[0m")).collect();
+        }
         let Some(p) = self.preview.filter(|p| p.sent) else { return Vec::new() };
         (0..rows.min(p.rows)).map(|row| placeholder_row(p.id, row, p.cols)).collect()
+    }
+}
+
+/// `345 B`, `1.2 KB`, `3.4 MB`.
+fn human_bytes(n: u64) -> String {
+    if n < 1024 {
+        format!("{n} B")
+    } else if n < 1024 * 1024 {
+        format!("{:.1} KB", n as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", n as f64 / (1024.0 * 1024.0))
+    }
+}
+
+/// The first lines of clipboard text as the footer draws them: tabs
+/// widened, control characters dropped, each line clipped to the form.
+fn text_preview(head: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(head);
+    let width = (FORM_WIDTH - 4) as usize;
+    text.lines()
+        .take(TEXT_PREVIEW_ROWS)
+        .map(|l| {
+            let clean: String = l
+                .replace('\t', "    ")
+                .chars()
+                .filter(|c| !c.is_control())
+                .collect();
+            if clean.chars().count() > width {
+                let mut out: String = clean.chars().take(width.saturating_sub(1)).collect();
+                out.push('…');
+                out
+            } else {
+                clean
+            }
+        })
+        .collect()
+}
+
+/// The clipboard tab's path field takes the remembered path for what the
+/// clipboard turned out to hold, unless the user already typed one.
+fn prefill_clip_path(form: &mut Form<Copier>, text: bool) {
+    let want = if text {
+        form.model.remembered.clip_text_path.clone().unwrap_or_else(|| DEFAULT_CLIP_TEXT_PATH.to_string())
+    } else {
+        form.model.remembered.clip_path.clone().unwrap_or_else(|| DEFAULT_CLIP_PATH.to_string())
+    };
+    let fields = match form.model.kind {
+        Kind::Clipboard => &mut form.fields,
+        Kind::Files => &mut form.model.stash,
+    };
+    if let Some(f) = fields.get_mut(CLIP_PATH) {
+        if !f.touched {
+            f.value = want;
+        }
     }
 }
 
@@ -731,16 +828,31 @@ async fn probe_clipboard(state: State, mode: ModeId, auto_switch: bool) {
     let root = root.trim_end_matches('/').to_string();
     let stamp = now_ms();
     let t0 = stamp;
-    let found = match clipboard_image() {
-        Ok(Some(img)) => Ok(Clip {
+    let found = match clipboard_read() {
+        Ok(Some(Clipboard::Image { name, width, height, bytes })) => Ok(Clip {
             root: root.clone(),
-            name: img.name,
+            name,
             local: true,
             preview_name: None,
-            width: img.width,
-            height: img.height,
+            width,
+            height,
+            bytes,
+            text: None,
         }),
-        Ok(None) => Err("no image on the clipboard".to_string()),
+        Ok(Some(Clipboard::Text { name, bytes })) => {
+            let head = fs_read(&name, 0, TEXT_PREVIEW_BYTES).await.map(|(b, _)| b).unwrap_or_default();
+            Ok(Clip {
+                root: root.clone(),
+                name,
+                local: true,
+                preview_name: None,
+                width: 0,
+                height: 0,
+                bytes,
+                text: Some(text_preview(&head)),
+            })
+        }
+        Ok(None) => Err("nothing on the clipboard".to_string()),
         Err(e) if matches!(e.code, ErrorCode::Unsupported | ErrorCode::CapDenied) => {
             probe_by_script(&root).await
         }
@@ -759,16 +871,32 @@ async fn probe_clipboard(state: State, mode: ModeId, auto_switch: bool) {
         };
         match found {
             Ok(clip) => {
-                set_clip_label(form, format!("Image ({}x{})", clip.width, clip.height));
-                let (cols, rows) = preview_box(clip.width, clip.height, form.model.cell_aspect);
-                let id = ((stamp & 0x00ff_ffff) as u32).max(1);
-                form.model.preview = Some(Preview { id, cols, rows, sent: false });
-                form.model.clip = ClipState::Image(clip.clone());
-                if auto_switch && form.model.kind == Kind::Files {
+                set_clip_label(form, clip.label());
+                prefill_clip_path(form, clip.is_text());
+                let image = if clip.is_text() {
+                    None
+                } else {
+                    let (cols, rows) = preview_box(clip.width, clip.height, form.model.cell_aspect);
+                    let id = ((stamp & 0x00ff_ffff) as u32).max(1);
+                    form.model.preview = Some(Preview { id, cols, rows, sent: false });
+                    Some((id, cols, rows))
+                };
+                form.model.clip = ClipState::Ready(clip.clone());
+                // An image is worth switching for; text is always there.
+                if image.is_some() && auto_switch && form.model.kind == Kind::Files {
                     switch_kind(form);
                 }
                 form::render(form);
-                Some((clip, id, cols, rows))
+                match image {
+                    Some((id, cols, rows)) => Some((clip, id, cols, rows)),
+                    None => {
+                        log(&format!(
+                            "scp: clipboard text ({}) read in {read_ms} ms",
+                            human_bytes(clip.bytes)
+                        ));
+                        None
+                    }
+                }
             }
             Err(why) => {
                 set_clip_label(form, "none".to_string());
@@ -788,8 +916,11 @@ async fn probe_clipboard(state: State, mode: ModeId, auto_switch: bool) {
             clip.height,
             now_ms().saturating_sub(t1)
         ));
-    } else {
-        log(&format!("scp: clipboard probe took {read_ms} ms: no image"));
+    } else if !matches!(
+        state.borrow().as_ref().map(|f| &f.model.clip),
+        Some(ClipState::Ready(_))
+    ) {
+        log(&format!("scp: clipboard probe took {read_ms} ms: nothing usable"));
     }
 }
 
@@ -804,6 +935,8 @@ async fn probe_by_script(root: &str) -> Result<Clip, String> {
         preview_name: Some(format!("clip-{stamp}.preview.png")),
         width: 0,
         height: 0,
+        bytes: 0,
+        text: None,
     };
     // The JavaScript rides in the environment: no quoting of a quoted
     // script inside a quoted script.
@@ -984,7 +1117,7 @@ fn discard(form: &mut Form<Copier>, keep_files: bool) {
     if let Some(p) = form.model.preview.filter(|p| p.sent) {
         let _ = mode_write(form.mode, kitty_delete(p.id).as_bytes());
     }
-    if let ClipState::Image(clip) = &form.model.clip {
+    if let ClipState::Ready(clip) = &form.model.clip {
         if !keep_files {
             spawn(remove_clip(clip.clone()));
         }
@@ -1096,12 +1229,12 @@ async fn submit_files(state: State) {
     run_copy(state, mode, cmd, what).await;
 }
 
-/// The clipboard image's destination as a file path: a directory (a
-/// trailing `/`, or nothing) gets the default file name.
-fn clip_dest(path: &str) -> String {
+/// The clipboard's destination as a file path: a directory (a trailing
+/// `/`, or nothing) gets the default file name for what it holds.
+fn clip_dest(path: &str, name: &str) -> String {
     let path = path.trim();
     if path.is_empty() || path.ends_with('/') {
-        format!("{path}{CLIP_NAME}")
+        format!("{path}{name}")
     } else {
         path.to_string()
     }
@@ -1123,12 +1256,12 @@ async fn submit_clipboard(state: State) {
         let to = form.fields[CLIP_TO].value.trim().to_string();
         let path = form.fields[CLIP_PATH].value.trim().to_string();
         let clip = match &form.model.clip {
-            ClipState::Image(c) => Some(c.clone()),
+            ClipState::Ready(c) => Some(c.clone()),
             _ => None,
         };
         let err = match (&clip, &form.model.clip) {
             (None, ClipState::Probing) => Some("still reading the clipboard".to_string()),
-            (None, _) => Some("no image on the clipboard".to_string()),
+            (None, _) => Some("nothing on the clipboard to copy".to_string()),
             (Some(_), _) if is_local(&to) && path.is_empty() => {
                 Some("a destination path is required (a remote one may be empty: its home)".to_string())
             }
@@ -1141,7 +1274,7 @@ async fn submit_clipboard(state: State) {
         }
         let clip = clip.unwrap();
         let home = form.home.clone();
-        let dest = clip_dest(&path);
+        let dest = clip_dest(&path, clip.default_name());
         let local = is_local(&to);
         // The preview copy, when the fallback made one, goes with the copy.
         let extra = clip.preview().map(|p| format!(" {}", quote(&p))).unwrap_or_default();
@@ -1170,7 +1303,11 @@ async fn submit_clipboard(state: State) {
             )
         };
         form.model.remembered.clip_to = Some(if to.is_empty() { LOCAL.to_string() } else { to });
-        form.model.remembered.clip_path = Some(path);
+        if clip.is_text() {
+            form.model.remembered.clip_text_path = Some(path);
+        } else {
+            form.model.remembered.clip_path = Some(path);
+        }
         form.model.remembered.save();
         form.busy = true;
         form.error = None;
@@ -1312,7 +1449,7 @@ impl Plugin for Scp {
                     // Closed from outside (the window went): the files
                     // can still go; the terminal's image cannot.
                     if let Some(form) = st.as_ref() {
-                        if let ClipState::Image(clip) = &form.model.clip {
+                        if let ClipState::Ready(clip) = &form.model.clip {
                             spawn(remove_clip(clip.clone()));
                         }
                     }
@@ -1395,9 +1532,16 @@ mod tests {
 
     #[test]
     fn destinations() {
-        assert_eq!(clip_dest("/tmp/"), "/tmp/clipboard.png");
-        assert_eq!(clip_dest(""), "clipboard.png");
-        assert_eq!(clip_dest("/tmp/shot.png"), "/tmp/shot.png");
+        assert_eq!(clip_dest("/tmp/", CLIP_NAME), "/tmp/clipboard.png");
+        assert_eq!(clip_dest("", CLIP_TEXT_NAME), "clipboard.txt");
+        assert_eq!(clip_dest("/tmp/shot.png", CLIP_NAME), "/tmp/shot.png");
+        assert_eq!(human_bytes(345), "345 B");
+        assert_eq!(human_bytes(1234), "1.2 KB");
+        assert_eq!(human_bytes(3_600_000), "3.4 MB");
+        let lines = text_preview(b"a\tb\nsecond\x07 line\n\nfour\n");
+        assert_eq!(lines, vec!["a    b", "second line", "", "four"]);
+        let long = "x".repeat(200);
+        assert_eq!(text_preview(long.as_bytes())[0].chars().count(), (FORM_WIDTH - 4) as usize);
         assert_eq!(parent_dir("/tmp/shot.png"), "/tmp");
         assert_eq!(parent_dir("/shot.png"), "/");
         assert_eq!(parent_dir("shot.png"), ".");
