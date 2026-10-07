@@ -886,11 +886,24 @@ What to know:
   own binary** (`ocr-darwin.c`, Vision through the Objective-C runtime,
   no completion block). The plugin runs it as a job and finds the binary
   through `#{tmux_binary}`, so the `tmux` on PATH never matters. It is
-  not a host call because a run takes 350-450 ms on a screenshot and
-  the very first run on a Mac took 64 s here (model setup, once); the
-  server never waits either way. Esc during that minute abandons the
-  result rather than killing the job: a task cancel only discards the
-  completion.
+  not a host call because a run takes 350-450 ms on a screenshot when
+  the Neural Engine has the model, and the server never waits either
+  way. Esc during a slow run abandons the result rather than killing the
+  job: a task cancel only discards the completion.
+- **A run takes a minute whenever the compiled model is not cached, and
+  on a loaded machine that is every run.** `sample` shows the time in
+  the in-process ANE compiler (`Espresso::AOT::MILCompilerForANE`): the
+  recogniser's model is compiled for the Neural Engine, and the compiled
+  program lives only in `aned`'s memory (the user-level
+  `~/Library/Caches/com.apple.e5rt.e5bundlecache` never received one).
+  With swap at 9 GB of 10 it was evicted between every run; earlier the
+  same day, runs were 0.4 s each. No request setting avoids it (language
+  correction off, language detection off, the fast level: 33-66 s each).
+  A resident helper does not help either: after a compile-path first
+  request, the second request in the same process fails with
+  `CRImageReaderError error 1`, in a plain test program too, so the
+  one-shot process stays and the view says after three seconds that the
+  run may take a minute.
 - **Lines are rebuilt from boxes** (`ocr.rs`, `assemble`): boxes whose
   centres sit within half a text height are one row, joined with the gap
   between them as spaces (none when they touch: Vision cuts a word in
