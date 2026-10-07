@@ -89,14 +89,14 @@ keys g; keys g
 BACK=$(curline)
 [ "$BACK" = "$TOP" ] || fail "gg did not return to the top ($BOT -> $BACK, want $TOP)"
 
-# f folds the band the cursor is in: its rows go and the cursor lands on
-# the band header, which says how many it holds; f again unfolds it, and
+# z folds the band the cursor is in: its rows go and the cursor lands on
+# the band header, which says how many it holds; z again unfolds it, and
 # l goes back down to the first row.
-keys f
-[ -z "$(firstrow)" ] || fail "f did not fold the band: $(screen)"
+keys z
+[ -z "$(firstrow)" ] || fail "z did not fold the band: $(screen)"
 screen | grep -q 'working (3)' || fail "the folded band shows no count: $(screen)"
-keys f
-[ -n "$(firstrow)" ] || fail "f did not unfold the band: $(screen)"
+keys z
+[ -n "$(firstrow)" ] || fail "z did not unfold the band: $(screen)"
 keys l
 keys g; keys g
 

@@ -1276,7 +1276,7 @@ mod tests {
     #[test]
     fn levels_h_l_and_fold() {
         let mut e = engine();
-        e.keys = Engine::base_keys().with("fold", "f", "moving", "fold").with("fold_all", "Z", "moving", "fold all");
+        e.keys = Engine::base_keys().with("fold", "z", "moving", "fold").with("fold_all", "Z", "moving", "fold all");
         // j/k walk the cursor's level: from a session, the sessions.
         e.select_key("a/s1");
         e.handle_key("j", None);
@@ -1301,13 +1301,13 @@ mod tests {
         assert_eq!(e.selected_key().as_deref(), Some("a/s2/w1"));
         // f on a row folds the group it is in and lands on it; f again
         // unfolds, the cursor staying on the group.
-        assert_eq!(e.handle_key("f", None), Outcome::Expanded("a/s2".into(), false));
+        assert_eq!(e.handle_key("z", None), Outcome::Expanded("a/s2".into(), false));
         assert_eq!(e.selected_key().as_deref(), Some("a/s2"));
         assert!(!keys(&e).contains(&"a/s2/w1".to_string()));
-        assert_eq!(e.handle_key("f", None), Outcome::Expanded("a/s2".into(), true));
+        assert_eq!(e.handle_key("z", None), Outcome::Expanded("a/s2".into(), true));
         assert_eq!(e.selected_key().as_deref(), Some("a/s2"));
         // The toggle survives a refresh.
-        e.handle_key("f", None);
+        e.handle_key("z", None);
         e.set_nodes(tree());
         assert!(!e.is_expanded(e.node("a/s2").unwrap()));
     }
@@ -1432,12 +1432,12 @@ mod tests {
     #[test]
     fn headers_fold_too() {
         let mut e = engine();
-        e.keys = Engine::base_keys().with("fold", "f", "moving", "fold").with("fold_all", "Z", "moving", "fold all");
+        e.keys = Engine::base_keys().with("fold", "z", "moving", "fold").with("fold_all", "Z", "moving", "fold all");
         // h from a session reaches the server header; f folds it, the
         // cursor stays on it, and it shows how many rows it hides.
         e.select_key("a/s1");
         e.handle_key("h", None);
-        assert_eq!(e.handle_key("f", None), Outcome::Expanded("srv:alpha".into(), false));
+        assert_eq!(e.handle_key("z", None), Outcome::Expanded("srv:alpha".into(), false));
         assert_eq!(e.selected_key().as_deref(), Some("srv:alpha"));
         assert_eq!(keys(&e), vec!["srv:alpha", "srv:beta", "b/s1", "b/s1/w1"]);
         assert_eq!(e.descendants(0), 3);

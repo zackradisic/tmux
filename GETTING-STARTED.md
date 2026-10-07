@@ -395,7 +395,7 @@ opencode), grouped by state: **needs input / waiting / working / done**, with a
 live preview of the selected pane. `j`/`k` move, `Enter` jumps to the pane,
 `Space` opens an action menu on the selected row — every action, with the
 ones that do not apply to that row dimmed — and its items are the picker's
-own keys: `a` archives, `h` folds finished rows, `/` filters, `C-f` greps
+own keys: `a` archives, `.` shows finished rows, `z` folds a band, `/` filters, `C-f` greps
 live pane contents, `c` copies the agent's session id, `w` moves a row
 between "needs input" and "waiting" when the roster's guess is not yours.
 A row in the attention band shows *why* it wants you, in the harness's own

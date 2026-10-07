@@ -172,7 +172,7 @@ pub fn keys() -> KeyTable {
     Engine::base_keys()
         .with("kill", "x", "rows", "kill the session / window / pane (asks)")
         .with("rename", "r", "rows", "rename the session or window")
-        .with("zoom", "z", "rows", "zoom the pane")
+        .with("zoom", "m", "rows", "maximise (zoom) the pane")
         .with("new", "S", "rows", "new session here (session_creator)")
         .with("worktree", "W", "rows", "new worktree session here (session_creator)")
         .with("menu", "Space", "rows", "the action menu")
@@ -180,7 +180,7 @@ pub fn keys() -> KeyTable {
         .with("reconnect", "R", "links", "reconnect the link now")
         .with("allow", "a", "links", "allow a plugin asking to call back here")
         .with("deny", "D", "links", "deny it")
-        .with("fold", "f", "moving", "fold / unfold the group under the cursor")
+        .with("fold", "z", "moving", "fold / unfold the group under the cursor")
         .with("fold_all", "Z", "moving", "fold or unfold every group at this level")
         // `t` both ways: the agents picker's `t` lands here.
         .with("agents", "t", "picker", "the agents picker, on this row's pane")

@@ -1,6 +1,7 @@
 #!/bin/sh
 # The sessions chooser on one server: `pick w` shows sessions with their
-# windows, `h`/`l` fold and unfold, Enter switches the client, `r`
+# windows, `h`/`l` move between levels, `z` folds, Enter switches the
+# client, `r`
 # renames, `x` twice kills, `@sessions-filter` drops rows, and an
 # `@sessions-key-<K>` option runs a command against the highlighted row.
 #
@@ -82,14 +83,14 @@ screen | grep -q '1: editor' || fail "windows not shown in w mode"
 screen | grep -q '2 sessions' || fail "header does not count 2 sessions"
 currow | grep -q 'editor' || fail "cursor not on the current window: $(currow)"
 
-# h goes up a level, to the session; f folds the group under the cursor
-# and f again unfolds it, the cursor staying on it.
+# h goes up a level, to the session; z folds the group under the cursor
+# and z again unfolds it, the cursor staying on it.
 keys h
 currow | grep -q 'alpha' || fail "h did not go up to the session: $(currow)"
-keys f
-screen | grep -q '1: editor' && fail "f did not fold alpha"
-keys f
-screen | grep -q '1: editor' || fail "f did not unfold alpha"
+keys z
+screen | grep -q '1: editor' && fail "z did not fold alpha"
+keys z
+screen | grep -q '1: editor' || fail "z did not unfold alpha"
 # l goes down into the first window; j walks the windows; l again shows
 # the window's panes as rows and lands on the first.
 keys l
