@@ -2,7 +2,7 @@
 //!
 //! Press the hotkey (bind it to `plugin-command agents pick`) to open a
 //! floating chooser: one row per agent, grouped by state (needs input,
-//! waiting, working, done) and, inside each group, most recently active
+//! working, waiting, done) and, inside each group, most recently active
 //! first. A live preview of the highlighted pane sits to the right.
 //! `j`/`k` move, `gg`/`G` jump to the ends, Enter jumps to the pane, `a`
 //! archives, `.` folds in the finished ones. `q` or Esc closes the picker.

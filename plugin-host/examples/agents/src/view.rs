@@ -2573,25 +2573,25 @@ fn archive_after(p: &Picker) -> PickAfter {
 
 /// The band an agent belongs to, lowest first. `needs_input` sits at the
 /// top (a human is blocking it), then the ones still in a turn, then the
-/// finished ones.
+/// ones that stopped and wait for a reply, then the finished ones.
 fn band(a: &Agent) -> u8 {
     if !a.live() {
         return 3; // done / history
     }
     match a.status.as_str() {
         "needs_input" => 0,
-        "waiting" => 1,
-        "working" => 2,
+        "working" => 1,
+        "waiting" => 2,
         "done" => 3,
-        _ => 2,
+        _ => 1,
     }
 }
 
 fn band_label(b: u8) -> &'static str {
     match b {
         0 => "needs input",
-        1 => "waiting",
-        2 => "working",
+        1 => "working",
+        2 => "waiting",
         _ => "done",
     }
 }

@@ -41,7 +41,7 @@ Everything here is quick and dirty on purpose. The real references are
 **The plugins that ship with it**
 
 - **agents** (`prefix + A`) — every coding-agent session you have running,
-  grouped by *needs input / waiting / working / done*, with a live pane
+  grouped by *needs input / working / waiting / done*, with a live pane
   preview. Jump to one, archive it, filter, or grep live pane contents. Works
   across linked machines, and you can message an agent by id. *Tested mostly
   with Claude Code.*
@@ -391,7 +391,7 @@ Also: `unload-plugin`, `enable-plugin` / `disable-plugin`.
 
 ### agents — `prefix + A`
 Roster of coding-agent CLI sessions running in your panes (claude, codex, pi,
-opencode), grouped by state: **needs input / waiting / working / done**, with a
+opencode), grouped by state: **needs input / working / waiting / done**, with a
 live preview of the selected pane. `j`/`k` move, `Enter` jumps to the pane,
 `Space` opens an action menu on the selected row — every action, with the
 ones that do not apply to that row dimmed — and its items are the picker's
