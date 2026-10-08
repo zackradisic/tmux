@@ -21,6 +21,9 @@ pub const ST_MAGENTA: u16 = 512;
 pub const ST_INVERT: u16 = 1024;
 /// The bright ANSI variant of the colour.
 pub const ST_BRIGHT: u16 = 2048;
+/// Orange (256-colour 208): between green and red, for "busy, but
+/// not by itself".
+pub const ST_ORANGE: u16 = 4096;
 
 /// One cell of a rendered line: a character and its style bits.
 pub type Styled = (char, u16);
@@ -472,6 +475,8 @@ pub fn emit_cells(line: &[Styled], current: bool) -> String {
                 out.push_str(if bright { ";92" } else { ";32" });
             } else if st & ST_MAGENTA != 0 {
                 out.push_str(if bright { ";95" } else { ";35" });
+            } else if st & ST_ORANGE != 0 {
+                out.push_str(if bright { ";38;5;214" } else { ";38;5;208" });
             }
             out.push('m');
             cur = Some(st);

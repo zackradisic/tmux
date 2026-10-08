@@ -14,7 +14,7 @@ use listkit::engine::Outcome;
 use listkit::keys::KeyTable;
 use listkit::lines::{clamp_dim, default_size, SizeBox};
 use listkit::remotes::{spin_since, FETCH_STUCK_MS, SPIN_FRAMES, SPIN_MS};
-use listkit::styled::{plain_cells, Styled, ST_BOLD, ST_CODE, ST_CYAN, ST_DIM, ST_RED};
+use listkit::styled::{plain_cells, Styled, ST_BOLD, ST_CODE, ST_CYAN, ST_DIM, ST_ORANGE, ST_RED};
 use listkit::text::{clip, fmt_age, menu_item, menu_safe, tilde_of};
 use listkit::{Engine, Node, Preview, SigilSpec};
 use serde::Deserialize;
@@ -51,6 +51,7 @@ struct AgentSnap {
 struct AgentRow {
     pane: Option<i64>,
     status: String,
+    shell: bool,
     ended_ms: Option<i64>,
     life: String,
     name: Option<String>,
@@ -63,6 +64,8 @@ struct AgentRow {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentInfo {
     pub status: String,
+    /// Working only because a background shell still runs (orange).
+    pub shell: bool,
     /// The name the agents picker shows: the user's, or the harness's,
     /// whichever was set last.
     pub name: String,
@@ -194,7 +197,7 @@ pub fn sigils() -> Vec<SigilSpec> {
         SigilSpec::new('#', "session", false, Some("s"), "narrow to a session (prefix)"),
         SigilSpec::new(':', "command", false, Some("c"), "narrow to a command (prefix)"),
         SigilSpec::new('~', "dir", true, None, "narrow to a directory (part of its ~ path)"),
-        SigilSpec::new('!', "status", false, None, "narrow to an agent status: working, waiting, needs_input"),
+        SigilSpec::new('!', "status", false, None, "narrow to an agent status: working, shell, waiting, needs_input"),
     ]
 }
 
@@ -419,7 +422,7 @@ pub async fn fetch_agents(picker: Rc<RefCell<Option<Picker>>>, remotes: Rc<RefCe
             if a.ended_ms.is_some() || a.life == "archived" {
                 continue;
             }
-            let info = AgentInfo { status: a.status.clone(), name: a.display_name() };
+            let info = AgentInfo { status: a.status.clone(), shell: a.shell, name: a.display_name() };
             map.insert((server.clone(), pane as u32), info);
         }
     }
@@ -436,10 +439,14 @@ pub async fn fetch_agents(picker: Rc<RefCell<Option<Picker>>>, remotes: Rc<RefCe
 // the tree as nodes
 // ---------------------------------------------------------------------------
 
+/// Worst first. `shell` is the agents picker's working-with-a-flag: the
+/// turn ended but a background shell still runs, so it ranks under a
+/// turn in progress and over an agent that waits on the user.
 fn status_rank(s: &str) -> u8 {
     match s {
-        "needs_input" => 3,
-        "working" => 2,
+        "needs_input" => 4,
+        "working" => 3,
+        "shell" => 2,
         "waiting" => 1,
         _ => 0,
     }
@@ -449,6 +456,7 @@ fn badge(status: Option<&str>) -> Vec<Styled> {
     match status {
         Some("needs_input") => vec![('◉', ST_BOLD | ST_CODE), (' ', 0)],
         Some("working") => vec![('●', ST_CYAN), (' ', 0)],
+        Some("shell") => vec![('●', ST_ORANGE), (' ', 0)],
         Some("waiting") => vec![('◍', ST_DIM), (' ', 0)],
         _ => Vec::new(),
     }
@@ -466,7 +474,7 @@ fn pane_agent<'a>(p: &'a Picker, server: &str, pn: &Pn) -> Option<&'a AgentInfo>
 }
 
 fn pane_status<'a>(p: &'a Picker, server: &str, pn: &Pn) -> Option<&'a str> {
-    pane_agent(p, server, pn).map(|a| a.status.as_str())
+    pane_agent(p, server, pn).map(|a| if a.shell { "shell" } else { a.status.as_str() })
 }
 
 /// The agent's name for a row: a pane's own agent, or the one agent of a

@@ -2696,7 +2696,7 @@ fn unadorned(s: &str) -> &str {
 
 fn haystack(a: &Agent) -> String {
     format!(
-        "{} {} {} {} {} {} {} {} {} {} {}",
+        "{} {} {} {} {} {} {} {} {} {} {} {}",
         a.id,
         display_name(a),
         a.kind,
@@ -2708,6 +2708,7 @@ fn haystack(a: &Agent) -> String {
         a.note.as_deref().unwrap_or(""),
         a.reason.as_deref().unwrap_or(""),
         if a.is_local() { "" } else { a.server.as_str() },
+        if a.shell { "shell" } else { "" },
     )
 }
 
@@ -2952,8 +2953,10 @@ fn server_node(p: &Picker, server: &str) -> Node {
     n
 }
 
-/// The badge: the agent's state as one coloured glyph. Magenta for an
-/// archived agent, dim for a finished one; an unread stopped agent gets
+/// The badge: the agent's state as one coloured glyph. Green while in a
+/// turn, orange when the turn ended but a background shell it started
+/// still runs (its exit starts the next turn, so no one is waited on).
+/// Magenta for an archived agent, dim for a finished one; an unread stopped agent gets
 /// a block behind its glyph, the one coloured background in the list,
 /// so it cannot be missed at a glance.
 fn badge_cells(a: &Agent) -> Styled {
@@ -2966,6 +2969,7 @@ fn badge_cells(a: &Agent) -> Styled {
     match a.status.as_str() {
         "needs_input" if a.unread() => ('!', ST_HIT),
         "needs_input" => ('!', ST_BOLD | ST_CODE),
+        "working" if a.shell => ('●', ST_ORANGE),
         "working" => ('●', ST_GREEN),
         "waiting" if a.unread() => ('◉', ST_BOLD | ST_CYAN | ST_BRIGHT | ST_INVERT),
         "waiting" => ('◍', ST_CYAN),
@@ -3436,6 +3440,9 @@ fn info_lines(p: &Picker, a: &Agent, pw: usize) -> Vec<Vec<Styled>> {
         )
     };
     rows.push(("where", where_));
+    if a.shell {
+        rows.push(("state", "turn ended, a background shell still runs".into()));
+    }
     let cwd = card.and_then(|c| c.live_cwd.clone()).or_else(|| a.cwd.clone());
     rows.push(("cwd", cwd.as_deref().map(tilde).unwrap_or_else(|| "unknown".into())));
     let mut branch = a.git_branch.clone().unwrap_or_else(|| "unknown".into());

@@ -524,6 +524,9 @@ async fn apply(a: &mut Agent, mut r: Resolved) {
     if let Some(v) = status {
         a.status = v;
     }
+    if let Some(sh) = r.shell {
+        a.shell = sh && a.status == "working";
+    }
     if r.started_ms.is_some() {
         a.started_ms = r.started_ms;
     }

@@ -277,6 +277,11 @@ pub struct Agent {
     pub git_branch: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
+    /// Working only because a background shell is still running: the
+    /// turn ended and the shell's exit starts the next one. Learned from
+    /// the session file on every render, never stored.
+    #[serde(default)]
+    pub shell: bool,
 }
 
 fn default_server() -> String {
@@ -372,6 +377,7 @@ fn agents_from(rows: &Rows) -> Vec<Agent> {
             cwd: s(row.get_named("cwd")),
             git_branch: s(row.get_named("git_branch")),
             model: s(row.get_named("model")),
+            shell: false,
         })
         .collect()
 }

@@ -30,6 +30,10 @@ pub struct Resolved {
     pub real_id: Option<String>,
     pub name: Option<String>,
     pub status: Option<String>,
+    /// Is the harness between turns only because a background shell it
+    /// started is still running? `Some(false)` says the file knows and
+    /// it is not; `None` that the harness has no such state.
+    pub shell: Option<bool>,
     pub started_ms: Option<i64>,
     pub last_active_ms: Option<i64>,
     pub source_path: Option<String>,
@@ -165,10 +169,15 @@ fn parse_claude(
         (Some(sid), Some(cwd)) => Some(crate::transcript::claude_transcript_path(home, cwd, sid)),
         _ => None,
     };
-    let status = match v.get("status").and_then(|x| x.as_str()) {
-        Some("busy") => Some("working".to_string()),
-        Some("idle") => Some("waiting".to_string()),
-        _ => None,
+    // `shell` (2.1.29x): the turn ended but a background shell the agent
+    // started is still running, and its exit starts the next turn. The
+    // agent is not waiting on the user, so it stays `working`, flagged
+    // so the row can say why.
+    let (status, shell) = match v.get("status").and_then(|x| x.as_str()) {
+        Some("busy") => (Some("working".to_string()), Some(false)),
+        Some("shell") => (Some("working".to_string()), Some(true)),
+        Some("idle") => (Some("waiting".to_string()), Some(false)),
+        _ => (None, None),
     };
     Some((
         pane,
@@ -178,6 +187,7 @@ fn parse_claude(
             real_id: sid.map(|s| format!("claude:{s}")),
             name: v.get("name").and_then(|x| x.as_str()).map(str::to_string),
             status,
+            shell,
             started_ms: v.get("startedAt").and_then(|x| x.as_i64()),
             last_active_ms: v.get("updatedAt").and_then(|x| x.as_i64()),
             source_path: Some(path.to_string()),

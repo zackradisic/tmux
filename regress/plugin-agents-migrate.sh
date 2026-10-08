@@ -146,5 +146,22 @@ open_picker
 [ "$(q "SELECT status FROM agents WHERE ended_ms IS NULL")" = waiting ] ||
 	fail "a fresher idle did not move the row out of needs_input"
 
+# `shell`: the turn ended but a background shell the agent started still
+# runs, and its exit starts the next turn. Not waiting on the user, so
+# the row is working, in that band, with the shell state on its card.
+write_session_file shell "$((now + 1200000))"
+open_picker
+[ "$(q "SELECT status FROM agents WHERE ended_ms IS NULL")" = working ] ||
+	fail "the file's shell state did not make the row working: $(q "SELECT status FROM agents WHERE ended_ms IS NULL")"
+screen | grep -q 'working' || fail "the row is not in the working band"
+$TMUX send-keys -t "$FORM" i; sleep 1.0
+screen | grep -q 'background shell still runs' || fail "the info card does not say a shell runs"
+$TMUX send-keys -t "$FORM" Escape; sleep 0.3
+# The shell is done and the agent idle again: back to waiting.
+write_session_file idle "$((now + 1800000))"
+open_picker
+[ "$(q "SELECT status FROM agents WHERE ended_ms IS NULL")" = waiting ] ||
+	fail "idle after shell did not return the row to waiting"
+
 cleanup
 exit 0
