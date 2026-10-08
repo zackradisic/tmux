@@ -279,7 +279,7 @@ pub struct Agent {
     pub model: Option<String>,
     /// Working only because a background shell is still running: the
     /// turn ended and the shell's exit starts the next one. Learned from
-    /// the session file on every render, never stored.
+    /// the session file; kept in the `shell_ids` setting, not a column.
     #[serde(default)]
     pub shell: bool,
 }
@@ -822,7 +822,43 @@ pub async fn live_agents() -> Result<Vec<Agent>, HostError> {
         params![],
     )
     .await?;
-    Ok(agents_from(&rows))
+    let mut agents = agents_from(&rows);
+    let parked = shell_ids().await;
+    for a in &mut agents {
+        a.shell = parked.contains(&a.id);
+    }
+    Ok(agents)
+}
+
+/// The setting that holds the ids of the agents parked on a background
+/// shell (see [`Agent::shell`]). A setting, not a column: every reader
+/// of the roster must agree on the flag or a row blinks between the
+/// event path (store only) and the timer (store + session files), and
+/// a column would bump the schema, which an older plugin a `tmux2
+/// update` reverts to then refuses to open.
+const SHELL_IDS: &str = "shell_ids";
+
+async fn shell_ids() -> std::collections::HashSet<String> {
+    get_setting(SHELL_IDS)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
+}
+
+/// Record whether an agent is parked on a background shell. Written only
+/// on a change, so the enrich pass costs one read per render.
+pub async fn set_shell(id: &str, on: bool) {
+    let mut ids = shell_ids().await;
+    let changed = if on { ids.insert(id.to_string()) } else { ids.remove(id) };
+    if changed {
+        let mut v: Vec<String> = ids.into_iter().collect();
+        v.sort();
+        let _ = set_setting(SHELL_IDS, &serde_json::to_string(&v).unwrap_or_default()).await;
+    }
 }
 
 /// Every agent whose pane is still meant to exist, archived or not: the

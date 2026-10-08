@@ -525,7 +525,11 @@ async fn apply(a: &mut Agent, mut r: Resolved) {
         a.status = v;
     }
     if let Some(sh) = r.shell {
-        a.shell = sh && a.status == "working";
+        let sh = sh && a.status == "working";
+        if a.shell != sh {
+            store::set_shell(&a.id, sh).await;
+            a.shell = sh;
+        }
     }
     if r.started_ms.is_some() {
         a.started_ms = r.started_ms;

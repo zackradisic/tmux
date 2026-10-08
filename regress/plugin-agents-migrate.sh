@@ -154,6 +154,11 @@ open_picker
 [ "$(q "SELECT status FROM agents WHERE ended_ms IS NULL")" = working ] ||
 	fail "the file's shell state did not make the row working: $(q "SELECT status FROM agents WHERE ended_ms IS NULL")"
 screen | grep -q 'working' || fail "the row is not in the working band"
+# The flag is kept in the store, so an event-driven reload (store only,
+# no session files) agrees with the timer and the dot does not blink.
+shell_ids() { q "SELECT value FROM settings WHERE key = 'shell_ids'"; }
+[ "$(shell_ids)" = "[\"claude:$SID\"]" ] ||
+	fail "shell_ids setting does not hold the agent: $(shell_ids)"
 $TMUX send-keys -t "$FORM" i; sleep 1.0
 screen | grep -q 'background shell still runs' || fail "the info card does not say a shell runs"
 $TMUX send-keys -t "$FORM" Escape; sleep 0.3
@@ -162,6 +167,7 @@ write_session_file idle "$((now + 1800000))"
 open_picker
 [ "$(q "SELECT status FROM agents WHERE ended_ms IS NULL")" = waiting ] ||
 	fail "idle after shell did not return the row to waiting"
+[ "$(shell_ids)" = "[]" ] || fail "shell_ids was not cleared: $(shell_ids)"
 
 cleanup
 exit 0
