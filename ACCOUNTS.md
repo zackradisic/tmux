@@ -113,6 +113,24 @@ pane's environment and looks for the session file (and the transcript)
 under it instead of `~/.claude`; its sidecar allows that variable and the
 profiles directory.
 
+## Adding a login: `+`
+
+`+` (or `plugin-command accounts login [server]`) makes a profile with no
+credential in it (`profiles/login-<n>/`, seeded like the others) and
+opens a claude under it in a popup on the pressing client (a window on a
+remote, or with no client). That claude has no login, so it asks for one;
+the machine's own login is never replaced, and every other claude keeps
+running as it was. The provider watches the profile for twenty minutes
+(every two seconds: the hashed Keychain item on a Mac, the file
+elsewhere) and stores what lands as a slot, with the identity claude
+writes into the profile's config, or from the profile endpoint when that
+is missing. A status line says which slot. The popup can then be left
+with `/exit`, or kept: it is a claude running as the new account. The
+`claude` config key names what the popup runs (a test stands `sleep` in).
+
+`a` is the other way in: it stores whatever the machine is logged in as,
+for a login made with `/login` the usual way.
+
 ## Across a link
 
 The panel calls `list`, `switch`, `best`, `add`, `profile`, ... on
@@ -139,7 +157,8 @@ pushed copy without the shell says so in its block.
 opens it for the row's server. One block per server: the local one, then
 each linked server that is up. The cursor walks the slots; `Enter`
 switches (asks), `b` best pick (the slot with the most room before its
-binding window, asks), `a` adds the server's login, `n` starts a claude as
+binding window, asks), `+` logs in to another account, `a` adds the
+server's login, `n` starts a claude as
 the slot, `r` refetches, `d` holds a slot out of best pick, `x` removes
 (asks), `i` imports cswap's accounts from the Keychain, `c` compact rows,
 `?` help. A mode takes keys only from an attached client, which is why

@@ -531,7 +531,6 @@ pub fn slug(email: &str) -> String {
         .collect()
 }
 
-#[allow(dead_code)]
 /// The Keychain service claude derives for a `CLAUDE_CONFIG_DIR` value:
 /// the first 8 hex of the sha256 of the exact string exported.
 pub fn profile_keychain_service(config_dir: &str) -> String {
@@ -562,8 +561,33 @@ pub async fn ensure_profile(
     oauth_account: &Value,
 ) -> Result<String, String> {
     let dir = format!("{}/{slot}-{}", p.profiles_dir(), slug(email));
+    make_profile(p, &dir, Some(creds), Some(oauth_account)).await?;
+    Ok(dir)
+}
+
+/// A profile with no login in it: a claude started there asks for one,
+/// and the machine's own login is never touched. `watch_login` in the
+/// provider captures what lands. The name is unique per call.
+pub async fn login_profile(p: &Platform) -> Result<String, String> {
+    let dir = format!("{}/login-{}", p.profiles_dir(), nonce());
+    make_profile(p, &dir, None, None).await?;
+    Ok(dir)
+}
+
+/// Make or refresh a profile directory: the credential (only when the
+/// profile has none yet; a live claude there owns its own copy), the
+/// config seed, the shared symlinks.
+async fn make_profile(
+    p: &Platform,
+    dir: &str,
+    creds: Option<&str>,
+    oauth_account: Option<&Value>,
+) -> Result<(), String> {
     let n = nonce();
-    let creds_file = stage(p, &format!("prof-creds-{n}.json"), creds).await?;
+    let creds_file = match creds {
+        Some(c) => Some(stage(p, &format!("prof-creds-{n}.json"), c).await?),
+        None => None,
+    };
     // The config seed: identity plus the two keys that keep onboarding
     // from showing (`theme`, `hasCompletedOnboarding`). Merged into an
     // existing profile config so its own projects and history stay.
@@ -574,7 +598,9 @@ pub async fn ensure_profile(
         .and_then(|t| serde_json::from_str::<Value>(&t).ok())
         .unwrap_or_else(|| Value::Object(Map::new()));
     let mut cfg = existing.as_object().cloned().unwrap_or_default();
-    cfg.insert("oauthAccount".into(), oauth_account.clone());
+    if let Some(oa) = oauth_account {
+        cfg.insert("oauthAccount".into(), oa.clone());
+    }
     cfg.insert("hasCompletedOnboarding".into(), Value::Bool(true));
     // From the machine's own config: the theme, the MCP servers, and
     // the per-project entries (folder trust above all: without it the
@@ -613,30 +639,37 @@ pub async fn ensure_profile(
             dst = sq(&format!("{dir}/{item}"))
         ));
     }
+    let seed_creds = match &creds_file {
+        Some(f) => format!(
+            "if [ ! -f \"$d/.credentials.json\" ]; then cp {} \"$d/.credentials.json\"; fi",
+            sq(&f.abs)
+        ),
+        None => String::new(),
+    };
     let script = format!(
         "umask 077
 d={dir}
 mkdir -p \"$d\" && chmod 700 \"$d\"
-if [ ! -f \"$d/.credentials.json\" ]; then cp {creds} \"$d/.credentials.json\"; fi
+{seed_creds}
 cp {cfg} \"$d/.claude.json.tmp\" && mv -f \"$d/.claude.json.tmp\" \"$d/.claude.json\"
 {links}
 echo DONE
 ",
-        dir = sq(&dir),
-        creds = sq(&creds_file.abs),
+        dir = sq(dir),
         cfg = sq(&cfg_file.abs),
     );
     let out = run_job(&script, None).await;
-    unstage(&creds_file).await;
+    if let Some(f) = &creds_file {
+        unstage(f).await;
+    }
     unstage(&cfg_file).await;
     let out = out.map_err(|e| e.message.clone())?;
     if !out.output.contains("DONE") {
         return Err(format!("profile {dir}: {}", out.output.trim()));
     }
-    Ok(dir)
+    Ok(())
 }
 
-#[allow(dead_code)]
 /// The credential a profile's claude holds now: its hashed Keychain item
 /// on a Mac (claude migrates the seed there on first write), else the
 /// profile's file.

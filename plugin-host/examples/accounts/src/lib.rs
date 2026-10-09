@@ -17,6 +17,9 @@
 //!   list                   one status line: slot, email, the binding window
 //!   status                 the login here
 //!   add [slot] [alias]     store the login here as a slot (or refresh its slot)
+//!   login                  a claude in a popup under an empty profile, to log
+//!                          in to another account; the login is stored as a
+//!                          slot when it lands (the machine's is untouched)
 //!   switch <slot|email|alias>
 //!   best                   switch to the slot with the most room
 //!   refresh                fetch every slot's usage now
@@ -74,6 +77,17 @@ struct AccountsConfig {
     home: Option<String>,
     credentials: Option<String>,
     keychain_service: Option<String>,
+    /// What a login window runs (default `claude`); a test stands
+    /// something harmless in.
+    claude: Option<String>,
+}
+
+thread_local! {
+    static LOGIN_COMMAND: RefCell<String> = RefCell::new("claude".into());
+}
+
+pub(crate) fn login_command() -> String {
+    LOGIN_COMMAND.with(|c| c.borrow().clone())
 }
 
 struct Accounts {
@@ -87,6 +101,9 @@ impl Plugin for Accounts {
 
     fn init(ctx: &Ctx, config: Self::Config) -> Result<Self, String> {
         let role = ctx.role();
+        if let Some(c) = config.claude.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+            LOGIN_COMMAND.with(|l| *l.borrow_mut() = c.to_string());
+        }
         claude::set_overrides(claude::Overrides {
             home: config.home.clone().filter(|h| !h.is_empty()),
             file_only: config.credentials.as_deref() == Some("file"),
@@ -183,6 +200,15 @@ impl Accounts {
         let client = event.scope.client.map(u64::from);
         let here = event.scope.pane;
         match verb.as_str() {
+            "login" => {
+                if !self.role.views() {
+                    let _ = display_message("accounts: a provider has no screen to log in on");
+                    return;
+                }
+                let server = args.first().cloned().unwrap_or_else(|| view::LOCAL.to_string());
+                let client = client.or_else(view::any_client);
+                ctx.spawn(view::start_login(server, client));
+            }
             "pick" => {
                 if !self.role.views() {
                     let _ = display_message("accounts: a provider has no panel");
@@ -196,7 +222,7 @@ impl Accounts {
             }
             "" | "help" => {
                 let _ = display_message(
-                    "accounts: pick | list | status | add | switch <slot> | best | refresh | remove | disable | enable | alias | profile | import",
+                    "accounts: pick | login | list | status | add | switch <slot> | best | refresh | remove | disable | enable | alias | profile | import",
                 );
             }
             _ => {

@@ -54,8 +54,8 @@ $TMUX set -s remote-ssh-command \
 # its own fake home.
 XDG_DATA_HOME="$XDG_B" $TMUX2 load-plugin -s server $CAPS -o home="$HOME_B" -o credentials=file "$WASM" ||
     fail "load-plugin on B"
-XDG_DATA_HOME="$XDG_A" $TMUX load-plugin -s server $CAPS -o home="$HOME_A" -o credentials=file "$WASM" ||
-    fail "load-plugin on A"
+XDG_DATA_HOME="$XDG_A" $TMUX load-plugin -s server $CAPS -o home="$HOME_A" -o credentials=file \
+    -o claude="sleep 120" "$WASM" || fail "load-plugin on A"
 
 LOG="$TMUX plugin-log -n 200 accounts"
 AOPT="$TMUX show-options -s -v"
@@ -114,6 +114,28 @@ $TMUX plugin-command accounts "switch 1" || fail "switch 1 under lock"
 wait_for 20 "$LOG | grep -q 'switch: .*lock is held'" || fail "live lock: $($LOG | tail -3)"
 grep -q '"accessToken":"at-2"' "$HOME_A/.claude/.credentials.json" || fail "switched under a live lock"
 rmdir "$HOME_A/.claude/.oauth_refresh.lock"
+
+# --- a login window ----------------------------------------------------------
+
+# `login` opens a claude (here: sleep) under a profile with no credential
+# and watches it; a login landing there becomes a slot, and the machine's
+# own login is untouched.
+$TMUX plugin-command accounts login || fail "login"
+wait_for 6 "$LOG | grep -q 'login profile '" || fail "no login profile: $($LOG | tail -3)"
+PROF=$($LOG | grep 'login profile ' | tail -1 | sed 's/.*login profile //')
+[ -d "$PROF" ] || fail "profile $PROF not made"
+wait_for 6 "$TMUX list-windows -F '#{window_name}' | grep -q '^login$'" || fail "no login window"
+grep -q '"hasCompletedOnboarding": true' "$PROF/.claude.json" || fail "profile config not seeded"
+[ -f "$PROF/.credentials.json" ] && fail "a login profile must start without a credential"
+far=$(( $(date +%s) * 1000 + 86400000 ))
+cat > "$PROF/.credentials.json" <<JSON
+{"claudeAiOauth":{"accessToken":"at-3","refreshToken":"rt-3","expiresAt":$far,"scopes":["user:inference"]}}
+JSON
+sed -i.bak 's/"hasCompletedOnboarding": true/"hasCompletedOnboarding": true, "oauthAccount": {"accountUuid":"uuid-3","emailAddress":"three@example.com","organizationUuid":"org-3","organizationName":"Org Three"}/' "$PROF/.claude.json"
+wait_for 15 "$LOG | grep -q 'login: added slot 3: three@example.com'" || fail "login not captured: $($LOG | tail -3)"
+grep -q '"accessToken":"at-2"' "$HOME_A/.claude/.credentials.json" || fail "the machine login changed on a login window"
+sqlite3 "$XDG_A/tmux/plugins/accounts/store.db" "select email from accounts where slot = 3" |
+    grep -q 'three@example.com' || fail "slot 3 not stored"
 
 # --- over a link ------------------------------------------------------------
 

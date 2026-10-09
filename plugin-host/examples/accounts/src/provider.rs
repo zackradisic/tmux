@@ -450,28 +450,48 @@ pub async fn best() -> Reply {
 /// that already holds it).
 pub async fn add(req: &AddReq) -> Reply {
     let p = claude::platform().await;
-    let now = now_ms() as i64;
     let accounts = store::all().await.unwrap_or_default();
     let lv = live(&p, &accounts).await;
     let Some(creds) = lv.creds.clone() else {
-        return Reply::err("no login here: run claude and log in, then add");
+        return Reply::err("no login here: run claude and log in, then add (or + for a login window)");
     };
-    if claude::refresh_token(&creds).is_none() {
-        return Reply::err("the login here has no refresh token (an API key?); only OAuth logins can be stored");
+    let oauth_account = lv.oauth_account.clone().map(|v| v.to_string()).unwrap_or_default();
+    let r = add_login(&p, creds, lv.identity.clone(), oauth_account, req.slot, &req.alias).await;
+    if r.ok {
+        if let Some(slot) = r.slot {
+            let _ = store::set_setting("active", &slot.to_string()).await;
+        }
     }
-    // Identity from the config; when it lacks one, ask the API.
-    let mut identity = lv.identity.clone();
+    r
+}
+
+/// Store a credential as a slot: the machine's login (`add`) or one that
+/// landed in a login profile (`watch_login`). The identity comes with it
+/// when the config had one, else from the API.
+async fn add_login(
+    p: &Platform,
+    creds: String,
+    identity: Option<Identity>,
+    oauth_account: String,
+    slot: Option<i64>,
+    alias: &str,
+) -> Reply {
+    let now = now_ms() as i64;
+    let accounts = store::all().await.unwrap_or_default();
+    if claude::refresh_token(&creds).is_none() {
+        return Reply::err("the login has no refresh token (an API key?); only OAuth logins can be stored");
+    }
+    let mut identity = identity;
     if identity.is_none() {
         if let Some(tok) = claude::access_token(&creds) {
-            identity = oauth::fetch_profile(&p, &tok).await;
+            identity = oauth::fetch_profile(p, &tok).await;
         }
     }
     let Some(id) = identity else {
-        return Reply::err("cannot tell whose login this is (no oauthAccount in ~/.claude.json)");
+        return Reply::err("cannot tell whose login this is (no oauthAccount, and the profile endpoint did not say)");
     };
-    let oauth_account = lv.oauth_account.clone().map(|v| v.to_string()).unwrap_or_default();
     let existing = store::find_identity(&accounts, &id.email, &id.org_uuid).cloned();
-    let slot = match (req.slot, &existing) {
+    let slot = match (slot, &existing) {
         (Some(s), _) => s,
         (None, Some(e)) => e.slot,
         (None, None) => store::next_slot(&accounts),
@@ -481,10 +501,10 @@ pub async fn add(req: &AddReq) -> Reply {
             return Reply::err(format!("slot {slot} holds {}; remove it first or pick another", taken.email));
         }
     }
-    let alias = if req.alias.is_empty() {
+    let alias = if alias.is_empty() {
         existing.as_ref().map(|e| e.alias.clone()).unwrap_or_default()
     } else {
-        req.alias.clone()
+        alias.to_string()
     };
     let a = Account {
         slot,
@@ -494,7 +514,11 @@ pub async fn add(req: &AddReq) -> Reply {
         account_uuid: id.account_uuid.clone(),
         alias,
         credentials: creds,
-        oauth_account,
+        oauth_account: if oauth_account.is_empty() {
+            existing.as_ref().map(|e| e.oauth_account.clone()).unwrap_or_default()
+        } else {
+            oauth_account
+        },
         disabled: false,
         added_ms: existing.as_ref().map(|e| e.added_ms).unwrap_or(now),
         updated_ms: now,
@@ -507,9 +531,68 @@ pub async fn add(req: &AddReq) -> Reply {
     if let Some(e) = existing.filter(|e| e.slot != slot) {
         let _ = store::remove(e.slot).await;
     }
-    let _ = store::set_setting("active", &slot.to_string()).await;
     changed();
     Reply { slot: Some(slot), ..Reply::ok(format!("slot {slot}: {} [{}]", id.email, id.org_name)) }
+}
+
+/// How long a login window is watched for a login to land.
+const LOGIN_WATCH_MS: u64 = 20 * 60 * 1000;
+
+/// A profile with no login in it, for a claude to log in under: the
+/// path to export as CLAUDE_CONFIG_DIR. Watched from here until a
+/// credential lands there, which is then stored as a slot.
+pub async fn login_start() -> Reply {
+    let p = claude::platform().await;
+    match claude::login_profile(&p).await {
+        Ok(dir) => {
+            log(&format!("accounts: login profile {dir}"));
+            let d = dir.clone();
+            spawn(async move {
+                watch_login(d).await;
+            });
+            Reply { dir: Some(dir.clone()), ..Reply::ok(dir) }
+        }
+        Err(e) => Reply::err(e),
+    }
+}
+
+async fn watch_login(dir: String) {
+    let p = claude::platform().await;
+    let started = now_ms();
+    while now_ms() - started < LOGIN_WATCH_MS {
+        if sleep_ms(2000).await.is_err() {
+            return;
+        }
+        let Ok(Some(creds)) = claude::read_profile_credentials(&p, &dir).await else { continue };
+        if claude::refresh_token(&creds).is_none() {
+            continue;
+        }
+        // claude writes the identity into the profile's config on login.
+        let oauth_account = claude::read_file(&format!("{dir}/.claude.json"))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .and_then(|c| c.get("oauthAccount").cloned())
+            .filter(|v| v.is_object());
+        let identity = oauth_account.as_ref().and_then(claude::identity_of);
+        let r = add_login(
+            &p,
+            creds,
+            identity,
+            oauth_account.map(|v| v.to_string()).unwrap_or_default(),
+            None,
+            "",
+        )
+        .await;
+        let msg = if r.ok { format!("added {}", r.message) } else { r.message.clone() };
+        log(&format!("accounts: login: {msg}"));
+        let _ = display_message(&format!("accounts: {msg}"));
+        if r.ok {
+            return;
+        }
+    }
+    log(&format!("accounts: login: nothing landed in {dir}; giving up"));
 }
 
 pub async fn remove(slot: i64) -> Reply {
@@ -646,8 +729,8 @@ pub async fn import_cswap() -> Reply {
 // the service surface
 // ---------------------------------------------------------------------------
 
-pub const METHODS: [&str; 10] =
-    ["list", "switch", "best", "add", "refresh", "remove", "disable", "alias", "profile", "import"];
+pub const METHODS: [&str; 11] =
+    ["list", "switch", "best", "add", "refresh", "remove", "disable", "alias", "profile", "import", "login"];
 
 pub async fn handle(req: ServiceRequest) {
     let r: Result<(), HostError> = match req.method.as_str() {
@@ -682,6 +765,7 @@ pub async fn handle(req: ServiceRequest) {
             Err(e) => req.fail(&e.message),
         },
         "import" => req.reply_json(&import_cswap().await),
+        "login" => req.reply_json(&login_start().await),
         _ => req.fail("unknown method"),
     };
     if let Err(e) = r {

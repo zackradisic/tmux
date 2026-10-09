@@ -110,6 +110,7 @@ async fn call0(server: &str, method: &str) -> Reply {
             "best" => provider::best().await,
             "add" => provider::add(&AddReq::default()).await,
             "import" => provider::import_cswap().await,
+            "login" => provider::login_start().await,
             _ => Reply { ok: false, message: format!("no {method}"), slot: None, dir: None },
         }
     } else {
@@ -336,6 +337,7 @@ enum Act {
     Call { server: String, method: &'static str, req: SlotReq },
     Call0 { server: String, method: &'static str },
     NewAgent { server: String, slot: i64 },
+    Login { server: String },
 }
 
 pub fn on_key(panel: &Shared, ctx: &Ctx, event: &Event) {
@@ -381,6 +383,13 @@ pub fn on_key(panel: &Shared, ctx: &Ctx, event: &Event) {
             let panel = Rc::clone(panel);
             ctx.spawn(async move {
                 new_agent(panel, server, slot).await;
+            });
+        }
+        Act::Login { server } => {
+            let client = panel.borrow().as_ref().and_then(|p| p.client);
+            close(panel);
+            ctx.spawn(async move {
+                start_login(server, client).await;
             });
         }
     }
@@ -487,6 +496,10 @@ fn key_action(p: &mut Panel, key: &str) -> Act {
             Some(b) => Act::Call0 { server: b.server.clone(), method: "add" },
             None => Act::None,
         },
+        "+" | "L" => match p.cur.and_then(|(bi, _)| p.blocks.get(bi)).or_else(|| p.blocks.first()) {
+            Some(b) => Act::Login { server: b.server.clone() },
+            None => Act::None,
+        },
         "i" => match p.cur.and_then(|(bi, _)| p.blocks.get(bi)).or_else(|| p.blocks.first()) {
             Some(b) => Act::Call0 { server: b.server.clone(), method: "import" },
             None => Act::None,
@@ -572,6 +585,44 @@ async fn new_agent(panel: Shared, server: String, slot: i64) {
     if let Err(e) = run_command(&cmd).await {
         let _ = display_message(&format!("accounts: {}", e.message));
     }
+}
+
+/// Log in to another account on `server` without touching its login: a
+/// claude in a popup (a window on a remote, or with no client) under a
+/// profile with no credential, which asks for one; the provider there
+/// watches the profile and stores what lands as a slot.
+pub async fn start_login(server: String, client: Option<u64>) {
+    let r = call0(&server, "login").await;
+    let Some(dir) = r.dir.filter(|_| r.ok) else {
+        let _ = display_message(&format!("accounts: {}", r.message));
+        return;
+    };
+    let launch = crate::login_command();
+    let inner = format!("CLAUDE_CONFIG_DIR={} {launch}", claude::sq(&dir));
+    let cmd = if server == LOCAL {
+        match client.and_then(client_name) {
+            Some(c) => format!(
+                "display-popup -E -c {} -w 90% -h 85% -T ' log in, then /exit ' {}",
+                claude::sq(&c),
+                claude::sq(&inner)
+            ),
+            None => format!("new-window -n login {}", claude::sq(&inner)),
+        }
+    } else {
+        let Some(sess) = list_sessions()
+            .ok()
+            .and_then(|v| v.into_iter().map(|s| s.name).find(|n| n.starts_with(&format!("{server}/"))))
+        else {
+            let _ = display_message(&format!("accounts: no mirrored session of {server} to open the login in"));
+            return;
+        };
+        format!("new-window -t {} -n login {}", claude::sq(&format!("{sess}:")), claude::sq(&inner))
+    };
+    if let Err(e) = run_command(&cmd).await {
+        let _ = display_message(&format!("accounts: {}", e.message));
+        return;
+    }
+    let _ = display_message("accounts: log in there; the slot appears when the login lands");
 }
 
 fn client_name(id: u64) -> Option<String> {
@@ -709,6 +760,7 @@ fn help_lines() -> Vec<&'static str> {
         "  ⏎    switch the login on that server to the slot (asks)",
         "  b    best pick: the slot with the most room (asks)",
         "  a    add the server's current login as a slot (or update it)",
+        "  +    log in to another account (a popup; the login is never replaced)",
         "  n    start a claude as this slot in its own window (agents form)",
         "  r    refetch every slot's usage now",
         "  d    hold a slot out of best pick / put it back",
@@ -838,7 +890,7 @@ pub fn render(p: &mut Panel) {
     } else if !p.status.is_empty() {
         p.status.clone()
     } else {
-        "\x1b[2m⏎ switch  b best  a add login  n new agent  r refresh  d hold  x remove  ? more  esc\x1b[0m".into()
+        "\x1b[2m⏎ switch  b best  + log in  a add login  n new agent  r refresh  x remove  ? more  esc\x1b[0m".into()
     };
     out.push_str(&format!("\x1b[{h};1H{}", clip_ansi(&foot, w)));
     let _ = mode_write(p.mode, out.as_bytes());
