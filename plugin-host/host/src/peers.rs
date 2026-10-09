@@ -22,12 +22,46 @@
 
 use std::ffi::CString;
 
+use tmux_plugin_abi::{EventHeader, EventScope, FieldWriter, KeyRef, PeerGrant};
+
 use crate::bridge;
+use crate::intern;
 use crate::services;
 use crate::sqlite;
 use crate::state::REGISTRY;
 
 const ALL: &str = "*";
+
+/// The grant table as the `peers_list` import hands it to a plugin: a
+/// `u32 count` list of grant records.
+pub fn list_record() -> Vec<u8> {
+    let rows = sqlite::peers_list();
+    let mut out = Vec::new();
+    out.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+    for (server, plugin, state, first_seen) in rows {
+        PeerGrant { server, plugin, state, first_seen }.emit(&mut out);
+    }
+    out
+}
+
+/// Tell the plugins that subscribed: a pair went `pending`, was allowed
+/// or denied, or its row was deleted (`revoked`). Queued like any event,
+/// so it never re-enters a plugin from inside a command.
+fn fire_peer_event(server: &str, plugin: &str, state: &str) {
+    let header = EventHeader {
+        event_id: intern::intern("peer-changed"),
+        seq: 0,
+        scope: EventScope::default(),
+    };
+    let mut buf = Vec::new();
+    header.write(&mut buf);
+    let mut w = FieldWriter::new();
+    w.str(KeyRef::Id(intern::intern("server")), server);
+    w.str(KeyRef::Id(intern::intern("plugin")), plugin);
+    w.str(KeyRef::Id(intern::intern("state")), state);
+    buf.extend_from_slice(&w.finish());
+    crate::events::enqueue_raw(buf);
+}
 
 /// May `server` call this server's `plugin`? The local server always may;
 /// otherwise a row for the plugin, or a wildcard row, must be `allow`.
@@ -96,6 +130,7 @@ pub fn reconcile(peer: u32) -> Vec<String> {
             continue; // already decided (or wildcarded)
         }
         if sqlite::peers_ensure(&server, &name, "pending") {
+            fire_peer_event(&server, &name, "pending");
             new_pending.push(name);
         }
     }
@@ -199,12 +234,18 @@ pub fn cmd_list() -> String {
 pub fn cmd_set(server: &str, plugin: Option<&str>, state: &str) {
     let plugin = plugin.unwrap_or(ALL);
     sqlite::peers_set(server, plugin, state);
+    fire_peer_event(server, plugin, state);
 }
 
 /// `plugin-peers revoke <server> [plugin]`: delete the row so the next
 /// hello asks again.
 pub fn cmd_revoke(server: &str, plugin: Option<&str>) -> bool {
-    sqlite::peers_delete(server, plugin.unwrap_or(ALL))
+    let plugin = plugin.unwrap_or(ALL);
+    let gone = sqlite::peers_delete(server, plugin);
+    if gone {
+        fire_peer_event(server, plugin, "revoked");
+    }
+    gone
 }
 
 /// `plugin-peers menu [server]`: reopen the handshake menu on `client`.

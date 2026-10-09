@@ -4121,6 +4121,7 @@ struct remote_link *remote_link_create(const char *, const char *,
 		    const char *, int,
 	    char **);
 void	 remote_link_destroy(struct remote_link *);
+void	 remote_link_reconnect(struct remote_link *);
 struct remote_link *remote_link_find(const char *, const char *);
 struct remote_link *remote_link_find_by_id(u_int);
 struct remote_link *remote_link_first(void);
@@ -4227,6 +4228,9 @@ char		*osdep_get_fds(int);
 
 /* clipboard-darwin.c */
 int		 clipboard_to_file(const char *, int *, u_int *, u_int *, uint64_t *);
+
+/* ocr-darwin.c */
+int	 ocr_main(int, char **);
 struct event_base *osdep_event_init(void);
 
 /* utf8-combined.c */

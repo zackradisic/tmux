@@ -1801,6 +1801,24 @@ remote_link_schedule_retry(struct remote_link *rl)
 }
 
 /*
+ * Reconnect now (remote-attach -R): drop the ssh job if one is running,
+ * forget the backoff and connect again at once instead of waiting out
+ * the retry timer. A link down for a while sits on the 60 s cap; this is
+ * the user saying the host is back.
+ */
+void
+remote_link_reconnect(struct remote_link *rl)
+{
+	if (rl->dying)
+		return;
+	if (rl->job != NULL)
+		remote_link_disconnect(rl); /* re-arms the retry timer */
+	evtimer_del(&rl->retry_timer);
+	rl->backoff = 0;
+	remote_link_connect(rl);
+}
+
+/*
  * Expand the remote-ssh-command option for a host. remote_command is the
  * tmux command line for the remote end (quoted for its shell); the shadow
  * session, when there is one, lets the table formats find the link.

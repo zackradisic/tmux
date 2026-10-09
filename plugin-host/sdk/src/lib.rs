@@ -64,7 +64,7 @@ pub mod prelude {
     pub use crate::{params, Ctx, Plugin};
     pub use tmux_plugin_abi::db::{DbValue, ExecResult, Row, Rows};
     pub use tmux_plugin_abi::{
-        ClientInfo, EventScope, HostError, PaneInfo, Role, SelfInfo,
+        ClientInfo, EventScope, HostError, PaneInfo, PeerGrant, Role, SelfInfo,
         ServerInfo, SessionInfo, Version, WindowInfo,
     };
 }

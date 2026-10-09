@@ -524,7 +524,7 @@ pub async fn open(
             }
             name
         });
-        (Some(p.mode), p.launchers.clone(), session, remote, local_pane, harness, revive, fork_name)
+        (Some(p.engine.mode), p.launchers.clone(), session, remote, local_pane, harness, revive, fork_name)
     };
     // The folder: the row's pane cwd (a shadow's is the remote's cached
     // path), else the pressing client's pane, like `prefix S`. The

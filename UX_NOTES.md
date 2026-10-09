@@ -868,6 +868,105 @@ sketching where the seam goes before building either.
   few milliseconds natively, a few hundred through the script. The
   plugin log says how long it took (`scp: clipboard WxH read in N ms`).
 
+### F2. OCR of the clipboard image: a child process, a view in place of the form
+
+`plugin-command scp ocr` (a row in the palette; no key of its own) opens
+the clipboard form and, once the image is read, swaps the form for a
+two-column view: the recognised text on the left, the image placed
+again on the right, sized to that column. Enter copies the text
+(`load-buffer -w`, so the terminal's clipboard gets it too), `p` pastes
+it into the pane the palette was opened from, `s` makes it the clipboard
+tab's text so the ordinary to/path/Enter flow sends it to a host, `c`
+runs again with Vision's language correction flipped, Esc closes.
+
+The run is not tied to the view. Esc while it is still recognising
+closes the float and lets the run finish: the text lands on the
+clipboard and the status line says `OCR done: 36 lines copied`. Opening
+the form again from another window (the first version said "form
+already open" and showed nothing there) closes the old float and opens
+where the key was pressed, with the same rule for a run in flight. So a
+minute-long run costs nothing but the minute.
+
+What to know:
+
+- **The recogniser is `tmux ocr <png>`, a child process of the server's
+  own binary** (`ocr-darwin.c`, Vision through the Objective-C runtime,
+  no completion block). The plugin runs it as a job and finds the binary
+  through `#{tmux_binary}`, so the `tmux` on PATH never matters. It is
+  not a host call because a run takes 350-450 ms on a screenshot when
+  the Neural Engine has the model, and the server never waits either
+  way. Esc during a slow run abandons the result rather than killing the
+  job: a task cancel only discards the completion.
+- **A run takes a minute whenever the compiled model is not cached, and
+  on a loaded machine that is every run.** `sample` shows the time in
+  the in-process ANE compiler (`Espresso::AOT::MILCompilerForANE`): the
+  recogniser's model is compiled for the Neural Engine, and the compiled
+  program lives only in `aned`'s memory (the user-level
+  `~/Library/Caches/com.apple.e5rt.e5bundlecache` never received one).
+  With swap at 9 GB of 10 it was evicted between every run; earlier the
+  same day, runs were 0.4 s each. No request setting avoids it (language
+  correction off, language detection off, the fast level: 33-66 s each).
+  A resident helper does not help either: after a compile-path first
+  request, the second request in the same process fails with
+  `CRImageReaderError error 1`, in a plain test program too, so the
+  one-shot process stays and the view says after three seconds that the
+  run may take a minute.
+- **Lines are rebuilt from boxes** (`ocr.rs`, `assemble`): boxes whose
+  centres sit within half a text height are one row, joined with the gap
+  between them as spaces (none when they touch: Vision cuts a word in
+  two now and then), indented by the distance from the leftmost row, and
+  a gap of more than one line pitch becomes blank lines. A Menlo code
+  render came back as its 36 lines exactly, bar one `]` read as `l`,
+  which no setting fixes; correction on or off made no difference on
+  code.
+- **A plugin that asks for a resize on every resize event hangs the
+  server.** The host delivers `mode-resize` synchronously inside the
+  `mode_resize` call when it clamps the size, so "render asks for the
+  size it wants, the event sets the size it got, render asks again" is an
+  infinite loop inside one event drain, and the wasm epoch deadline did
+  not trip. The view asks once per wanted size (`View::asked`). formkit
+  only escapes this because its forms always fit. The host should queue
+  the event for the next drain instead.
+- **Linux has no recogniser**: `tmux ocr` exits 3 and the view says so.
+- Not verified by eye in Ghostty, like the preview itself: the tmux side
+  was checked byte for byte on a scratch server (one `t=f` placement for
+  the column, the form's placement deleted and placed again on Esc).
+
+## The palette
+
+### K1. Rows come from three places; the key column is for learning
+
+`prefix+Space` opens the `palette` plugin: a listkit float whose search
+box has the keyboard from the start (`Engine::quick`), Enter runs the
+highlighted row, Esc closes. The rows:
+
+- **plugins**: each plugin named in `providers` answers a `palette`
+  service call with `[{title, hint, key, text}]`; a row runs as
+  `plugin-command -t <pane> <plugin> <text>` with the pane the palette
+  was opened from. scp, agents and sessions answer today; a plugin
+  without the method is skipped.
+- **keys**: `list-keys -T prefix` through `#{tmux_binary}`, the
+  bindings with a `-N` note, the note as the title. tmux's own notes are
+  known (`stock.rs`, generated from `key-bindings.c`) and go under a
+  folded `tmux` group; the user's show up top. A binding that runs a
+  provider's row is the same action: the row takes its key and the
+  binding is dropped (`merge_keys`), so `T` shows beside "Clipboard to a
+  host" and the row is not listed twice.
+- **items**: `"title|key|command"` strings in the config.
+
+Rough edges:
+
+- Rows run with no client: `run_command` queues the string with no
+  client or target, so a command that wants "the current pane" gets what
+  `cmd_find_from_nothing` picks: on a one-client workstation the right
+  thing, on a server with several clients the most recent. A `-c`
+  on the plugin host's `run_command` would fix it properly.
+- Single-letter accelerators were considered and dropped: with an empty
+  box the first letter would run a row instead of starting a search.
+- The row list is gathered on every open (one `list-keys` job, one call
+  per provider); it draws as each source lands, and the cursor stays on
+  the first row until the user moves it.
+
 ## Copy mode
 
 ### C1. Live copy mode: what it does not do yet

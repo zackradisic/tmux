@@ -435,6 +435,14 @@ main(int argc, char **argv)
 	else
 		tmux_binary = argv[0];
 
+	/*
+	 * `tmux ocr [-n] file`: a tool mode that never touches a server
+	 * (ocr-darwin.c). Checked before the options because it is not a
+	 * command for one.
+	 */
+	if (argc >= 2 && strcmp(argv[1], "ocr") == 0)
+		exit(ocr_main(argc - 2, argv + 2));
+
 	while ((opt = getopt(argc, argv, "2c:CDdf:hlL:NqS:T:uUvVZ:")) != -1) {
 		switch (opt) {
 		case '2':

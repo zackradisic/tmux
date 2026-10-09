@@ -3000,6 +3000,15 @@ format_cb_socket_path(__unused struct format_tree *ft)
 	return (xstrdup(socket_path));
 }
 
+/* Callback for tmux_binary. */
+static void *
+format_cb_tmux_binary(__unused struct format_tree *ft)
+{
+	if (tmux_binary == NULL)
+		return (NULL);
+	return (xstrdup(tmux_binary));
+}
+
 /* Callback for version. */
 static void *
 format_cb_version(__unused struct format_tree *ft)
@@ -4040,6 +4049,9 @@ static const struct format_table_entry format_table[] = {
 	},
 	{ "synchronized_output_flag", FORMAT_TABLE_STRING,
 	  format_cb_synchronized_output_flag
+	},
+	{ "tmux_binary", FORMAT_TABLE_STRING,
+	  format_cb_tmux_binary
 	},
 	{ "tree_mode_format", FORMAT_TABLE_STRING,
 	  format_cb_tree_mode_format

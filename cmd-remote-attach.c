@@ -24,8 +24,8 @@
 #include "tmux.h"
 
 /*
- * Mirror a session on a remote tmux server as a local shadow session, or
- * with -k drop such a link again.
+ * Mirror a session on a remote tmux server as a local shadow session,
+ * with -k drop such a link again, or with -R reconnect it now.
  */
 
 static enum cmd_retval	cmd_remote_attach_exec(struct cmd *,
@@ -35,8 +35,8 @@ const struct cmd_entry cmd_remote_attach_entry = {
 	.name = "remote-attach",
 	.alias = "remote",
 
-	.args = { "c:kLt:", 1, 1, NULL },
-	.usage = "[-kL] [-c working-directory] [-t remote-session] host",
+	.args = { "c:kLRt:", 1, 1, NULL },
+	.usage = "[-kLR] [-c working-directory] [-t remote-session] host",
 
 	.flags = CMD_STARTSERVER,
 	.exec = cmd_remote_attach_exec
@@ -75,6 +75,26 @@ cmd_remote_attach_exec(struct cmd *self, struct cmdq_item *item)
 				killed++;
 			}
 			rl = next;
+		}
+		if (killed == 0) {
+			cmdq_error(item, "no remote link to %s", host);
+			return (CMD_RETURN_ERROR);
+		}
+		return (CMD_RETURN_NORMAL);
+	}
+
+	if (args_has(args, 'R')) {
+		for (rl = remote_link_first(); rl != NULL;
+		    rl = remote_link_next(rl)) {
+			if (strcmp(remote_link_host(rl), host) != 0)
+				continue;
+			if (session != NULL &&
+			    (remote_link_remote_session(rl) == NULL ||
+			    strcmp(remote_link_remote_session(rl),
+			    session) != 0))
+				continue;
+			remote_link_reconnect(rl);
+			killed++;
 		}
 		if (killed == 0) {
 			cmdq_error(item, "no remote link to %s", host);

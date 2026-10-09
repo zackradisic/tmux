@@ -1,0 +1,16 @@
+# Capability sidecar for the palette plugin: the command palette
+# (`plugin-command palette open`, bind it to prefix+Space).
+#
+# read-state finds the pressing client's window and expands
+# #{tmux_binary}; run-process runs `list-keys` for the rows that are
+# key bindings; run-command runs the chosen row; mode is the float;
+# service-call asks each provider plugin for its rows (`palette`).
+
+[caps]
+requests = [
+  "read-state",
+  "run-command",
+  "run-process",
+  "mode",
+  "service-call",
+]
