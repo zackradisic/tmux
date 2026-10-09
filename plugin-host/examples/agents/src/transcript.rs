@@ -594,11 +594,16 @@ async fn locate_claude(id: &str) -> Option<String> {
 /// keeps `~/.claude/projects/<cwd with every non-alphanumeric character
 /// as '-'>/<session id>.jsonl`.
 pub fn claude_transcript_path(home: &str, cwd: &str, sid: &str) -> String {
+    claude_transcript_path_in(&format!("{home}/.claude"), cwd, sid)
+}
+
+/// The same under any config home (`CLAUDE_CONFIG_DIR`).
+pub fn claude_transcript_path_in(config_home: &str, cwd: &str, sid: &str) -> String {
     let slug: String = cwd
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
-    format!("{home}/.claude/projects/{slug}/{sid}.jsonl")
+    format!("{config_home}/projects/{slug}/{sid}.jsonl")
 }
 
 #[cfg(test)]

@@ -1,0 +1,38 @@
+# Capability sidecar for the accounts plugin: several Claude Code logins
+# per machine, with their rate-limit windows, switched from a panel.
+#
+# db            the accounts and their cached usage, in store.db
+# run-process   the shell: `security` (macOS Keychain), curl (the usage
+#               and token endpoints), mkdir/rmdir (Claude Code's own
+#               lock directories), cp/mv under umask 077
+# fs-read-any   ~/.claude.json and ~/.claude/.credentials.json
+# fs-write      staging files in the plugin's own data directory, which
+#               init makes 0700; nothing outside it is written by the
+#               host, every install goes through the shell under the lock
+# fs-list       the profile directories (cswap-style per-session logins)
+# mode          the panel
+# run-command   plugin-command into the agents picker, switch-client
+# service-*     the panel asks the provider on every linked server, and
+#               the provider here answers the panel on a workstation
+[caps]
+requests = [
+  "db",
+  "run-process",
+  "run-command",
+  "mode",
+  "fs-read",
+  "fs-read-any",
+  "fs-write",
+  "fs-list",
+  "service-serve",
+  "service-call",
+  "display-message",
+]
+
+# The provider answers the workstation that linked to it; a server that
+# linked IN is never allowed to switch the login here. Nothing is listed
+# because an initiator's calls are never gated, and that is the only
+# direction a switch should ever travel.
+[caps.services]
+call = ["accounts@*", "agents@*"]
+serve_remote = []

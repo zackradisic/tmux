@@ -526,6 +526,8 @@ pub enum PickAfter {
     /// Kill this local pane. `kill-pane` on a shadow runs on the remote
     /// server (see tmux.1, REMOTE SESSIONS), so it kills the real pane.
     KillPane(u32),
+    /// The accounts panel for this server (the row's), over the picker.
+    Accounts(String),
     /// Type this key into the local pane the preview shows: the keyboard
     /// is the preview's. Same route as `Interrupt`, one key per press.
     Type(u32, String),
@@ -1686,6 +1688,7 @@ async fn open_menu(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>) {
             items.push_str(&menu_item("type into pane", &k.focus, live));
             items.push_str(&menu_item("new agent here", &k.new, true));
             items.push_str(&menu_item("fork this agent", "f", true));
+            items.push_str(&menu_item("accounts on this server", "@", true));
             items.push_str(&menu_item("message", "m", true));
             let stopped =
                 a.live() && matches!(a.status.as_str(), "needs_input" | "waiting");
@@ -2378,6 +2381,12 @@ fn dispatch_key(
             // the cursor, or from the pressing client's pane when the
             // list is empty.
             after = PickAfter::NewAgent(false);
+        } else if key == "@" {
+            // The logins on the row's server: the accounts plugin's
+            // panel, where a slot can be switched or a claude started as
+            // one. With no row, the local server's.
+            let server = p.selected().map(|a| a.server.clone()).unwrap_or_else(|| store::LOCAL.to_string());
+            after = PickAfter::Accounts(server);
         } else if key == "f" {
             // Fork the row's agent: the form, prefilled to resume its
             // session as a copy with a name of its own.
@@ -2527,7 +2536,15 @@ fn dispatch_key(
             });
         }
         PickAfter::NewAgent(fork) => {
-            ctx.spawn(crate::newagent::open(Rc::clone(picker), client, fork));
+            ctx.spawn(crate::newagent::open(Rc::clone(picker), client, fork, None));
+        }
+        PickAfter::Accounts(server) => {
+            ctx.spawn(async move {
+                let cmd = format!("plugin-command accounts {}", formkit::text::quote(&format!("pick {server}")));
+                if let Err(e) = run_command(&cmd).await {
+                    let _ = display_message(&format!("agents: {}", e.message));
+                }
+            });
         }
         PickAfter::Read(ids, read) => {
             ctx.spawn(apply_read(Rc::clone(picker), Rc::clone(remotes), ids, read));
@@ -4418,6 +4435,7 @@ fn draw_help(p: &Picker, out: &mut String, x: usize, pw: usize, ph: usize) {
         (n(&k.kill), "kill its pane (asks)"),
         (n(&k.new), "new agent, prefilled from the row"),
         ("f".into(), "fork this agent (a copy of its session, its own name)"),
+        ("@".into(), "the logins on the row's server (accounts panel)"),
         ("J / K".into(), "mark the row and move"),
         (n(&k.menu), "the action menu"),
         ("i".into(), "info card (y copies its cwd)"),
