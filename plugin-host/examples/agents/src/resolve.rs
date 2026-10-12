@@ -90,7 +90,13 @@ pub async fn claude_claims_pane(pane: u32) -> bool {
 /// this is the last chance to learn its id).
 async fn claude_for_pane_in(pane: u32, session: Option<&str>) -> Option<Resolved> {
     let home = home()?;
-    let dir = format!("{home}/.claude/sessions");
+    // A claude run under CLAUDE_CONFIG_DIR (the accounts plugin's
+    // per-window login) keeps its session files and transcripts there.
+    let config_home = match pane_env(PaneId(pane), "CLAUDE_CONFIG_DIR") {
+        Ok(Some(d)) if !d.trim().is_empty() => d.trim().trim_end_matches('/').to_string(),
+        _ => format!("{home}/.claude"),
+    };
+    let dir = format!("{config_home}/sessions");
     // A session file outlives the server that made it: after a restart
     // the new server hands out the same pane ids again, so a stale file
     // can name a live pane by number alone. The window id must match
@@ -113,7 +119,7 @@ async fn claude_for_pane_in(pane: u32, session: Option<&str>) -> Option<Resolved
     if let Ok(Some(pid)) = pane_pid(PaneId(pane)) {
         let path = format!("{dir}/{pid}.json");
         if let Ok((bytes, _)) = fs_read(&path, 0, 16 * 1024).await {
-            if let Some((p, w, s, r)) = parse_claude(&path, &bytes, &home) {
+            if let Some((p, w, s, r)) = parse_claude(&path, &bytes, &config_home) {
                 if claims(p, w, &s) {
                     return Some(r);
                 }
@@ -134,7 +140,7 @@ async fn claude_for_pane_in(pane: u32, session: Option<&str>) -> Option<Resolved
         let Ok((bytes, _)) = fs_read(&path, 0, 16 * 1024).await else {
             continue;
         };
-        if let Some((p, w, s, r)) = parse_claude(&path, &bytes, &home) {
+        if let Some((p, w, s, r)) = parse_claude(&path, &bytes, &config_home) {
             if claims(p, w, &s) {
                 return Some(r);
             }
@@ -149,7 +155,7 @@ async fn claude_for_pane_in(pane: u32, session: Option<&str>) -> Option<Resolved
 fn parse_claude(
     path: &str,
     bytes: &[u8],
-    home: &str,
+    config_home: &str,
 ) -> Option<(u32, Option<u32>, String, Resolved)> {
     let v = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
     // tmux is "session:@window.%pane".
@@ -166,7 +172,7 @@ fn parse_claude(
     // The transcript sits under the project directory named for the cwd.
     let cwd = v.get("cwd").and_then(|x| x.as_str()).filter(|c| !c.is_empty()).map(str::to_string);
     let transcript_path = match (sid, cwd.as_deref()) {
-        (Some(sid), Some(cwd)) => Some(crate::transcript::claude_transcript_path(home, cwd, sid)),
+        (Some(sid), Some(cwd)) => Some(crate::transcript::claude_transcript_path_in(config_home, cwd, sid)),
         _ => None,
     };
     // `shell` (2.1.29x): the turn ended but a background shell the agent

@@ -770,6 +770,45 @@ impl Agents {
             ctx.spawn(view::pick_open(picker, cfg, remotes, client, here, seek, seek_id));
             return;
         }
+        if verb == "new" {
+            // "new [@server] [--profile <dir>]": the new-agent form with
+            // no row behind it - the accounts panel's n, which runs the
+            // harness under that profile directory (CLAUDE_CONFIG_DIR),
+            // in a window on that server.
+            if !self.role.views() {
+                let _ = display_message("agents: a provider has no form");
+                return;
+            }
+            let mut remote = None;
+            let mut env = String::new();
+            let mut client = event.scope.client.map(u64::from);
+            let mut words = text.split_whitespace().skip(1).peekable();
+            while let Some(w) = words.next() {
+                if let Some(host) = w.strip_prefix('@') {
+                    remote = Some(host.to_string());
+                } else if w == "--client" {
+                    // The caller's client by name (a plugin's command has
+                    // none of its own).
+                    if let Some(name) = words.next() {
+                        client = list_clients()
+                            .ok()
+                            .and_then(|cs| cs.into_iter().find(|c| c.name == name).map(|c| u64::from(c.id)))
+                            .or(client);
+                    }
+                } else if w == "--profile" {
+                    // The rest of the line is the directory.
+                    let dir: Vec<&str> = words.by_ref().collect();
+                    let dir = dir.join(" ");
+                    if !dir.is_empty() {
+                        env = format!("CLAUDE_CONFIG_DIR={}", formkit::text::quote(&dir));
+                    }
+                }
+            }
+            let extra = newagent::Extra { env, remote, launchers: self.cfg.launchers.clone() };
+            let picker = Rc::clone(&self.picker);
+            ctx.spawn(newagent::open(picker, client.or_else(crate::view::any_client), false, Some(extra)));
+            return;
+        }
         if verb == "menu-key" {
             // "menu-key <key> [x y]": an item of the action menu, handing
             // its key back to the picker. The menu is drawn by tmux, so

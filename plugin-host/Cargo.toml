@@ -19,6 +19,7 @@ members = [
     "examples/cron",
     "examples/agents",
     "examples/mailbox",
+    "examples/accounts",
     "examples/services-probe",
     "tools/index",
 ]

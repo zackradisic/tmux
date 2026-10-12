@@ -112,7 +112,10 @@ pub struct NewAgent {
     reuse: bool,
     /// The picker's mode, closed together with the form on success so
     /// the new agent's pane is what you see.
-    picker_mode: ModeId,
+    picker_mode: Option<ModeId>,
+    /// Shell assignments put before the command (`CLAUDE_CONFIG_DIR='…'`):
+    /// a per-window login from the accounts plugin.
+    env: String,
     /// The row's harness, for the shape of the resume flag.
     harness: String,
     /// The resume id, kept across the worktree kind, which has no field.
@@ -435,12 +438,52 @@ fn toggle(form: &mut Form<NewAgent>) -> Option<String> {
 /// Open the form over the picker, prefilled from its highlighted row.
 /// `picker` is read for the row and the picker's mode; the form is its
 /// own float.
-pub async fn open(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>, fork: bool) {
+/// What a caller other than the picker's `n` hands the form: the
+/// accounts plugin's `n` (a profile directory to run the harness under,
+/// on a server), with the launchers the picker would have had.
+#[derive(Debug, Clone, Default)]
+pub struct Extra {
+    pub env: String,
+    pub remote: Option<String>,
+    pub launchers: Vec<(String, String)>,
+}
+
+pub async fn open(
+    picker: Rc<RefCell<Option<Picker>>>,
+    client: Option<u64>,
+    fork: bool,
+    extra: Option<Extra>,
+) {
     if state().borrow().is_some() {
         return;
     }
-    // What the row gives us, read under one borrow.
-    let (picker_mode, launchers, session, remote, local_pane, harness, revive, fork_name) = {
+    let extra = extra.unwrap_or_default();
+    // The pressing client: its session and window are where the form
+    // opens, and the defaults when no row is behind it.
+    let client_info = client.and_then(|cid| {
+        list_clients().ok()?.iter().find_map(|c| {
+            (u64::from(c.id) == cid).then(|| (c.name.clone(), c.session))
+        })
+    });
+    let client_session = client_info
+        .as_ref()
+        .and_then(|(_, s)| *s)
+        .and_then(|s| resolve_session(SessionId(s)).ok());
+    // What the row gives us, read under one borrow. With no picker open
+    // (the accounts panel's n) the form starts from the extra and the
+    // client: a window in the client's session (or the first mirrored
+    // session of the named server), in its pane's folder.
+    let (picker_mode, launchers, session, remote, local_pane, harness, revive, fork_name) = if picker.borrow().is_none() {
+        let remote = extra.remote.clone();
+        let session = match &remote {
+            Some(host) => list_sessions()
+                .ok()
+                .and_then(|v| v.into_iter().map(|s| s.name).find(|n| n.starts_with(&format!("{host}/"))))
+                .unwrap_or_default(),
+            None => client_session.as_ref().map(|s| s.name.clone()).unwrap_or_default(),
+        };
+        (None, extra.launchers.clone(), session, remote, None, "claude".to_string(), None, None)
+    } else {
         let b = picker.borrow();
         let Some(p) = b.as_ref() else { return };
         let row = p.selected();
@@ -481,22 +524,21 @@ pub async fn open(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>, fork
             }
             name
         });
-        (p.engine.mode, p.launchers.clone(), session, remote, local_pane, harness, revive, fork_name)
+        (Some(p.engine.mode), p.launchers.clone(), session, remote, local_pane, harness, revive, fork_name)
     };
     // The folder: the row's pane cwd (a shadow's is the remote's cached
-    // path), else the pressing client's pane, like `prefix S`.
-    let client_info = client.and_then(|cid| {
-        list_clients().ok()?.iter().find_map(|c| {
-            (u64::from(c.id) == cid).then(|| (c.name.clone(), c.session))
-        })
-    });
-    let client_pane = client_info
+    // path), else the pressing client's pane, like `prefix S`. The
+    // active pane may be a float with no directory (the panel that
+    // asked for this form, not yet torn down): the first pane of the
+    // window with one stands in then.
+    let client_pane = client_session
         .as_ref()
-        .and_then(|(_, s)| *s)
-        .and_then(|s| resolve_session(SessionId(s)).ok())
         .and_then(|v| v.current_window)
         .and_then(|w| resolve_window(WindowId(w)).ok())
-        .and_then(|w| w.active_pane);
+        .and_then(|w| {
+            let has_cwd = |p: &u32| resolve_pane(PaneId(*p)).ok().is_some_and(|pi| !pi.cwd.is_empty());
+            w.active_pane.filter(has_cwd).or_else(|| w.panes.iter().copied().find(has_cwd))
+        });
     let folder = revive
         .as_ref()
         .map(|(_, cwd, _)| cwd.clone())
@@ -509,11 +551,7 @@ pub async fn open(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>, fork
                 .filter(|c| !c.is_empty())
         })
         .unwrap_or_default();
-    let window = client_info
-        .as_ref()
-        .and_then(|(_, s)| *s)
-        .and_then(|s| resolve_session(SessionId(s)).ok())
-        .and_then(|v| v.current_window);
+    let window = client_session.as_ref().and_then(|v| v.current_window);
     let Some(window) = window else {
         let _ = display_message("agents: no client to open the form for");
         return;
@@ -575,6 +613,7 @@ pub async fn open(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>, fork
         confirm_create: false,
         reuse: false,
         picker_mode,
+        env: extra.env.clone(),
         harness,
         resume,
         fork: fork_value,
@@ -724,10 +763,11 @@ async fn submit() {
                 form.model.client_name.clone(),
                 form.model.picker_mode,
                 form.model.harness.clone(),
+                form.model.env.clone(),
             ),
         )
     };
-    let (confirmed, reuse, remote, client_name, picker_mode, harness) = model_bits;
+    let (confirmed, reuse, remote, client_name, picker_mode, harness, env) = model_bits;
     let get = |l: &str| {
         labels
             .iter()
@@ -778,6 +818,9 @@ async fn submit() {
     let name = get("name");
     let launchers = st.borrow().as_ref().map(|f| f.model.launchers.clone()).unwrap_or_default();
     let command = expand_command(&launchers, &get("command"));
+    // A per-window login: the assignments go before the expanded line,
+    // so the launcher's own flags stay.
+    let command = if env.is_empty() { command } else { format!("{env} {command}") };
     let fork = fork_on(&get("fork")) && !get("resume").is_empty();
     let command = match get("resume").as_str() {
         "" => command,
@@ -828,7 +871,9 @@ async fn submit() {
     let _ = mode_close(mode);
     *st.borrow_mut() = None;
     // The picker too: the point of starting an agent is to talk to it.
-    let _ = mode_close(picker_mode);
+    if let Some(m) = picker_mode {
+        let _ = mode_close(m);
+    }
     if let Some(client) = client_name {
         let _ = run_command(&format!(
             "switch-client -c {} -t {}",

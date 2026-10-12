@@ -349,6 +349,8 @@ pub enum PickAfter {
     /// Kill this local pane. `kill-pane` on a shadow runs on the remote
     /// server (see tmux.1, REMOTE SESSIONS), so it kills the real pane.
     KillPane(u32),
+    /// The accounts panel for this server (the row's), over the picker.
+    Accounts(String),
     /// Type this key into the local pane the preview shows: the keyboard
     /// is the preview's. Same route as `Interrupt`, one key per press.
     Type(u32, String),
@@ -563,6 +565,7 @@ fn key_table(k: &PickKeys) -> KeyTable {
         .with("kill", "X", "rows", "kill its pane (asks)")
         .with("new", "n", "rows", "new agent, prefilled from the row")
         .with("fork", "f", "rows", "fork this agent (a copy of its session, its own name)")
+        .with("accounts", "@", "rows", "the logins on the row's server (accounts panel)")
         .with("menu", "Space", "rows", "the action menu")
         .with("info", "i", "rows", "info card (y copies its cwd)")
         .with("copy_cwd", "y", "rows", "copy the info card's directory")
@@ -1468,6 +1471,7 @@ async fn open_menu(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>) {
             items.push_str(&menu_item("agents", "type into pane", &k("focus"), live));
             items.push_str(&menu_item("agents", "new agent here", &k("new"), true));
             items.push_str(&menu_item("agents", "fork this agent", &k("fork"), true));
+            items.push_str(&menu_item("agents", "accounts on this server", &k("accounts"), true));
             items.push_str(&menu_item("agents", "message", &k("message"), true));
             let stopped =
                 a.live() && matches!(a.status.as_str(), "needs_input" | "waiting");
@@ -2128,6 +2132,13 @@ fn dispatch_key(
                         None => {}
                     }
                 }
+                "accounts" => {
+                    // The logins on the row's server: the accounts plugin's
+                    // panel, where a slot can be switched or a claude
+                    // started as one. With no row, the local server's.
+                    let server = p.selected().map(|a| a.server.clone()).unwrap_or_else(|| store::LOCAL.to_string());
+                    after = PickAfter::Accounts(server);
+                }
                 "info" => {
                     // The info card in place of the preview, and back.
                     p.show_info = !p.show_info;
@@ -2264,7 +2275,15 @@ fn dispatch_key(
             });
         }
         PickAfter::NewAgent(fork) => {
-            ctx.spawn(crate::newagent::open(Rc::clone(picker), client, fork));
+            ctx.spawn(crate::newagent::open(Rc::clone(picker), client, fork, None));
+        }
+        PickAfter::Accounts(server) => {
+            ctx.spawn(async move {
+                let cmd = format!("plugin-command accounts {}", formkit::text::quote(&format!("pick {server}")));
+                if let Err(e) = run_command(&cmd).await {
+                    let _ = display_message(&format!("agents: {}", e.message));
+                }
+            });
         }
         PickAfter::Read(ids, read) => {
             ctx.spawn(apply_read(Rc::clone(picker), Rc::clone(remotes), ids, read));

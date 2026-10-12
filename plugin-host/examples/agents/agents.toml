@@ -60,6 +60,9 @@ names = [
   "AI_AGENT",
   "OPENCODE",
   "_",
+  # A claude run as one account by the accounts plugin keeps its session
+  # files under this directory instead of ~/.claude.
+  "CLAUDE_CONFIG_DIR",
 ]
 
 # The only directories the roster ever reads. fs-read stays sandboxed
@@ -71,6 +74,9 @@ paths = [
   "~/.claude/sessions",
   # The transcripts the conversation search reads (see transcript.rs).
   "~/.claude/projects",
+  # The accounts plugin's per-account profiles (CLAUDE_CONFIG_DIR), each
+  # with its own sessions/ and projects/.
+  "~/.local/share/tmux/plugins/accounts/profiles",
   "~/.codex/sessions",
   "~/.codex/archived_sessions",
   "~/.pi",
