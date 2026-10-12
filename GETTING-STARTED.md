@@ -191,7 +191,7 @@ you can keep one config for both:
 sync-plugins ~/.tmux/plugins.toml
 
 bind A   plugin-command agents pick          # agent roster
-bind s   plugin-command sessions 'pick s'    # sessions chooser (folded)
+bind s   plugin-command sessions 'pick s'    # sessions chooser (folded); p sets @project
 bind w   plugin-command sessions 'pick w'    # the same, windows shown
 bind C-r plugin-command resurrect pick       # save/restore picker
 bind S   plugin-command session_creator new  # new session (folder)
@@ -205,7 +205,7 @@ bind -T choose-tree W plugin-command session_creator worktree
 
 # Remote link state in the status line: only a linked session has
 # #{session_remote_host}, so this is empty on a local session.
-set -g status-left "#{?session_remote_host,#{?remote_connected,#[fg=colour245]⇄ #{session_remote_host}#[default] ,#[bg=red#,fg=white#,bold] ⚠ #{session_remote_host} disconnected#{?remote_error,: #{=/48/…:remote_error},} #[default] },}[#{session_name}] "
+set -g status-left "#{?session_remote_host,#{?remote_connected,#[fg=colour245]⇄ #{session_remote_host}#[default] ,#[bg=red#,fg=white#,bold] ⚠ #{session_remote_host} disconnected#{?remote_error,: #{=/48/…:remote_error},} #[default] },}#{?@project,#[fg=colour245]#{@project}#[default] ,}[#{session_name}] "
 set -g status-right "#{@git_branch}#{?@git_dirty,*,} | %H:%M"
 %endif
 ```
@@ -457,7 +457,9 @@ A form for creating a session: plain (folder + name) or git worktree
 (repo / name / dest / branch), `C-t` toggles. Prefills come from the current
 pane, or from the highlighted row if you press `S`/`W` inside the `prefix + w`
 tree. `C-j`/`C-k` move between fields, `C-u` clears one, `Tab` completes in
-place.
+place. The last field, `project`, follows the name and lands as the session's
+`@project` option, which the agents picker groups by; the sessions chooser
+shows it on the row and `p` there changes it (on a window too).
 
 ### notify-toast — `prefix + N`
 Any program that emits OSC 9 or OSC 777 (e.g. an agent's stop hook running

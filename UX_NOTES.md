@@ -2,12 +2,14 @@
 
 Rough edges hit while actually living in this thing. Observations and
 half-formed ideas, not designs — nothing here is fixed unless a heading
-says so. Three areas so far: remote links, the agents picker, and the
-session/window chooser.
+says so. Areas so far: remote links, the agents picker, the
+session/window chooser, projects and notes, files and the clipboard, the
+palette, copy mode.
 
 - [Remote links](#remote-links) — §R1–R8
-- [Agents picker](#agents-picker) — §A1–A2
+- [Agents picker](#agents-picker) — §A1–A3
 - [Sessions and windows](#sessions-and-windows) — §S1
+- [Projects and notes](#projects-and-notes) — §P1–P2
 
 ## Remote links
 
@@ -1008,3 +1010,114 @@ are likely to bite:
 - **Over a link** the wheel events ride `send-keys` like any key, so the
   feature works on a remote pane. The refresh waits on the round trip, so a
   burst of `C-u` lands as one jump rather than a scroll.
+
+## Projects and notes
+
+Two things wanted while juggling a dozen agents across four servers:
+seeing the agents **by what they are working on**, and one **scratch pad
+of notes and todos** per piece of work that both the user and the agents
+can read and edit. They are one idea: a project is the grouping key for
+the picker *and* the thing a notes file belongs to.
+
+### P1. Group agents by project, not by server (built Oct 12 2026)
+
+The picker grouped by server, then by band. For how this fork is used
+that was the wrong first cut: "which box is it on" matters less than "is
+this the GLM speed work or the tmux2 work", and with seven agents in
+`tab` and five in `tmux2` the related rows sat interleaved across the
+bands with nothing but the `#session` filter to pull them together.
+
+**Why the obvious keys did not work on their own.** On Sep 29 2026, 10
+of 13 live local agents had session `tmux2`, cwd `~/Code/tmux2` and
+branch `wasm-plugins`, and were doing five different things. By Oct 12
+the sessions were named on purpose (`tab`, `tmux2`, `tsc-checks`,
+`zackoverflow`), so the session name had become a real key - and an
+explicit tag only needed to cover the exceptions.
+
+**What was built.** The picker groups by project by default: a header
+per project, the rows under it by state (the dot says which; no band
+headers, which was half of §R8's chrome), the projects with an agent
+waiting on you at the top, and a machine column at the right edge since
+no header names the server any more - remote agents sort into the same
+projects. A row's project is the first of:
+
+1. the **tag** on the agent - a `project` column in the agents store
+   (schema v12), set with `p` in the picker (the marked rows too) or by
+   the agent from its own pane, `plugin-command -t "$TMUX_PANE" agents
+   "project <name>"`. A remote row's tag goes over the `act` RPC to the
+   provider that owns the row, as a rename does; an older provider there
+   says "update it";
+2. the **`@project` tmux option** its pane resolves to - pane, then
+   window, then session, one `#{@project}` format lookup per pane.
+   `project -w <name>` and `project -s <name>` from the pane set the
+   window's and the session's; so does plain `set -w @project <name>`.
+   The option is stamped on every row-building path (the enriched list,
+   the cheap `changed` broadcast, the view's own read): a value present
+   on one path and missing on another made a row jump between groups,
+   the same bug the shell flag had;
+3. the **session name**, unless it is just a number;
+4. the last segment of the **directory**;
+5. "other".
+
+`^project` is the search-box token and `P` narrows to a row's project;
+the info card says which of the five answered. `v` cycles the grouping:
+project, server (the old view, bands under a server header, the session
+column back), flat (bands only); the choice is kept in the store
+(`pick_group`). `g` could not be the key - the engine takes it as half
+of `gg`.
+
+The option is the same one everywhere else: the sessions chooser shows
+it on session and window rows (a window's only when it is its own, not
+inherited) and sets it with `p` - on a linked remote row through the
+remote's sessions provider, since `set-option` on a shadow stays local
+and the remote's agents would never see it; resurrect saves and restores
+it per session and per window (the non-inheriting read, so a window that
+had none gets none back); the session creator's `project` field follows
+the name and lands as `@project` on the new session; and
+`#{?@project,...}` in `status-left` shows it next to the session name.
+`regress/plugin-agents-project.sh` covers the picker and the verb, the
+chooser, resurrect and creator suites the rest.
+
+**Open.** One tag per agent, so each row appears once; a drafter-benchmark
+agent that is both "GLM speed" and "specdec bench" has to pick. Two boxes
+each running a default `main` session merge into one `main` group by
+name - the tag is the way out, and dropping default-looking names
+(`main`, `0`) through to the directory would be the cheap fix if it
+bites. A tag set on a provisional row survives the id migration
+(`merge_id` carries it); one set on an agent that is later resumed into
+another window keeps its own tag but loses a window-level one, which is
+right. Remote tags need the remote's agents plugin at this version or
+newer; the Mac keeps no fallback table.
+
+### P2. A per-project scratch pad that agents edit too
+
+What is wanted: a markdown file of notes and todo lists per project,
+edited in vim as a plain list, that agents read at the start and tick
+items off or add findings to as they go. The picker would show it as the
+preview when a project header is selected - the group nodes are built
+for a preview of their own (`Preview::Markdown`, the renderer exists), so
+this is the next thing to hang off §P1. It lives somewhere tmux2 owns,
+e.g. `~/.local/share/tmux2/notes/<project>.md`, not inside a repo:
+projects like "GLM speed" have no repo, and many agents share one.
+
+**The real problem is concurrent edits.** Several agents plus vim could
+write the same file at once: an agent's Edit tool is read-replace-write
+(two racing is a lost update), vim writes the whole buffer back on `:w`
+and overwrites everything an agent wrote since it loaded, and a remote
+agent cannot touch the Mac's file at all, so its edits cross the bridge
+anyway - which gives a natural place to serialise them.
+
+Options, least to most machinery: (1) structured ops only, agents never
+write free text - clean, but gives up editing a list in vim; (2)
+markdown on disk, ops for agents, a three-way merge on the user's save
+(a `BufWritePre` hook or a `tmux2 notes save` wrapper: base = the file
+as loaded, mine = the buffer, theirs = the file now; conflict markers as
+git leaves them); (3) stable ids on list items (`^t7`) so an op lands on
+the right line however the file shifted, which makes (2)'s ops robust
+and the merge rarely needed; (4) a text CRDT with the `.md` as a
+projection - the only real multi-writer answer, but vim is not a CRDT
+client, so every `:w` is still a diff. Leaning 2 + 3, with the ops kept
+small enough that the storage can change underneath later. Agents only
+keep the notes current if told to, so this also wants a short skill:
+"your project is X; read its notes when you start; tick todos and add
+findings through the notes commands, never by writing the file."

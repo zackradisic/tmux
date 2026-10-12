@@ -3329,7 +3329,7 @@ fn row_node(p: &Picker, a: &Agent, depth: u8) -> Node {
         } else {
             0
         };
-        let mut cells = plain_cells(&format!("{:<10}", clip(machine, 10)), style);
+        let mut cells = plain_cells(&format!("{:<12}", clip(machine, 12)), style);
         cells.extend(plain_cells(&format!(" {:<8} {:>6}", clip(&a.kind, 8), age), 0));
         cells
     };
