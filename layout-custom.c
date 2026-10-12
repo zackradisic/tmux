@@ -293,9 +293,15 @@ layout_parse(struct window *w, const char *layout, char **cause)
 		goto fail;
 	}
 
-	/* Resize window to the layout size. */
-	if (sx != 0 && sy != 0)
-		window_resize(w, tiled_lc->g.sx, tiled_lc->g.sy, -1, -1);
+	/*
+	 * Resize the window to the layout size; recalculate_sizes() below
+	 * brings it back to the clients, and that resize is what fits the
+	 * layout to the window. The stub for an empty window already has the
+	 * window's size. (sx and sy are only summed for a split root, so a
+	 * single-pane layout must not be skipped here: the window would keep
+	 * its size with a layout that no longer fills it.)
+	 */
+	window_resize(w, tiled_lc->g.sx, tiled_lc->g.sy, -1, -1);
 
 	/* Destroy the old layout and swap to the new. */
 	layout_free_cell(w->layout_root, 0);
