@@ -57,6 +57,8 @@ pub struct Sess {
     /// The row format, expanded.
     pub text: String,
     pub hidden: bool,
+    /// The session's own `@project` option (not inherited from a window).
+    pub project: String,
     pub windows: Vec<Win>,
 }
 
@@ -75,6 +77,9 @@ pub struct Win {
     pub active_pane: Option<u32>,
     pub text: String,
     pub hidden: bool,
+    /// The `@project` the window resolves to: its own, else its
+    /// session's (the format lookup walks up).
+    pub project: String,
     pub panes: Vec<Pn>,
 }
 
@@ -155,7 +160,7 @@ pub fn snapshot(f: &Formats) -> Tree {
         f.session, f.filter
     );
     let wfmt = format!(
-        "#{{window_zoomed_flag}}\u{1}#{{window_activity_flag}}\u{1}#{{window_layout}}\u{1}#{{window_active}}\u{1}{}\u{1}{}",
+        "#{{window_zoomed_flag}}\u{1}#{{window_activity_flag}}\u{1}#{{window_layout}}\u{1}#{{window_active}}\u{1}{}\u{1}{}\u{1}#{{@project}}",
         f.window, f.filter
     );
     let pfmt = format!(
@@ -177,11 +182,16 @@ pub fn snapshot(f: &Formats) -> Tree {
             last_attached: sf[4].parse().unwrap_or(0),
             text: sf[5].clone(),
             hidden: hidden_by(&f.filter, &sf[6]),
+            // Read, not expanded: `#{@project}` on a session target would
+            // answer with the current window's value when that has one.
+            project: get_option_in(OptionTarget::Session(SessionId(s.id)), "@project")
+                .map(|v| v.trim().to_string())
+                .unwrap_or_default(),
             windows: Vec::new(),
         };
         for (index, wid) in &s.windows {
             let Some(w) = windows.get(wid) else { continue };
-            let wf = fields(OptionTarget::Window(WindowId(*wid)), &wfmt, 6);
+            let wf = fields(OptionTarget::Window(WindowId(*wid)), &wfmt, 7);
             let mut win = Win {
                 id: *wid,
                 index: *index,
@@ -195,6 +205,7 @@ pub fn snapshot(f: &Formats) -> Tree {
                 active_pane: w.active_pane,
                 text: wf[4].clone(),
                 hidden: hidden_by(&f.filter, &wf[5]),
+                project: wf[6].trim().to_string(),
                 panes: Vec::new(),
             };
             for pid in &w.panes {

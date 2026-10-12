@@ -141,6 +141,34 @@ $TMUX send-keys -t "$FORM" BSpace BSpace BSpace BSpace gamma Enter; sleep 0.8
 $TMUX list-sessions -F '#{session_name}' | grep -q '^gamma$' || fail "rename did not take: $($TMUX list-sessions -F '#{session_name}')"
 screen | grep -q 'gamma' || fail "renamed row not shown"
 
+# p sets the session's @project from a prompt; the row shows it. A
+# window's own @project shows on the window row (an inherited one does
+# not: the session row already says it).
+keys p
+screen | grep -q 'project' || fail "no project prompt"
+$TMUX send-keys -t "$FORM" glm Enter; sleep 0.8
+[ "$($TMUX show-options -t gamma -v @project)" = glm ] ||
+    fail "p did not set @project: $($TMUX show-options -t gamma -v @project)"
+screen | grep -q 'glm' || fail "the project is not on the session row"
+$TMUX set -w -t alpha:0 @project ops
+$TMUX set -t alpha @project tmux
+keys Escape
+open_picker w
+screen | grep -q 'tmux' || fail "alpha's project is not on its row"
+screen | grep -q 'ops' || fail "the window's own project is not on its row"
+screen | grep '1: editor' | grep -q 'tmux' && fail "an inherited project leaked onto a window row: $(screen)"
+# ^ narrows to a project.
+keys /
+keys '^' o p
+screen | grep -q 'ops' || fail "^op lost the ops window"
+screen | grep -q 'gamma' && fail "^op kept gamma"
+keys C-u
+keys Escape
+$TMUX set -u -w -t alpha:0 @project
+$TMUX set -u -t alpha @project
+keys Escape
+open_picker s
+
 # x asks, x again kills the pane under the cursor.
 keys g; keys g; keys l; keys j; keys l; keys j
 currow | grep -q 'sleep' || fail "cursor not on a pane row: $(currow)"

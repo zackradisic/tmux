@@ -140,6 +140,14 @@ impl Model for Creator {
                 }
             }
         }
+        // The project follows the name until it is typed over: the
+        // agents picker groups by it, and a session named on purpose is
+        // usually a project.
+        let name = value_of(fields, "name");
+        let pi = idx(fields, "project");
+        if !fields[pi].touched {
+            fields[pi].value = name;
+        }
     }
 
     fn accepted(&mut self, _fields: &[Field], _i: usize, kind: RowKind) {
@@ -245,6 +253,7 @@ fn session_exists(name: &str) -> bool {
 /// entering the worktree kind.
 fn toggle(form: &mut Form<Creator>) -> Option<String> {
     let name = form.fields[form.idx("name")].clone();
+    let project = form.fields[form.idx("project")].clone();
     let detect = match form.model.kind {
         Kind::Plain => {
             let folder = form.value("folder");
@@ -255,6 +264,7 @@ fn toggle(form: &mut Form<Creator>) -> Option<String> {
                     name,
                     field("dest", String::new()),
                     field("branch", String::new()),
+                    project,
                 ],
                 "name",
             );
@@ -263,7 +273,7 @@ fn toggle(form: &mut Form<Creator>) -> Option<String> {
         Kind::Worktree => {
             let repo = form.value("repo");
             form.model.kind = Kind::Plain;
-            form.replace_fields(vec![field("folder", repo), name], "name");
+            form.replace_fields(vec![field("folder", repo), name, project], "name");
             None
         }
     };
@@ -327,10 +337,12 @@ async fn open_form(state: State, kind: Kind, target_pane: Option<u64>, client: O
             field("name", String::new()),
             field("dest", String::new()),
             field("branch", String::new()),
+            field("project", String::new()),
         ],
         Kind::Plain => vec![
             field("folder", cwd.clone().unwrap_or_default()),
             field("name", String::new()),
+            field("project", String::new()),
         ],
     };
     // A prefilled first field is usually accepted as-is: start on name
@@ -470,10 +482,18 @@ async fn submit(state: State) {
     };
 
     // The session first, the close second: a duplicate name (or any
-    // new-session error) renders in the still-open form.
+    // new-session error) renders in the still-open form. The project
+    // (the last field) lands as the session's `@project` in the same
+    // command string, so the agents picker groups it from the start.
     let sess = session_name(&name);
+    let project = values.last().map(String::as_str).unwrap_or("").trim();
+    let tag = if project.is_empty() {
+        String::new()
+    } else {
+        format!(" ; set-option -t {} @project {}", quote(&sess), quote(project))
+    };
     if let Err(e) =
-        run_command(&format!("new-session -d -s {} -c {}", quote(&sess), quote(&dir))).await
+        run_command(&format!("new-session -d -s {} -c {}{tag}", quote(&sess), quote(&dir))).await
     {
         form::fail(&state, mode, e.message.clone());
         return;

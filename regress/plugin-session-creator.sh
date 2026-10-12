@@ -127,9 +127,14 @@ screen | grep -q '\[plain\]' || fail "C-t did not swap back to plain"
 screen | grep -q "folder *$WORK/proj-a" || fail "folder did not come back from repo"
 
 # --- Enter creates the session --------------------------------------------
+# The project field follows the name until typed over, and lands as the
+# session's @project.
+screen | grep -q 'project *proj-a' || fail "project did not mirror name"
 keys Enter
 wait_closed
 $TMUX list-sessions -F '#{session_name}' | grep -qx 'proj-a' || fail "session proj-a was not created"
+[ "$($TMUX show-options -t proj-a -v @project)" = proj-a ] ||
+    fail "@project not set on the new session (got $($TMUX show-options -t proj-a -v @project))"
 [ "$($TMUX display-message -p -t proj-a: '#{pane_current_path}')" = "$WORK/proj-a" ] ||
     fail "session proj-a is not rooted in the folder"
 

@@ -133,6 +133,10 @@ struct SavedWindow {
     active_pane: Option<u32>,
     /// TAILQ order (the order layout_parse assigns positionally).
     panes: Vec<SavedPane>,
+    /// The window's own `@project` option (the agents picker groups by
+    /// it), set back after restore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -145,6 +149,9 @@ struct SavedSession {
     /// stays empty; restore re-links and the remote fills it back in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     remote: Option<SavedRemote>,
+    /// The session's own `@project` option.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
 }
 
 /// What `remote-attach` needs to build the link again.
@@ -1397,6 +1404,10 @@ fn capture_world() -> Result<Capture, String> {
                 .map(|(idx, _)| *idx),
             windows: Vec::new(),
             remote: session_link(s),
+            project: get_option_in(OptionTarget::Session(SessionId(s.id)), c"@project")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
         };
         // The remote server holds this session's real state; capturing
         // the shadow would save its panes twice over and restore them
@@ -1418,6 +1429,12 @@ fn capture_world() -> Result<Capture, String> {
             )
             .map(|v| v == "on")
             .unwrap_or(true);
+            // The window's own option, not the session's it would
+            // inherit in a format: the session saves its own.
+            let project = get_option_in(OptionTarget::Window(WindowId(win_id)), c"@project")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty());
 
             let mut sw = SavedWindow {
                 index,
@@ -1428,6 +1445,7 @@ fn capture_world() -> Result<Capture, String> {
                 layout,
                 active_pane: w.active_pane,
                 panes: Vec::new(),
+                project,
             };
             for &pane_id in &w.panes {
                 let Some(p) = pane_by_id.get(&pane_id) else { continue };
@@ -1953,6 +1971,9 @@ async fn restore_session(
 
     // run_command completions never carry failure; verify by existence.
     let live = find_session(name)?;
+    if let Some(p) = &session.project {
+        let _ = run_command(&format!("set-option -t {} @project {}", q(name), q(p))).await;
+    }
 
     // base-index may differ from the saved first index.
     if let Some(&(actual, _)) = live.windows.first() {
@@ -2137,6 +2158,9 @@ async fn restore_window(
             q(&target)
         ))
         .await;
+    }
+    if let Some(p) = &w.project {
+        let _ = run_command(&format!("set-option -w -t {} @project {}", q(&target), q(p))).await;
     }
     Ok(())
 }

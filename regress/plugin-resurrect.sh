@@ -62,6 +62,8 @@ $TMUX new-pane -d -t alpha:0 -x 60 -y 12 -X 20 -Y 10 \
 $TMUX new-session -d -s beta -x 100 -y 30 \
     "sh -c 'echo MARK-B0; exec sleep 600'"
 $TMUX select-window -t alpha:1
+$TMUX set -t alpha @project glm
+$TMUX set -w -t alpha:1 @project build
 sleep 0.3
 
 layout_before=$($TMUX display -p -t alpha:0 '#{window_layout}')
@@ -146,13 +148,23 @@ done
 
 # Working directories.
 cwd=$($TMUX display -p -t alpha:0.1 '#{pane_current_path}')
-[ "$cwd" = "/tmp" ] || fail "cwd not restored (got $cwd)"
+# macOS resolves /tmp to /private/tmp.
+[ "$cwd" = "/tmp" ] || [ "$cwd" = "/private/tmp" ] || fail "cwd not restored (got $cwd)"
 
 # Window name + current window.
 name=$($TMUX display -p -t alpha:1 '#{window_name}')
 [ "$name" = "buildwin" ] || fail "window name not restored (got $name)"
 cur=$($TMUX display -p -t alpha: '#{window_index}')
 [ "$cur" = "1" ] || fail "current window not restored (got $cur)"
+
+# The @project options: the session's own and the window's own, and
+# nothing on a window that had none.
+[ "$($TMUX show-options -t alpha -v @project)" = glm ] ||
+    fail "session @project not restored (got $($TMUX show-options -t alpha -v @project))"
+[ "$($TMUX show-options -w -t alpha:1 -v @project)" = build ] ||
+    fail "window @project not restored (got $($TMUX show-options -w -t alpha:1 -v @project))"
+[ -z "$($TMUX show-options -w -t alpha:0 -v @project 2>/dev/null)" ] ||
+    fail "a window that had no @project got one"
 
 # Status names the snapshot and the store.
 $TMUX plugin-command resurrect status

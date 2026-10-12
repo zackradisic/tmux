@@ -125,6 +125,13 @@ pub struct Target {
     /// The layout's pane ids (the owning server's) with their indexes,
     /// for the map above the preview.
     pub labels: Vec<(u32, String)>,
+    /// The `@project` the row shows (a session's own; a window's, which
+    /// may be inherited).
+    pub project: String,
+    /// The object's id on the server that owns it, for setting an
+    /// option there: a remote row's session or window id on the remote.
+    pub remote_session: Option<u32>,
+    pub remote_window: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -170,11 +177,13 @@ pub struct Picker {
 
 /// Prompt tags.
 const PROMPT_RENAME: u32 = 1;
+const PROMPT_PROJECT: u32 = 2;
 
 pub fn keys() -> KeyTable {
     Engine::base_keys()
         .with("kill", "x", "rows", "kill the session / window / pane (asks)")
         .with("rename", "r", "rows", "rename the session or window")
+        .with("project", "p", "rows", "set the project (@project) of the session or window")
         .with("zoom", "m", "rows", "maximise (zoom) the pane")
         .with("new", "S", "rows", "new session here (session_creator)")
         .with("worktree", "W", "rows", "new worktree session here (session_creator)")
@@ -198,6 +207,7 @@ pub fn sigils() -> Vec<SigilSpec> {
         SigilSpec::new(':', "command", false, Some("c"), "narrow to a command (prefix)"),
         SigilSpec::new('~', "dir", true, None, "narrow to a directory (part of its ~ path)"),
         SigilSpec::new('!', "status", false, None, "narrow to an agent status: working, shell, waiting, needs_input"),
+        SigilSpec::new('^', "project", false, Some("P"), "narrow to a project (prefix)"),
     ]
 }
 
@@ -553,6 +563,9 @@ fn session_nodes(
     } else if !linked && server != LOCAL {
         right.extend(plain_cells("not linked ", ST_DIM));
     }
+    if !s.project.is_empty() {
+        right.extend(plain_cells(&format!("{} ", s.project), ST_CYAN));
+    }
     if s.last_attached > 0 {
         let age = (p.now_ms / 1000).saturating_sub(s.last_attached as u64);
         right.extend(plain_cells(&fmt_age(age), ST_DIM));
@@ -561,10 +574,13 @@ fn session_nodes(
     let mut node = Node::group(skey.clone(), depth, p.entry == 'w', true);
     node.left = left;
     node.right = right;
-    node.haystack = format!("{} {}", s.name, text);
+    node.haystack = format!("{} {} {}", s.name, text, s.project);
     node.tokens = vec![('@', host.to_string()), ('#', s.name.clone())];
     if let Some(st) = status {
         node.tokens.push(('!', st.to_string()));
+    }
+    if !s.project.is_empty() {
+        node.tokens.push(('^', s.project.clone()));
     }
     node.dim = dim;
     let here_sess = p.here.is_some()
@@ -583,6 +599,9 @@ fn session_nodes(
         panes: Vec::new(),
         layout: String::new(),
         labels: Vec::new(),
+        project: s.project.clone(),
+        remote_session: (server != LOCAL).then_some(s.id),
+        remote_window: None,
     };
     if let Some(w) = cur_win {
         t.window = local.and_then(|l| l.windows.iter().find(|lw| lw.index == w.index).map(|lw| lw.id)).or(if server == LOCAL { Some(w.id) } else { None });
@@ -614,6 +633,11 @@ fn session_nodes(
             left.extend(plain_cells(&text, 0));
         }
         let mut right: Vec<Styled> = Vec::new();
+        // The window's project only when it is its own: every window
+        // inherits the session's, which the session row already says.
+        if !w.project.is_empty() && w.project != s.project {
+            right.extend(plain_cells(&format!("{} ", w.project), ST_CYAN));
+        }
         if w.zoomed {
             right.push(('Z', ST_BOLD));
         }
@@ -623,11 +647,14 @@ fn session_nodes(
         let mut node = Node::group(wkey.clone(), depth + 1, false, true);
         node.left = left;
         node.right = right;
-        node.haystack = format!("{} {} {} {}", w.index, w.name, text, agent_name_for_window(p, server, w).unwrap_or(""));
+        node.haystack = format!("{} {} {} {} {}", w.index, w.name, text, agent_name_for_window(p, server, w).unwrap_or(""), w.project);
         let cmd = w.panes.iter().find(|pn| pn.active).map(|pn| pn.cmd.clone()).unwrap_or_default();
         node.tokens = vec![(':', cmd)];
         if let Some(st) = status {
             node.tokens.push(('!', st.to_string()));
+        }
+        if !w.project.is_empty() {
+            node.tokens.push(('^', w.project.clone()));
         }
         node.dim = dim;
         node.here = server == LOCAL && p.here.is_some() && w.panes.iter().any(|pn| Some(pn.id) == p.here);
@@ -643,6 +670,9 @@ fn session_nodes(
             panes: w.panes.iter().filter_map(|pn| local_pane(pn.id).map(|lp| (lp, pn.index.to_string()))).collect(),
             layout: w.layout.clone(),
             labels: w.panes.iter().map(|pn| (pn.id, pn.index.to_string())).collect(),
+            project: w.project.clone(),
+            remote_session: (server != LOCAL).then_some(s.id),
+            remote_window: (server != LOCAL).then_some(w.id),
         };
         node.preview = preview_for(p, &t, &wkey, Some(w), "", s);
         targets.insert(wkey.clone(), t);
@@ -712,6 +742,9 @@ fn session_nodes(
                     panes: Vec::new(),
                     layout: String::new(),
                     labels: Vec::new(),
+                    project: String::new(),
+                    remote_session: None,
+                    remote_window: None,
                 },
             );
             out.push(node);
@@ -1194,6 +1227,64 @@ fn execute(picker: &Rc<RefCell<Option<Picker>>>, remotes: &Rc<RefCell<Remotes>>,
                 after_run_refresh = true;
                 render(p);
             }
+            Outcome::Prompt(PROMPT_PROJECT, text) => {
+                let Some(t) = p.engine.selected_key().and_then(|k| p.targets.get(&k).cloned()) else { return };
+                if text.contains('\'') {
+                    p.engine.status = Some("a quote I will not paste".into());
+                    render(p);
+                    return;
+                }
+                let kind = match t.kind {
+                    Kind::Session => "session",
+                    Kind::Window => "window",
+                    _ => {
+                        p.engine.status = Some("only a session or a window here takes a project".into());
+                        render(p);
+                        return;
+                    }
+                };
+                if t.server != LOCAL {
+                    // The option belongs to the owning server: a
+                    // `set-option` on the shadow would stay here, unseen
+                    // by the remote's agents. Ask its sessions provider.
+                    let id = if kind == "session" { t.remote_session } else { t.remote_window };
+                    let Some(id) = id else { return };
+                    let server = t.server.clone();
+                    let picker = Rc::clone(picker);
+                    let remotes = Rc::clone(remotes);
+                    render(p);
+                    spawn(async move {
+                        let req = serde_json::json!({ "kind": kind, "id": id, "value": text });
+                        let r = service::call(&format!("@{server}"), "project", &serde_json::to_vec(&req).unwrap_or_default()).await;
+                        let why = match r {
+                            Ok(_) => None,
+                            Err(e) if e.message.contains("unknown method") => Some(format!("{server}: its sessions plugin is older - update it")),
+                            Err(e) => Some(format!("{server}: {}", e.message)),
+                        };
+                        if let Some(p) = picker.borrow_mut().as_mut() {
+                            p.engine.status = why.clone().or_else(|| Some("project set".into()));
+                            render(p);
+                        }
+                        if why.is_none() {
+                            let _ = sleep_ms(80).await;
+                            refresh_local(&picker, &remotes).await;
+                        }
+                    });
+                    return;
+                }
+                run = match (kind, t.session, t.window) {
+                    ("session", Some(s), _) if text.is_empty() => Some(format!("set-option -u -t '${s}' @project")),
+                    ("session", Some(s), _) => Some(format!("set-option -t '${s}' @project '{text}'")),
+                    ("window", _, Some(w)) if text.is_empty() => Some(format!("set-option -u -w -t '@{w}' @project")),
+                    ("window", _, Some(w)) => Some(format!("set-option -w -t '@{w}' @project '{text}'")),
+                    _ => None,
+                };
+                if run.is_none() {
+                    p.engine.status = Some("nothing local here to tag".into());
+                }
+                after_run_refresh = true;
+                render(p);
+            }
             Outcome::Prompt(_, _) => return,
             Outcome::Key(k) => {
                 if k == "Tab" || k == "BTab" {
@@ -1267,6 +1358,14 @@ fn execute(picker: &Rc<RefCell<Option<Picker>>>, remotes: &Rc<RefCell<Remotes>>,
                             p.engine.open_prompt("rename", &t.name, PROMPT_RENAME);
                         } else {
                             p.engine.status = Some("only a session or a window here can be renamed".into());
+                        }
+                        render(p);
+                    }
+                    "project" => {
+                        if matches!(t.kind, Kind::Session | Kind::Window) {
+                            p.engine.open_prompt("project", &t.project, PROMPT_PROJECT);
+                        } else {
+                            p.engine.status = Some("only a session or a window here takes a project".into());
                         }
                         render(p);
                     }
@@ -1462,6 +1561,7 @@ fn menu_cmd(p: &Picker, t: &Target) -> String {
     let mut items = String::new();
     items.push_str(&menu_item(NAME, "switch", k.key_of("activate"), t.kind != Kind::Server));
     items.push_str(&menu_item(NAME, "rename", k.key_of("rename"), matches!(t.kind, Kind::Session | Kind::Window) && t.session.is_some()));
+    items.push_str(&menu_item(NAME, "set project", k.key_of("project"), matches!(t.kind, Kind::Session | Kind::Window)));
     items.push_str(&menu_item(NAME, "kill", k.key_of("kill"), matches!(t.kind, Kind::Session | Kind::Window | Kind::Pane)));
     items.push_str(&menu_item(NAME, "zoom pane", k.key_of("zoom"), t.kind == Kind::Pane));
     items.push_str(&menu_item(NAME, "new session here", k.key_of("new"), t.pane.is_some()));
