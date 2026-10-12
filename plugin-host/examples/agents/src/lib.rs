@@ -1,9 +1,25 @@
 //! A roster of the agent CLI sessions running in your panes.
 //!
 //! Press the hotkey (bind it to `plugin-command agents pick`) to open a
-//! floating chooser: one row per agent, grouped by state (needs input,
-//! working, waiting, done) and, inside each group, most recently active
-//! first. A live preview of the highlighted pane sits to the right.
+//! floating chooser: one row per agent, grouped by PROJECT - a header
+//! per project, the rows under it by state (needs input, working,
+//! waiting, done; the dot says which) and then most recently active
+//! first, the projects with an agent waiting on you at the top. A row's
+//! project is, most specific first: the tag on the agent (`p` in the
+//! picker, on the marked rows too; or `plugin-command -t $TMUX_PANE
+//! agents "project <name>"` from the agent's own pane, which crosses a
+//! link); the `@project` tmux option its pane resolves to - pane, then
+//! window, then session (`project -w <name>` and `project -s <name>`
+//! from the pane set those; so does `set -w @project <name>`); the
+//! session it runs in, unless that is just a number; the last part of
+//! its directory. Remote agents sort into the same projects by their own
+//! server's options and session names, so the right edge of every row
+//! names the machine (red when its link is down). `^project` is the
+//! search-box token for it, `P` on a row narrows to its project. `v`
+//! cycles the grouping - by project, by server (the old view: a header
+//! per server, bands under it, the session column), flat (bands only) -
+//! and the choice is remembered. A live preview of the highlighted pane
+//! sits to the right.
 //! `j`/`k` move, `gg`/`G` jump to the ends, Enter jumps to the pane, `a`
 //! archives, `.` folds in the finished ones. `q` or Esc closes the picker.
 //! The cursor opens on the row for the pane the hotkey was pressed in,
@@ -11,15 +27,16 @@
 //! further: when that pane's agent has finished, or was archived, it
 //! opens into the history (or the archive) so the row is there to land
 //! on. Bind the two to different keys (Zack: `prefix a` / `prefix A`).
-//! Each row ends in the session the pane lives in, the harness and the
-//! age. The search box takes filter tokens beside the words: `@server`,
-//! `#session` and `~dir` narrow the roster (prefix, prefix, substring of
-//! the `~` path; several of a kind are alternatives, kinds combine), a
+//! Each row ends in the machine (or, grouped by server, the session) the
+//! pane lives in, the harness and the age. The search box takes filter
+//! tokens beside the words: `@server`, `#session`, `~dir` and `^project`
+//! narrow the roster (prefix, prefix, substring of the `~` path, prefix;
+//! several of a kind are alternatives, kinds combine), a
 //! typed sigil opens a dropdown of the roster's values with their row
 //! counts (Tab/Down walk it, Enter takes one, Esc puts it away), a
 //! backslash makes a sigil an ordinary word, the header counts "n of m
-//! live" and shows the tokens. `s`, `S` and `d` on a row narrow to its
-//! session, server or folder, and again widen back.
+//! live" and shows the tokens. `s`, `S`, `d` and `P` on a row narrow to
+//! its session, server, folder or project, and again widen back.
 //! `?` puts a quick reference of all of this in the preview column.
 //! Enter (or `n`) on a finished or killed agent's row brings it back:
 //! the new-agent form opens prefilled to resume it - its harness session
@@ -270,6 +287,8 @@ struct AgentsConfig {
     pick_read: Option<String>,
     pick_unread: Option<String>,
     pick_sessions: Option<String>,
+    pick_project: Option<String>,
+    pick_group: Option<String>,
 }
 
 #[derive(Clone)]
@@ -308,6 +327,10 @@ pub(crate) struct PickKeys {
     pub unread: String,
     /// Flip to the sessions chooser, on the highlighted row's pane.
     pub sessions: String,
+    /// Set the project tag of the row (or the marked rows).
+    pub project: String,
+    /// Cycle the grouping: by project, by server, flat.
+    pub group: String,
 }
 
 impl Default for PickKeys {
@@ -336,6 +359,10 @@ impl Default for PickKeys {
             unread: "u".into(),
             // `t` for the tree: the sessions chooser flips back with `g`.
             sessions: "t".into(),
+            project: "p".into(),
+            // `g` is the first half of `gg` in the engine, so the view
+            // toggle is `v`.
+            group: "v".into(),
         }
     }
 }
@@ -445,6 +472,8 @@ impl Config {
                 read: pick(&c.pick_read, d.read),
                 unread: pick(&c.pick_unread, d.unread),
                 sessions: pick(&c.pick_sessions, d.sessions),
+                project: pick(&c.pick_project, d.project),
+                group: pick(&c.pick_group, d.group),
             },
         })
     }
@@ -875,6 +904,34 @@ impl Agents {
             });
             return;
         }
+        if verb == "project" {
+            // "project [-w|-s] <name>": tag the pane's agent, or set the
+            // window's or session's `@project` option. No name clears.
+            let Some(pane) = event.scope.pane else {
+                let _ = display_message("agents: project needs -t <pane>");
+                return;
+            };
+            let rest = text.splitn(2, char::is_whitespace).nth(1).unwrap_or("").trim();
+            let (scope, rest) = match rest.split_once(char::is_whitespace) {
+                Some(("-w", r)) => (Some('w'), r.trim()),
+                Some(("-s", r)) => (Some('s'), r.trim()),
+                None if rest == "-w" => (Some('w'), ""),
+                None if rest == "-s" => (Some('s'), ""),
+                _ => (None, rest),
+            };
+            let name = Some(rest.to_string()).filter(|n| !n.is_empty() && n != "-");
+            let picker = Rc::clone(&self.picker);
+            let remotes = Rc::clone(&self.remotes);
+            ctx.spawn(async move {
+                if let Err(e) = provider::on_project(pane, scope, name.as_deref()).await {
+                    let _ = display_message(&format!("agents: {e}"));
+                    return;
+                }
+                provider::broadcast_changed().await;
+                view::refresh_if_open(&picker, &remotes).await;
+            });
+            return;
+        }
         if STATUSES.contains(&verb.as_str()) {
             let Some(pane) = event.scope.pane else { return };
             let task = text
@@ -894,7 +951,7 @@ impl Agents {
             return;
         }
         let _ = display_message(&format!(
-            "agents: unknown verb {verb:?} (pick|working|needs_input|waiting|done)"
+            "agents: unknown verb {verb:?} (pick|project|working|needs_input|waiting|done)"
         ));
     }
 }

@@ -91,6 +91,9 @@ FORM=$($TMUX list-panes -a -F '#{pane_id} #{pane_mode}' |
 [ -n "$FORM" ] || fail "picker did not open"
 screen | grep -q '1 live' || fail "the agent is not on the roster"
 screen | grep -q 'actions' || fail "the footer does not point at the menu"
+# These rows are read by band, so group by server (the default is by
+# project): v cycles the grouping and the choice sticks across reopens.
+keys v
 
 # --- Space draws the menu -------------------------------------------------
 

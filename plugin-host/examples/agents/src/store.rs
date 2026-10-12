@@ -20,7 +20,7 @@
 use serde::{Deserialize, Serialize};
 use tmux_plugin_sdk::prelude::*;
 
-pub const USER_VERSION: i64 = 11;
+pub const USER_VERSION: i64 = 12;
 
 /// The server a row belongs to. A provider only ever writes rows for its
 /// own server, so every stored row says "local"; the view stamps the link
@@ -59,7 +59,8 @@ CREATE TABLE IF NOT EXISTS agents (
   harness_version TEXT,
   cwd TEXT,
   git_branch TEXT,
-  model TEXT);
+  model TEXT,
+  project TEXT);
 CREATE INDEX IF NOT EXISTS agents_live ON agents(ended_ms, last_active_ms);
 -- At most one live agent per pane per server; NULL panes (ended) do not
 -- collide.
@@ -97,7 +98,7 @@ CREATE TABLE IF NOT EXISTS search_index (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   blob BLOB NOT NULL,
   max_rowid INTEGER NOT NULL);
-PRAGMA user_version = 11;";
+PRAGMA user_version = 12;";
 
 /// The v1 -> v2 upgrade: the resolved columns did not exist in v1.
 const MIGRATE_V2: &str = "
@@ -220,12 +221,22 @@ const MIGRATE_V11: &str = "
 ALTER TABLE agents ADD COLUMN last_pane INTEGER;
 PRAGMA user_version = 11;";
 
+/// The v11 -> v12 upgrade: the project tag. What the user (or the agent
+/// itself) says this agent is working on, for grouping the picker by
+/// project; NULL means "go by the pane's `@project` option, then the
+/// session". A column, not a setting: it is user state that must follow
+/// the row through an id migration and into the archive.
+const MIGRATE_V12: &str = "
+ALTER TABLE agents ADD COLUMN project TEXT;
+PRAGMA user_version = 12;";
+
 const COLS: &str = "id, kind, status, life, pane, session, window, task, \
                     note, name, name_ms, user_name, user_name_ms, \
                     waiting_ms, acked_ms, first_seen_ms, \
                     last_status_ms, started_ms, last_active_ms, source_path, \
                     ended_ms, reason, server, transcript_path, \
-                    transcript_cursor, harness_version, cwd, git_branch, model";
+                    transcript_cursor, harness_version, cwd, git_branch, model, \
+                    project";
 
 /// One agent. Serialized as JSON when a provider ships its rows to a view
 /// on another server, so every field is plain data.
@@ -282,6 +293,15 @@ pub struct Agent {
     /// the session file; kept in the `shell_ids` setting, not a column.
     #[serde(default)]
     pub shell: bool,
+    /// The project tag set on this agent (by `p` in the picker, or by the
+    /// agent through the `project` verb). See [`MIGRATE_V12`].
+    #[serde(default)]
+    pub project: Option<String>,
+    /// The `@project` option the pane resolves to (pane, then window, then
+    /// session), stamped when the rows are built, never stored: the
+    /// picker's fallback when no tag is set.
+    #[serde(default)]
+    pub project_opt: Option<String>,
 }
 
 fn default_server() -> String {
@@ -378,6 +398,8 @@ fn agents_from(rows: &Rows) -> Vec<Agent> {
             git_branch: s(row.get_named("git_branch")),
             model: s(row.get_named("model")),
             shell: false,
+            project: s(row.get_named("project")),
+            project_opt: None,
         })
         .collect()
 }
@@ -439,6 +461,10 @@ pub fn migrate_sync() -> Result<(), String> {
         }
         if version <= 10 {
             db_exec_sync(MIGRATE_V11, params![])
+                .map_err(|e| format!("db: {e}"))?;
+        }
+        if version <= 11 {
+            db_exec_sync(MIGRATE_V12, params![])
                 .map_err(|e| format!("db: {e}"))?;
         }
     }
@@ -588,6 +614,13 @@ pub async fn merge_id(
     now_ms: i64,
 ) -> Result<(), HostError> {
     db_batch(&[
+        // A tag set while the row was provisional is the user's; the
+        // durable row keeps its own if it has one.
+        (
+            "UPDATE agents SET project = COALESCE(project, \
+                (SELECT project FROM agents WHERE id = ?1)) WHERE id = ?2",
+            params![old, new],
+        ),
         ("DELETE FROM agents WHERE id = ?1", params![old]),
         (
             "UPDATE agents SET pane = ?2, session = ?3, window = ?4, \
@@ -652,6 +685,18 @@ pub async fn rename_by_user(
             user_name_ms = CASE WHEN ?2 IS NULL THEN NULL ELSE ?3 END \
          WHERE id = ?1",
         params![id, name, now_ms],
+    )
+    .await?;
+    Ok(())
+}
+
+/// The project tag. Empty or `None` clears it, so the row goes back to
+/// the pane's `@project` option and then its session.
+pub async fn set_project(id: &str, project: Option<&str>) -> Result<(), HostError> {
+    let project = project.map(str::trim).filter(|s| !s.is_empty());
+    db_exec(
+        "UPDATE agents SET project = ?2 WHERE id = ?1",
+        params![id, project],
     )
     .await?;
     Ok(())

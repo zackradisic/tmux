@@ -60,6 +60,47 @@ const MAX_INFLIGHT: usize = 4;
 /// Prompt tags: what Enter in the search line means.
 const TAG_RENAME: u32 = 1;
 const TAG_MESSAGE: u32 = 2;
+const TAG_PROJECT: u32 = 3;
+
+/// How the list is grouped. `Project` is the default: one header per
+/// project (see [`project_of`]), the rows under it by status with no
+/// band headers, and a machine column at the right since the header no
+/// longer says where a row runs. `Server` is the older view: a header
+/// per server (when rows come from more than one), bands under it, the
+/// session column. `Flat` is bands only, every server's rows together.
+/// `v` cycles them; the choice is kept in the store (`pick_group`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Group {
+    Project,
+    Server,
+    Flat,
+}
+
+impl Group {
+    fn as_str(self) -> &'static str {
+        match self {
+            Group::Project => "project",
+            Group::Server => "server",
+            Group::Flat => "flat",
+        }
+    }
+
+    fn parse(s: &str) -> Group {
+        match s.trim() {
+            "server" => Group::Server,
+            "flat" => Group::Flat,
+            _ => Group::Project,
+        }
+    }
+
+    fn next(self) -> Group {
+        match self {
+            Group::Project => Group::Server,
+            Group::Server => Group::Flat,
+            Group::Flat => Group::Project,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // remote rosters
@@ -286,6 +327,8 @@ pub enum PickAfter {
     Life(Vec<(String, String)>, String),
     /// Set the turn status of these (server, id) rows by hand.
     Status(Vec<(String, String)>, String),
+    /// Tag these (server, id) rows with a project (empty clears).
+    Project(Vec<(String, String)>, String),
     /// Put this text on the pressing client's clipboard.
     Copy(String),
     /// A wheel notch over the live preview: into the pane it shows, at
@@ -403,8 +446,11 @@ pub struct Picker {
     /// The captured text of the highlighted remote row that has no local
     /// mirror, by row key, once the provider answered.
     pub remote_capture: Option<(String, Vec<String>)>,
-    /// Rows come from more than one server: show server headers.
+    /// Rows come from more than one server: show server headers (in the
+    /// `Server` grouping) and look for mirrors.
     pub multi: bool,
+    /// How the list is grouped; see [`Group`].
+    pub group: Group,
     /// The query the conversation hits below are for.
     pub transcript_query: String,
     /// Conversation hits for that query, by row key: the turn to open on,
@@ -479,6 +525,7 @@ fn sigils() -> Vec<SigilSpec> {
         SigilSpec::new('@', "server", false, Some("S"), "narrow to a server (prefix)"),
         SigilSpec::new('#', "session", false, Some("s"), "narrow to a session (prefix)"),
         SigilSpec::new('~', "dir", true, Some("d"), "narrow to a directory (part of its ~ path)"),
+        SigilSpec::new('^', "project", false, Some("P"), "narrow to a project (prefix)"),
     ]
 }
 
@@ -494,8 +541,8 @@ fn key_table(k: &PickKeys) -> KeyTable {
         .note("moving", "j/k ↑/↓", "move the cursor")
         .note("moving", "gg / G", "first / last row")
         .note("moving", "J / K", "mark the row and move")
-        .with("fold", "z", "moving", "fold / unfold the band (or server) the cursor is in")
-        .with("fold_all", "Z", "moving", "fold or unfold every band (or server)")
+        .with("fold", "z", "moving", "fold / unfold the group the cursor is in")
+        .with("fold_all", "Z", "moving", "fold or unfold every group")
         .note("moving", "wheel", "over the preview: scrolls the pane itself")
         .with("filter", "/", "search box", "focus the box; words match names, tasks, conversations")
         .with("content", "C-f", "search box", "also grep the panes' contents")
@@ -509,6 +556,7 @@ fn key_table(k: &PickKeys) -> KeyTable {
         .with("read", "r", "rows", "mark read")
         .with("unread", "u", "rows", "mark unread")
         .with("rename", "R", "rows", "rename")
+        .with("project", "p", "rows", "set the project of the row (or the marked rows)")
         .with("copy", "c", "rows", "copy the agent id")
         .with("message", "m", "rows", "message the agent")
         .with("interrupt", "x", "rows", "interrupt (C-c) the agent")
@@ -525,6 +573,7 @@ fn key_table(k: &PickKeys) -> KeyTable {
         .note("conversation (Tab)", "Space / b", "page down / up")
         .note("conversation (Tab)", "Esc", "back to the list")
         .with("close", "Escape", "picker", "close (Esc first puts a card or the marks away)")
+        .with("group", "v", "picker", "group by project / by server / flat (bands only)")
         .note("picker", "+ / -", "resize")
         .note("picker", "?", "this card");
     for (action, key) in [
@@ -539,6 +588,8 @@ fn key_table(k: &PickKeys) -> KeyTable {
         ("close", &k.close),
         ("content", &k.content),
         ("rename", &k.rename),
+        ("project", &k.project),
+        ("group", &k.group),
         ("interrupt", &k.interrupt),
         ("kill", &k.kill),
         ("focus", &k.focus),
@@ -706,6 +757,7 @@ async fn gather_rows(
     if enrich {
         provider::enrich_live(&mut rows).await;
     }
+    provider::stamp_project_opts(&mut rows);
     let mut captures = Vec::new();
     if req.archived {
         rows.extend(store::archived().await.unwrap_or_default());
@@ -864,6 +916,11 @@ pub async fn pick_open(
             engine.restore_expanded(folds);
         }
     }
+    // And the grouping: by project unless the user cycled it.
+    let group = match store::get_setting("pick_group").await {
+        Ok(Some(v)) => Group::parse(&v),
+        _ => Group::Project,
+    };
     let mut p = Picker {
         engine,
         rows,
@@ -894,6 +951,7 @@ pub async fn pick_open(
         mirrors: if multi { find_mirrors() } else { HashMap::new() },
         remote_capture: None,
         multi,
+        group,
         transcript_query: String::new(),
         transcript_hits: HashMap::new(),
         hit_rows: Vec::new(),
@@ -1339,6 +1397,55 @@ pub async fn apply_status(
     reload_picker(picker, remotes, false).await;
 }
 
+/// Tag rows with a project, wherever they live: the local store for a
+/// local row, the `act` RPC for a remote one (its own provider holds the
+/// row, and an older provider there says so). Empty clears the tag, and
+/// the row goes back to its pane's `@project` option, then its session.
+pub async fn apply_project(
+    picker: Rc<RefCell<Option<Picker>>>,
+    remotes: Rc<RefCell<Remotes>>,
+    ids: Vec<(String, String)>,
+    project: String,
+) {
+    let name = Some(project.trim()).filter(|s| !s.is_empty());
+    let mut done = 0usize;
+    let mut refused: Option<String> = None;
+    for (server, id) in &ids {
+        let r = if server == LOCAL {
+            store::set_project(id, name).await.map_err(|e| e.message)
+        } else {
+            act_remote(server, id, "project", name).await
+        };
+        match r {
+            Ok(()) => done += 1,
+            Err(why) => {
+                if refused.is_none() {
+                    refused = Some(why);
+                }
+            }
+        }
+    }
+    {
+        let mut b = picker.borrow_mut();
+        if let Some(p) = b.as_mut() {
+            let verb = match name {
+                Some(n) => format!("tagged {n}"),
+                None => "project cleared".to_string(),
+            };
+            p.status(match (done, refused) {
+                (1, None) => verb,
+                (n, None) => format!("{n} {verb}"),
+                (0, Some(why)) => why,
+                (n, Some(why)) => format!("{n} {verb}; {why}"),
+            });
+            p.engine.clear_marks();
+        }
+    }
+    let req = list_req_of(&picker);
+    fetch_remotes_now(Rc::clone(&picker), Rc::clone(&remotes), req).await;
+    reload_picker(picker, remotes, false).await;
+}
+
 /// The action menu for the selected row: every picker action, with the
 /// ones that do not apply dimmed, opened on the client that asked for it.
 ///
@@ -1371,6 +1478,7 @@ async fn open_menu(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>) {
             items.push_str(&menu_item("agents", "info", &k("info"), true));
             items.push_str(&menu_item("agents", "help", "?", true));
             items.push_str(&menu_item("agents", "rename", &k("rename"), true));
+            items.push_str(&menu_item("agents", "set project", &k("project"), true));
             items.push_str(" ''");
             let band = if flagged { "move to waiting" } else { "flag: needs input" };
             items.push_str(&menu_item("agents", band, &k("attention"), movable));
@@ -1388,6 +1496,8 @@ async fn open_menu(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>) {
                 "show finished (history)"
             };
             items.push_str(&menu_item("agents", hist, &k("history"), true));
+            let grp = format!("group by {}", p.group.next().as_str());
+            items.push_str(&menu_item("agents", &grp, &k("group"), true));
             Some((menu_safe(&display_name(a), 30), items))
         })
     }) else {
@@ -1840,6 +1950,15 @@ fn dispatch_key(
                     match tag {
                         TAG_RENAME => after = PickAfter::Rename(server, id, text),
                         TAG_MESSAGE if !text.is_empty() => after = PickAfter::Message(server, id, text),
+                        TAG_PROJECT => {
+                            // The marked rows, else the highlighted one.
+                            let ids = p
+                                .targets()
+                                .iter()
+                                .map(|a| (a.server.clone(), a.id.clone()))
+                                .collect();
+                            after = PickAfter::Project(ids, text);
+                        }
                         _ => {}
                     }
                 }
@@ -1910,6 +2029,34 @@ fn dispatch_key(
                         p.engine.open_prompt("rename", &init, TAG_RENAME);
                         pick_render(p);
                     }
+                }
+                "project" => {
+                    // Tag the row (or the marked rows). The box opens on
+                    // the tag already set - not the session or option
+                    // the row falls back to - so what you see is what a
+                    // clear would take away.
+                    if let Some(a) = p.selected() {
+                        let init = a.project.clone().unwrap_or_default();
+                        let n = p.targets().len();
+                        let label = if n > 1 { format!("project ×{n}") } else { "project".to_string() };
+                        p.engine.open_prompt(&label, &init, TAG_PROJECT);
+                        pick_render(p);
+                    }
+                }
+                "group" => {
+                    p.group = p.group.next();
+                    p.status(match p.group {
+                        Group::Project => "grouped by project",
+                        Group::Server => "grouped by server",
+                        Group::Flat => "flat: bands only",
+                    });
+                    let v = p.group.as_str().to_string();
+                    spawn(async move {
+                        let _ = store::set_setting("pick_group", &v).await;
+                    });
+                    let keep = p.keep();
+                    pick_reshow(p, keep, false);
+                    pick_render(p);
                 }
                 "message" => {
                     // Message the selected agent: its mailbox holds it
@@ -2131,6 +2278,14 @@ fn dispatch_key(
                 Rc::clone(remotes),
                 ids,
                 status,
+            ));
+        }
+        PickAfter::Project(ids, project) => {
+            ctx.spawn(apply_project(
+                Rc::clone(picker),
+                Rc::clone(remotes),
+                ids,
+                project,
             ));
         }
         PickAfter::Reload => {
@@ -2587,6 +2742,43 @@ fn band(a: &Agent) -> u8 {
     }
 }
 
+/// The project a row belongs to, most specific source first: the tag on
+/// the agent; the `@project` option its pane resolves to (pane, window,
+/// then session - stamped by its own server's provider); the session it
+/// runs in, unless that is unnamed (a number); the last segment of its
+/// working directory; else "other".
+pub fn project_of(a: &Agent) -> String {
+    project_with_source(a).0
+}
+
+/// [`project_of`] with where the answer came from, for the info card.
+fn project_with_source(a: &Agent) -> (String, &'static str) {
+    let clean = |s: &str| Some(s.trim()).filter(|s| !s.is_empty()).map(str::to_string);
+    if let Some(t) = a.project.as_deref().and_then(clean) {
+        return (t, "tag");
+    }
+    if let Some(o) = a.project_opt.as_deref().and_then(clean) {
+        return (o, "@project option");
+    }
+    if let Some(s) = a
+        .session
+        .as_deref()
+        .and_then(clean)
+        .filter(|s| !s.chars().all(|c| c.is_ascii_digit()))
+    {
+        return (s, "session");
+    }
+    if let Some(d) = a
+        .cwd
+        .as_deref()
+        .and_then(|c| c.trim_end_matches('/').rsplit('/').next())
+        .and_then(clean)
+    {
+        return (d, "directory");
+    }
+    ("other".to_string(), "nothing to go by")
+}
+
 fn band_label(b: u8) -> &'static str {
     match b {
         0 => "needs input",
@@ -2871,27 +3063,96 @@ fn build_nodes(p: &mut Picker) -> Vec<Node> {
         idx = keyed.into_iter().map(|k| k.0).collect();
     }
     let mut nodes: Vec<Node> = Vec::new();
-    let mut prev_server: Option<String> = None;
-    let mut prev_band: Option<u8> = None;
-    let item_depth = if p.multi { 2 } else { 1 };
-    for i in idx {
-        let a = &p.rows[i];
-        if p.multi && prev_server.as_deref() != Some(a.server.as_str()) {
-            nodes.push(server_node(p, &a.server));
-            prev_server = Some(a.server.clone());
-            prev_band = None;
+    let band_node = |key: String, b: u8, depth: u8| -> Node {
+        let mut n = Node::group(key, depth, true, false);
+        n.left = plain_cells(band_label(b), ST_DIM | ST_BOLD);
+        n.header_glyph = None;
+        n.indent = Some(1);
+        n
+    };
+    match p.group {
+        Group::Server => {
+            let mut prev_server: Option<String> = None;
+            let mut prev_band: Option<u8> = None;
+            let item_depth = if p.multi { 2 } else { 1 };
+            for i in idx {
+                let a = &p.rows[i];
+                if p.multi && prev_server.as_deref() != Some(a.server.as_str()) {
+                    nodes.push(server_node(p, &a.server));
+                    prev_server = Some(a.server.clone());
+                    prev_band = None;
+                }
+                let b = band(a);
+                if prev_band != Some(b) {
+                    let mut n =
+                        band_node(format!("band\u{1}{}\u{1}{b}", a.server), b, item_depth - 1);
+                    n.tokens = vec![('@', a.server.clone())];
+                    nodes.push(n);
+                    prev_band = Some(b);
+                }
+                nodes.push(row_node(p, a, item_depth));
+            }
         }
-        let b = band(a);
-        if prev_band != Some(b) {
-            let mut n = Node::group(format!("band\u{1}{}\u{1}{b}", a.server), item_depth - 1, true, false);
-            n.left = plain_cells(band_label(b), ST_DIM | ST_BOLD);
-            n.header_glyph = None;
-            n.indent = Some(1);
-            n.tokens = vec![('@', a.server.clone())];
-            nodes.push(n);
-            prev_band = Some(b);
+        Group::Flat => {
+            // Bands only, every server's rows together. `idx` is
+            // server-major, so regroup by band; the sort is stable, so
+            // each band keeps its order (rank, or relevance) within.
+            let mut by_band: Vec<(u8, usize)> = idx.iter().map(|&i| (band(&p.rows[i]), i)).collect();
+            by_band.sort_by_key(|&(b, _)| b);
+            let mut prev_band: Option<u8> = None;
+            for (b, i) in by_band {
+                if prev_band != Some(b) {
+                    nodes.push(band_node(format!("band\u{1}all\u{1}{b}"), b, 0));
+                    prev_band = Some(b);
+                }
+                nodes.push(row_node(p, &p.rows[i], 1));
+            }
         }
-        nodes.push(row_node(p, a, item_depth));
+        Group::Project => {
+            // One group per project: its rows by band, then in `idx`
+            // order (frozen rank, or relevance under a query); the
+            // groups by their most urgent row, then the latest activity,
+            // then name, so a project with an agent waiting on you is at
+            // the top and a dormant one sinks.
+            let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+            let mut at: HashMap<String, usize> = HashMap::new();
+            for (pos, &i) in idx.iter().enumerate() {
+                let name = project_of(&p.rows[i]);
+                let g = *at.entry(name.clone()).or_insert_with(|| {
+                    groups.push((name, Vec::new()));
+                    groups.len() - 1
+                });
+                groups[g].1.push(pos);
+            }
+            let row = |pos: usize| &p.rows[idx[pos]];
+            for (_, members) in &mut groups {
+                members.sort_by_key(|&pos| (band(row(pos)), pos));
+            }
+            let urgency = |m: &[usize]| m.iter().map(|&pos| band(row(pos))).min().unwrap_or(u8::MAX);
+            let latest = |m: &[usize]| m.iter().map(|&pos| row(pos).active_ms()).max().unwrap_or(0);
+            groups.sort_by(|x, y| {
+                urgency(&x.1)
+                    .cmp(&urgency(&y.1))
+                    .then(latest(&y.1).cmp(&latest(&x.1)))
+                    .then(x.0.cmp(&y.0))
+            });
+            for (name, members) in groups {
+                let mut n = Node::group(format!("proj\u{1}{name}"), 0, true, false);
+                n.left = plain_cells(&name, ST_CYAN);
+                n.haystack = name.clone();
+                n.tokens = vec![('^', name.clone())];
+                // `@server` keeps a group whose rows all share the server;
+                // a mixed group is matched row by row.
+                let servers: HashSet<&str> = members.iter().map(|&pos| row(pos).server.as_str()).collect();
+                if servers.len() == 1 {
+                    n.tokens.push(('@', servers.into_iter().next().unwrap_or("").to_string()));
+                }
+                nodes.push(n);
+                for pos in members {
+                    nodes.push(row_node(p, row(pos), 1));
+                }
+            }
+        }
     }
     // A server whose copy this side rejects has no rows, and nor does
     // one being fetched for the first time; give both a line anyway, so
@@ -3025,20 +3286,40 @@ fn row_node(p: &Picker, a: &Agent, depth: u8) -> Node {
     if let Some(t) = tail {
         left.extend(plain_cells(&format!("  ·  {t}"), ST_DIM));
     }
-    // session + kind + age are fixed columns at the right edge - the
-    // session is where the pane lives, which the name does not say.
-    let right = format!(
-        "{:<12} {:<8} {:>6}",
-        clip(a.session.as_deref().unwrap_or(""), 12),
-        clip(&a.kind, 8),
-        fmt_age(p.age_ms(a) / 1000)
-    );
+    // Fixed columns at the right edge: where the pane lives, which the
+    // name does not say, then the harness and the age. Grouped by server
+    // that is the session; otherwise the machine, since no header names
+    // it - red when its link is down (the rows are dimmed too).
+    let age = fmt_age(p.age_ms(a) / 1000);
+    let right: Vec<Styled> = if p.group == Group::Server {
+        plain_cells(
+            &format!(
+                "{:<12} {:<8} {:>6}",
+                clip(a.session.as_deref().unwrap_or(""), 12),
+                clip(&a.kind, 8),
+                age
+            ),
+            0,
+        )
+    } else {
+        let machine = if a.is_local() { "local" } else { a.server.as_str() };
+        let style = if p.down.contains_key(&a.server) {
+            ST_RED
+        } else if a.is_local() {
+            ST_DIM
+        } else {
+            0
+        };
+        let mut cells = plain_cells(&format!("{:<10}", clip(machine, 10)), style);
+        cells.extend(plain_cells(&format!(" {:<8} {:>6}", clip(&a.kind, 8), age), 0));
+        cells
+    };
     let mut n = Node::item(key.clone(), depth);
     n.indent = Some(0);
     n.left = left;
-    n.right = plain_cells(&right, 0);
+    n.right = right;
     n.haystack = haystack(a);
-    n.tokens = vec![('@', a.server.clone())];
+    n.tokens = vec![('@', a.server.clone()), ('^', project_of(a))];
     if let Some(s) = a.session.as_deref().filter(|s| !s.is_empty()) {
         n.tokens.push(('#', s.to_string()));
     }
@@ -3328,7 +3609,12 @@ pub fn pick_render(p: &mut Picker) {
     } else {
         ""
     };
-    p.engine.header_tag = format!("({live} live{view_tag}{unread_tag}{servers_tag}{content_tag}{selected})");
+    let group_tag = match p.group {
+        Group::Project => ", by project",
+        Group::Server => "",
+        Group::Flat => ", flat",
+    };
+    p.engine.header_tag = format!("({live} live{view_tag}{unread_tag}{servers_tag}{group_tag}{content_tag}{selected})");
     p.engine.empty_text = if p.archived_only && p.engine.filter.trim().is_empty() {
         "(nothing archived)".into()
     } else {
@@ -3440,6 +3726,8 @@ fn info_lines(p: &Picker, a: &Agent, pw: usize) -> Vec<Vec<Styled>> {
         )
     };
     rows.push(("where", where_));
+    let (proj, src) = project_with_source(a);
+    rows.push(("project", format!("{proj}  ({src})")));
     if a.shell {
         rows.push(("state", "turn ended, a background shell still runs".into()));
     }

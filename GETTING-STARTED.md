@@ -391,17 +391,29 @@ Also: `unload-plugin`, `enable-plugin` / `disable-plugin`.
 
 ### agents — `prefix + A`
 Roster of coding-agent CLI sessions running in your panes (claude, codex, pi,
-opencode), grouped by state: **needs input / working / waiting / done**, with a
-live preview of the selected pane. `j`/`k` move, `Enter` jumps to the pane,
-`Space` opens an action menu on the selected row — every action, with the
-ones that do not apply to that row dimmed — and its items are the picker's
-own keys: `a` archives, `.` shows finished rows, `z` folds a band, `/` filters, `C-f` greps
-live pane contents, `c` copies the agent's session id, `w` moves a row
-between "needs input" and "waiting" when the roster's guess is not yours.
-A row in the attention band shows *why* it wants you, in the harness's own
-words. Identity comes from the harness's own session files, not from a
-guess at the process, so rows survive a `restart-server` — and the roster is
-durable in the plugin's SQLite store.
+opencode), grouped by **project**, with a live preview of the selected pane.
+Inside a project the rows sort by state (the dot: bright for *needs input*,
+green *working*, orange *working on a background shell*, dim *waiting*), and
+a project with an agent waiting on you floats to the top. The right edge of
+every row names the machine the pane is on, so agents on linked servers sit
+in the same projects as local ones. A row's project is the first of: the tag
+on the agent (`p` in the picker, or from the agent's own pane:
+`plugin-command -t "$TMUX_PANE" agents "project glm-speed"`), the `@project`
+tmux option its pane resolves to (pane, window, then session; `project -w
+<name>` / `project -s <name>` from the pane set those, as does `set -w
+@project <name>`), the session name, the directory. `v` cycles the grouping:
+by project, by server (a header per server with *needs input / working /
+waiting / done* bands under it), or flat. `j`/`k` move, `Enter` jumps to the
+pane, `Space` opens an action menu on the selected row — every action, with
+the ones that do not apply to that row dimmed — and its items are the
+picker's own keys: `a` archives, `.` shows finished rows, `z` folds a group,
+`/` filters (`^proj`, `#session`, `@server`, `~dir` tokens narrow it), `C-f`
+greps live pane contents, `c` copies the agent's session id, `w` moves a row
+between "needs input" and "waiting" when the roster's guess is not yours. A
+row that needs input shows *why* it wants you, in the harness's own words.
+Identity comes from the harness's own session files, not from a guess at the
+process, so rows survive a `restart-server` — and the roster is durable in the
+plugin's SQLite store.
 
 > Only really tested hard with **Claude Code**. The others are detected but
 > less exercised.

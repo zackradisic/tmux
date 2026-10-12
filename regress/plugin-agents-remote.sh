@@ -66,6 +66,9 @@ sleep 2.0
 FORM=$($TMUX list-panes -a -F '#{pane_id} #{pane_mode}' |
     awk '/plugin-mode/ { print $1 }')
 [ -n "$FORM" ] || fail "picker did not open"
+# These rows are read by band, so group by server (the default is by
+# project): v cycles the grouping and the choice sticks across reopens.
+keys v
 
 # Two servers, one agent each, grouped by server.
 wait_for 8 "$TMUX capture-pane -M -p -t $FORM | grep -q '2 servers'" ||

@@ -14,7 +14,8 @@
 //!   turns   { id, from, to }         -> the stored conversation, by seq
 //!   stats   { id }                   -> Stats (what the conversation adds
 //!                                       up to, for the info card)
-//!   act     { id, verb, name? }      -> "ok" (ack | archive | unarchive | rename)
+//!   act     { id, verb, name? }      -> "ok" (ack | archive | unarchive |
+//!                                       rename | status | project)
 //!
 //! and follows the `changed` topic, which carries a fresh Snapshot after
 //! every write. Times are the provider's clock; `now_ms` in the Snapshot
@@ -287,6 +288,64 @@ pub fn pane_title(pane: u32, kind: &str) -> Option<String> {
     let host = parts.next().unwrap_or("");
     let cwd = parts.next().unwrap_or("");
     clean_title(title, kind, host_short, host, cwd).map(str::to_string)
+}
+
+/// Stamp every live row with the `@project` option its pane resolves to.
+/// One `#{@project}` per pane: the format lookup walks pane, window,
+/// global-window, then session, so a tag set on any of them lands here.
+/// Runs wherever rows are built - the enriched list, the cheap `changed`
+/// broadcast, the view's own read - because a value present on one path
+/// and missing on another makes a row jump between groups.
+pub fn stamp_project_opts(rows: &mut [Agent]) {
+    for a in rows.iter_mut().filter(|a| a.live()) {
+        let Some(p) = a.pane else { continue };
+        a.project_opt = format_expand(OptionTarget::Pane(PaneId(p as u32)), "#{@project}")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+    }
+}
+
+/// The `project` verb from a pane. `project <name>` tags the pane's
+/// agent; `project -w <name>` sets the window's `@project` option and
+/// `project -s <name>` the session's, so every agent there inherits it.
+/// An empty name clears. Options go through `set-option`, not the option
+/// import: the plugin is granted `run-command`, not `write-options`.
+pub async fn on_project(
+    pane: u32,
+    scope: Option<char>,
+    name: Option<&str>,
+) -> Result<(), String> {
+    let Some(scope) = scope else {
+        let Some(a) = store::live_by_pane(i64::from(pane)).await.ok().flatten() else {
+            return Err(format!("no agent in %{pane}"));
+        };
+        return store::set_project(&a.id, name).await.map_err(|e| e.message);
+    };
+    let panes = list_panes().unwrap_or_default();
+    let Some(pi) = panes.iter().find(|p| p.id == pane) else {
+        return Err(format!("no pane %{pane}"));
+    };
+    let target = match scope {
+        'w' => format!("-w -t @{}", pi.window),
+        's' => {
+            let sid = list_windows()
+                .unwrap_or_default()
+                .iter()
+                .find(|w| w.id == pi.window)
+                .and_then(|w| w.sessions.first().copied());
+            let Some(sid) = sid else {
+                return Err(format!("%{pane} is in no session"));
+            };
+            format!("-t ${sid}")
+        }
+        other => return Err(format!("project: unknown flag -{other} (-w or -s)")),
+    };
+    let cmd = match name {
+        Some(n) => format!("set-option {target} @project {}", formkit::text::quote(n)),
+        None => format!("set-option -u {target} @project"),
+    };
+    run_command(&cmd).await.map_err(|e| e.message)
 }
 
 /// The useful part of a pane title, or nothing.
@@ -1086,6 +1145,7 @@ pub fn register_services() {
 pub async fn snapshot(req: ListReq) -> Snapshot {
     let mut rows = store::live_agents().await.unwrap_or_default();
     enrich_live(&mut rows).await;
+    stamp_project_opts(&mut rows);
     if req.archived {
         // Every archived row, including the live ones (which the live
         // set above already holds, minus the archived - see the store).
@@ -1099,7 +1159,8 @@ pub async fn snapshot(req: ListReq) -> Snapshot {
 /// Tell every subscribed view that the roster changed. Cheap (no
 /// enrich): the rows as stored, with the clock.
 pub async fn broadcast_changed() {
-    let rows = store::live_agents().await.unwrap_or_default();
+    let mut rows = store::live_agents().await.unwrap_or_default();
+    stamp_project_opts(&mut rows);
     let snap = Snapshot { now_ms: now_ms() as i64, agents: rows };
     let _ = service::emit_json(TOPIC, &snap);
 }
@@ -1182,6 +1243,7 @@ pub async fn handle(req: ServiceRequest, cfg: Rc<Config>) {
                     let n = q.name.as_deref().filter(|s| !s.is_empty());
                     store::rename_by_user(&q.id, n, now).await.is_ok()
                 }
+                "project" => store::set_project(&q.id, q.name.as_deref()).await.is_ok(),
                 // The view moved a row between the attention band and
                 // `waiting` by hand. Only those two: a view has no
                 // business declaring an agent to be mid-turn or finished,

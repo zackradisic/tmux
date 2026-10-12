@@ -122,6 +122,9 @@ sleep 0.6
 # row to the durable id, capture and all.
 write_session_file idle "$now"
 open_picker
+# These rows are read by band, so group by server (the default is by
+# project): v cycles the grouping and the choice sticks across reopens.
+$TMUX send-keys -t "$FORM" v; sleep 0.5
 [ "$(q "SELECT id FROM agents WHERE ended_ms IS NULL")" = "claude:$SID" ] ||
 	fail "the row did not migrate off its provisional id: $(q "SELECT id FROM agents WHERE ended_ms IS NULL")"
 [ "$(q "SELECT id FROM captures")" = "claude:$SID" ] ||

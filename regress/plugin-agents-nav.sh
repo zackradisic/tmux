@@ -72,6 +72,10 @@ sleep 1.5
 
 open_picker
 screen | grep -q '3 live' || fail "expected 3 live agents"
+# These rows are read by band, so group by server (the default is by
+# project): v cycles the grouping and the choice sticks across reopens.
+keys v
+screen | grep -q 'grouped by server' || fail "v did not group by server: $(screen)"
 # The top row, not the cursor's: the picker opens on the agent you are
 # sitting in, which need not be the first row.
 TOP=$(firstrow)

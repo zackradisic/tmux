@@ -78,6 +78,9 @@ sleep 1.0
 
 open_picker
 screen | grep -q '1 live' || fail "the agent is not on the roster"
+# These rows are read by band, so group by server (the default is by
+# project): v cycles the grouping and the choice sticks across reopens.
+keys v
 
 # --- the note: why the agent wants you, shown on the row -------------------
 

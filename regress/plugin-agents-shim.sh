@@ -82,6 +82,9 @@ sleep 1.5
 # An ordinary tool: working.
 shim pretool '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"}}'
 open_picker
+# These rows are read by band, so group by server (the default is by
+# project): v cycles the grouping and the choice sticks across reopens.
+$TMUX_L send-keys -t "$FORM" v; sleep 0.5
 screen | grep -q 'working' || fail "pretool Bash did not report working"
 
 # A question dialog: needs input, with the question on the row.
