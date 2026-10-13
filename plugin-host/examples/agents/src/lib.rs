@@ -2,9 +2,11 @@
 //!
 //! Press the hotkey (bind it to `plugin-command agents pick`) to open a
 //! floating chooser: one row per agent, grouped by PROJECT - a header
-//! per project, the rows under it by state (needs input, working,
-//! waiting, done; the dot says which) and then most recently active
-//! first, the projects with an agent waiting on you at the top. A row's
+//! per project, the rows under it in the order you keep them: a new row
+//! (or project) goes in first, `M-j` / `M-k` move the row - or, with the
+//! cursor on the header (`h` from a row), the whole project - and the
+//! order is remembered; the dot says the state (needs input, working,
+//! waiting, done), the finished rows sit under the live ones. A row's
 //! project is, most specific first: the tag on the agent (`p` in the
 //! picker, on the marked rows too; or `plugin-command -t $TMUX_PANE
 //! agents "project <name>"` from the agent's own pane, which crosses a
@@ -289,6 +291,8 @@ struct AgentsConfig {
     pick_sessions: Option<String>,
     pick_project: Option<String>,
     pick_group: Option<String>,
+    pick_move_down: Option<String>,
+    pick_move_up: Option<String>,
 }
 
 #[derive(Clone)]
@@ -331,6 +335,9 @@ pub(crate) struct PickKeys {
     pub project: String,
     /// Cycle the grouping: by project, by server, flat.
     pub group: String,
+    /// Move the row (or, from its header, the project) down / up.
+    pub move_down: String,
+    pub move_up: String,
 }
 
 impl Default for PickKeys {
@@ -363,6 +370,8 @@ impl Default for PickKeys {
             // `g` is the first half of `gg` in the engine, so the view
             // toggle is `v`.
             group: "v".into(),
+            move_down: "M-j".into(),
+            move_up: "M-k".into(),
         }
     }
 }
@@ -474,6 +483,8 @@ impl Config {
                 sessions: pick(&c.pick_sessions, d.sessions),
                 project: pick(&c.pick_project, d.project),
                 group: pick(&c.pick_group, d.group),
+                move_down: pick(&c.pick_move_down, d.move_down),
+                move_up: pick(&c.pick_move_up, d.move_up),
             },
         })
     }

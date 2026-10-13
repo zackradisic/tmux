@@ -63,12 +63,14 @@ const TAG_MESSAGE: u32 = 2;
 const TAG_PROJECT: u32 = 3;
 
 /// How the list is grouped. `Project` is the default: one header per
-/// project (see [`project_of`]), the rows under it by status with no
-/// band headers, and a machine column at the right since the header no
-/// longer says where a row runs. `Server` is the older view: a header
-/// per server (when rows come from more than one), bands under it, the
-/// session column. `Flat` is bands only, every server's rows together.
-/// `v` cycles them; the choice is kept in the store (`pick_group`).
+/// project (see [`project_of`]), the rows under it in the order they
+/// were put (new ones first, `M-j` / `M-k` move them; the finished ones
+/// below the live), no band headers, and a machine column at the right
+/// since the header no longer says where a row runs. `Server` is the
+/// older view: a header per server (when rows come from more than one),
+/// bands under it, the session column. `Flat` is bands only, every
+/// server's rows together. `v` cycles them; the choice is kept in the
+/// store (`pick_group`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Group {
     Project,
@@ -406,12 +408,18 @@ pub struct Picker {
     /// cursor sits on moves under a refresh, so the pane is remembered
     /// here rather than re-read from the selection on the second press.
     pub pending_kill: Option<u32>,
-    /// A stable display rank per row key, assigned in the recency order
-    /// the FIRST time each agent is seen this session. Live refreshes sort
-    /// by server, band then this rank, so an activity-time bump never
-    /// reshuffles rows under the cursor.
-    pub order: HashMap<String, u64>,
-    pub order_next: u64,
+    /// The display rank per row key: where the row sits among its
+    /// neighbours. A row gets one the first time it is seen, in front of
+    /// everything (newest first, a batch in ideal band + recency order);
+    /// from then on only `M-j` / `M-k` change it, so neither a refresh
+    /// nor a reopen reshuffles rows under the cursor. Kept in the store
+    /// (`pick_order`, the keys in rank order).
+    pub order: HashMap<String, i64>,
+    /// The rank the next new row goes in front of.
+    pub order_front: i64,
+    /// The same for the project groups, by name (`pick_proj_order`).
+    pub proj_order: HashMap<String, i64>,
+    pub proj_front: i64,
     /// The 2s refresh task, cancelled when the picker closes or reopens.
     pub timer: Option<TaskId>,
     /// The pane the picker was opened from. Its row gets a "you are here"
@@ -559,6 +567,8 @@ fn key_table(k: &PickKeys) -> KeyTable {
         .with("unread", "u", "rows", "mark unread")
         .with("rename", "R", "rows", "rename")
         .with("project", "p", "rows", "set the project of the row (or the marked rows)")
+        .with("move_down", "M-j", "rows", "move the row down; on a project header (h), the project")
+        .with("move_up", "M-k", "rows", "move the row up; on a project header (h), the project")
         .with("copy", "c", "rows", "copy the agent id")
         .with("message", "m", "rows", "message the agent")
         .with("interrupt", "x", "rows", "interrupt (C-c) the agent")
@@ -593,6 +603,8 @@ fn key_table(k: &PickKeys) -> KeyTable {
         ("rename", &k.rename),
         ("project", &k.project),
         ("group", &k.group),
+        ("move_down", &k.move_down),
+        ("move_up", &k.move_up),
         ("interrupt", &k.interrupt),
         ("kill", &k.kill),
         ("focus", &k.focus),
@@ -635,6 +647,11 @@ impl Picker {
     /// -> durable), which changes the key but never the pane.
     fn keep(&self) -> Option<(String, String, Option<i64>)> {
         self.selected().map(|a| (a.key(), a.server.clone(), a.pane))
+    }
+
+    /// Whether a project group (by name) has a live row in the list.
+    fn group_has_live(&self, name: &str) -> bool {
+        self.rows.iter().any(|a| a.live() && project_of(a) == name)
     }
 
     /// Put the cursor on the row for the pane the picker was opened from,
@@ -906,9 +923,13 @@ pub async fn pick_open(
             }
         }
     }
-    let mut order: HashMap<String, u64> = HashMap::new();
-    let mut order_next: u64 = 0;
-    stable_sort(&mut order, &mut order_next, &mut rows);
+    // The order the rows (and the project groups) were left in: moved
+    // with `M-j` / `M-k`, or just where they landed when first seen.
+    let (mut order, mut order_front) = load_ranks("pick_order").await;
+    let (proj_order, proj_front) = load_ranks("pick_proj_order").await;
+    if stable_sort(&mut order, &mut order_front, &mut rows) {
+        save_ranks("pick_order", &order);
+    }
     let multi = is_multi(&rows, &fetching, now_ms());
     let mut engine = Engine::new(mode, width, height, "agents", key_table(&cfg.keys), sigils());
     engine.size = SIZE;
@@ -940,7 +961,9 @@ pub async fn pick_open(
         launchers: cfg.launchers.clone(),
         pending_kill: None,
         order,
-        order_next,
+        order_front,
+        proj_order,
+        proj_front,
         timer: None,
         current_pane: here,
         here_id,
@@ -1010,9 +1033,11 @@ pub async fn reload_picker(
         // Capture the selected agent (key AND pane) against the OLD rows
         // before we swap them in, so the highlight follows the agent.
         let keep = p.keep();
-        // Stable order (server + band + frozen rank), so a refresh never
-        // reshuffles rows under the cursor.
-        stable_sort(&mut p.order, &mut p.order_next, &mut rows);
+        // Stable order (server + band + the kept rank), so a refresh
+        // never reshuffles rows under the cursor.
+        if stable_sort(&mut p.order, &mut p.order_front, &mut rows) {
+            save_ranks("pick_order", &p.order);
+        }
         p.roster_len = rows.len();
         p.rows = rows;
         p.captures = captures;
@@ -2047,6 +2072,10 @@ fn dispatch_key(
                         pick_render(p);
                     }
                 }
+                "move_down" | "move_up" => {
+                    move_selected(p, if name == "move_down" { 1 } else { -1 });
+                    pick_render(p);
+                }
                 "group" => {
                     p.group = p.group.next();
                     p.status(match p.group {
@@ -2813,32 +2842,139 @@ fn server_rank(a: &Agent) -> (bool, &str) {
 }
 
 /// Order rows for a live refresh WITHOUT reshuffling under the cursor.
-/// New agents get a rank in ideal (band + unread + recency) order the
-/// first time they appear; thereafter rows sort by server, band then that
-/// frozen rank. Server and band are primary, so a status change that
-/// moves an agent to another band still moves it - only the churn from
-/// activity-time bumps is removed.
+/// New agents get a rank the first time they appear - in front of every
+/// row already ranked, a batch of them in ideal (band + unread +
+/// recency) order among themselves; thereafter rows sort by server, band
+/// then that rank. Server and band are primary here, so in the band
+/// views a status change that moves an agent to another band still
+/// moves it; the project view orders its groups by the rank alone (see
+/// [`build_nodes`]). `M-j` / `M-k` swap ranks. Returns whether a row got
+/// a rank, so the caller can save them.
 fn stable_sort(
-    order: &mut HashMap<String, u64>,
-    order_next: &mut u64,
+    order: &mut HashMap<String, i64>,
+    order_front: &mut i64,
     rows: &mut Vec<Agent>,
-) {
+) -> bool {
     // Ideal order first, so a batch of new agents is ranked sensibly.
     sort_rows(rows);
-    for a in rows.iter() {
-        let key = a.key();
-        if !order.contains_key(&key) {
-            order.insert(key, *order_next);
-            *order_next += 1;
-        }
+    let new: Vec<String> = rows.iter().map(Agent::key).filter(|k| !order.contains_key(k)).collect();
+    for key in new.iter().rev() {
+        *order_front -= 1;
+        order.insert(key.clone(), *order_front);
     }
-    let rank = |a: &Agent| order.get(&a.key()).copied().unwrap_or(u64::MAX);
+    let rank = |a: &Agent| order.get(&a.key()).copied().unwrap_or(i64::MAX);
     rows.sort_by(|a, b| {
         server_rank(a)
             .cmp(&server_rank(b))
             .then(band(a).cmp(&band(b)))
             .then(rank(a).cmp(&rank(b)))
     });
+    !new.is_empty()
+}
+
+/// A rank map from the store: the setting holds the keys in rank order,
+/// so the ranks are their positions and new ones go in front, from -1
+/// down.
+async fn load_ranks(setting: &str) -> (HashMap<String, i64>, i64) {
+    let keys: Vec<String> = match store::get_setting(setting).await {
+        Ok(Some(v)) => serde_json::from_str(&v).unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    (keys.into_iter().enumerate().map(|(i, k)| (k, i as i64)).collect(), 0)
+}
+
+/// Most ranks a setting keeps: the bottom of the order (the rows seen
+/// longest ago, mostly finished ones) is dropped past this; a row that
+/// comes back gets a fresh rank in front, which is where a new row goes
+/// anyway.
+const RANKS_KEPT: usize = 2000;
+
+fn save_ranks(setting: &'static str, order: &HashMap<String, i64>) {
+    let mut keys: Vec<(&String, &i64)> = order.iter().collect();
+    keys.sort_by_key(|(_, r)| **r);
+    keys.truncate(RANKS_KEPT);
+    let v = serde_json::to_string(&keys.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    spawn(async move {
+        let _ = store::set_setting(setting, &v).await;
+    });
+}
+
+/// `M-j` / `M-k`: move the highlighted row one place down or up among
+/// the rows beside it, or - with the cursor on a project header (`h`
+/// from a row) - the whole project among the projects. Ranks are swapped
+/// with the neighbour, saved, and the list rebuilt; the cursor follows.
+/// Refused under a word search (the rows are in relevance order then),
+/// across a band in the band views (bands order first there), and
+/// between a live row and a finished one (the finished sit below).
+fn move_selected(p: &mut Picker, dir: i32) {
+    if !p.engine.query().words.is_empty() {
+        p.status("clear the search to move rows");
+        return;
+    }
+    let vis: Vec<(String, u8, bool)> =
+        p.engine.visible().map(|n| (n.key.clone(), n.depth, n.is_group())).collect();
+    let sel = p.engine.sel();
+    let Some((key, depth, _)) = vis.get(sel).cloned() else { return };
+    // The neighbour: the next node at the same depth in that direction,
+    // before anything shallower (a header ends the group).
+    let mut neighbour: Option<String> = None;
+    let mut i = sel as i64 + dir as i64;
+    while i >= 0 && (i as usize) < vis.len() {
+        let (k, d, _) = &vis[i as usize];
+        if *d < depth {
+            break;
+        }
+        if *d == depth {
+            neighbour = Some(k.clone());
+            break;
+        }
+        i += dir as i64;
+    }
+    if let Some(name) = key.strip_prefix("proj\u{1}") {
+        let Some(other) = neighbour.as_deref().and_then(|k| k.strip_prefix("proj\u{1}")) else {
+            p.status(if dir > 0 { "last project" } else { "first project" });
+            return;
+        };
+        if p.group_has_live(name) != p.group_has_live(other) {
+            p.status("a project with no live agent stays below the ones with one");
+            return;
+        }
+        let (a, b) = (p.proj_order[name], p.proj_order[other]);
+        p.proj_order.insert(name.to_string(), b);
+        p.proj_order.insert(other.to_string(), a);
+        save_ranks("pick_proj_order", &p.proj_order);
+    } else if key.starts_with("srv\u{1}") || key.starts_with("band\u{1}") {
+        p.status("only rows and projects move; v groups by project");
+        return;
+    } else {
+        let Some(other) = neighbour else {
+            p.status(match (p.group, dir > 0) {
+                (Group::Project, true) => "last in its project (p moves it to another)",
+                (Group::Project, false) => "first in its project",
+                (_, true) => "last in its band (the bands keep their order)",
+                (_, false) => "first in its band (the bands keep their order)",
+            });
+            return;
+        };
+        let live = |p: &Picker, k: &str| p.by_key.get(k).is_some_and(|&i| p.rows[i].live());
+        if p.group == Group::Project && live(p, &key) != live(p, &other) {
+            p.status("finished rows stay below the live ones");
+            return;
+        }
+        let (a, b) = (p.order[&key], p.order[&other]);
+        p.order.insert(key.clone(), b);
+        p.order.insert(other, a);
+        save_ranks("pick_order", &p.order);
+        let mut rows = std::mem::take(&mut p.rows);
+        stable_sort(&mut p.order, &mut p.order_front, &mut rows);
+        p.rows = rows;
+    }
+    let keep = p.keep();
+    pick_reshow(p, keep, false);
+    // The engine kept the cursor on the key; a header is not a row, so
+    // `keep` had nothing for it, and the key alone is right there too.
+    p.engine.select_key(&key);
 }
 
 fn sort_rows(rows: &mut [Agent]) {
@@ -3117,7 +3253,14 @@ fn build_nodes(p: &mut Picker) -> Vec<Node> {
             // server-major, so regroup by band; the sort is stable, so
             // each band keeps its order (rank, or relevance) within.
             let mut by_band: Vec<(u8, usize)> = idx.iter().map(|&i| (band(&p.rows[i]), i)).collect();
-            by_band.sort_by_key(|&(b, _)| b);
+            if needle.is_empty() {
+                // By rank inside the band, whatever the server, so a row
+                // can be moved past one from another machine.
+                let rank = |i: usize| p.order.get(&p.rows[i].key()).copied().unwrap_or(i64::MAX);
+                by_band.sort_by_key(|&(b, i)| (b, rank(i)));
+            } else {
+                by_band.sort_by_key(|&(b, _)| b);
+            }
             let mut prev_band: Option<u8> = None;
             for (b, i) in by_band {
                 if prev_band != Some(b) {
@@ -3143,18 +3286,44 @@ fn build_nodes(p: &mut Picker) -> Vec<Node> {
                 });
                 groups[g].1.push(pos);
             }
+            // A project seen for the first time goes in front of the
+            // others, a batch of them by urgency then latest activity;
+            // from then on its place is its own (`M-j` / `M-k` on the
+            // header). Projects with no live agent sit below the rest.
             let row = |pos: usize| &p.rows[idx[pos]];
-            for (_, members) in &mut groups {
-                members.sort_by_key(|&pos| (band(row(pos)), pos));
-            }
             let urgency = |m: &[usize]| m.iter().map(|&pos| band(row(pos))).min().unwrap_or(u8::MAX);
             let latest = |m: &[usize]| m.iter().map(|&pos| row(pos).active_ms()).max().unwrap_or(0);
-            groups.sort_by(|x, y| {
+            let has_live = |m: &[usize]| m.iter().any(|&pos| row(pos).live());
+            let mut new: Vec<&(String, Vec<usize>)> =
+                groups.iter().filter(|(name, _)| !p.proj_order.contains_key(name)).collect();
+            new.sort_by(|x, y| {
                 urgency(&x.1)
                     .cmp(&urgency(&y.1))
                     .then(latest(&y.1).cmp(&latest(&x.1)))
                     .then(x.0.cmp(&y.0))
             });
+            let new: Vec<String> = new.into_iter().map(|(name, _)| name.clone()).collect();
+            let mut proj_order = std::mem::take(&mut p.proj_order);
+            for name in new.iter().rev() {
+                p.proj_front -= 1;
+                proj_order.insert(name.clone(), p.proj_front);
+            }
+            if !new.is_empty() {
+                save_ranks("pick_proj_order", &proj_order);
+            }
+            // Within a project: the live rows in rank order, the finished
+            // ones under them - or, under a search, by relevance (`idx`
+            // order) inside each band.
+            let rank = |pos: usize| p.order.get(&row(pos).key()).copied().unwrap_or(i64::MAX);
+            for (_, members) in &mut groups {
+                if needle.is_empty() {
+                    members.sort_by_key(|&pos| (!row(pos).live(), rank(pos)));
+                } else {
+                    members.sort_by_key(|&pos| (band(row(pos)), pos));
+                }
+            }
+            groups.sort_by_key(|(name, m)| (!has_live(m), proj_order.get(name).copied().unwrap_or(i64::MAX)));
+            p.proj_order = proj_order;
             for (name, members) in groups {
                 let mut n = Node::group(format!("proj\u{1}{name}"), 0, true, false);
                 n.left = plain_cells(&name, ST_CYAN);

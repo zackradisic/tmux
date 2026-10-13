@@ -1035,11 +1035,11 @@ the sessions were named on purpose (`tab`, `tmux2`, `tsc-checks`,
 explicit tag only needed to cover the exceptions.
 
 **What was built.** The picker groups by project by default: a header
-per project, the rows under it by state (the dot says which; no band
-headers, which was half of §R8's chrome), the projects with an agent
-waiting on you at the top, and a machine column at the right edge since
-no header names the server any more - remote agents sort into the same
-projects. A row's project is the first of:
+per project, the rows under it in the order you keep them (the dot says
+the state; no band headers, which was half of §R8's chrome), and a
+machine column at the right edge since no header names the server any
+more - remote agents sort into the same projects. A row's project is the
+first of:
 
 1. the **tag** on the agent - a `project` column in the agents store
    (schema v12), set with `p` in the picker (the marked rows too) or by
@@ -1065,6 +1065,23 @@ project, server (the old view, bands under a server header, the session
 column back), flat (bands only); the choice is kept in the store
 (`pick_group`). `g` could not be the key - the engine takes it as half
 of `gg`.
+
+**The order is yours (Oct 13 2026).** The first cut sorted the rows in a
+project by state and the projects by their most urgent row, which meant
+the list rearranged itself under you whenever an agent finished a turn -
+the very churn the frozen rank had removed from the band view. Now a row
+gets a rank the first time it is seen (in front: newest first, a batch
+in band + recency order among themselves), a project likewise, and both
+are kept in the store (`pick_order`, `pick_proj_order`: the keys in
+order, the bottom 2000 at most). `M-j` / `M-k` swap the highlighted row
+with its neighbour, or - with the cursor on the project header, where
+`h` puts it from any row - the project with the next one; the cursor
+follows. The refusals say why: at the edge of a project ("`p` moves it
+to another"), under a word search (relevance order), between a live row
+and a finished one (the finished sit below the live, and a project with
+no live agent below the ones with one), and in the band views across a
+band - there a row moves inside its band and a server or band header
+does not move. `regress/plugin-agents-move.sh` covers it.
 
 The option is the same one everywhere else: the sessions chooser shows
 it on session and window rows (a window's only when it is its own, not
