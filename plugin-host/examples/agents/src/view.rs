@@ -351,10 +351,10 @@ pub enum PickAfter {
     /// Interrupt the agent in this local pane: C-c, nothing else. For a
     /// remote row this is its shadow, whose fd is one end of the link's
     /// socketpair, so the key travels to the remote like a typed one.
-    Interrupt(u32),
+    Interrupt(Vec<u32>),
     /// Kill this local pane. `kill-pane` on a shadow runs on the remote
     /// server (see tmux.1, REMOTE SESSIONS), so it kills the real pane.
-    KillPane(u32),
+    KillPane(Vec<u32>),
     /// The accounts panel for this server (the row's), over the picker.
     Accounts(String),
     /// Type this key into the local pane the preview shows: the keyboard
@@ -411,7 +411,11 @@ pub struct Picker {
     /// press to confirm. Killing a pane cannot be undone, and the row the
     /// cursor sits on moves under a refresh, so the pane is remembered
     /// here rather than re-read from the selection on the second press.
-    pub pending_kill: Option<u32>,
+    pub pending_kill: Option<Vec<u32>>,
+    /// The rows the last archive took, (server, id), for the undo key:
+    /// an archived row leaves the list, so there is nothing to press `a`
+    /// on to bring it back.
+    pub last_archive: Vec<(String, String)>,
     /// The display rank per row key: where the row sits among its
     /// neighbours. A row gets one the first time it is seen, in front of
     /// everything (newest first, a batch in ideal band + recency order);
@@ -564,6 +568,7 @@ fn key_table(k: &PickKeys) -> KeyTable {
         .note("search box", "C-u", "clear the box")
         .note("search box", "Esc Enter", "leave the box, keep the query")
         .with("archive", "a", "rows", "archive / un-archive")
+        .with("unarchive", "U", "rows", "undo the last archive: those rows come back")
         .with("archived", "A", "rows", "the archive view")
         .with("history", ".", "rows", "show finished agents too")
         .with("attention", "w", "rows", "move between attention and waiting")
@@ -597,6 +602,7 @@ fn key_table(k: &PickKeys) -> KeyTable {
         ("activate", &k.jump),
         ("filter", &k.filter),
         ("archive", &k.archive),
+        ("unarchive", &k.unarchive),
         ("attention", &k.attention),
         ("copy", &k.copy),
         ("menu", &k.menu),
@@ -964,6 +970,7 @@ pub async fn pick_open(
         history_before_archive: false,
         launchers: cfg.launchers.clone(),
         pending_kill: None,
+        last_archive: Vec::new(),
         order,
         order_front,
         proj_order,
@@ -1313,11 +1320,15 @@ pub async fn apply_life(
         let mut b = picker.borrow_mut();
         if let Some(p) = b.as_mut() {
             let verb = if life == "active" { "unarchived" } else { "archived" };
+            let undo = if life == "archived" { format!(" ({} undoes)", pretty_key(p.key("unarchive"))) } else { String::new() };
             p.status(if ids.len() == 1 {
-                verb.to_string()
+                format!("{verb}{undo}")
             } else {
-                format!("{} {verb}", ids.len())
+                format!("{} {verb}{undo}", ids.len())
             });
+            if life == "archived" {
+                p.last_archive = ids.clone();
+            }
             // The bulk action consumed the selection.
             p.engine.clear_marks();
         }
@@ -2146,6 +2157,17 @@ fn dispatch_key(
             },
             Outcome::Action(name, _) => match name {
                 "archive" => after = archive_after(p),
+                "unarchive" => {
+                    // Undo the last archive: the rows it took come back
+                    // to the roster, wherever the cursor is now.
+                    if p.last_archive.is_empty() {
+                        p.status("nothing archived yet this time");
+                        pick_render(p);
+                    } else {
+                        let ids = std::mem::take(&mut p.last_archive);
+                        after = PickAfter::Life(ids, "active".to_string());
+                    }
+                }
                 "attention" => match attention_after(p) {
                     Ok(a) => after = a,
                     Err(why) => {
@@ -2255,14 +2277,19 @@ fn dispatch_key(
                     // answers with its own "are you sure?", and the live
                     // preview shows it, so the second press is an
                     // informed one rather than a guess.
-                    match live_pane_of_selection(p) {
-                        Some(pane) => {
-                            after = PickAfter::Interrupt(pane);
-                            p.status(format!("interrupt sent to %{pane}"));
-                        }
-                        None => {
+                    let panes = live_panes_of_targets(p);
+                    match panes.as_slice() {
+                        [] => {
                             let why = unreachable_reason(p);
                             p.status(why);
+                        }
+                        [pane] => {
+                            p.status(format!("interrupt sent to %{pane}"));
+                            after = PickAfter::Interrupt(panes);
+                        }
+                        _ => {
+                            p.status(format!("interrupt sent to {} panes", panes.len()));
+                            after = PickAfter::Interrupt(panes);
                         }
                     }
                     pick_render(p);
@@ -2271,21 +2298,23 @@ fn dispatch_key(
                     // Killing the pane takes the agent's process and its
                     // scrollback with it, so it asks first. The second
                     // press must be on the same pane the first one named.
-                    match live_pane_of_selection(p) {
-                        Some(pane) => {
-                            if kill_pending == Some(pane) {
-                                after = PickAfter::KillPane(pane);
-                                p.status(format!("killing %{pane}"));
-                            } else {
-                                p.pending_kill = Some(pane);
-                                let k = pretty_key(p.key("kill"));
-                                p.status(format!("kill %{pane}? {k} again to confirm"));
-                            }
-                        }
-                        None => {
-                            let why = unreachable_reason(p);
-                            p.status(why);
-                        }
+                    let panes = live_panes_of_targets(p);
+                    if panes.is_empty() {
+                        let why = unreachable_reason(p);
+                        p.status(why);
+                    } else if kill_pending.as_deref() == Some(panes.as_slice()) {
+                        p.status(match panes.as_slice() {
+                            [pane] => format!("killing %{pane}"),
+                            _ => format!("killing {} panes", panes.len()),
+                        });
+                        after = PickAfter::KillPane(panes);
+                    } else {
+                        let k = pretty_key(p.key("kill"));
+                        p.status(match panes.as_slice() {
+                            [pane] => format!("kill %{pane}? {k} again to confirm"),
+                            _ => format!("kill {} panes? {k} again to confirm", panes.len()),
+                        });
+                        p.pending_kill = Some(panes);
                     }
                     pick_render(p);
                 }
@@ -2519,30 +2548,52 @@ fn dispatch_key(
                 reload_picker(picker, remotes, false).await;
             });
         }
-        PickAfter::Interrupt(pane) => {
-            // Synchronous: one key into the pane. Nothing is reloaded -
+        PickAfter::Interrupt(panes) => {
+            // Synchronous: one key into each pane. Nothing is reloaded -
             // the refresh tick repaints the preview, which is where the
             // agent's answer to the interrupt shows up.
-            if let Err(e) = send_key(PaneId(pane), "C-c") {
-                if let Some(p) = picker.borrow_mut().as_mut() {
-                    p.status(format!("interrupt failed: {}", e.message));
-                    pick_render(p);
+            let mut failed: Option<String> = None;
+            for pane in &panes {
+                if let Err(e) = send_key(PaneId(*pane), "C-c") {
+                    if failed.is_none() {
+                        failed = Some(e.message.clone());
+                    }
                 }
             }
+            if let Some(p) = picker.borrow_mut().as_mut() {
+                if let Some(why) = failed {
+                    p.status(format!("interrupt failed: {why}"));
+                }
+                p.engine.clear_marks();
+                pick_render(p);
+            }
         }
-        PickAfter::KillPane(pane) => {
+        PickAfter::KillPane(panes) => {
             let picker = Rc::clone(picker);
             let remotes = Rc::clone(remotes);
             ctx.spawn(async move {
                 // On a shadow pane this runs on the remote server, which is
                 // what kills the real agent. The roster follows on its own:
                 // the pane dying retires the row through pane-destroyed.
-                let r = run_command(&format!("kill-pane -t %{pane}")).await;
+                let mut killed = 0usize;
+                let mut failed: Option<String> = None;
+                for pane in &panes {
+                    match run_command(&format!("kill-pane -t %{pane}")).await {
+                        Ok(_) => killed += 1,
+                        Err(e) => {
+                            if failed.is_none() {
+                                failed = Some(e.message.clone());
+                            }
+                        }
+                    }
+                }
                 if let Some(p) = picker.borrow_mut().as_mut() {
-                    p.status(match &r {
-                        Ok(_) => format!("killed %{pane}"),
-                        Err(e) => format!("kill failed: {}", e.message),
+                    p.status(match (&failed, panes.as_slice()) {
+                        (None, [pane]) => format!("killed %{pane}"),
+                        (None, _) => format!("killed {killed} panes"),
+                        (Some(why), _) => format!("killed {killed} of {}; {why}", panes.len()),
                     });
+                    p.engine.clear_marks();
                     pick_render(p);
                 }
                 reload_picker(picker, remotes, false).await;
@@ -3051,13 +3102,13 @@ fn save_ranks(setting: &'static str, order: &HashMap<String, i64>) {
     });
 }
 
-/// `M-j` / `M-k`: move the highlighted row one place down or up among
-/// the rows beside it, or - with the cursor on a project header (`h`
-/// from a row) - the whole project among the projects. Ranks are swapped
-/// with the neighbour, saved, and the list rebuilt; the cursor follows.
-/// Refused under a word search (the rows are in relevance order then),
-/// across a band in the band views (bands order first there), and
-/// between a live row and a finished one (the finished sit below).
+/// `M-j` / `M-k`: with the cursor on a project header (`h` from a row),
+/// move the project one place among the projects; in the band views,
+/// move the highlighted row among the rows of its band. Ranks are
+/// swapped with the neighbour, saved, and the list rebuilt; the cursor
+/// follows. Refused under a word search (the rows are in relevance order
+/// then), on a row in the project view (rows there order by state,
+/// unread and recency), and past the edge of a band or of the projects.
 fn move_selected(p: &mut Picker, dir: i32) {
     if !p.engine.query().words.is_empty() {
         p.status("clear the search to move rows");
@@ -3098,21 +3149,18 @@ fn move_selected(p: &mut Picker, dir: i32) {
     } else if key.starts_with("srv\u{1}") || key.starts_with("band\u{1}") {
         p.status("only rows and projects move; v groups by project");
         return;
+    } else if p.group == Group::Project {
+        p.status("rows order by state, unread and recency; h then M-j/M-k moves the project, p moves a row to another");
+        return;
     } else {
         let Some(other) = neighbour else {
-            p.status(match (p.group, dir > 0) {
-                (Group::Project, true) => "last in its project (p moves it to another)",
-                (Group::Project, false) => "first in its project",
-                (_, true) => "last in its band (the bands keep their order)",
-                (_, false) => "first in its band (the bands keep their order)",
+            p.status(if dir > 0 {
+                "last in its band (the bands keep their order)"
+            } else {
+                "first in its band (the bands keep their order)"
             });
             return;
         };
-        let live = |p: &Picker, k: &str| p.by_key.get(k).is_some_and(|&i| p.rows[i].live());
-        if p.group == Group::Project && live(p, &key) != live(p, &other) {
-            p.status("finished rows stay below the live ones");
-            return;
-        }
         let (a, b) = (p.order[&key], p.order[&other]);
         p.order.insert(key.clone(), b);
         p.order.insert(other, a);
@@ -3218,6 +3266,13 @@ fn live_pane_of_selection(p: &Picker) -> Option<u32> {
     let a = p.selected()?;
     a.pane.filter(|_| a.live())?;
     p.local_pane_of(a)
+}
+
+/// The live local panes (or mirrors) of the marked rows, else of the
+/// highlighted one: what an interrupt or a kill acts on. A target with
+/// no reachable pane is left out.
+fn live_panes_of_targets(p: &Picker) -> Vec<u32> {
+    p.targets().into_iter().filter_map(|a| p.local_pane_of(a)).collect()
 }
 
 /// Why [`live_pane_of_selection`] gave nothing, in the words the jump key
@@ -3462,13 +3517,17 @@ fn build_nodes(p: &mut Picker) -> Vec<Node> {
             if !new.is_empty() {
                 save_ranks("pick_proj_order", &proj_order);
             }
-            // Within a project: the live rows in rank order, the finished
-            // ones under them - or, under a search, by relevance (`idx`
-            // order) inside each band.
-            let rank = |pos: usize| p.order.get(&row(pos).key()).copied().unwrap_or(i64::MAX);
+            // Within a project the rows order by priority: state (needs
+            // input, working, waiting, done), unread first, then the most
+            // recently active - live, so a row that just spoke rises; or,
+            // under a search, by relevance (`idx` order) inside each band.
+            // The projects are what you order by hand.
             for (_, members) in &mut groups {
                 if needle.is_empty() {
-                    members.sort_by_key(|&pos| (!row(pos).live(), rank(pos)));
+                    members.sort_by_key(|&pos| {
+                        let a = row(pos);
+                        (band(a), !a.unread(), std::cmp::Reverse(a.active_ms()))
+                    });
                 } else {
                     members.sort_by_key(|&pos| (band(row(pos)), pos));
                 }

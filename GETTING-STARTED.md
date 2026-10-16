@@ -392,12 +392,15 @@ Also: `unload-plugin`, `enable-plugin` / `disable-plugin`.
 ### agents — `prefix + A`
 Roster of coding-agent CLI sessions running in your panes (claude, codex, pi,
 opencode), grouped by **project**, with a live preview of the selected pane.
-Inside a project the rows stay in the order you keep them: a new one goes in
-first, `M-j` / `M-k` move the highlighted row down / up, and with the cursor
-on the project header (`h` from any of its rows) the same keys move the
-whole project; the order is remembered. The dot shows the state (bright for
+Inside a project the rows order by priority: state first (the dot: bright for
 *needs input*, green *working*, orange *working on a background shell*, dim
-*waiting*), finished rows sit under the live ones. The right edge of every
+*waiting*), unread before read, then the most recently active; finished rows
+sit under the live ones. The projects are in the order you keep them: with
+the cursor on a project header (`h` from any of its rows) `M-j` / `M-k` move
+it down / up, a new project goes in first, and the order is remembered. `J` /
+`K` mark the row and move on; every row action then takes the marked rows
+(archive, read, interrupt, kill, project, fold). `U` undoes the last archive.
+The right edge of every
 row names the machine the pane is on, so agents on linked servers sit in the
 same projects as local ones. A row's project is the first of: the tag
 on the agent (`p` in the picker, or from the agent's own pane:

@@ -1106,6 +1106,28 @@ there, read off the shadow's `window_remote_id`), since a `set-option`
 on the shadow stays here. `regress/plugin-agents-rename.sh` covers the
 three.
 
+**Rows by priority again; marks and an undo (Oct 16 2026, later).** The
+manual order inside a project lasted three days: an unread row that had
+just spoken sat under a day-old one because it had been seen later, and
+the user read that as broken sorting - which it was, from where they
+sit. Rows in a project now order live by state, unread first, then
+recency (what the band view's ideal order always was); the projects stay
+in the user's order, and `M-j` / `M-k` on a row in the project view
+explain that (`p` moves a row to another project, `h` then the keys move
+the project). The band views keep the frozen rank and row moves. A
+folded header had been drawing as an indented row of the group above it
+(the line builder took "the cursor may land here" for "this is an
+item"); it draws as a header now, `▹ name (n)` at the margin. `U` undoes
+the last archive (the rows it took come back; archived rows leave the
+list, so there was nothing to press `a` on). Every row action takes the
+marked rows (`J` / `K` mark and move; two presses, two rows: the cursor
+row is not a target while rows are marked): archive, read/unread,
+attention, project, and now interrupt (C-c to each pane), kill (asked by
+count, confirmed once for all) and fold (`z` folds the marked rows'
+projects with the cursor's). Marking a header with `J` marks nothing an
+action can use - a header as "all its rows" is the next step.
+`regress/plugin-agents-marks.sh` covers the marks and the undo.
+
 The option is the same one everywhere else: the sessions chooser shows
 it on session and window rows (a window's only when it is its own, not
 inherited) and sets it with `p` - on a linked remote row through the

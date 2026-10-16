@@ -111,7 +111,8 @@ case "$(headers)" in
 *) fail "expected the x and gamma projects: $(headers)" ;;
 esac
 # Narrow to x so the first row is one of its two, whatever the project
-# order came out as.
+# order came out as. Rows in a project order by state, unread and
+# recency, not by hand: M-j says so and nothing moves.
 keys /
 keys '^' x
 keys Escape
@@ -119,20 +120,8 @@ keys Escape
 before=$(rows)
 keys g g
 keys M-j
-after=$(rows)
-[ "$after" != "$before" ] || fail "M-j did not move the row: $before"
-[ "$(echo "$after" | awk '{print $2}')" = "$(echo "$before" | awk '{print $1}')" ] ||
-	fail "the first row did not go second: $before -> $after"
-# Once more at the bottom: refused, with a status, nothing moves.
-keys M-j
-screen | grep -q 'last in its project' || fail "no status at the bottom of the project"
-[ "$(rows)" = "$after" ] || fail "a refused move changed the order: $(rows)"
-# And back up.
-keys M-k
-[ "$(rows)" = "$before" ] || fail "M-k did not move it back: $(rows)"
-keys M-j
-[ "$(q "SELECT value FROM settings WHERE key = 'pick_order'")" != "" ] ||
-	fail "pick_order was not saved"
+screen | grep -q 'rows order by state' || fail "no status for a row move in the project view"
+[ "$(rows)" = "$before" ] || fail "a refused move changed the order: $(rows)"
 keys /
 keys C-u
 keys Escape
@@ -159,7 +148,7 @@ open_picker
 keys /
 keys '^' x
 keys Escape
-[ "$(rows)" = "$after" ] || fail "the reopen forgot the row order: $(rows) vs $after"
+[ "$(rows)" = "$before" ] || fail "the reopen changed the row order: $(rows) vs $before"
 keys /
 keys C-u
 keys Escape

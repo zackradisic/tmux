@@ -667,6 +667,22 @@ impl Engine {
         let Some(j) = target else { return Outcome::Nothing };
         let open = !self.is_expanded(&self.nodes[j]);
         let k = self.nodes[j].key.clone();
+        // Marked rows: their groups fold (or unfold) with the cursor's,
+        // the same way round, so a selection across projects folds them
+        // all with one key.
+        if !self.marked.is_empty() {
+            let groups: Vec<String> = self
+                .view
+                .iter()
+                .copied()
+                .filter(|&v| self.marked.contains(&self.nodes[v].key))
+                .filter_map(|v| if self.nodes[v].is_group() { Some(v) } else { self.parent_of(v) })
+                .map(|g| self.nodes[g].key.clone())
+                .collect();
+            for g in groups {
+                self.expanded.insert(g, open);
+            }
+        }
         self.set_fold(&k, open)
     }
 
