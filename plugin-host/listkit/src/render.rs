@@ -172,6 +172,8 @@ impl Engine {
                 clip(to.trim(), 16),
                 pretty_key(self.keys.key_of("unfocus"))
             )
+        } else if self.prompt.as_ref().is_some_and(|p| !p.candidates.is_empty()) {
+            "type · Tab/↓ walk the list · Enter take, Enter accept · Esc cancel".to_string()
         } else if self.prompt.is_some() {
             "type · Enter accept · Esc cancel".to_string()
         } else if self.filtering && !self.quick {
@@ -232,13 +234,21 @@ impl Engine {
     /// typed, one line per value with its row count; the highlighted one
     /// in reverse. Drawn last, over the top of the list.
     fn draw_completions(&self, out: &mut String, list_w: usize) {
-        if !self.filtering || self.completions.is_empty() {
+        if self.completions.is_empty() {
             return;
         }
-        let chars = self.sigil_chars();
-        let Some((sigil, partial)) = typing_token(&self.filter, &chars) else { return };
-        // "  search " is nine cells; the sigil sits where the token starts.
-        let col = query::dropdown_col(&self.filter, partial, 10);
+        // A prompt's dropdown sits under its box, where the text starts;
+        // the search box's under the token being typed, with its sigil.
+        let (col, sigil) = if let Some(p) = &self.prompt {
+            (3 + p.label.chars().count().min(12) + 1, String::new())
+        } else if self.filtering {
+            let chars = self.sigil_chars();
+            let Some((sigil, partial)) = typing_token(&self.filter, &chars) else { return };
+            // "  search " is nine cells; the sigil sits where the token starts.
+            (query::dropdown_col(&self.filter, partial, 10), sigil.to_string())
+        } else {
+            return;
+        };
         let wmax = self.completions.iter().map(|(v, _)| v.chars().count()).max().unwrap_or(0);
         let width = (wmax + 8).min(list_w.saturating_sub(col + 1)).max(4);
         for (i, (v, n)) in self.completions.iter().enumerate() {

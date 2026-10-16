@@ -1083,6 +1083,29 @@ no live agent below the ones with one), and in the band views across a
 band - there a row moves inside its band and a server or band header
 does not move. `regress/plugin-agents-move.sh` covers it.
 
+**Three more (Oct 16 2026).** The `p` box now lists the projects on the
+roster as a dropdown (the listkit prompt grew candidates: Tab / ↓ walk,
+Enter takes the highlighted one into the box, the next Enter accepts;
+the sessions chooser's `p` has the same list from its tree). `R` with
+the cursor on a project header (`h` from a row) renames the project:
+each row goes to the new name by the thing that put it there - a tag is
+retagged, an `@project` option is set at the scope that holds it (pane,
+window or session - one `set-option` per scope, not per row), a row
+named by its session gets `@project` on that session so the next agent
+there follows, a directory-named row is tagged; a remote row is tagged
+through `act project`, the one thing its provider does for us. The
+project's rank comes along, a `^old` in the search box becomes `^new`
+(the list would be empty otherwise), the cursor lands on the new header.
+`n` and `f` carry the project: the new-agent form has a `project` field
+prefilled from the row (or the header the cursor is on, or the pressing
+pane's `@project`), with the same dropdown, and the `new-window` /
+`new-session` is chained with a `set-option @project` on what it made -
+locally; a window started into a linked session gets its option from
+the remote's agents provider (`act project_window` by the window's id
+there, read off the shadow's `window_remote_id`), since a `set-option`
+on the shadow stays here. `regress/plugin-agents-rename.sh` covers the
+three.
+
 The option is the same one everywhere else: the sessions chooser shows
 it on session and window rows (a window's only when it is its own, not
 inherited) and sets it with `p` - on a linked remote row through the

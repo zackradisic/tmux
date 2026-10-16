@@ -1363,7 +1363,12 @@ fn execute(picker: &Rc<RefCell<Option<Picker>>>, remotes: &Rc<RefCell<Remotes>>,
                     }
                     "project" => {
                         if matches!(t.kind, Kind::Session | Kind::Window) {
-                            p.engine.open_prompt("project", &t.project, PROMPT_PROJECT);
+                            // The projects already in the tree, to pick from.
+                            let mut cands: Vec<String> =
+                                p.targets.values().map(|x| x.project.clone()).filter(|v| !v.is_empty()).collect();
+                            cands.sort();
+                            cands.dedup();
+                            p.engine.open_prompt_with("project", &t.project, PROMPT_PROJECT, cands);
                         } else {
                             p.engine.status = Some("only a session or a window here takes a project".into());
                         }

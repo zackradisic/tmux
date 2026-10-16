@@ -17,7 +17,12 @@
 //! its directory. Remote agents sort into the same projects by their own
 //! server's options and session names, so the right edge of every row
 //! names the machine (red when its link is down). `^project` is the
-//! search-box token for it, `P` on a row narrows to its project. `v`
+//! search-box token for it, `P` on a row narrows to its project. The
+//! `p` box offers the projects already on the roster (Tab walks, Enter
+//! takes); `R` on a project header renames the project, every row in it
+//! moving by whatever put it there (its tag, the option, the session);
+//! `n` and `f` start the new agent in the row's project (the form has a
+//! `project` field, prefilled, with the same dropdown). `v`
 //! cycles the grouping - by project, by server (the old view: a header
 //! per server, bands under it, the session column), flat (bands only) -
 //! and the choice is remembered. A live preview of the highlighted pane

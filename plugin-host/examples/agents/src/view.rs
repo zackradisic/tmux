@@ -61,6 +61,7 @@ const MAX_INFLIGHT: usize = 4;
 const TAG_RENAME: u32 = 1;
 const TAG_MESSAGE: u32 = 2;
 const TAG_PROJECT: u32 = 3;
+const TAG_RENAME_PROJECT: u32 = 4;
 
 /// How the list is grouped. `Project` is the default: one header per
 /// project (see [`project_of`]), the rows under it in the order they
@@ -288,7 +289,7 @@ pub fn any_client() -> Option<u64> {
 /// that server is an older agents build that does not know the verb. Its
 /// `act` falls through to "act: <verb> failed", which read on this side
 /// as nothing happening - the row stayed put and the log alone said why.
-async fn act_remote(
+pub(crate) async fn act_remote(
     server: &str,
     id: &str,
     verb: &str,
@@ -331,6 +332,9 @@ pub enum PickAfter {
     Status(Vec<(String, String)>, String),
     /// Tag these (server, id) rows with a project (empty clears).
     Project(Vec<(String, String)>, String),
+    /// Rename a project: every row in it goes to the new name, each by
+    /// the thing that put it there (tag, option, session).
+    RenameProject(String, String),
     /// Put this text on the pressing client's clipboard.
     Copy(String),
     /// A wheel notch over the live preview: into the pane it shows, at
@@ -565,7 +569,7 @@ fn key_table(k: &PickKeys) -> KeyTable {
         .with("attention", "w", "rows", "move between attention and waiting")
         .with("read", "r", "rows", "mark read")
         .with("unread", "u", "rows", "mark unread")
-        .with("rename", "R", "rows", "rename")
+        .with("rename", "R", "rows", "rename the agent; on a project header (h), the project")
         .with("project", "p", "rows", "set the project of the row (or the marked rows)")
         .with("move_down", "M-j", "rows", "move the row down; on a project header (h), the project")
         .with("move_up", "M-k", "rows", "move the row up; on a project header (h), the project")
@@ -1474,6 +1478,132 @@ pub async fn apply_project(
     reload_picker(picker, remotes, false).await;
 }
 
+/// The project names in the list, for a prompt's dropdown.
+fn project_candidates(p: &Picker) -> Vec<String> {
+    let mut v: Vec<String> = p.rows.iter().map(project_of).collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// Which scope's `@project` a local pane resolves to for `value`: the
+/// pane's own, its window's, else the session's.
+fn option_scope(pane: u32, value: &str) -> char {
+    let own = |t: OptionTarget| get_option_in(t, "@project").ok().is_some_and(|v| v == value);
+    if own(OptionTarget::Pane(PaneId(pane))) {
+        return 'p';
+    }
+    let window = list_panes().unwrap_or_default().iter().find(|p| p.id == pane).map(|p| p.window);
+    if window.is_some_and(|w| own(OptionTarget::Window(WindowId(w)))) {
+        return 'w';
+    }
+    's'
+}
+
+/// Rename a project: every row in it goes to the new name by the thing
+/// that put it there - a tag is retagged, an `@project` option is set
+/// where it is (pane, window or session), a row named by its session
+/// gets the option on that session (so the next agent there follows),
+/// one named by its directory is tagged. A remote row is tagged, the
+/// one thing its provider does for us. The project's place in the list
+/// comes along.
+pub async fn apply_rename_project(
+    picker: Rc<RefCell<Option<Picker>>>,
+    remotes: Rc<RefCell<Remotes>>,
+    old: String,
+    new: String,
+) {
+    let rows: Vec<Agent> = picker
+        .borrow()
+        .as_ref()
+        .map(|p| p.rows.iter().filter(|a| project_of(a) == old).cloned().collect())
+        .unwrap_or_default();
+    let mut done = 0usize;
+    let mut refused: Option<String> = None;
+    // A session (or window) option is set once, not once per row in it.
+    let mut set_scopes: HashSet<String> = HashSet::new();
+    for a in &rows {
+        let (_, src) = project_with_source(a);
+        let r = if !a.is_local() {
+            act_remote(&a.server, &a.id, "project", Some(&new)).await
+        } else {
+            match (src, a.pane) {
+                ("session", Some(pane)) => {
+                    let scope = format!("s:{}", a.session.as_deref().unwrap_or(""));
+                    if set_scopes.insert(scope) {
+                        provider::on_project(pane as u32, Some('s'), Some(&new)).await
+                    } else {
+                        Ok(())
+                    }
+                }
+                ("@project option", Some(pane)) => match option_scope(pane as u32, &old) {
+                    'p' => run_command(&format!(
+                        "set-option -p -t %{pane} @project {}",
+                        formkit::text::quote(&new)
+                    ))
+                    .await
+                    .map_err(|e| e.message),
+                    scope => {
+                        let key = match scope {
+                            'w' => format!("w:{}", a.session.as_deref().unwrap_or(""))
+                                + &list_panes()
+                                    .unwrap_or_default()
+                                    .iter()
+                                    .find(|p| p.id == pane as u32)
+                                    .map(|p| format!("/{}", p.window))
+                                    .unwrap_or_default(),
+                            _ => format!("s:{}", a.session.as_deref().unwrap_or("")),
+                        };
+                        if set_scopes.insert(key) {
+                            provider::on_project(pane as u32, Some(scope), Some(&new)).await
+                        } else {
+                            Ok(())
+                        }
+                    }
+                },
+                _ => store::set_project(&a.id, Some(&new)).await.map_err(|e| e.message),
+            }
+        };
+        match r {
+            Ok(()) => done += 1,
+            Err(why) => {
+                if refused.is_none() {
+                    refused = Some(why);
+                }
+            }
+        }
+    }
+    {
+        let mut b = picker.borrow_mut();
+        if let Some(p) = b.as_mut() {
+            if let Some(rank) = p.proj_order.remove(&old) {
+                p.proj_order.insert(new.clone(), rank);
+                save_ranks("pick_proj_order", &p.proj_order);
+            }
+            let n = rows.len();
+            p.status(match refused {
+                None => format!("{old} → {new} ({n} row{})", if n == 1 { "" } else { "s" }),
+                Some(why) => format!("{old} → {new}: {done} of {n}; {why}"),
+            });
+        }
+    }
+    let req = list_req_of(&picker);
+    fetch_remotes_now(Rc::clone(&picker), Rc::clone(&remotes), req).await;
+    reload_picker(Rc::clone(&picker), remotes, false).await;
+    // A `^old` in the search box follows the rename (the list would be
+    // empty otherwise), and the cursor, which was on the old header,
+    // goes onto the new one.
+    let mut b = picker.borrow_mut();
+    if let Some(p) = b.as_mut() {
+        if listkit::query::toggle_word(&mut p.engine.filter, &format!("^{old}")) {
+            listkit::query::toggle_word(&mut p.engine.filter, &format!("^{new}"));
+            p.engine.refilter();
+        }
+        p.engine.select_key(&format!("proj\u{1}{new}"));
+        pick_render(p);
+    }
+}
+
 /// The action menu for the selected row: every picker action, with the
 /// ones that do not apply dimmed, opened on the client that asked for it.
 ///
@@ -1974,7 +2104,14 @@ fn dispatch_key(
             }
             Outcome::PreviewWheel(pane, k, x, y) => after = PickAfter::Wheel(pane.0, k, x, y),
             Outcome::Prompt(tag, text) => {
-                if let Some(a) = p.selected() {
+                if tag == TAG_RENAME_PROJECT {
+                    let key = p.engine.selected_key();
+                    if let Some(old) = key.as_deref().and_then(|k| k.strip_prefix("proj\u{1}")) {
+                        if !text.is_empty() && text != old {
+                            after = PickAfter::RenameProject(old.to_string(), text);
+                        }
+                    }
+                } else if let Some(a) = p.selected() {
                     let (server, id) = (a.server.clone(), a.id.clone());
                     match tag {
                         TAG_RENAME => after = PickAfter::Rename(server, id, text),
@@ -2057,6 +2194,16 @@ fn dispatch_key(
                         let init = a.user_name.clone().unwrap_or_default();
                         p.engine.open_prompt("rename", &init, TAG_RENAME);
                         pick_render(p);
+                    } else {
+                        // On a project header (`h` from a row): rename the
+                        // project, every row in it moving with it.
+                        let key = p.engine.selected_key();
+                        if let Some(old) = key.as_deref().and_then(|k| k.strip_prefix("proj\u{1}")) {
+                            let old = old.to_string();
+                            let cands = project_candidates(p);
+                            p.engine.open_prompt_with("project name", &old, TAG_RENAME_PROJECT, cands);
+                            pick_render(p);
+                        }
                     }
                 }
                 "project" => {
@@ -2068,7 +2215,8 @@ fn dispatch_key(
                         let init = a.project.clone().unwrap_or_default();
                         let n = p.targets().len();
                         let label = if n > 1 { format!("project ×{n}") } else { "project".to_string() };
-                        p.engine.open_prompt(&label, &init, TAG_PROJECT);
+                        let cands = project_candidates(p);
+                        p.engine.open_prompt_with(&label, &init, TAG_PROJECT, cands);
                         pick_render(p);
                     }
                 }
@@ -2352,6 +2500,9 @@ fn dispatch_key(
                 let _ = store::set_setting("pick_w", &w.to_string()).await;
                 let _ = store::set_setting("pick_h", &h.to_string()).await;
             });
+        }
+        PickAfter::RenameProject(old, new) => {
+            ctx.spawn(apply_rename_project(Rc::clone(picker), Rc::clone(remotes), old, new));
         }
         PickAfter::Rename(server, id, name) => {
             let picker = Rc::clone(picker);

@@ -1244,6 +1244,27 @@ pub async fn handle(req: ServiceRequest, cfg: Rc<Config>) {
                     store::rename_by_user(&q.id, n, now).await.is_ok()
                 }
                 "project" => store::set_project(&q.id, q.name.as_deref()).await.is_ok(),
+                // `@project` on one of THIS server's windows, by its id
+                // here (`@12`): a new agent started into a linked session
+                // from another server's picker is tagged this way, since
+                // a `set-option` on the shadow window over there stays
+                // over there.
+                "project_window" => {
+                    let id = q.id.trim_start_matches('@');
+                    if id.is_empty() || !id.chars().all(|c| c.is_ascii_digit()) {
+                        false
+                    } else {
+                        let cmd = match q.name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                            Some(n) => format!("set-option -w -t @{id} @project {}", formkit::text::quote(n)),
+                            None => format!("set-option -u -w -t @{id} @project"),
+                        };
+                        let ok = run_command(&cmd).await.is_ok();
+                        if ok {
+                            broadcast_changed().await;
+                        }
+                        ok
+                    }
+                }
                 // The view moved a row between the attention band and
                 // `waiting` by hand. Only those two: a view has no
                 // business declaring an agent to be mid-turn or finished,

@@ -52,7 +52,9 @@ cleanup() {
 	rm -rf "$HOME" "$DEPLOY"
 }
 fail() { echo "FAIL: $*" >&2; echo "--- screen:" >&2; screen >&2; cleanup; exit 1; }
-q() { python3 "$DUMP" "$XDG_DATA_HOME" "$1"; }
+# sqlite3, not python3: the system python3 needs an Xcode SDK that is
+# not always there.
+q() { db=$(find "$XDG_DATA_HOME" -name store.db | head -1); [ -n "$db" ] && sqlite3 "$db" "$1"; }
 screen() { $TMUX capture-pane -M -p -t "$FORM" | sed '/^ *$/d'; }
 keys() { $TMUX send-keys -t "$FORM" "$@"; sleep 0.5; }
 open_picker() {

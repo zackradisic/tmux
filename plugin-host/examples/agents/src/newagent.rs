@@ -122,6 +122,9 @@ pub struct NewAgent {
     resume: String,
     /// The fork flag, kept the same way.
     fork: String,
+    /// The projects on the roster, (name, "n agents"), for the project
+    /// field's dropdown.
+    projects: Vec<(String, String)>,
 }
 
 /// Is the fork field on?
@@ -166,6 +169,7 @@ impl Model for NewAgent {
                     .map(|s| (s.name, format!("{} windows", s.windows.len())))
                     .collect(),
             }),
+            "project" => Some(Source::Words { title: "projects".into(), words: self.projects.clone() }),
             "command" => Some(Source::Words {
                 title: "launchers".into(),
                 words: self
@@ -324,6 +328,7 @@ fn fields_for(
     command: Field,
     resume: Field,
     fork: Field,
+    project: Field,
 ) -> Vec<Field> {
     match kind {
         Kind::Window => vec![
@@ -333,8 +338,9 @@ fn fields_for(
             command,
             resume,
             fork,
+            project,
         ],
-        Kind::Session => vec![field("folder", folder.to_string()), name, command, resume, fork],
+        Kind::Session => vec![field("folder", folder.to_string()), name, command, resume, fork, project],
         Kind::Worktree => vec![
             field("repo", folder.to_string()),
             name,
@@ -342,6 +348,7 @@ fn fields_for(
             field("branch", String::new()),
             field("session", session.to_string()),
             command,
+            project,
         ],
     }
 }
@@ -418,6 +425,9 @@ fn toggle(form: &mut Form<NewAgent>) -> Option<String> {
         .map(|i| form.fields[i].clone())
         .unwrap_or_else(|| field("fork", form.model.fork.clone()));
     form.model.fork = fork.value.trim().to_string();
+    let project = idx(&form.fields, "project")
+        .map(|i| form.fields[i].clone())
+        .unwrap_or_else(|| field("project", String::new()));
     let folder = idx(&form.fields, "folder")
         .or_else(|| idx(&form.fields, "repo"))
         .map(|i| form.fields[i].value.trim().to_string())
@@ -428,7 +438,7 @@ fn toggle(form: &mut Form<NewAgent>) -> Option<String> {
     let next = form.model.kind.next();
     form.model.kind = next;
     let session = form.model.session.clone();
-    form.replace_fields(fields_for(next, &session, &folder, name, command, resume, fork), "name");
+    form.replace_fields(fields_for(next, &session, &folder, name, command, resume, fork, project), "name");
     form.model.confirm_create = false;
     form.model.reuse = false;
     (next == Kind::Worktree && !folder.is_empty() && form.model.remote.is_none())
@@ -539,6 +549,45 @@ pub async fn open(
             let has_cwd = |p: &u32| resolve_pane(PaneId(*p)).ok().is_some_and(|pi| !pi.cwd.is_empty());
             w.active_pane.filter(has_cwd).or_else(|| w.panes.iter().copied().find(has_cwd))
         });
+    // The project the new agent joins: the row's (or, with the cursor on
+    // a project header, that project's), else the one the pressing
+    // client's pane resolves to. And every project on the roster, for
+    // the field's dropdown.
+    let (project, projects) = {
+        let b = picker.borrow();
+        match b.as_ref() {
+            Some(p) => {
+                let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+                for a in &p.rows {
+                    *counts.entry(crate::view::project_of(a)).or_insert(0) += 1;
+                }
+                let mut list: Vec<(String, String)> = counts
+                    .into_iter()
+                    .map(|(n, c)| (n, format!("{c} agent{}", if c == 1 { "" } else { "s" })))
+                    .collect();
+                list.sort();
+                let own = match p.selected() {
+                    Some(a) => crate::view::project_of(a),
+                    None => p
+                        .engine
+                        .selected_key()
+                        .as_deref()
+                        .and_then(|k| k.strip_prefix("proj\u{1}"))
+                        .unwrap_or_default()
+                        .to_string(),
+                };
+                (own, list)
+            }
+            None => (String::new(), Vec::new()),
+        }
+    };
+    let project = if project.is_empty() {
+        client_pane
+            .and_then(|p| format_expand(OptionTarget::Pane(PaneId(p)), "#{@project}").ok())
+            .unwrap_or_default()
+    } else {
+        project
+    };
     let folder = revive
         .as_ref()
         .map(|(_, cwd, _)| cwd.clone())
@@ -602,6 +651,7 @@ pub async fn open(
         field("command", command),
         field("resume", resume.clone()),
         field("fork", fork_value.clone()),
+        field("project", project),
     );
     let model = NewAgent {
         kind,
@@ -617,6 +667,7 @@ pub async fn open(
         harness,
         resume,
         fork: fork_value,
+        projects,
     };
     let mut form = Form::new(mode, FORM_WIDTH, FORM_HEIGHT, fields, model);
     // Start on the first empty field; with everything prefilled, on the
@@ -759,7 +810,7 @@ async fn submit() {
             (
                 form.model.confirm_create,
                 form.model.reuse,
-                form.model.remote.is_some(),
+                form.model.remote.clone(),
                 form.model.client_name.clone(),
                 form.model.picker_mode,
                 form.model.harness.clone(),
@@ -767,7 +818,8 @@ async fn submit() {
             ),
         )
     };
-    let (confirmed, reuse, remote, client_name, picker_mode, harness, env) = model_bits;
+    let (confirmed, reuse, remote_host, client_name, picker_mode, harness, env) = model_bits;
+    let remote = remote_host.is_some();
     let get = |l: &str| {
         labels
             .iter()
@@ -835,14 +887,33 @@ async fn submit() {
         }
     };
     let session = get("session");
+    let project = get("project").trim().to_string();
+    // The project rides on the new window (or the new session) as its
+    // `@project` option, chained onto the command: `new-window` makes
+    // the new window the session's current one, so that is what the
+    // `-t session:` of the `set-option` finds. A remote session's shadow
+    // window would only get a local option, so the remote is asked to
+    // set it on its own window instead, below.
+    let tag = |target: &str, window: bool| -> String {
+        if project.is_empty() || remote {
+            return String::new();
+        }
+        format!(
+            " ; set-option {}-t {} @project {}",
+            if window { "-w " } else { "" },
+            quote(target),
+            quote(&project)
+        )
+    };
     let (cmd, target) = if !session.is_empty() {
         (
             format!(
-                "new-window -t {} -c {} -n {} {}",
+                "new-window -t {} -c {} -n {} {}{}",
                 quote(&format!("{session}:")),
                 quote(&dir),
                 quote(&name),
-                quote(&command)
+                quote(&command),
+                tag(&format!("{session}:"), true)
             ),
             session.clone(),
         )
@@ -850,10 +921,11 @@ async fn submit() {
         let sess = session_name(&name);
         (
             format!(
-                "new-session -d -s {} -c {} {}",
+                "new-session -d -s {} -c {} {}{}",
                 quote(&sess),
                 quote(&dir),
-                quote(&command)
+                quote(&command),
+                tag(&sess, false)
             ),
             sess,
         )
@@ -867,6 +939,24 @@ async fn submit() {
     if let Err(e) = run_command(&cmd).await {
         form::fail(&st, mode, e.message.clone());
         return;
+    }
+    // A remote session: the new window's shadow is here, the window
+    // itself over there; its provider sets the option by the id there.
+    if let (Some(host), false) = (&remote_host, project.is_empty()) {
+        let wid = list_sessions()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|s| s.name == target)
+            .and_then(|s| s.current_window)
+            .and_then(|w| format_expand(OptionTarget::Window(WindowId(w)), "#{window_remote_id}").ok())
+            .filter(|id| !id.is_empty());
+        let r = match wid {
+            Some(id) => crate::view::act_remote(host, &id, "project_window", Some(&project)).await,
+            None => Err("the new window's remote id is not known yet".to_string()),
+        };
+        if let Err(why) = r {
+            let _ = display_message(&format!("project not set on {host}: {why}"));
+        }
     }
     let _ = mode_close(mode);
     *st.borrow_mut() = None;

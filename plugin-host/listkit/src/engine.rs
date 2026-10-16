@@ -66,6 +66,10 @@ pub struct Prompt {
     pub label: String,
     pub buf: String,
     pub tag: u32,
+    /// Values offered in a dropdown under the box as the text is typed
+    /// (a project name): Tab / ↓ and BTab / ↑ walk them, Enter takes the
+    /// highlighted one into the box, Esc hides them. Empty: no dropdown.
+    pub candidates: Vec<String>,
 }
 
 pub struct Engine {
@@ -605,9 +609,33 @@ impl Engine {
     }
 
     pub fn open_prompt(&mut self, label: &str, initial: &str, tag: u32) {
+        self.open_prompt_with(label, initial, tag, Vec::new());
+    }
+
+    /// A prompt with a dropdown of values to pick from (see
+    /// [`Prompt::candidates`]); the whole list shows while the box is
+    /// empty, so what exists is in view before anything is typed.
+    pub fn open_prompt_with(&mut self, label: &str, initial: &str, tag: u32, candidates: Vec<String>) {
         self.filtering = false;
         self.preview_focus = false;
-        self.prompt = Some(Prompt { label: label.to_string(), buf: initial.to_string(), tag });
+        self.completion_hidden = false;
+        self.prompt = Some(Prompt { label: label.to_string(), buf: initial.to_string(), tag, candidates });
+        self.update_prompt_completions();
+    }
+
+    /// The prompt's dropdown for what is in its box: the candidates the
+    /// text is a part of, minus an exact match on its own.
+    fn update_prompt_completions(&mut self) {
+        self.completions.clear();
+        self.completion_idx = 0;
+        if self.completion_hidden {
+            return;
+        }
+        let Some(p) = self.prompt.as_ref() else { return };
+        if p.candidates.is_empty() {
+            return;
+        }
+        self.completions = query::complete_values(p.candidates.iter().cloned(), p.buf.trim(), true);
     }
 
     pub fn prompt(&self) -> Option<&Prompt> {
@@ -932,15 +960,44 @@ impl Engine {
 
     fn prompt_key(&mut self, key: &str) -> Outcome {
         let close = self.keys.key_of("close").to_string();
+        // The dropdown first: walk it, take from it, or put it away.
+        let dropdown = !self.completions.is_empty();
+        if dropdown && (key == "Tab" || key == "Down") {
+            self.completion_idx = (self.completion_idx + 1) % self.completions.len();
+            return Outcome::Redraw;
+        }
+        if dropdown && (key == "BTab" || key == "Up") {
+            self.completion_idx = (self.completion_idx + self.completions.len() - 1) % self.completions.len();
+            return Outcome::Redraw;
+        }
+        if dropdown && key == close {
+            self.completion_hidden = true;
+            self.completions.clear();
+            return Outcome::Redraw;
+        }
+        if dropdown && key == "Enter" {
+            // Enter takes the highlighted value into the box when it is
+            // not already what is typed; the next Enter accepts the box.
+            let (v, _) = self.completions[self.completion_idx].clone();
+            if let Some(p) = self.prompt.as_mut() {
+                if p.buf.trim() != v {
+                    p.buf = v;
+                    self.completions.clear();
+                    return Outcome::Redraw;
+                }
+            }
+        }
         let Some(p) = self.prompt.as_mut() else { return Outcome::Nothing };
         if key == close {
             self.prompt = None;
+            self.completions.clear();
             return Outcome::Redraw;
         }
         if key == "Enter" {
             let tag = p.tag;
             let text = p.buf.trim().to_string();
             self.prompt = None;
+            self.completions.clear();
             return Outcome::Prompt(tag, text);
         }
         if key == "BSpace" {
@@ -954,6 +1011,9 @@ impl Engine {
         } else {
             return Outcome::Nothing;
         }
+        // Typing brings a hidden dropdown back.
+        self.completion_hidden = false;
+        self.update_prompt_completions();
         Outcome::Redraw
     }
 
@@ -1490,5 +1550,34 @@ mod tests {
         assert_eq!(e.handle_key("z", None), Outcome::Key("z".into()));
         assert_eq!(e.handle_key("Enter", None), Outcome::Activate("a/s1".into()));
         assert_eq!(e.handle_key("+", None), Outcome::Resize(132, 44));
+    }
+
+    #[test]
+    fn prompt_with_candidates() {
+        let mut e = engine();
+        let cands = vec!["glm".to_string(), "tmux2".to_string(), "tab".to_string()];
+        // Empty box: every candidate is on offer.
+        e.open_prompt_with("project", "", 3, cands.clone());
+        assert_eq!(e.completions.len(), 3);
+        // Typing narrows by substring; Tab walks; Enter takes the
+        // highlighted one into the box, the next Enter accepts the box.
+        e.handle_key("t", None);
+        assert_eq!(e.completions.len(), 2);
+        e.handle_key("Tab", None);
+        let picked = e.completions[e.completion_idx].0.clone();
+        assert_eq!(e.handle_key("Enter", None), Outcome::Redraw);
+        assert_eq!(e.prompt.as_ref().map(|p| p.buf.clone()), Some(picked.clone()));
+        assert!(e.completions.is_empty());
+        assert_eq!(e.handle_key("Enter", None), Outcome::Prompt(3, picked));
+        // Esc puts the dropdown away first, then closes the prompt; typing
+        // brings it back.
+        e.open_prompt_with("project", "", 3, cands);
+        assert_eq!(e.handle_key("Escape", None), Outcome::Redraw);
+        assert!(e.prompt.is_some() && e.completions.is_empty());
+        e.handle_key("g", None);
+        assert_eq!(e.completions.len(), 1);
+        assert_eq!(e.handle_key("Escape", None), Outcome::Redraw);
+        assert_eq!(e.handle_key("Escape", None), Outcome::Redraw);
+        assert!(e.prompt.is_none());
     }
 }

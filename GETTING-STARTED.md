@@ -410,6 +410,11 @@ waiting / done* bands under it), or flat. `j`/`k` move, `Enter` jumps to the
 pane, `Space` opens an action menu on the selected row — every action, with
 the ones that do not apply to that row dimmed — and its items are the
 picker's own keys: `a` archives, `.` shows finished rows, `z` folds a group,
+`p` tags the row with a project (the box lists the projects you already have:
+Tab walks them, Enter takes one, Enter again applies), `R` on a project header
+(`h` from any of its rows) renames the project and every row in it moves, `n`
+/ `f` start or fork an agent into the row's project (the form's `project`
+field, prefilled, same dropdown),
 `/` filters (`^proj`, `#session`, `@server`, `~dir` tokens narrow it), `C-f`
 greps live pane contents, `c` copies the agent's session id, `w` moves a row
 between "needs input" and "waiting" when the roster's guess is not yours. A
