@@ -65,14 +65,20 @@ impl Engine {
                         let n = &self.nodes[self.view[*id]];
                         let cur = *id == self.sel;
                         let open = self.is_expanded(n);
+                        // A glyph header folded swaps its glyph for the
+                        // closed one, in the same cell; a plain (indented)
+                        // header gets the closed glyph after its indent.
                         let mut cells: Vec<Styled> = match n.header_glyph {
-                            Some(g) => vec![(g, ST_BOLD), (' ', 0)],
-                            None => std::iter::repeat((' ', 0)).take(n.indent_cells()).collect(),
+                            Some(g) => vec![(if open { g } else { CLOSED }, ST_BOLD), (' ', 0)],
+                            None => {
+                                let mut v: Vec<Styled> = std::iter::repeat((' ', 0)).take(n.indent_cells()).collect();
+                                if !open {
+                                    v.push((CLOSED, ST_DIM));
+                                    v.push((' ', 0));
+                                }
+                                v
+                            }
                         };
-                        if !open {
-                            cells.push((CLOSED, ST_DIM));
-                            cells.push((' ', 0));
-                        }
                         let bold = if n.header_glyph.is_some() { ST_BOLD } else { 0 };
                         cells.extend(n.left.iter().map(|&(c, s)| (c, s | bold)));
                         if !open {

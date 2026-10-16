@@ -382,7 +382,10 @@ impl Engine {
             let vpos = self.view.len();
             self.view.push(i);
             self.matched.push(matched[i]);
-            if self.can_select(i) {
+            // A header draws as a header folded or not: folded, it only
+            // becomes a place the cursor may land (`can_select`), it does
+            // not turn into an indented row of the group above it.
+            if self.nodes[i].selectable() {
                 self.lines.push(Line::Item(vpos));
             } else {
                 if self.spacers && !filtering && !self.lines.is_empty() {
