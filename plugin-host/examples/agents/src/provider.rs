@@ -258,6 +258,17 @@ pub fn name_window_when_seen(session: &str, window: &str, name: &str) {
 /// session file within the first seconds of its life.
 const PENDING_DELAYS_MS: [u64; 3] = [2000, 5000, 15000];
 
+/// Is the pane the active pane of the current window of some attached
+/// client - on screen in front of the user right now?
+fn looked_at(pane: u32) -> bool {
+    let Ok(clients) = list_clients() else { return false };
+    clients
+        .iter()
+        .filter_map(|c| c.session)
+        .filter_map(|s| resolve_session(SessionId(s)).ok()?.current_window)
+        .any(|w| resolve_window(WindowId(w)).ok().and_then(|wi| wi.active_pane) == Some(pane))
+}
+
 /// Is this pane a shadow of a pane on another server? Its agent belongs
 /// to that server's provider, so this one leaves it alone.
 fn is_shadow(pane: u32) -> bool {
@@ -782,6 +793,14 @@ pub async fn report(pane: u32, status: String, task: Option<String>, cfg: Rc<Con
         } else {
             (task, None)
         };
+        // A `working` report while the user is looking at the pane is
+        // their own doing (they typed): that reads the row. One that
+        // arrives while they are elsewhere - a mailbox message, a hook,
+        // a resumed queue - leaves it unread: the stop before it was
+        // never got to, and the row says so while the agent works.
+        if status == "working" && looked_at(pane) {
+            let _ = store::acknowledge_pane(pane as i64, now).await;
+        }
         let n = store::set_status(
             pane as i64,
             &status,

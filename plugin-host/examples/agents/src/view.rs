@@ -1639,10 +1639,10 @@ async fn open_menu(picker: Rc<RefCell<Option<Picker>>>, client: Option<u64>) {
             items.push_str(&menu_item("agents", "fork this agent", &k("fork"), true));
             items.push_str(&menu_item("agents", "accounts on this server", &k("accounts"), true));
             items.push_str(&menu_item("agents", "message", &k("message"), true));
-            let stopped =
-                a.live() && matches!(a.status.as_str(), "needs_input" | "waiting");
-            items.push_str(&menu_item("agents", "mark read", &k("read"), stopped && a.unread()));
-            items.push_str(&menu_item("agents", "mark unread", &k("unread"), stopped && !a.unread()));
+            // Read and unread apply to any live row: a working one can be
+            // unread too (it resumed without you).
+            items.push_str(&menu_item("agents", "mark read", &k("read"), a.live() && a.unread()));
+            items.push_str(&menu_item("agents", "mark unread", &k("unread"), a.live() && !a.unread()));
             items.push_str(&menu_item("agents", "sessions chooser here", &k("sessions"), true));
             items.push_str(&menu_item("agents", "copy id", &k("copy"), durable_id(a).is_some()));
             items.push_str(&menu_item("agents", "info", &k("info"), true));
@@ -3628,6 +3628,11 @@ fn badge_cells(a: &Agent) -> Styled {
     match a.status.as_str() {
         "needs_input" if a.unread() => ('!', ST_HIT),
         "needs_input" => ('!', ST_BOLD | ST_CODE),
+        // Unread while working: it resumed without you, and the stop
+        // before this turn was never got to. The same block as a
+        // waiting unread row, in the working colour.
+        "working" if a.unread() && a.shell => ('●', ST_BOLD | ST_ORANGE | ST_BRIGHT | ST_INVERT),
+        "working" if a.unread() => ('●', ST_BOLD | ST_GREEN | ST_BRIGHT | ST_INVERT),
         "working" if a.shell => ('●', ST_ORANGE),
         "working" => ('●', ST_GREEN),
         "waiting" if a.unread() => ('◉', ST_BOLD | ST_CYAN | ST_BRIGHT | ST_INVERT),

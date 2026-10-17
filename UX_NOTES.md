@@ -1128,6 +1128,21 @@ projects with the cursor's). Marking a header with `J` marks nothing an
 action can use - a header as "all its rows" is the next step.
 `regress/plugin-agents-marks.sh` covers the marks and the undo.
 
+**Unread while working (Oct 16 2026, later still).** Unread was a
+property of stopped rows only, so an agent that stopped, was never got
+to, and then resumed on its own (a mailbox message, a hook) looked like
+any other working row - the stop you missed vanished under the new
+turn. `unread()` now holds through `working`; the dot is the same
+inverted block in the working colour. The ack that keeps this honest: a
+`working` report for a pane that is the active pane of some attached
+client's current window acknowledges the row first (`looked_at` in the
+provider) - the user typed, the turn is theirs. A pane under an open
+picker float is not "looked at" (the float is the active pane), which
+is right: typing through the picker acks on its own. Marking read or
+unread by hand now applies to any live row. The orange dot, for the
+record, is *working on a background shell it started*, not waiting:
+waiting is the hollow cyan `◍`.
+
 The option is the same one everywhere else: the sessions chooser shows
 it on session and window rows (a window's only when it is its own, not
 inherited) and sets it with `p` - on a linked remote row through the

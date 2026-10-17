@@ -144,5 +144,33 @@ done
 [ "$(q "$UNREAD_SQL")" = "1" ] ||
     fail "jump did not clear the unread it jumped to (got $(q "$UNREAD_SQL"))"
 
+# --- unread while working -------------------------------------------------
+# An agent that resumes work while the user is elsewhere keeps its unread:
+# the stop before the turn was never got to. One that resumes while its
+# pane is on screen (the user typed) is read. The jump above made the
+# jumped pane the active one; the other is off screen and still unread.
+WORK_UNREAD="SELECT COUNT(*) FROM agents WHERE status='working' AND waiting_ms IS NOT NULL \
+    AND (acked_ms IS NULL OR acked_ms < waiting_ms)"
+ACTIVE=$($TMUX display-message -p -t alpha '#{pane_id}')
+if [ "$ACTIVE" = "$P1" ]; then OTHER=$P2; else OTHER=$P1; fi
+open_picker
+$TMUX plugin-command -t "$OTHER" agents "working"
+sleep 0.8
+[ "$(q "$WORK_UNREAD")" = 1 ] ||
+	fail "a working report off screen read the row (got $(q "$WORK_UNREAD"))"
+screen | grep -q '1 unread' || fail "the header lost the unread of the working row"
+# The on-screen one: a fresh stop (unread), then a working report while it
+# is in front of the user, which reads it. The picker is closed first: its
+# float is the window's active pane while it is up, so nothing under it
+# counts as looked at (typing through the picker acks on its own).
+$TMUX send-keys -t "$FORM" Escape; sleep 0.5
+$TMUX plugin-command -t "$ACTIVE" agents "working"; sleep 0.3
+$TMUX plugin-command -t "$ACTIVE" agents "waiting"; sleep 0.3
+$TMUX plugin-command -t "$ACTIVE" agents "working"; sleep 0.8
+[ "$(q "$WORK_UNREAD")" = 1 ] ||
+	fail "a working report on screen did not read the row (got $(q "$WORK_UNREAD"))"
+open_picker
+screen | grep -q '1 unread' || fail "the header does not say 1 unread after the on-screen turn"
+
 cleanup
 exit 0

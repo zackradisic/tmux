@@ -3,8 +3,10 @@
 //! Press the hotkey (bind it to `plugin-command agents pick`) to open a
 //! floating chooser: one row per agent, grouped by PROJECT - a header
 //! per project, the rows under it by priority (state: needs input,
-//! working, waiting, done - the dot says which; unread first; then the
-//! most recently active; the finished under the live), the projects in
+//! working, waiting, done - the dot says which, drawn as a block while
+//! the row is unread, a working row too when it resumed without you;
+//! unread first; then the most recently active; the finished under the
+//! live), the projects in
 //! the order you keep them: a new project goes in first, `M-j` / `M-k`
 //! with the cursor on its header (`h` from a row) move it, and the order
 //! is remembered. `J` / `K` mark rows; every row action then takes the

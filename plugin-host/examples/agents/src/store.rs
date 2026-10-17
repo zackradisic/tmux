@@ -347,7 +347,11 @@ impl Agent {
     /// live stopped row with no ack is unread. The cursor landing on a
     /// row is not an acknowledgement: scrolling past is not reading.
     pub fn unread(&self) -> bool {
-        if !self.live() || !matches!(self.status.as_str(), "waiting" | "needs_input") {
+        // A working agent stays unread when it resumed without the user:
+        // the stop they never got to is still behind the new turn. A
+        // turn the user started themselves (a `working` report while
+        // they looked at the pane) acknowledges, see the provider.
+        if !self.live() || !matches!(self.status.as_str(), "waiting" | "needs_input" | "working") {
             return false;
         }
         match self.waiting_ms {
@@ -778,6 +782,18 @@ pub async fn acknowledge(id: &str, now_ms: i64) -> Result<u64, HostError> {
     let r = db_exec(
         "UPDATE agents SET acked_ms = ?2 WHERE id = ?1",
         params![id, now_ms],
+    )
+    .await?;
+    Ok(r.changes as u64)
+}
+
+/// Acknowledge the live row on a pane: the user was looking at the pane
+/// when its agent went to work, so the turn is theirs and the stop
+/// before it was read.
+pub async fn acknowledge_pane(pane: i64, now_ms: i64) -> Result<u64, HostError> {
+    let r = db_exec(
+        "UPDATE agents SET acked_ms = ?2 WHERE pane = ?1 AND ended_ms IS NULL",
+        params![pane, now_ms],
     )
     .await?;
     Ok(r.changes as u64)
