@@ -164,6 +164,21 @@ fn looks_like_version(base: &str) -> bool {
     (2..=4).contains(&n) && parts.all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// A command name as the configuration spells it: the npm install of
+/// Claude Code ships its native binary as `bin/claude.exe` (the symlink
+/// `claude` points at it), and the pane's current command is the process
+/// name, which is the file's. Without this a Claude started through that
+/// install is no agent at all: its reports find no row, every look ends
+/// the pane, and the picker never shows it.
+fn command_stem(base: &str) -> &str {
+    let n = base.len();
+    if n > 4 && base.is_char_boundary(n - 4) && base[n - 4..].eq_ignore_ascii_case(".exe") {
+        &base[..n - 4]
+    } else {
+        base
+    }
+}
+
 /// The agent kind a pane runs. Command name first (reliable, and the only
 /// signal Codex offers), then the interpreter's launched script, then
 /// the environment. `AI_AGENT` is a hint, not proof: Claude Code sets it
@@ -178,7 +193,7 @@ async fn detect(pane: u32, cfg: &Config) -> Detected {
     if let Ok(cmd) =
         format_expand(OptionTarget::Pane(PaneId(pane)), "#{pane_current_command}")
     {
-        let base = cmd.rsplit('/').next().unwrap_or(&cmd);
+        let base = command_stem(cmd.rsplit('/').next().unwrap_or(&cmd));
         if let Some(k) = commands.iter().find(|c| c.as_str() == base) {
             return Detected::Kind(k.clone());
         }
@@ -769,6 +784,20 @@ pub async fn report(pane: u32, status: String, task: Option<String>, cfg: Rc<Con
     let now = now_ms() as i64;
     if status == "done" {
         let live = store::live_by_pane(pane as i64).await.ok().flatten();
+        // A row still on its provisional id gets its last look at the
+        // session file now, as a closed pane's does (`end_pane`): the
+        // harness exits right after this report and takes the file with
+        // it. Without the id the row cannot be resumed, forked or
+        // searched, and a Claude started again in the same pane cannot
+        // rejoin it.
+        let live = match live {
+            Some(a) if a.id.starts_with("prov-") => {
+                let mut rows = vec![a];
+                enrich_live(&mut rows).await;
+                rows.pop()
+            }
+            other => other,
+        };
         if let Some(a) = &live {
             if let Some(text) = capture_tail(pane) {
                 let _ = store::save_capture(&a.id, &text).await;
@@ -1312,7 +1341,7 @@ pub async fn handle(req: ServiceRequest, cfg: Rc<Config>) {
 
 #[cfg(test)]
 mod title_tests {
-    use super::clean_title;
+    use super::{clean_title, command_stem};
 
     #[test]
     fn codex_topic_loses_its_directory_suffix() {
@@ -1347,5 +1376,14 @@ mod title_tests {
         );
         assert_eq!(clean_title("tab | other", "codex", "mbp", "mbp.local", "/Users/z/Code/tab"), Some("tab | other"));
         assert_eq!(clean_title("topic", "codex", "mbp", "mbp.local", ""), Some("topic"));
+    }
+
+    #[test]
+    fn command_stem_strips_exe() {
+        assert_eq!(command_stem("claude.exe"), "claude");
+        assert_eq!(command_stem("claude.EXE"), "claude");
+        assert_eq!(command_stem("claude"), "claude");
+        assert_eq!(command_stem(".exe"), ".exe");
+        assert_eq!(command_stem("2.1.304"), "2.1.304");
     }
 }
