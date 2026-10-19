@@ -187,7 +187,15 @@ fn command_stem(base: &str) -> &str {
 /// carry the server's copy. A claude row needs the harness's own session
 /// file to name the pane (see `resolve::claude_claims_pane`), unless the
 /// configuration says `trust_env`.
-async fn detect(pane: u32, cfg: &Config) -> Detected {
+///
+/// `reported`: a shim's own report for the pane (`agents working` from a
+/// hook) is the one proof that an agent runs there, whatever the pane
+/// command reads. A Claude started by a non-interactive shell (`zsh -c
+/// 'claude ...; exec zsh'`, as an agent spawning an agent does) shares
+/// the shell's process group, and the pane command is the group
+/// leader's name: `zsh`. Then the session file naming this pane says
+/// which Claude, and an AI_AGENT names any other kind.
+async fn detect(pane: u32, cfg: &Config, reported: bool) -> Detected {
     let commands = &cfg.commands;
     let mut version_like = false;
     if let Ok(cmd) =
@@ -211,6 +219,9 @@ async fn detect(pane: u32, cfg: &Config) -> Detected {
         }
         version_like = looks_like_version(base);
     }
+    if reported && crate::resolve::claude_claims_pane(pane).await {
+        return Detected::Kind("claude".into());
+    }
     let hint = pane_env(PaneId(pane), "AI_AGENT")
         .ok()
         .flatten()
@@ -231,7 +242,7 @@ async fn detect(pane: u32, cfg: &Config) -> Detected {
         // shell. Only a command we cannot read as itself - the macOS
         // launcher execs a version-named binary - earns a look at the
         // files, just below.
-        Some("claude") if !cfg.trust_env => {}
+        Some("claude") if !cfg.trust_env && !reported => {}
         Some(k) => return Detected::Kind(k.to_string()),
         None => {}
     }
@@ -444,6 +455,15 @@ pub fn capture_tail(pane: u32) -> Option<String> {
 /// agent. A shadow pane (mirrored from another server) is never an agent
 /// here: its own server's provider owns it.
 pub async fn classify(pane: u32, cfg: Rc<Config>) {
+    classify_in(pane, cfg, false).await
+}
+
+/// `classify` for a pane a shim just reported on: see `detect`.
+pub async fn classify_reported(pane: u32, cfg: Rc<Config>) {
+    classify_in(pane, cfg, true).await
+}
+
+async fn classify_in(pane: u32, cfg: Rc<Config>, reported: bool) {
     if !owns_store() {
         return;
     }
@@ -452,7 +472,7 @@ pub async fn classify(pane: u32, cfg: Rc<Config>) {
         let _ = store::end_by_pane(pane as i64, now, "closed").await;
         return;
     }
-    let kind = match detect(pane, &cfg).await {
+    let kind = match detect(pane, &cfg, reported).await {
         Detected::Kind(k) => {
             PENDING_LOOKS.with(|p| p.borrow_mut().remove(&pane));
             k
@@ -841,7 +861,7 @@ pub async fn report(pane: u32, status: String, task: Option<String>, cfg: Rc<Con
         .unwrap_or(0);
         if n == 0 {
             // The shim beat classify to it; discover the pane, then retry.
-            classify(pane, Rc::clone(&cfg)).await;
+            classify_reported(pane, Rc::clone(&cfg)).await;
             let _ = store::set_status(
                 pane as i64,
                 &status,
