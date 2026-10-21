@@ -19,6 +19,18 @@
 //!    (and immediately on `pane-focus-out` when focus events are on), so
 //!    background panes do no git work.
 //!
+//! Only a pane that is on display probes: the active pane of a window that
+//! is the current window of a session with a client attached. A server
+//! with dozens of windows has dozens of active panes, but the status line
+//! only ever shows the one you are looking at, so the others would be
+//! forking git for nobody. An active pane that is not on display keeps a
+//! cheap tick (a few host reads per interval, no process) so it catches up
+//! within one interval when a client switches to it; `client-session-changed`
+//! carries no pane, so no event reaches it for that.
+//!
+//! Remote (shadow) panes never probe: their cwd is on another machine, so a
+//! local `git` there would answer for the wrong directory.
+//!
 //! A slow `git status` can never pile up: refreshes are skipped while one
 //! is already in flight, and tmux itself never blocks (the probe runs as
 //! an async job).
@@ -55,6 +67,8 @@ const GIT_PROBE: &str = concat!(
 struct GitStatus {
     pane: PaneId,
     interval: u64,
+    /// A shadow of a pane on another server: never probed.
+    remote: bool,
     /// Poll-loop generation: bumping it makes any live loop exit at its
     /// next wakeup. Shared with the loop tasks via Rc (guest is
     /// single-threaded).
@@ -65,7 +79,9 @@ struct GitStatus {
 }
 
 impl GitStatus {
-    /// Start (or restart) the focused-poll loop; any previous loop dies.
+    /// Start (or restart) the active-pane poll loop; any previous loop
+    /// dies. The loop ticks while the pane is its window's active pane and
+    /// probes only on the ticks where the pane is on display.
     fn start_polling(&self, ctx: &Ctx) {
         let my_epoch = self.epoch.get() + 1;
         self.epoch.set(my_epoch);
@@ -82,7 +98,9 @@ impl GitStatus {
                 if !info.active {
                     return;
                 }
-                probe_and_publish(pane, info, &in_flight).await;
+                if on_display(&info) {
+                    probe_and_publish(pane, info, &in_flight).await;
+                }
                 if sleep_ms(interval).await.is_err() {
                     return; // instance torn down
                 }
@@ -116,6 +134,23 @@ impl Plugin for GitStatus {
         }
         let pane = PaneId(me.scope_id);
 
+        let info = resolve_pane(pane).ok();
+        let remote = info.as_ref().is_some_and(|i| i.remote);
+
+        let plugin = Self {
+            pane,
+            interval,
+            remote,
+            epoch: Rc::new(Cell::new(0)),
+            in_flight: Rc::new(Cell::new(false)),
+        };
+
+        if remote {
+            // Nothing to probe here, ever: publish empty and stay quiet.
+            publish(pane, "", false);
+            return Ok(plugin);
+        }
+
         ctx.subscribe(&[
             "window-pane-changed",   // became active pane (always fires)
             "session-window-changed", // window switch made this pane visible
@@ -125,30 +160,24 @@ impl Plugin for GitStatus {
         ])
         .map_err(|e| e.message.clone())?;
 
-        let plugin = Self {
-            pane,
-            interval,
-            epoch: Rc::new(Cell::new(0)),
-            in_flight: Rc::new(Cell::new(false)),
-        };
-
         // Focus events only fire on changes, so seed the initial state: if
         // this pane is currently its window's active pane, poll until a
-        // focus-out says otherwise; either way publish once now.
-        let active = resolve_pane(pane).map(|i| i.active).unwrap_or(false);
-        if active {
-            plugin.start_polling(ctx); // first loop iteration refreshes
+        // focus-out says otherwise (the first tick probes if it is on
+        // display). Anything else publishes empty and waits for a trigger:
+        // the status line cannot show it before one fires anyway.
+        if info.is_some_and(|i| i.active) {
+            plugin.start_polling(ctx);
         } else {
-            let in_flight = Rc::clone(&plugin.in_flight);
-            ctx.spawn(async move {
-                refresh_even_if_inactive(pane, &in_flight).await;
-            });
+            publish(pane, "", false);
         }
 
         Ok(plugin)
     }
 
     fn on_event(&mut self, ctx: &Ctx, event: Event) {
+        if self.remote {
+            return;
+        }
         match event.name().as_str() {
             // This pane became the one on display: refresh now (loop's
             // first iteration) + poll while it stays active.
@@ -170,20 +199,30 @@ impl Plugin for GitStatus {
     }
 }
 
-async fn refresh(pane: PaneId, in_flight: &Cell<bool>) {
-    // Background panes are not shown in the status line; they catch up on
-    // their next focus-in or prompt-after-focus.
-    let Ok(info) = resolve_pane(pane) else { return };
-    if !info.active {
-        return;
+/// Is somebody looking at this pane: the active pane of its window, with
+/// that window current in a session a client is attached to? Shadow panes
+/// of remote links never count (see the module docs).
+fn on_display(info: &PaneInfo) -> bool {
+    if info.remote || !info.active {
+        return false;
     }
-    probe_and_publish(pane, info, in_flight).await;
+    let Ok(window) = resolve_window(WindowId(info.window)) else {
+        return false;
+    };
+    window.sessions.iter().any(|&sid| {
+        resolve_session(SessionId(sid))
+            .map(|s| s.attached && s.current_window == Some(info.window))
+            .unwrap_or(false)
+    })
 }
 
-/// Used once at init so a freshly-loaded plugin publishes something even
-/// for panes that are not active right now.
-async fn refresh_even_if_inactive(pane: PaneId, in_flight: &Cell<bool>) {
+async fn refresh(pane: PaneId, in_flight: &Cell<bool>) {
+    // Panes nobody is looking at are not in any status line; they catch
+    // up on their next focus-in, prompt-after-focus or poll tick.
     let Ok(info) = resolve_pane(pane) else { return };
+    if !on_display(&info) {
+        return;
+    }
     probe_and_publish(pane, info, in_flight).await;
 }
 
