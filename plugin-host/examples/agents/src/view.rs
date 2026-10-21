@@ -665,19 +665,24 @@ impl Picker {
     }
 
     /// Put the cursor on the row for the pane the picker was opened from,
-    /// if that row is on screen and the cursor has not been moved since
-    /// open. Returns whether it landed.
+    /// if that row is in the list and the cursor has not been moved since
+    /// open. A folded group opens on the way to it: the picker opened
+    /// from an agent lands on that agent, whatever was folded last time.
+    /// Returns whether it landed.
     fn select_here(&mut self) -> bool {
         if !self.seek_here || (self.current_pane.is_none() && self.here_id.is_none()) {
             return false;
         }
         let key = self
-            .engine
-            .visible()
-            .find(|n| self.by_key.get(&n.key).is_some_and(|&i| self.is_here(&self.rows[i])))
-            .map(|n| n.key.clone());
+            .by_key
+            .iter()
+            .filter(|(_, &i)| self.is_here(&self.rows[i]))
+            .map(|(k, _)| k.clone())
+            .min();
         let Some(key) = key else { return false };
-        self.engine.select_key(&key);
+        if !self.engine.reveal_key(&key) {
+            return false;
+        }
         self.seek_here = false;
         true
     }

@@ -83,6 +83,20 @@ bot=$(border_count)
     fail "no here-border when opened from an agent pane (gg $top, G $bot)"
 
 # Opened from the non-agent pane P3: no row matches, no border.
+# Fold the group the here row is in, close, reopen: the picker still
+# lands on the here row, opening its group on the way (the folds are
+# remembered across opens, so without this the cursor had nowhere to go).
+$TMUX send-keys -t "$FORM" g; $TMUX send-keys -t "$FORM" g; sleep 0.4
+$TMUX send-keys -t "$FORM" z; sleep 0.5
+$TMUX capture-pane -M -p -t "$FORM" | grep -q '▸ [^●◍◉!·].*([0-9][0-9]*)' ||
+    fail "z did not fold the here row's group: $($TMUX capture-pane -M -p -t "$FORM" | grep '▸')"
+$TMUX send-keys -t "$FORM" q; sleep 0.4
+open_from "$P1"
+cur=$($TMUX capture-pane -M -p -t "$FORM" | grep '▸')
+echo "$cur" | grep -q '▸ [●◍◉!·]' ||
+    fail "reopened over a folded group: cursor not on a row: '$cur'"
+[ "$(border_count)" -eq 0 ] ||
+    fail "reopened over a folded group: cursor not on the here row (▎ count $(border_count))"
 $TMUX send-keys -t "$FORM" q; sleep 0.4
 open_from "$P3"
 [ "$(border_count)" -eq 0 ] ||
