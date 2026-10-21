@@ -1,0 +1,2 @@
+- Qwen 3.5 4B fine tune as drafter
+  - Quantize it to MXINT8 or SBFP12

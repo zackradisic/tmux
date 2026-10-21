@@ -1,0 +1,40 @@
+- Qwen 3.5 4B fine tune as drafter
+  - Quantize it to MXINT8 or SBFP12
+
+  - The strat is basically:
+    - Even dflash2 is bad at overall coding agent prediction
+    - Reasoning is the worst
+    - But we can be really good at predicting common patterns that show up in
+      coding:
+      - Repeated file paths
+      - Any previously mentioned text which is repeated
+      - Tool calls / coding
+
+    - We consistently score MUCH better on these. Like AL@8 is really high like 7 or 8
+
+    - So we could potentially bump the draft block if we know it is going to be
+      a long sequence of tokens. 
+
+- What do we need to get there
+
+  - SFT qwen 3.5 4B
+    - FLA / conv1d need to install dat shit or it will be slow
+
+  - Qwen 3.5 4B quantized
+    - MXINT8 seems to take no effect on AL@8
+    - 
+
+      ┌──────────────────┬────────┬────────────────────────────┬───────────────────────────┬──────────────────────────┬─────────────────┬─────────┐
+      │      model       │ params │ SBFP12, block 64 (4.125 b) │ SBFP12, block 32 (4.25 b) │ SBFP12, block 16 (4.5 b) │ MXINT4 (4.25 b) │ MXINT8  │
+      ├──────────────────┼────────┼────────────────────────────┼───────────────────────────┼──────────────────────────┼─────────────────┼─────────┤
+      │ Qwen3-1.7B / v11 │ 1.72B  │ 0.89 GB                    │ 0.91 GB                   │ 0.97 GB                  │ 0.91 GB         │ 1.77 GB │
+      ├──────────────────┼────────┼────────────────────────────┼───────────────────────────┼──────────────────────────┼─────────────────┼─────────┤
+      │ Qwen3.5-2B       │ 1.94B  │ 1.00 GB                    │ 1.03 GB                   │ 1.09 GB                  │ 1.03 GB         │ 2.00 GB │
+      ├──────────────────┼────────┼────────────────────────────┼───────────────────────────┼──────────────────────────┼─────────────────┼─────────┤
+      │ Qwen3-4B         │ 4.02B  │ 2.07 GB                    │ 2.14 GB                   │ 2.26 GB                  │ 2.14 GB         │ 4.15 GB │
+      ├──────────────────┼────────┼────────────────────────────┼───────────────────────────┼──────────────────────────┼─────────────────┼─────────┤
+      │ Qwen3.5-4B       │ 4.33B  │ 2.23 GB                    │ 2.30 GB                   │ 2.44 GB                  │ 2.30 GB         │ 4.46 GB │
+      └──────────────────┴────────┴────────────────────────────┴───────────────────────────┴──────────────────────────┴─────────────────┴─────────┘
+
+  - Run it on dmatrix
+
