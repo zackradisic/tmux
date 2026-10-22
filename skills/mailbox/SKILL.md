@@ -8,8 +8,8 @@ description: Send a message to another agent running in a tmux2 pane, on this ma
 tmux2 is a tmux fork. Its `agents` plugin keeps a roster of every agent
 running in a pane, and its `mailbox` plugin stores messages addressed to an
 agent by id. A message is never typed into the other agent's pane. It is
-stored, then pushed into that Claude session as one queued user turn, so it
-cannot corrupt a half-typed prompt or submit on Enter.
+stored, then pushed into that Claude or opencode session as one queued user
+turn, so it cannot corrupt a half-typed prompt or submit on Enter.
 
 This text lives inside the tmux2 binary. Print it with the live block below
 filled in for your pane, and reread it rather than trusting memory, because it
@@ -226,6 +226,16 @@ Claude session, and neither produces an error when missing:
 
 Without these the message is stored unread and the agent sits idle.
 
+For an **opencode** session the push goes through opencode's own service
+instead (`POST /api/session/<id>/prompt`, delivery `steer`), so what must
+hold there is: the row is bound to its session (the picker shows
+`opencode:<id>`, not a provisional id), the service is running and
+registered (`~/.local/state/opencode/service.json` names its url and
+password), and `curl` is installed. The prefix of a message delivered to
+opencode names the pane literally (`-t %N`), because opencode runs its
+tools in the shared service, where `$TMUX_PANE` is not the agent's pane:
+reply with the command exactly as the prefix gives it.
+
 ## Receiving and replying
 
 A message arrives as a user turn prefixed `Message from <sender> via the
@@ -255,6 +265,7 @@ The raw store is `~/.local/share/tmux/plugins/mailbox/store.db`, table
 | Symptom | Cause | Check |
 |---|---|---|
 | Sent, receiver never reacts, row has `read=0` in its mailbox store | receiver's agents plugin lacks `claude-notify`, or `crossSessionInbound` unset | caps in the receiver's `plugins.toml`; its settings.json |
+| Same, receiver is opencode | row still provisional, service not registered, or no `curl` | `i` card shows `opencode:<id>`; `~/.local/state/opencode/service.json` exists; the tmux2 log line `agents: push to opencode:...` |
 | `unknown agent` from the remote side | bare id, roster never pulled there | add `@<peer-name>` |
 | `no such server` | peer name changed, or link down | `hostname` / `peer-name` file on the initiator; link state |
 | `E_DENIED` | grant missing on the initiator | `plugin-peers list`, then `allow` |

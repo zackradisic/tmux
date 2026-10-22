@@ -51,7 +51,7 @@ pub struct Resolved {
     pub cwd: Option<String>,
 }
 
-fn home() -> Option<String> {
+pub(crate) fn home() -> Option<String> {
     home_dir().ok().filter(|s| !s.is_empty())
 }
 
@@ -724,6 +724,12 @@ thread_local! {
 /// Where opencode keeps its database.
 pub fn opencode_db() -> Option<String> {
     Some(format!("{}/.local/share/opencode/opencode.db", home()?))
+}
+
+/// Where opencode's service registers itself: its url, pid and password,
+/// mode 0600. The push (see push.rs) speaks to that service.
+pub fn opencode_registration() -> Option<String> {
+    Some(format!("{}/.local/state/opencode/service.json", home()?))
 }
 
 /// One statement against opencode's database, read-only, as JSON rows.

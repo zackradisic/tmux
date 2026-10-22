@@ -450,7 +450,9 @@ tmux2 plugin-command mailbox list               # unread counts
 ```
 
 With `claude-notify`, a message is pushed straight into the receiving Claude
-session's inbox socket, so the agent wakes with it. See `CROSS-AGENT.md`.
+session's inbox socket, so the agent wakes with it. A message to an opencode
+session is posted to the service that runs it (`run-process`, `curl`), with
+the same effect. See `CROSS-AGENT.md`.
 
 ### resurrect — `prefix + C-r`
 Periodically snapshots your panes to disk (**including scrollback**) and

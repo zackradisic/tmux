@@ -40,6 +40,13 @@ The database is read once per row every 5 s while the picker is open
 (a render asks, a cached answer serves the renders between), and once
 more when the pane closes.
 
+A mailbox message to an opencode row (`agents message opencode:<id>
+...`) is pushed the same way Claude's is, but through the service: one
+`curl` job posts it to `/api/session/<id>/prompt` as a steer, with the
+address and password from `~/.local/state/opencode/service.json` (see
+`CROSS-AGENT.md`, "Push"). The message's prefix names the pane as
+`-t %N`, since `$TMUX_PANE` in the service is not the agent's pane.
+
 ## pi (required for a stable id + activity time)
 
 pi keeps no file the plugin can map from outside, so a tiny in-process

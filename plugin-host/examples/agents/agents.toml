@@ -14,7 +14,9 @@
 #
 # claude-notify pushes a mailbox message into the Claude session that owns
 # the box, over its inbox socket, so the agent wakes with it. Without it
-# messages stay in the mailbox for `inbox`.
+# messages stay in the mailbox for `inbox`. The same push into an opencode
+# session goes through its service instead (a curl job under run-process,
+# the address and password from the registration file under fs-read).
 
 [caps]
 requests = [
@@ -40,7 +42,9 @@ requests = [
   # screen, mkdir and git worktree add on Enter. fs-list is above.
   # Also how opencode's sessions and conversations are read: one
   # `sqlite3 -readonly -json` job per poll on its database (its own db
-  # capability reaches only the roster's store).
+  # capability reaches only the roster's store), and how a mailbox
+  # message is pushed into an opencode session: one curl job posting it
+  # to the service that runs the session.
   "run-process",
   "fs-read-any",
   # Publishes the durable id on the agent's pane as the @agent_id option,
@@ -84,4 +88,7 @@ paths = [
   "~/.codex/archived_sessions",
   "~/.pi",
   "~/.local/share/opencode",
+  # opencode's service registration (url, pid, password): where a mailbox
+  # message to an opencode session is posted.
+  "~/.local/state/opencode",
 ]

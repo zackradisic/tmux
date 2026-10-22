@@ -11,8 +11,9 @@ keystrokes.
 It is a wasm plugin. No Python, no external program. An agent talks to it
 with `plugin-command`, and the plugin's own services carry a message
 between servers over the tmux2 bridge. The last hop, from the mailbox
-into the reader's live Claude session, is one line on the inbox socket
-that Claude Code binds for every session (see "Push" below).
+into the reader's live session, is one line on the inbox socket that
+Claude Code binds for every session, or one request to the service that
+runs an opencode session (see "Push" below).
 
 ## The mailbox plugin
 
@@ -122,8 +123,32 @@ The chain, all inside the tmux event loop:
 
 Across a link nothing is added: the message rides the bridge to the
 reader's server as before, and that server's agents plugin does the push
-locally. A box that is not a Claude agent here (a plain box, a codex or
-pi agent, a Claude with no socket) is left unread for `inbox`.
+locally. A box that is not a Claude or opencode agent here (a plain box,
+a codex or pi agent, a Claude with no socket, an opencode row not yet
+bound to its session) is left unread for `inbox`.
+
+### opencode
+
+opencode 2.x has no inbox socket: every session runs inside one
+background service (`opencode serve --service`) with an HTTP API, and a
+session has a durable inbox of its own there. A prompt posted to
+`/api/session/<id>/prompt` with delivery `steer` is one queued user turn
+in the same sense as Claude's socket line: opencode takes it at the next
+step boundary of a running turn, or starts a turn with it when the
+session is idle, and nothing is typed into the pane.
+
+The agents plugin knows the session id from the row (`opencode:<id>`,
+bound through opencode's database; see `shims/README.md`). It reads the
+service's registration file, `~/.local/state/opencode/service.json`
+(url, pid, password, mode 0600), and posts the message through one
+`curl` job under `run-process`. The job's shell reads the password from
+the registration itself and hands it to curl as a config on stdin, so
+it is on no command line. The prefix names the row's pane literally
+(`-t %N`) instead of `$TMUX_PANE`: opencode's tools run in the service,
+whose environment names whichever pane started it. No capability beyond
+the plugin's own `run-process` and `fs-read` is involved, and a plugin a
+link pushed here gets neither by default, so a linked server cannot
+speak into local opencode sessions through its own copy either.
 
 `claude_notify` needs the `claude-notify` capability. The agents sidecar
 requests it; it is never in the default grants for a plugin a remote

@@ -562,8 +562,8 @@ impl Plugin for Agents {
         view::PICKER.with(|c| *c.borrow_mut() = Some(Rc::clone(&picker)));
         if role.provides() {
             provider::register_services();
-            // Follow the local mailbox: a message to a Claude agent here is
-            // pushed into its session (see push.rs).
+            // Follow the local mailbox: a message to a Claude or opencode
+            // agent here is pushed into its session (see push.rs).
             push::follow();
             ctx.spawn(provider::reconcile(Rc::clone(&cfg)));
             ctx.spawn(provider::sweep_loop());
