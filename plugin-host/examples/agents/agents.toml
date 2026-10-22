@@ -38,6 +38,9 @@ requests = [
   # branches like the session creator does, through formkit: one
   # directory listing and one shell job per scan, git for the rows on
   # screen, mkdir and git worktree add on Enter. fs-list is above.
+  # Also how opencode's sessions and conversations are read: one
+  # `sqlite3 -readonly -json` job per poll on its database (its own db
+  # capability reaches only the roster's store).
   "run-process",
   "fs-read-any",
   # Publishes the durable id on the agent's pane as the @agent_id option,

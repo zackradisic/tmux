@@ -46,7 +46,7 @@ use crate::store::{self, NewTurn, TurnRow};
 /// The harnesses the host can extract a transcript for (see
 /// `transcript_extract` in the ABI). Any other kind has rows and
 /// captures as before, no turns.
-pub const HARNESSES: &[&str] = &["claude", "codex"];
+pub const HARNESSES: &[&str] = &["claude", "codex", "opencode"];
 
 /// What a turn is. Mirrors the store's `kind` column and the ABI's kind
 /// byte.
@@ -402,7 +402,8 @@ async fn backfill_facts() {
     let mut filled = 0usize;
     for a in rows {
         let Some(path) = a.transcript_path.as_deref() else { continue };
-        if !HARNESSES.contains(&a.kind.as_str()) {
+        // opencode's facts (model, directory) come with its messages.
+        if !HARNESSES.contains(&a.kind.as_str()) || a.kind == "opencode" {
             continue;
         }
         let Ok(got) = transcript_extract(path, 0, &a.kind).await else { continue };
@@ -490,7 +491,15 @@ async fn ingest_once(id: &str) -> Result<(), ()> {
     let mut grouper = Grouper::default();
     let mut first_read = true;
     loop {
-        let got = match transcript_extract(&path, cursor, &a.kind).await {
+        let got = if a.kind == "opencode" {
+            // No file: the messages come out of opencode's database, the
+            // cursor a sequence number (see `opencode_extract`).
+            match opencode_extract(&a.id, cursor).await {
+                Some(g) => g,
+                None => return Err(()),
+            }
+        } else {
+            match transcript_extract(&path, cursor, &a.kind).await {
             Ok(g) => g,
             Err(e) => {
                 // A derived path that does not exist yet (or a wrong
@@ -510,6 +519,7 @@ async fn ingest_once(id: &str) -> Result<(), ()> {
                     log(&format!("agents: transcript {path}: {}", e.message));
                 }
                 return Err(());
+            }
             }
         };
         first_read = false;
@@ -582,6 +592,201 @@ async fn ingest_once(id: &str) -> Result<(), ()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// opencode: the conversation out of its database
+// ---------------------------------------------------------------------------
+
+/// Messages read per sqlite3 run. A session's whole history is a few
+/// runs; a turn is one.
+const OC_BATCH: usize = 200;
+
+/// The opencode harness has no transcript file: its messages are rows
+/// in its database (see `resolve::opencode`), and the cursor is a
+/// message sequence number rather than a byte offset. One sqlite3 run
+/// reads the messages past the cursor, with the parts the roster shows
+/// picked out in SQL - a user message's text; an assistant message's
+/// text and tool parts, less each tool's output - so the bulk of the
+/// database (tool output, reasoning, attachments) never crosses the
+/// pipe.
+///
+/// A message is written once and then updated in place while it streams
+/// (its tool parts land one by one, the text last), so the cursor never
+/// passes an assistant message without its `time.completed`: the read
+/// stops there and the next one, after the turn's `idle`, takes it
+/// whole. A user or idle message is complete when written.
+async fn opencode_extract(id: &str, cursor: u64) -> Option<Extracted> {
+    let sid = id.strip_prefix("opencode:")?;
+    if !sid.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
+        return None;
+    }
+    let sql = format!(
+        "SELECT seq, type, time_created AS ts, \
+            CASE type \
+              WHEN 'user' THEN json_extract(data, '$.text') \
+              WHEN 'assistant' THEN (SELECT json_group_array(json(json_remove(c.value, \
+                  '$.state.output', '$.state.metadata', '$.state.content', '$.state.time'))) \
+                FROM json_each(json_extract(data, '$.content')) c \
+                WHERE json_extract(c.value, '$.type') IN ('text', 'tool')) \
+            END AS body, \
+            json_extract(data, '$.model.id') AS model, \
+            (type <> 'assistant' OR json_extract(data, '$.time.completed') IS NOT NULL) AS complete \
+         FROM session_message WHERE session_id = {} AND seq > {cursor} \
+         ORDER BY seq LIMIT {OC_BATCH}",
+        crate::resolve::sql_quote(sid)
+    );
+    let rows = crate::resolve::opencode_query(&sql).await?;
+    let mut out = Extracted {
+        turns: Vec::new(),
+        version: None,
+        cwd: None,
+        branch: None,
+        model: None,
+        cursor,
+        eof: rows.len() < OC_BATCH,
+    };
+    for row in &rows {
+        if row.get("complete").and_then(|v| v.as_i64()) == Some(0) {
+            // Still streaming: nothing past it is consumed either.
+            out.eof = true;
+            break;
+        }
+        let seq = row.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+        if seq > out.cursor {
+            out.cursor = seq;
+        }
+        let ts_ms = row.get("ts").and_then(|v| v.as_i64()).filter(|&t| t > 0);
+        if let Some(m) = row.get("model").and_then(|v| v.as_str()).filter(|m| !m.is_empty()) {
+            out.model = Some(m.to_string());
+        }
+        let body = row.get("body");
+        match row.get("type").and_then(|v| v.as_str()) {
+            Some("user") => {
+                let text = body.and_then(|v| v.as_str()).unwrap_or("").trim();
+                if !text.is_empty() {
+                    out.turns.push(turn(TranscriptKind::User, text.to_string(), None, ts_ms));
+                }
+            }
+            Some("assistant") => {
+                // The parts come back as a JSON text of an array.
+                let parts: Vec<serde_json::Value> = body
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or_default();
+                let mut texts: Vec<&str> = Vec::new();
+                let mut tools: Vec<(String, Option<String>, Option<i64>)> = Vec::new();
+                for p in &parts {
+                    match p.get("type").and_then(|v| v.as_str()) {
+                        Some("text") => {
+                            if let Some(t) = p.get("text").and_then(|v| v.as_str()) {
+                                if !t.trim().is_empty() {
+                                    texts.push(t);
+                                }
+                            }
+                        }
+                        Some("tool") => {
+                            let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
+                            let input = p
+                                .get("state")
+                                .and_then(|s| s.get("input"))
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null);
+                            let at = p
+                                .get("time")
+                                .and_then(|t| t.get("created"))
+                                .and_then(|v| v.as_i64())
+                                .filter(|&t| t > 0)
+                                .or(ts_ms);
+                            let (text, path) = condense_opencode(name, &input);
+                            tools.push((text, path, at));
+                        }
+                        _ => {}
+                    }
+                }
+                if !texts.is_empty() {
+                    let text = texts.join("\n").trim().to_string();
+                    out.turns.push(turn(TranscriptKind::Assistant, text, None, ts_ms));
+                }
+                for (text, path, at) in tools {
+                    out.turns.push(turn(TranscriptKind::Tool, text, path, at));
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(out)
+}
+
+fn turn(kind: TranscriptKind, text: String, path: Option<String>, ts_ms: Option<i64>) -> TranscriptTurn {
+    TranscriptTurn { kind, text, path, ts_ms, offset: 0, len: 0 }
+}
+
+/// A tool call as one line, the way the host condenses Claude's: the
+/// tool and what it touched, an edit's line counts, never the content.
+/// opencode's tools are lower-case (`write`, `edit`, `shell`, ...); the
+/// line capitalises them so the preview reads the same for every
+/// harness.
+pub fn condense_opencode(name: &str, input: &serde_json::Value) -> (String, Option<String>) {
+    let s = |k: &str| input.get(k).and_then(|v| v.as_str()).filter(|v| !v.is_empty());
+    let lines = |k: &str| s(k).map(|v| v.lines().count()).unwrap_or(0);
+    let path = s("filePath").or_else(|| s("path")).or_else(|| s("file")).map(str::to_string);
+    let shown = path.as_deref().map(oc_short_path).unwrap_or_default();
+    let mut cap = String::new();
+    let mut chars = name.chars();
+    if let Some(c) = chars.next() {
+        cap.extend(c.to_uppercase());
+        cap.push_str(chars.as_str());
+    }
+    let line = match name {
+        "read" | "list" | "ls" => format!("{cap} {shown}"),
+        "glob" | "grep" => format!(
+            "{cap} {}{}",
+            s("pattern").unwrap_or(""),
+            if shown.is_empty() { String::new() } else { format!(" in {shown}") }
+        ),
+        "write" => format!("{cap} {shown} +{}", lines("content")),
+        "edit" => format!("{cap} {shown} +{} −{}", lines("newString"), lines("oldString")),
+        "bash" | "shell" => format!(
+            "{cap} {}",
+            s("description")
+                .map(|d| oc_first_line(d, 120))
+                .unwrap_or_else(|| oc_first_line(s("command").unwrap_or(""), 120))
+        ),
+        "task" => format!(
+            "{cap} {}: {}",
+            oc_first_line(s("description").unwrap_or(""), 60),
+            oc_first_line(s("prompt").unwrap_or(""), 120)
+        ),
+        "webfetch" => format!("{cap} {}", s("url").unwrap_or("")),
+        "websearch" => format!("{cap} {}", oc_first_line(s("query").unwrap_or(""), 120)),
+        "todowrite" | "todoread" | "question" => cap.clone(),
+        _ => {
+            let compact = if input.is_null() { String::new() } else { input.to_string() };
+            let mut head: String = compact.chars().take(120).collect();
+            if compact.chars().count() > 120 {
+                head.push('…');
+            }
+            format!("{cap} {head}")
+        }
+    };
+    (line.trim_end().to_string(), path)
+}
+
+/// The last two components of a path: enough to tell files apart on a
+/// line, as the host's Claude condenser shows them.
+fn oc_short_path(p: &str) -> String {
+    let parts: Vec<&str> = p.trim_end_matches('/').rsplit('/').take(2).collect();
+    parts.into_iter().rev().collect::<Vec<_>>().join("/")
+}
+
+fn oc_first_line(s: &str, max: usize) -> String {
+    let line = s.lines().next().unwrap_or("").trim();
+    let mut out: String = line.chars().take(max).collect();
+    if line.chars().count() > max {
+        out.push('…');
+    }
+    out
+}
+
 /// Find a Claude transcript by session id under every project directory:
 /// the fallback when the path derived from `cwd` was wrong. Lists a few
 /// dozen directories once; not a per-render cost.
@@ -609,6 +814,29 @@ pub fn claude_transcript_path_in(config_home: &str, cwd: &str, sid: &str) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opencode_tool_lines() {
+        let j = |t: &str| serde_json::from_str::<serde_json::Value>(t).unwrap();
+        assert_eq!(
+            condense_opencode("write", &j(r#"{"content":"hi\nthere\n","path":"/a/b/work/hello.txt"}"#)),
+            ("Write work/hello.txt +2".into(), Some("/a/b/work/hello.txt".into()))
+        );
+        assert_eq!(
+            condense_opencode("edit", &j(r#"{"filePath":"/a/x.rs","oldString":"a\nb","newString":"c"}"#)),
+            ("Edit a/x.rs +1 −2".into(), Some("/a/x.rs".into()))
+        );
+        assert_eq!(
+            condense_opencode("shell", &j(r#"{"command":"wc -c hello.txt\nmore","workdir":"/w"}"#)).0,
+            "Shell wc -c hello.txt"
+        );
+        assert_eq!(condense_opencode("bash", &j(r#"{"command":"ls","description":"List files"}"#)).0, "Bash List files");
+        assert_eq!(condense_opencode("grep", &j(r#"{"pattern":"foo","path":"/p/q"}"#)).0, "Grep foo in p/q");
+        assert_eq!(condense_opencode("read", &j(r#"{"filePath":"/p/q.txt"}"#)).0, "Read p/q.txt");
+        assert_eq!(condense_opencode("todowrite", &j(r#"{"todos":[]}"#)).0, "Todowrite");
+        assert_eq!(condense_opencode("mystery", &j(r#"{"k":"v"}"#)).0, "Mystery {\"k\":\"v\"}");
+        assert_eq!(condense_opencode("mystery", &serde_json::Value::Null).0, "Mystery");
+    }
 
     #[test]
     fn transcript_path_slug() {

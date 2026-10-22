@@ -11,18 +11,40 @@ help for two of the four harnesses.
 | Claude  | `~/.claude/sessions/<pid>.json` | no |
 | Codex   | a hook reports the id + rollout path | yes |
 | pi      | none - an in-process extension reports it | yes |
-| opencode| global db, no per-session file | yes |
+| opencode| its global database (`~/.local/share/opencode/opencode.db`) | no |
 
-## pi and opencode (required for a stable id + activity time)
+## opencode (no shim: the roster reads its database)
 
-These two keep no file the plugin can map from outside, so a tiny
-in-process extension reports the session id once (`identify`) and pushes
-turn state. Install the one you use:
+opencode 2.x keeps every session, message and tool call in one SQLite
+database and runs its plugins inside a background service shared by
+every pane (`opencode serve --service`), so an in-process plugin cannot
+say which pane it speaks for: the service's `TMUX_PANE` is whichever
+pane happened to start it, and a shim there would stamp every session
+on that one pane. **Do not install `opencode/agents.ts` under the
+service** - it is kept for `opencode --standalone`, where the plugin
+runs in the pane's own process.
 
-* pi: copy `pi/agents.ts` to `~/.pi/agent/extensions/agents.ts`.
-* opencode: copy `opencode/agents.ts` to
-  `~/.config/opencode/plugin/agents.ts` (or name it in the `plugin`
-  array of `opencode.json`).
+Instead the roster reads the database through the `sqlite3` CLI (the
+`run-process` capability; macOS ships `/usr/bin/sqlite3`, Linux needs
+the package). A pane running opencode is matched to the session created
+in its directory after the row appeared, or failing that to the session
+in that directory last worked on since (one resumed with `-c`/`-s`);
+the row moves to `opencode:<session id>`, its status follows the last
+message (`idle` closes a turn), its title and times are the session's,
+and the conversation - prompts, replies, tool calls condensed to one
+line each - is read into the store, so the picker shows it live (Tab)
+and after the pane is gone (history, `.`), and the search finds it. The
+`i` card's resume line is `opencode -s <id>`.
+
+The database is read once per row every 5 s while the picker is open
+(a render asks, a cached answer serves the renders between), and once
+more when the pane closes.
+
+## pi (required for a stable id + activity time)
+
+pi keeps no file the plugin can map from outside, so a tiny in-process
+extension reports the session id once (`identify`) and pushes turn
+state: copy `pi/agents.ts` to `~/.pi/agent/extensions/agents.ts`.
 
 ## Codex (required for a stable id + name)
 
@@ -61,17 +83,17 @@ Every shim sends one line, keyed by the pane, never an id:
     tmux -S "${TMUX%%,*}" plugin-command -t "$TMUX_PANE" agents "<verb>"
 
 The verbs are `identify <id> [session_file]` (from the codex hook and the
-in-process extensions) and the status words below.
+pi extension) and the status words below.
 
 ## The map from harness events to roster status
 
-| roster       | Claude Code       | Codex             | pi              | opencode              |
+| roster       | Claude Code       | Codex             | pi              | opencode (database)   |
 |--------------|-------------------|-------------------|-----------------|-----------------------|
-| working      | UserPromptSubmit  | UserPromptSubmit  | agent_start     | session.status busy   |
+| working      | UserPromptSubmit  | UserPromptSubmit  | agent_start     | last message not idle |
 |              | PreToolUse        | PreToolUse        | turn_start      |                       |
-| needs_input  | Stop; PreToolUse¹ | PermissionRequest | ui_prompt_start | permission/question   |
-| waiting      | (by hand: `w`)    | Stop              | agent_settled   | session.status idle   |
-| done         | (pane close)      | (pane close)      | session_shutdown| session.deleted       |
+| needs_input  | Stop; PreToolUse¹ | PermissionRequest | ui_prompt_start | (not known)           |
+| waiting      | (by hand: `w`)    | Stop              | agent_settled   | last message idle     |
+| done         | (pane close)      | (pane close)      | session_shutdown| (pane close)          |
 
 ¹ Claude's `Stop` reports `needs_input`, not `waiting`: under
 `--dangerously-skip-permissions` there are no permission prompts, so "it

@@ -388,10 +388,11 @@ pub fn resumable_id(id: &str) -> Option<String> {
 /// The command line with the harness's resume flag: `claude --resume
 /// <id>` (Claude, and any harness without a known form), `codex resume
 /// <id>` (a subcommand; global flags in the launcher line stay ahead of
-/// it).
+/// it), `opencode -s <id>`.
 pub fn resume_command(harness: &str, command: &str, resume: &str) -> String {
     match harness {
         "codex" => format!("{command} resume {resume}"),
+        "opencode" => format!("{command} -s {resume}"),
         _ => format!("{command} --resume {resume}"),
     }
 }

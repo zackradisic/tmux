@@ -4202,6 +4202,7 @@ fn info_lines(p: &Picker, a: &Agent, pw: usize) -> Vec<Vec<Styled>> {
         let resume = match a.kind.as_str() {
             "claude" => format!("claude --resume {id}"),
             "codex" => format!("codex resume {id}"),
+            "opencode" => format!("opencode -s {id}"),
             _ => id.to_string(),
         };
         rows.push(("resume", resume));

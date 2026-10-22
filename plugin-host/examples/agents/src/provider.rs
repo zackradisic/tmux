@@ -560,6 +560,7 @@ pub async fn enrich_live(rows: &mut [Agent]) {
         let mut r = match a.kind.as_str() {
             "claude" => resolve::claude(a).await,
             "codex" => resolve::codex(a).await,
+            "opencode" => resolve::opencode(a).await,
             _ => resolve::from_source(a).await,
         }
         .unwrap_or_default();
@@ -653,12 +654,14 @@ async fn apply(a: &mut Agent, mut r: Resolved) {
             // found by the scan) would otherwise be read only when it
             // ends. Debounced, off this path.
             transcript::request(a.id.clone(), false);
-        } else if a.kind == "codex" && grew && a.live() {
+        } else if matches!(a.kind.as_str(), "codex" | "opencode") && grew && a.live() {
             // Codex has no shim to say a turn ended; its rollout's mtime
             // moving is the only word of new turns. The read is cursor-
             // based, so a half-written turn is finished on the next one.
-            // Claude is left to its hooks: its file changes all through
-            // a turn, and its turn-end report already triggers the read.
+            // opencode is the same: its database's times move, nothing
+            // reports. Claude is left to its hooks: its file changes all
+            // through a turn, and its turn-end report already triggers
+            // the read.
             transcript::request(a.id.clone(), false);
         }
     }

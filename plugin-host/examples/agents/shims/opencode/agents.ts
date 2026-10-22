@@ -1,8 +1,13 @@
-// Install under ~/.config/opencode/plugin/agents.ts (or name it in the
-// `plugin` array of opencode.json).
+// ONLY for `opencode --standalone`. opencode 2.x runs its plugins in a
+// background service shared by every pane (`opencode serve --service`),
+// whose TMUX_PANE is whichever pane started it: installed there, this
+// would stamp every session on that one pane. The roster no longer needs
+// it - it reads opencode's database directly (see shims/README.md and
+// the plugin's `resolve::opencode`). Under --standalone the plugin runs in
+// the pane's own process, and this file still works: install it under
+// ~/.config/opencode/plugins/agents.ts.
 //
-// opencode keeps a global database, not a per-session file, so the plugin
-// cannot map a pane to a session from outside. This plugin does two jobs:
+// This plugin does two jobs:
 //
 //   1. identify - once per session, it tells the tmux `agents` plugin
 //      opencode's durable session id, so the roster binds the pane to a

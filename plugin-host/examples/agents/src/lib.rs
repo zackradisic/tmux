@@ -187,11 +187,13 @@
 //!     resumed session re-link to the same history.
 //!   * Name, real times, and turn state come from that same session file,
 //!     read at render time - Claude's `~/.claude/sessions/<pid>.json`,
-//!     Codex's open rollout, or the file a pi/opencode `identify` hook
-//!     reported. A per-harness shim may still push a finer turn status
-//!     through one wire:
+//!     Codex's open rollout, opencode's global SQLite database (read
+//!     through the sqlite3 CLI as a job, matched to the pane by directory
+//!     and start), or the file a pi `identify` hook reported. A
+//!     per-harness shim may still push a finer turn status through one
+//!     wire:
 //!       plugin-command -t $TMUX_PANE agents "<status> [task...]"
-//!     but none is required for Claude or Codex.
+//!     but none is required for Claude, Codex or opencode.
 //!
 //! The roster lives in the plugin's SQLite database (`store.db`), so it
 //! survives a restart and stays searchable. `init` re-scans every pane

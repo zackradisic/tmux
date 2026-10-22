@@ -12,8 +12,13 @@
 //!   * codex    - the rollout `*.jsonl` the TUI holds open, found through
 //!                `pane_fds`; its first line names the session_id, its
 //!                file mtime dates the last turn.
-//!   * pi /     - no external mapping exists, so a one-shot `identify`
-//!     opencode   hook reports the id and file once (see the plugin's
+//!   * opencode - its global SQLite database, read through the sqlite3
+//!                CLI as a job and matched to the pane by directory and
+//!                start (2.x runs its plugins in a shared background
+//!                service, so no shim can name the pane). Carries id,
+//!                title, times and the last message's type.
+//!   * pi       - no external mapping exists, so a one-shot `identify`
+//!                hook reports the id and file once (see the plugin's
 //!                `identify` verb); the file mtime dates activity.
 
 
@@ -23,7 +28,7 @@ use crate::store::Agent;
 
 /// What a resolver learned. Every field is optional; `enrich` folds only
 /// the ones that are present onto the row.
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct Resolved {
     /// The durable harness id, when known. A value different from the
     /// row's current id triggers a provisional->real migration.
@@ -665,7 +670,7 @@ pub fn parse_rfc3339_ms(s: &str) -> Option<i64> {
 }
 
 // ---------------------------------------------------------------------------
-// pi / opencode: the file an `identify` hook already recorded
+// pi: the file an `identify` hook already recorded
 // ---------------------------------------------------------------------------
 
 /// The `identify` verb stored the durable id and session file when the
@@ -678,9 +683,284 @@ pub async fn from_source(a: &Agent) -> Option<Resolved> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// opencode: the global database under ~/.local/share/opencode
+// ---------------------------------------------------------------------------
+//
+// opencode 2.x keeps every session in one SQLite database and runs its
+// plugins in a background service shared by every pane (`opencode serve
+// --service`), so an in-process shim cannot say which pane it speaks
+// for: the service's `TMUX_PANE` is whichever pane started it. The
+// roster reads the database instead, through the sqlite3 CLI as a job -
+// the plugin's own db capability reaches only its store, and ATTACH is
+// sandboxed away.
+//
+// A session is matched to a pane by its directory and its start: the
+// session created soonest after the row appeared, in the pane's
+// directory, is the pane's own; failing that, the session in that
+// directory last worked on since the row appeared (one resumed with
+// `-c` or `-s`). A session already bound to another live row is never
+// taken. Turn state is the last message's type (`idle` closes a turn),
+// activity its time, and the title is the session's.
+
+/// How often a row's session is read again. Every render asks; one
+/// sqlite3 process per interval per row answers.
+pub const OC_POLL_MS: i64 = 5_000;
+
+/// A session must have been touched this close to the row's appearance
+/// to be a candidate at all: a running one is touched after it, a fresh
+/// one is created a hair before the row is written.
+const OC_SLACK_MS: i64 = 2_000;
+
+thread_local! {
+    /// Per pane (or row id): when the database was last read, and what it
+    /// said, for the renders in between.
+    static OC_CACHE: std::cell::RefCell<std::collections::HashMap<String, (i64, Resolved)>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    /// A failed sqlite3 run is logged once, not once per render.
+    static OC_LOGGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Where opencode keeps its database.
+pub fn opencode_db() -> Option<String> {
+    Some(format!("{}/.local/share/opencode/opencode.db", home()?))
+}
+
+/// One statement against opencode's database, read-only, as JSON rows.
+/// `None` when sqlite3 or the database is missing or the statement
+/// failed; an empty vector for no rows.
+pub async fn opencode_query(sql: &str) -> Option<Vec<serde_json::Map<String, serde_json::Value>>> {
+    let db = opencode_db()?;
+    // The server's PATH may not carry sqlite3 (a login shell's does);
+    // macOS ships one in /usr/bin.
+    let cmd = format!(
+        "s=$(command -v sqlite3 2>/dev/null || echo /usr/bin/sqlite3); \
+         exec \"$s\" -readonly -json {} {}",
+        sh_quote(&db),
+        sh_quote(sql)
+    );
+    let out = run_job(cmd, None).await.ok()?;
+    if out.status != 0 || out.signalled {
+        if !OC_LOGGED.with(|l| l.replace(true)) {
+            log(&format!(
+                "agents: opencode: sqlite3 on {db} failed ({}): {}",
+                out.status,
+                out.output.lines().next().unwrap_or("")
+            ));
+        }
+        return None;
+    }
+    let text = out.output.trim();
+    if text.is_empty() {
+        return Some(Vec::new());
+    }
+    serde_json::from_str(text).ok()
+}
+
+/// A shell word: single-quoted, with embedded quotes spliced.
+pub fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// A SQL string literal.
+pub fn sql_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// What one session row says, as far as the roster needs.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OcSession {
+    pub id: String,
+    pub title: Option<String>,
+    pub directory: Option<String>,
+    pub created_ms: i64,
+    pub updated_ms: i64,
+    /// The last message's type: `user`, `assistant`, `idle`, ...
+    pub last_type: Option<String>,
+}
+
+/// The columns of a session row, with its last message folded in.
+const OC_SESSION_COLS: &str = "s.id AS id, s.title AS title, s.directory AS directory, \
+    s.time_created AS created, \
+    MAX(s.time_updated, COALESCE((SELECT MAX(m.time_updated) FROM session_message m \
+        WHERE m.session_id = s.id), 0)) AS updated, \
+    (SELECT m.type FROM session_message m WHERE m.session_id = s.id \
+        ORDER BY m.seq DESC LIMIT 1) AS last_type";
+
+fn oc_session_from(row: &serde_json::Map<String, serde_json::Value>) -> Option<OcSession> {
+    let s = |k: &str| row.get(k).and_then(|v| v.as_str()).filter(|v| !v.is_empty()).map(str::to_string);
+    let n = |k: &str| row.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
+    Some(OcSession {
+        id: s("id")?,
+        title: s("title"),
+        directory: s("directory"),
+        created_ms: n("created"),
+        updated_ms: n("updated"),
+        last_type: s("last_type"),
+    })
+}
+
+/// Pick the pane's session among the candidates in its directory. The
+/// one created soonest after the row appeared (less the slack) wins; a
+/// pane with nothing created since takes the one most recently worked
+/// on since it appeared - a resumed session. Sessions bound to another
+/// live row are out. None when nothing was touched since the row came:
+/// an opencode with nothing typed yet has no session.
+pub fn oc_pick<'a>(
+    cands: &'a [OcSession],
+    first_seen_ms: i64,
+    taken: &[String],
+) -> Option<&'a OcSession> {
+    let free = |s: &&OcSession| !taken.iter().any(|t| t == &s.id);
+    let since = first_seen_ms - OC_SLACK_MS;
+    cands
+        .iter()
+        .filter(free)
+        .filter(|s| s.created_ms >= since)
+        .min_by_key(|s| s.created_ms)
+        .or_else(|| {
+            cands
+                .iter()
+                .filter(free)
+                .filter(|s| s.updated_ms >= since)
+                .max_by_key(|s| s.updated_ms)
+        })
+}
+
+/// A pane's current directory as opencode would have recorded it, and
+/// the other spelling of it macOS allows (`/tmp` is `/private/tmp`).
+fn oc_dir_forms(dir: &str) -> Vec<String> {
+    let dir = dir.trim_end_matches('/');
+    let mut v = vec![dir.to_string()];
+    if let Some(rest) = dir.strip_prefix("/private") {
+        if !rest.is_empty() {
+            v.push(rest.to_string());
+        }
+    } else {
+        v.push(format!("/private{dir}"));
+    }
+    v
+}
+
+/// The resolver: read the row's session (bound rows), or find it among
+/// the sessions in the pane's directory (provisional rows). Cached per
+/// pane for `OC_POLL_MS`.
+pub async fn opencode(a: &Agent) -> Option<Resolved> {
+    let key = a.pane.map(|p| format!("%{p}")).unwrap_or_else(|| a.id.clone());
+    let now = now_ms() as i64;
+    let cached = OC_CACHE.with(|c| {
+        c.borrow().get(&key).filter(|(at, _)| now - at < OC_POLL_MS).map(|(_, r)| r.clone())
+    });
+    if let Some(r) = cached {
+        return Some(r);
+    }
+    let session = match a.id.strip_prefix("opencode:") {
+        Some(sid) => {
+            if !sid.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
+                return None;
+            }
+            let rows = opencode_query(&format!(
+                "SELECT {OC_SESSION_COLS} FROM session_v2 s WHERE s.id = {}",
+                sql_quote(sid)
+            ))
+            .await?;
+            rows.first().and_then(oc_session_from)?
+        }
+        None => {
+            let dir = match a.cwd.clone().filter(|d| !d.is_empty()) {
+                Some(d) => d,
+                None => {
+                    let pane = a.pane? as u32;
+                    format_expand(OptionTarget::Pane(PaneId(pane)), "#{pane_current_path}")
+                        .ok()
+                        .filter(|d| !d.is_empty())?
+                }
+            };
+            let dirs: Vec<String> = oc_dir_forms(&dir).iter().map(|d| sql_quote(d)).collect();
+            let since = a.first_seen_ms - OC_SLACK_MS;
+            let rows = opencode_query(&format!(
+                "SELECT {OC_SESSION_COLS} FROM session_v2 s \
+                 WHERE s.directory IN ({}) AND s.parent_id IS NULL \
+                   AND s.time_archived IS NULL AND s.time_updated >= {since} \
+                 ORDER BY s.time_created DESC LIMIT 50",
+                dirs.join(", ")
+            ))
+            .await?;
+            let cands: Vec<OcSession> = rows.iter().filter_map(oc_session_from).collect();
+            // Sessions another live row already answers for.
+            let taken: Vec<String> = crate::store::live_agents()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|o| o.id != a.id && o.pane != a.pane)
+                .filter_map(|o| o.id.strip_prefix("opencode:").map(str::to_string))
+                .collect();
+            let picked = oc_pick(&cands, a.first_seen_ms, &taken);
+            match picked {
+                Some(s) => s.clone(),
+                None => {
+                    // Nothing yet: ask again next interval, not next render.
+                    OC_CACHE.with(|c| c.borrow_mut().insert(key, (now, Resolved::default())));
+                    return None;
+                }
+            }
+        }
+    };
+    let status = match session.last_type.as_deref() {
+        Some("idle") => Some("waiting".to_string()),
+        Some(_) => Some("working".to_string()),
+        None => None,
+    };
+    let db = opencode_db();
+    let r = Resolved {
+        real_id: Some(format!("opencode:{}", session.id)),
+        name: session.title.clone(),
+        status,
+        started_ms: Some(session.created_ms).filter(|&t| t > 0),
+        last_active_ms: Some(session.updated_ms).filter(|&t| t > 0),
+        source_path: db.clone(),
+        transcript_path: db,
+        cwd: session.directory.clone(),
+        ..Default::default()
+    };
+    OC_CACHE.with(|c| c.borrow_mut().insert(key, (now, r.clone())));
+    Some(r)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn oc(id: &str, created: i64, updated: i64) -> OcSession {
+        OcSession { id: id.into(), created_ms: created, updated_ms: updated, ..Default::default() }
+    }
+
+    #[test]
+    fn oc_pick_prefers_the_session_created_after_the_row() {
+        let c = vec![oc("old", 100, 5_000), oc("mine", 3_000, 3_500), oc("later", 4_000, 4_100)];
+        assert_eq!(oc_pick(&c, 2_500, &[]).map(|s| s.id.as_str()), Some("mine"));
+        // Created within the slack before the row counts as after it.
+        assert_eq!(oc_pick(&c, 5_500, &[]).map(|s| s.id.as_str()), Some("later"));
+        // Taken by another pane: the next one.
+        assert_eq!(oc_pick(&c, 2_500, &["mine".into()]).map(|s| s.id.as_str()), Some("later"));
+    }
+
+    #[test]
+    fn oc_pick_falls_back_to_the_resumed_session() {
+        let c = vec![oc("idle", 100, 200), oc("resumed", 150, 9_000)];
+        assert_eq!(oc_pick(&c, 8_000, &[]).map(|s| s.id.as_str()), Some("resumed"));
+        // Nothing touched since the row came: no guess.
+        assert_eq!(oc_pick(&c, 20_000, &[]), None);
+        assert_eq!(oc_pick(&c, 8_000, &["resumed".into()]), None);
+    }
+
+    #[test]
+    fn oc_quoting_and_dir_forms() {
+        assert_eq!(sh_quote("a'b"), "'a'\\''b'");
+        assert_eq!(sql_quote("a'b"), "'a''b'");
+        assert_eq!(oc_dir_forms("/private/tmp/x/"), vec!["/private/tmp/x", "/tmp/x"]);
+        assert_eq!(oc_dir_forms("/Users/z"), vec!["/Users/z", "/private/Users/z"]);
+    }
 
     #[test]
     fn rfc3339_to_ms() {
