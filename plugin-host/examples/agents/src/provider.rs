@@ -392,8 +392,9 @@ pub async fn on_project(
 /// `<topic> | <dir>` once the thread has a topic and plain `<dir>` (the
 /// working directory's last component) before that, so the directory is
 /// peeled off and a title that is only the directory - or the cwd itself
-/// - is no name either. What survives is a title an agent actually
-/// wrote about its work.
+/// - is no name either. opencode titles its pane `OC | <topic>`, and the
+/// brand is the kind over again, so it is peeled too. What survives is a
+/// title an agent actually wrote about its work.
 fn clean_title<'a>(
     title: &'a str,
     kind: &str,
@@ -404,6 +405,13 @@ fn clean_title<'a>(
     let cwd = cwd.trim().trim_end_matches('/');
     let dir = cwd.rsplit('/').next().unwrap_or("");
     let mut title = title.trim();
+    if kind == "opencode" {
+        if let Some(rest) = title.strip_prefix("OC |") {
+            title = rest.trim();
+        } else if title == "OC" {
+            title = "";
+        }
+    }
     if !dir.is_empty() {
         if let Some((head, tail)) = title.rsplit_once(" | ") {
             if tail.trim() == dir {
@@ -568,9 +576,11 @@ pub async fn enrich_live(rows: &mut [Agent]) {
         // its kin write it there; Codex since 0.160 does too, behind a
         // ` | <dir>` suffix that `pane_title` peels), which beats the
         // session file's slug. Prefer it; keep the harness name (a Codex
-        // nickname) only as a fallback.
+        // nickname) only as a fallback. opencode's pane title is its
+        // session title cut short with an ellipsis; its database has the
+        // whole of it, so there the resolver's name comes first.
         let title = a.pane.and_then(|p| pane_title(p as u32, &a.kind));
-        r.name = title.or_else(|| r.name.take());
+        r.name = if a.kind == "opencode" { r.name.take().or(title) } else { title.or_else(|| r.name.take()) };
         apply(a, r).await;
     }
 }
@@ -1382,6 +1392,18 @@ mod title_tests {
         assert_eq!(clean_title("~/Code/tab", "codex", "mbp", "mbp.local", cwd), None);
         assert_eq!(clean_title("codex | tab", "codex", "mbp", "mbp.local", cwd), None);
         assert_eq!(clean_title("Codex", "codex", "mbp", "mbp.local", cwd), None);
+    }
+
+    #[test]
+    fn opencode_loses_its_brand() {
+        let cwd = "/Users/z/Code/tab";
+        assert_eq!(
+            clean_title("OC | Morph infra security ch…", "opencode", "mbp", "mbp.local", cwd),
+            Some("Morph infra security ch…")
+        );
+        assert_eq!(clean_title("OC | tab", "opencode", "mbp", "mbp.local", cwd), None);
+        assert_eq!(clean_title("OC", "opencode", "mbp", "mbp.local", cwd), None);
+        assert_eq!(clean_title("OC | topic", "codex", "mbp", "mbp.local", cwd), Some("OC | topic"));
     }
 
     #[test]
