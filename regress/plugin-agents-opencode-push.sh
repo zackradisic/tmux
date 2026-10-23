@@ -7,7 +7,9 @@
 # the credentials are the registration's, the delivery is `steer`, and
 # the prefix names the row's pane literally (opencode runs its tools in
 # the service, where $TMUX_PANE is not the agent's pane). With the
-# service gone the message stays unread for `inbox`.
+# service gone the message stays unread for `inbox`. `f` on the row forks
+# the session through the same service (`POST .../fork`) and the new
+# window resumes the copy.
 #
 # Needs the wasm examples built, and sqlite3, python3 and curl on PATH:
 #   cargo build -p agents -p mailbox --target wasm32-unknown-unknown --release
@@ -54,7 +56,10 @@ class H(http.server.BaseHTTPRequestHandler):
         body = self.rfile.read(n).decode("utf-8", "replace")
         with open(log, "a") as f:
             f.write(json.dumps({"path": self.path, "auth": self.headers.get("authorization"), "body": body}) + "\n")
-        out = json.dumps({"data": {"id": "msg_stub", "delivery": "steer"}}).encode()
+        if self.path.endswith("/fork"):
+            out = json.dumps({"data": {"id": "ses_forkedcopy0001", "title": "Push session (fork #1)"}}).encode()
+        else:
+            out = json.dumps({"data": {"id": "msg_stub", "delivery": "steer"}}).encode()
         self.send_response(200)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(out)))
@@ -137,7 +142,9 @@ oc "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, pare
 
 $TMUX kill-server 2>/dev/null
 sleep 0.5
-$TMUX -f/dev/null new-session -d -s alpha -x 200 -y 50 -c "$WORK" \
+# The fake opencode first on the server's PATH: a fork's window runs
+# `opencode -s <copy>` by name.
+PATH="$FAKE:$PATH" $TMUX -f/dev/null new-session -d -s alpha -x 200 -y 50 -c "$WORK" \
     "$FAKE/opencode -c 'sleep 600; :'" || fail "new-session"
 sleep 0.5
 PANE=$($TMUX list-panes -t alpha -F '#{pane_id}' | head -1)
@@ -176,6 +183,32 @@ grep -q "plugin-command -t $PANE agents" "$LOG" || fail "the prefix does not nam
 grep -q "skill -t $PANE show mailbox" "$LOG" || fail "the guide does not name the pane"
 grep -q 'tmux2-mailbox' "$LOG" || fail "no source in the metadata"
 wait_for 5 read_is 'hello opencode push' 1 || fail "pushed message not marked read"
+
+# f on the row: the form as a fork (fork yes, the row's session id in
+# resume, a name of its own); Enter asks the service for a copy and the
+# new window resumes that copy, not the original.
+: > "$LOG"
+open_picker
+$TMUX send-keys -t "$FORM" f
+i=0
+while [ "$i" -lt 20 ]; do
+	NEWF=$($TMUX list-panes -a -F '#{pane_id} #{pane_mode}' | awk '/plugin-mode/ { print $1 }' | grep -v "^$FORM\$" | head -1)
+	[ -n "$NEWF" ] && break
+	sleep 0.3; i=$((i + 1))
+done
+[ -n "$NEWF" ] || fail "f did not open the form on the opencode row ($($TMUX capture-pane -M -p -t "$FORM" | grep -i 'nothing to fork\|no session' | head -1))"
+sleep 0.5
+fscreen() { $TMUX capture-pane -M -p -t "$NEWF" | sed '/^ *$/d'; }
+fscreen | grep -q 'fork *yes' || fail "fork is not on: $(fscreen | grep fork)"
+fscreen | grep -q "resume *$SID" || fail "the form does not carry the session id: $(fscreen | grep resume)"
+fscreen | grep -q 'name .* fork' || fail "the fork did not get a name of its own: $(fscreen | grep name)"
+$TMUX send-keys -t "$NEWF" Enter
+wait_for 10 received "/api/session/$SID/fork" || fail "Enter did not ask the service for a fork"
+grep -q "\"auth\": \"$AUTH\"" "$LOG" || fail "the fork went without the registration's credentials"
+started() { $TMUX list-panes -a -F '#{pane_start_command}' | grep -q 'opencode -s ses_forkedcopy0001'; }
+wait_for 10 started || fail "no window resumes the copy: $($TMUX list-panes -a -F '#{pane_id} #{pane_start_command}')"
+$TMUX list-panes -a -F '#{pane_start_command}' | grep -q "opencode -s $SID" && fail "a window resumed the original instead of the copy"
+FORM=
 
 # With the service gone the message is stored and left unread.
 kill $STUB; wait $STUB 2>/dev/null; STUB=

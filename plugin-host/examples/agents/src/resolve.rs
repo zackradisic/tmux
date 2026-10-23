@@ -732,6 +732,70 @@ pub fn opencode_registration() -> Option<String> {
     Some(format!("{}/.local/state/opencode/service.json", home()?))
 }
 
+/// One request to opencode's service: `method` on `path` (under its
+/// url) with a JSON body, through a `curl` job. The answer's status and
+/// body. The service's address and password are in its registration;
+/// the job's shell reads the password from that file itself and hands
+/// it to curl as a config on stdin, so it is never on a command line.
+/// The server's PATH may not carry curl (a login shell's does); macOS
+/// and most Linux ship one in /usr/bin.
+pub async fn opencode_api(method: &str, path: &str, body: &serde_json::Value) -> Result<(u16, String), String> {
+    let reg = opencode_registration().ok_or("no home directory")?;
+    let (bytes, _) = fs_read(&reg, 0, 16 * 1024)
+        .await
+        .map_err(|_| format!("opencode's service is not registered (no {reg})"))?;
+    let info: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| format!("unreadable registration {reg}"))?;
+    let url = info
+        .get("url")
+        .and_then(|v| v.as_str())
+        .filter(|u| u.starts_with("http://") || u.starts_with("https://"))
+        .map(|u| u.trim_end_matches('/'))
+        .ok_or("the registration names no url")?;
+    let cmd = format!(
+        r#"pw=$(sed -n 's/.*"password"[[:space:]]*:[[:space:]]*"\([^"\\]*\)".*/\1/p' {reg} | head -n 1); c=$(command -v curl 2>/dev/null || echo /usr/bin/curl); if [ -n "$pw" ]; then printf 'user = "opencode:%s"\n' "$pw"; fi | "$c" -sS --config - --max-time 15 -w '\n%{{http_code}}' -X {method} -H 'content-type: application/json' -H 'accept: application/json' --data-binary {body} {url}"#,
+        reg = sh_quote(&reg),
+        method = sh_quote(method),
+        body = sh_quote(&body.to_string()),
+        url = sh_quote(&format!("{url}{path}")),
+    );
+    let out = run_job(cmd, None).await.map_err(|e| e.message)?;
+    let output = out.output.trim_end();
+    let (text, code) = output.rsplit_once('\n').unwrap_or(("", output));
+    let code: u16 = code.trim().parse().unwrap_or(0);
+    if out.status != 0 || out.signalled || code == 0 {
+        let detail = output.lines().next().unwrap_or("").trim();
+        return Err(format!("opencode service at {url} did not answer: {detail}"));
+    }
+    if !(200..300).contains(&code) {
+        let detail = text.lines().next().unwrap_or("").trim();
+        return Err(format!("opencode service at {url} answered {code}: {detail}"));
+    }
+    Ok((code, text.to_string()))
+}
+
+/// A session id as opencode writes them (`ses_` and base62), or none.
+pub fn opencode_sid(s: &str) -> Option<&str> {
+    (!s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')).then_some(s)
+}
+
+/// A copy of an opencode session through its last message, made by the
+/// service that holds it (`POST /api/session/<id>/fork`): the new
+/// session's id. The TUI then opens on that id (`opencode -s`), the way
+/// Claude's `--fork-session` copies a conversation into a new session.
+pub async fn opencode_fork(sid: &str) -> Result<String, String> {
+    let sid = opencode_sid(sid).ok_or("not an opencode session id")?;
+    let (_, text) = opencode_api("POST", &format!("/api/session/{sid}/fork"), &serde_json::json!({})).await?;
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|_| "the fork's answer is not JSON".to_string())?;
+    v.get("data")
+        .unwrap_or(&v)
+        .get("id")
+        .and_then(|i| i.as_str())
+        .and_then(opencode_sid)
+        .map(str::to_string)
+        .ok_or_else(|| "the fork's answer names no session id".to_string())
+}
+
 /// One statement against opencode's database, read-only, as JSON rows.
 /// `None` when sqlite3 or the database is missing or the statement
 /// failed; an empty vector for no rows.

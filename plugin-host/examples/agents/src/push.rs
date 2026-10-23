@@ -25,7 +25,7 @@
 
 use tmux_plugin_sdk::prelude::*;
 
-use crate::resolve::{self, sh_quote};
+use crate::resolve;
 use crate::store::{self, Agent};
 
 /// The mailbox topic payload: one stored message and its box.
@@ -119,43 +119,16 @@ async fn opencode(a: &Agent, sender: &str, text: &str) -> Result<(), String> {
     let sid = a
         .id
         .strip_prefix("opencode:")
-        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+        .and_then(resolve::opencode_sid)
         .ok_or("the row has no session id yet")?;
-    let reg = resolve::opencode_registration().ok_or("no home directory")?;
-    let (bytes, _) = fs_read(&reg, 0, 16 * 1024)
-        .await
-        .map_err(|_| format!("opencode's service is not registered (no {reg})"))?;
-    let info: serde_json::Value =
-        serde_json::from_slice(&bytes).map_err(|_| format!("unreadable registration {reg}"))?;
-    let url = info
-        .get("url")
-        .and_then(|v| v.as_str())
-        .filter(|u| u.starts_with("http://") || u.starts_with("https://"))
-        .map(|u| u.trim_end_matches('/'))
-        .ok_or("the registration names no url")?;
     let body = serde_json::json!({
         "text": text,
         "delivery": "steer",
         "metadata": { "source": "tmux2-mailbox", "sender": sender },
     });
-    // The password reaches curl through a config on stdin, read from the
-    // registration by the job's own shell: it is in no argv. The server's
-    // PATH may not carry curl (a login shell's does); macOS and most
-    // Linux ship one in /usr/bin.
-    let cmd = format!(
-        r#"pw=$(sed -n 's/.*"password"[[:space:]]*:[[:space:]]*"\([^"\\]*\)".*/\1/p' {reg} | head -n 1); c=$(command -v curl 2>/dev/null || echo /usr/bin/curl); if [ -n "$pw" ]; then printf 'user = "opencode:%s"\n' "$pw"; fi | "$c" -sS --config - --max-time 15 -o /dev/null -w '%{{http_code}}' -X POST -H 'content-type: application/json' -H 'accept: application/json' --data-binary {body} {url}"#,
-        reg = sh_quote(&reg),
-        body = sh_quote(&body.to_string()),
-        url = sh_quote(&format!("{url}/api/session/{sid}/prompt")),
-    );
-    let out = run_job(cmd, None).await.map_err(|e| e.message)?;
-    let output = out.output.trim();
-    let code = &output[output.len().saturating_sub(3)..];
-    if out.status == 0 && !out.signalled && code.starts_with('2') {
-        return Ok(());
-    }
-    let detail = output.lines().next().unwrap_or("").trim();
-    Err(format!("opencode service at {url} answered {code}: {detail}"))
+    // The service's address and password come from its registration;
+    // the password never reaches a command line (see `opencode_api`).
+    resolve::opencode_api("POST", &format!("/api/session/{sid}/prompt"), &body).await.map(|_| ())
 }
 
 #[cfg(test)]

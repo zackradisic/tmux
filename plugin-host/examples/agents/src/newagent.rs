@@ -38,11 +38,13 @@
 //! `fork` (a yes/no field, `C-f` flips it; `f` in the picker opens the
 //! form with it on, for a live row too) adds `--fork-session`: Claude
 //! copies the conversation into a new session instead of continuing the
-//! old one. The copy would carry the original's name and be
-//! indistinguishable in the roster, so the form names it - the old name
-//! plus `fork`, numbered when that is taken - and leaves that name for
-//! the agent that appears in the new window (`name_window_when_seen`),
-//! the way the rename key would.
+//! old one. An opencode row forks through the service that holds its
+//! session (`resolve::opencode_fork`, before the window opens) and the
+//! new window runs `opencode -s <copy>`. Either copy would carry the
+//! original's name and be indistinguishable in the roster, so the form
+//! names it - the old name plus `fork`, numbered when that is taken -
+//! and leaves that name for the agent that appears in the new window
+//! (`name_window_when_seen`), the way the rename key would.
 //!
 //! Built on `formkit`; this file is what the fields mean and what Enter
 //! does. The scans run in this plugin, so it needs
@@ -380,7 +382,7 @@ pub fn resumable_id(id: &str) -> Option<String> {
         return None;
     }
     match kind {
-        "claude" | "codex" => Some(rest.to_string()),
+        "claude" | "codex" | "opencode" => Some(rest.to_string()),
         _ => None,
     }
 }
@@ -394,6 +396,28 @@ pub fn resume_command(harness: &str, command: &str, resume: &str) -> String {
         "codex" => format!("{command} resume {resume}"),
         "opencode" => format!("{command} -s {resume}"),
         _ => format!("{command} --resume {resume}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn harnesses_with_a_session_id_resume() {
+        assert_eq!(resumable_id("claude:1b2c"), Some("1b2c".to_string()));
+        assert_eq!(resumable_id("codex:abc"), Some("abc".to_string()));
+        assert_eq!(resumable_id("opencode:ses_e9d2"), Some("ses_e9d2".to_string()));
+        assert_eq!(resumable_id("opencode:"), None);
+        assert_eq!(resumable_id("prov-opencode-12"), None);
+        assert_eq!(resumable_id("pi:abc"), None);
+    }
+
+    #[test]
+    fn resume_flag_per_harness() {
+        assert_eq!(resume_command("claude", "claude", "x"), "claude --resume x");
+        assert_eq!(resume_command("codex", "codex --yolo", "x"), "codex --yolo resume x");
+        assert_eq!(resume_command("opencode", "opencode", "ses_1"), "opencode -s ses_1");
     }
 }
 
@@ -875,7 +899,20 @@ async fn submit() {
     // so the launcher's own flags stay.
     let command = if env.is_empty() { command } else { format!("{env} {command}") };
     let fork = fork_on(&get("fork")) && !get("resume").is_empty();
-    let command = match get("resume").as_str() {
+    // opencode's fork is the service's: the copy exists before the
+    // window opens, and the window resumes the copy.
+    let resume = if fork && harness == "opencode" {
+        match crate::resolve::opencode_fork(&get("resume")).await {
+            Ok(id) => id,
+            Err(e) => {
+                form::fail(&st, mode, format!("fork failed: {e}"));
+                return;
+            }
+        }
+    } else {
+        get("resume")
+    };
+    let command = match resume.as_str() {
         "" => command,
         id => {
             let c = resume_command(&harness, &command, id);
