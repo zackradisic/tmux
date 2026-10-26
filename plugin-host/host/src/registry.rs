@@ -362,6 +362,7 @@ impl Registry {
                     let _ = writeln!(out, "  manifest: {}", m.display());
                 }
                 let _ = writeln!(out, "  caps: {}", def.caps.describe());
+                let _ = writeln!(out, "  memory: {} MB", def.caps.memory_limit >> 20);
                 for (_, slot) in self.instances.iter() {
                     let Some(inst) = slot.as_ref() else { continue };
                     if &inst.plugin != name {
