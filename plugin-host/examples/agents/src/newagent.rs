@@ -535,9 +535,12 @@ pub async fn open(
         // A row with no live pane: bring that agent back rather than
         // start a fresh one - its harness session id, the directory its
         // transcript recorded, and the old session's name for when that
-        // session is gone and a new one has to carry it. A fork resumes
-        // a live row's session the same way, as a copy.
-        let revive = row.filter(|a| fork || !a.live()).map(|a| {
+        // session is gone and a new one has to carry it. A row that is
+        // not ended but has no pane (a roster repaired after a sweep, a
+        // handoff that lost the pane) is just as gone: the picker's Enter
+        // sends it here for the same reason. A fork resumes a live row's
+        // session the same way, as a copy.
+        let revive = row.filter(|a| fork || !a.live() || a.pane.is_none()).map(|a| {
             (
                 resumable_id(&a.id).unwrap_or_default(),
                 a.cwd.clone().unwrap_or_default(),

@@ -269,6 +269,18 @@ fscreen | grep -q 'folder .*proj-x' || fail "folder was not the directory the se
 fscreen | grep -q 'session *beta' || fail "session was not the row's"
 $TMUX send-keys -t "$NEWF" Escape; sleep 0.5
 modes | grep -q "^$NEWF\$" && fail "Esc did not close the form"
+# A row that is not ended but has no pane (a roster repaired by hand
+# after a sweep, a handoff that lost the pane) is just as gone: Enter
+# opens the same form, resume prefilled, not a blank one.
+sqlite3 "$XDG_DATA_HOME/tmux/plugins/agents/store.db" \
+    "update agents set ended_ms = null, pane = null where id = '$BID'" || fail "un-end beta"
+open_form_on_beta
+shot "revive form, row live without a pane"
+fscreen | grep -q 'resume *1b2c3d4e-0000-4000-8000-000000000001' || fail "a pane-less live row opened a blank form: $(fscreen | grep resume)"
+fscreen | grep -q 'folder .*proj-x' || fail "folder was not the row's directory"
+$TMUX send-keys -t "$NEWF" Escape; sleep 0.5
+sqlite3 "$XDG_DATA_HOME/tmux/plugins/agents/store.db" \
+    "update agents set ended_ms = $(date +%s000), reason = 'exited' where id = '$BID'" || fail "re-end beta"
 # Session beta is gone: the form is the session kind, named after it.
 $TMUX kill-session -t beta; sleep 0.5
 open_form_on_beta
