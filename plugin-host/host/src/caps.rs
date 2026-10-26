@@ -162,6 +162,9 @@ pub struct EffectiveCaps {
     /// peer grants: a remote call for a method not here is denied before
     /// any grant is even consulted.
     pub serve_remote: Vec<String>,
+    /// Linear memory ceiling for each instance, from the sidecar's
+    /// `[limits] memory_mb` (clamped), else the host default.
+    pub memory_limit: usize,
 }
 
 impl EffectiveCaps {
@@ -245,10 +248,35 @@ struct ManifestCaps {
     services: ManifestCapsServices,
 }
 
+/// `[limits]`: what the plugin asks of the host beyond capabilities.
+#[derive(Debug, Deserialize, Default)]
+struct ManifestLimits {
+    /// Linear memory ceiling in MB. The host's default is small; a
+    /// plugin that holds a large structure (the agents search index)
+    /// asks for more here, within [`MAX_MEMORY_LIMIT`].
+    #[serde(default)]
+    memory_mb: Option<u64>,
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct Manifest {
     #[serde(default)]
     caps: ManifestCaps,
+    #[serde(default)]
+    limits: ManifestLimits,
+}
+
+/// Per-instance linear memory cap without a sidecar asking otherwise.
+pub const DEFAULT_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
+/// The most a sidecar may ask for.
+pub const MAX_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
+
+/// A sidecar's memory ask, clamped to [default, max].
+fn memory_limit(memory_mb: Option<u64>) -> usize {
+    match memory_mb {
+        Some(mb) => ((mb as usize) << 20).clamp(DEFAULT_MEMORY_LIMIT, MAX_MEMORY_LIMIT),
+        None => DEFAULT_MEMORY_LIMIT,
+    }
 }
 
 fn parse_names(names: &[String], what: &str) -> Result<u32, String> {
@@ -285,6 +313,7 @@ pub fn compute(wasm_path: &Path, grants: &[String]) -> Result<EffectiveCaps, Str
             fs_allow: Vec::new(),
             services_allow: Vec::new(),
             serve_remote: Vec::new(),
+            memory_limit: DEFAULT_MEMORY_LIMIT,
         }),
         Some(m) => {
             let requested =
@@ -296,6 +325,7 @@ pub fn compute(wasm_path: &Path, grants: &[String]) -> Result<EffectiveCaps, Str
                 fs_allow: m.caps.fs_read.paths,
                 services_allow: m.caps.services.call,
                 serve_remote: m.caps.services.serve_remote,
+                memory_limit: memory_limit(m.limits.memory_mb),
             })
         }
     }
@@ -320,5 +350,26 @@ mod tests {
     #[test]
     fn unknown_grant_rejected() {
         assert!(compute(Path::new("/x.wasm"), &["frobnicate".into()]).is_err());
+    }
+
+    #[test]
+    fn memory_ask_is_clamped() {
+        assert_eq!(memory_limit(None), DEFAULT_MEMORY_LIMIT);
+        assert_eq!(memory_limit(Some(1)), DEFAULT_MEMORY_LIMIT);
+        assert_eq!(memory_limit(Some(256)), 256 << 20);
+        assert_eq!(memory_limit(Some(4096)), MAX_MEMORY_LIMIT);
+    }
+
+    #[test]
+    fn sidecar_limits_are_read() {
+        let dir = std::env::temp_dir().join(format!("caps-limits-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wasm = dir.join("p.wasm");
+        std::fs::write(dir.join("p.toml"), "[caps]\nrequests = []\n[limits]\nmemory_mb = 256\n").unwrap();
+        let caps = compute(&wasm, &[]).unwrap();
+        assert_eq!(caps.memory_limit, 256 << 20);
+        std::fs::write(dir.join("p.toml"), "[caps]\nrequests = []\n").unwrap();
+        assert_eq!(compute(&wasm, &[]).unwrap().memory_limit, DEFAULT_MEMORY_LIMIT);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

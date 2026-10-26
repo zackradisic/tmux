@@ -24,9 +24,6 @@ use wasmtime::{
 use crate::engine::{HARD_TICKS, SOFT_TICKS};
 use crate::{dispatch, hostlog};
 
-/// Default per-instance linear memory cap.
-const DEFAULT_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
-
 /// Per-store data available to host imports during guest calls (the
 /// instance itself is checked out of the registry while the guest runs, so
 /// anything dispatch needs must live here).
@@ -158,6 +155,7 @@ pub fn instantiate(
     role: Role,
     caps: crate::caps::EffectiveCaps,
 ) -> Result<Guest, String> {
+    let memory_limit = caps.memory_limit;
     let data = StoreData {
         plugin: plugin.to_string(),
         generation,
@@ -167,7 +165,7 @@ pub fn instantiate(
         subscriptions: HashSet::new(),
         soft_warned: false,
         limits: StoreLimitsBuilder::new()
-            .memory_size(DEFAULT_MEMORY_LIMIT)
+            .memory_size(memory_limit)
             .memories(1)
             .tables(4)
             .instances(1)
