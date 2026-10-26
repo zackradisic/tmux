@@ -318,42 +318,60 @@ impl Index {
     // snapshot
     // -----------------------------------------------------------------------
 
-    /// Serialize to one blob. Terms in dictionary order, postings as
-    /// document deltas; all integers as varints.
+    /// The snapshot in pieces of at most [`CHUNK`] bytes, or `None` when
+    /// the guest heap has no room for them. Terms in dictionary order,
+    /// postings as document deltas; all integers as varints; the pieces
+    /// concatenate to what [`deserialize`] reads.
+    ///
+    /// Pieces, and asked for fallibly: the plugin's linear memory has a
+    /// hard ceiling, an index this size sits just under it, and one
+    /// contiguous buffer for the whole snapshot - let alone one growing
+    /// by doubling - is what ran into it and trapped the plugin. A
+    /// megabyte at a time fits in the gaps; and when even that is
+    /// refused the caller skips this snapshot instead of dying, since
+    /// the index is still in memory and every turn is in the store.
+    pub fn snapshot_chunks(&self) -> Option<Vec<Vec<u8>>> {
+        let mut out = Sink::new(self.serialized_len())?;
+        self.write(&mut out);
+        out.finish()
+    }
+
+    /// The snapshot as one buffer: tests, and a load that concatenates.
+    #[cfg(test)]
     pub fn serialize(&self) -> Vec<u8> {
-        // Sized exactly first: a vector growing by doubling under a
-        // snapshot this size would hold old and new copies at once,
-        // which is what ran the guest heap into its ceiling.
-        let mut out = Vec::with_capacity(self.serialized_len());
-        out.extend_from_slice(b"AGIX");
+        self.snapshot_chunks().expect("room").concat()
+    }
+
+    fn write(&self, out: &mut impl Out) {
+        out.extend(b"AGIX");
         out.push(1);
-        put_i64(&mut out, self.max_rowid);
-        put_u64(&mut out, self.total_len);
-        put_u64(&mut out, self.agents.len() as u64);
+        put_i64(out, self.max_rowid);
+        put_u64(out, self.total_len);
+        put_u64(out, self.agents.len() as u64);
         for (i, a) in self.agents.iter().enumerate() {
-            put_bytes(&mut out, a.as_bytes());
+            put_bytes(out, a.as_bytes());
             out.push(u8::from(self.removed[i]));
         }
-        put_u64(&mut out, self.docs.len() as u64);
+        put_u64(out, self.docs.len() as u64);
         for d in &self.docs {
-            put_u64(&mut out, d.agent as u64);
-            put_i64(&mut out, d.seq);
-            put_u64(&mut out, d.len as u64);
+            put_u64(out, d.agent as u64);
+            put_i64(out, d.seq);
+            put_u64(out, d.len as u64);
         }
-        put_u64(&mut out, self.dict.len() as u64);
+        put_u64(out, self.dict.len() as u64);
         for (term, &tid) in &self.dict {
-            put_bytes(&mut out, term.as_bytes());
+            put_bytes(out, term.as_bytes());
             let pl = &self.postings[tid as usize];
-            put_u64(&mut out, pl.len() as u64);
+            put_u64(out, pl.len() as u64);
             let mut prev = 0u32;
             for p in pl {
-                put_u64(&mut out, (p.doc - prev) as u64);
+                let doc = p.doc;
+                put_u64(out, (doc - prev) as u64);
                 out.push(p.tf);
                 out.push(p.tf_path);
-                prev = p.doc;
+                prev = doc;
             }
         }
-        out
     }
 
     /// The byte count [`serialize`] writes, by the same walk.
@@ -475,7 +493,91 @@ pub fn snippet(text: &str, terms: &[String], width: usize) -> String {
 // varints
 // ---------------------------------------------------------------------------
 
-fn put_u64(out: &mut Vec<u8>, mut v: u64) {
+/// A snapshot piece: what one fallible allocation asks for.
+pub const CHUNK: usize = 1 << 20;
+
+/// Where the writer puts bytes.
+trait Out {
+    fn push(&mut self, b: u8);
+    fn extend(&mut self, bytes: &[u8]);
+}
+
+impl Out for Vec<u8> {
+    fn push(&mut self, b: u8) {
+        Vec::push(self, b);
+    }
+    fn extend(&mut self, bytes: &[u8]) {
+        self.extend_from_slice(bytes);
+    }
+}
+
+/// Pieces of at most [`CHUNK`] bytes, each reserved exactly and
+/// fallibly before it is filled. `left` is what the writer still has to
+/// put, from the sizing walk, so the last piece is no bigger than it
+/// needs to be and a piece is never grown. A refused reservation (or a
+/// writer that puts more than it said) marks the sink failed; nothing
+/// aborts.
+struct Sink {
+    chunks: Vec<Vec<u8>>,
+    cur: Vec<u8>,
+    left: usize,
+    failed: bool,
+}
+
+impl Sink {
+    fn new(total: usize) -> Option<Sink> {
+        let mut s = Sink { chunks: Vec::new(), cur: Vec::new(), left: total, failed: false };
+        s.roll().then_some(s)
+    }
+
+    /// Close the piece in hand and reserve the next.
+    fn roll(&mut self) -> bool {
+        if !self.cur.is_empty() {
+            self.chunks.push(std::mem::take(&mut self.cur));
+        }
+        let n = self.left.min(CHUNK);
+        if n == 0 {
+            return false;
+        }
+        let mut v = Vec::new();
+        if v.try_reserve_exact(n).is_err() {
+            return false;
+        }
+        self.cur = v;
+        true
+    }
+
+    fn finish(mut self) -> Option<Vec<Vec<u8>>> {
+        if self.failed || self.left != 0 {
+            return None;
+        }
+        if !self.cur.is_empty() {
+            self.chunks.push(self.cur);
+        }
+        Some(self.chunks)
+    }
+}
+
+impl Out for Sink {
+    fn push(&mut self, b: u8) {
+        if self.failed {
+            return;
+        }
+        if self.cur.len() == self.cur.capacity() && !self.roll() {
+            self.failed = true;
+            return;
+        }
+        self.cur.push(b);
+        self.left -= 1;
+    }
+    fn extend(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.push(b);
+        }
+    }
+}
+
+fn put_u64(out: &mut impl Out, mut v: u64) {
     while v >= 0x80 {
         out.push((v as u8) | 0x80);
         v >>= 7;
@@ -493,13 +595,13 @@ fn vlen_i64(v: i64) -> usize {
     vlen(((v << 1) ^ (v >> 63)) as u64)
 }
 
-fn put_i64(out: &mut Vec<u8>, v: i64) {
+fn put_i64(out: &mut impl Out, v: i64) {
     put_u64(out, ((v << 1) ^ (v >> 63)) as u64);
 }
 
-fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
+fn put_bytes(out: &mut impl Out, b: &[u8]) {
     put_u64(out, b.len() as u64);
-    out.extend_from_slice(b);
+    out.extend(b);
 }
 
 struct Cursor<'a> {
@@ -623,7 +725,9 @@ mod tests {
         // A merged agent's tombstone survives the round trip.
         ix.rename_agent("claude:c", "claude:a");
         let blob = ix.serialize();
-        assert_eq!(blob.len(), blob.capacity(), "the snapshot is sized exactly, not grown");
+        let chunks = ix.snapshot_chunks().expect("room");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), chunks[0].capacity(), "a piece is sized exactly, not grown");
         let mut back = Index::deserialize(&blob).expect("deserialize");
         assert_eq!(back.max_rowid, 77);
         assert_eq!(back.doc_count(), 4);
@@ -634,6 +738,33 @@ mod tests {
         assert_eq!(back.search("remote", 10)[0].id, "claude:a");
         assert!(Index::deserialize(b"nope").is_none());
         assert!(Index::deserialize(&blob[..blob.len() - 3]).is_none());
+    }
+
+    #[test]
+    fn pieces_are_exact_and_rejoin() {
+        let mut ix = Index::new();
+        // Enough text that the snapshot spans several pieces.
+        for n in 0..4000 {
+            let prose: String = (0..40).map(|k| format!("w{}x{} ", n % 97, (n * 7 + k) % 1013)).collect();
+            ix.add_doc(&format!("claude:{}", n % 300), n as i64, &prose, &[]);
+        }
+        let chunks = ix.snapshot_chunks().expect("room");
+        assert!(chunks.len() > 1, "{} bytes in {} pieces", ix.serialized_len(), chunks.len());
+        let total: usize = chunks.iter().map(Vec::len).sum();
+        assert_eq!(total, ix.serialized_len());
+        for c in &chunks[..chunks.len() - 1] {
+            assert_eq!(c.len(), CHUNK);
+        }
+        let back = Index::deserialize(&chunks.concat()).expect("deserialize");
+        assert_eq!(back.doc_count(), 4000);
+        // A writer that would overrun its sizing fails the sink rather
+        // than growing a piece.
+        let mut s = Sink::new(3).unwrap();
+        s.extend(b"abcd");
+        assert!(s.finish().is_none());
+        let mut s = Sink::new(3).unwrap();
+        s.extend(b"ab");
+        assert!(s.finish().is_none(), "short of the sizing is a bug too");
     }
 
     #[test]
@@ -668,9 +799,13 @@ mod tests {
         let path = std::env::var("AGENTS_INDEX_BLOB").expect("AGENTS_INDEX_BLOB");
         let blob = std::fs::read(path).expect("read");
         let mut ix = Index::deserialize(&blob).expect("deserialize");
-        let again = ix.serialize();
-        assert_eq!(again.len(), again.capacity());
-        assert_eq!(again, blob);
+        let chunks = ix.snapshot_chunks().expect("room");
+        assert!(chunks.len() > 1, "a real snapshot is several pieces");
+        for (i, c) in chunks.iter().enumerate() {
+            assert_eq!(c.len(), c.capacity(), "piece {i}");
+            assert!(c.len() == CHUNK || i == chunks.len() - 1, "piece {i} is short");
+        }
+        assert_eq!(chunks.concat(), blob);
         ix.compact();
         assert_eq!(ix.serialize(), blob);
         eprintln!(

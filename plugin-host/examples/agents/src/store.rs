@@ -20,7 +20,7 @@
 use serde::{Deserialize, Serialize};
 use tmux_plugin_sdk::prelude::*;
 
-pub const USER_VERSION: i64 = 12;
+pub const USER_VERSION: i64 = 13;
 
 /// The server a row belongs to. A provider only ever writes rows for its
 /// own server, so every stored row says "local"; the view stamps the link
@@ -93,11 +93,15 @@ CREATE TABLE IF NOT EXISTS turns (
   PRIMARY KEY (id, seq),
   FOREIGN KEY(id) REFERENCES agents(id)
     ON DELETE CASCADE ON UPDATE CASCADE);
--- The search index snapshot (see index.rs): one row.
+-- The search index snapshot (see index.rs): one row for where it
+-- stops, its bytes in pieces (an empty blob here says: see the pieces).
 CREATE TABLE IF NOT EXISTS search_index (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   blob BLOB NOT NULL,
   max_rowid INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS search_chunks (
+  n INTEGER PRIMARY KEY,
+  blob BLOB NOT NULL);
 PRAGMA user_version = 12;";
 
 /// The v1 -> v2 upgrade: the resolved columns did not exist in v1.
@@ -229,6 +233,14 @@ PRAGMA user_version = 11;";
 const MIGRATE_V12: &str = "
 ALTER TABLE agents ADD COLUMN project TEXT;
 PRAGMA user_version = 12;";
+
+/// v13: the search index snapshot in pieces (see `save_index`). The
+/// one-row snapshot is still read until the first piecewise one lands.
+const MIGRATE_V13: &str = "
+CREATE TABLE IF NOT EXISTS search_chunks (
+  n INTEGER PRIMARY KEY,
+  blob BLOB NOT NULL);
+PRAGMA user_version = 13;";
 
 const COLS: &str = "id, kind, status, life, pane, session, window, task, \
                     note, name, name_ms, user_name, user_name_ms, \
@@ -469,6 +481,10 @@ pub fn migrate_sync() -> Result<(), String> {
         }
         if version <= 11 {
             db_exec_sync(MIGRATE_V12, params![])
+                .map_err(|e| format!("db: {e}"))?;
+        }
+        if version <= 12 {
+            db_exec_sync(MIGRATE_V13, params![])
                 .map_err(|e| format!("db: {e}"))?;
         }
     }
@@ -1384,22 +1400,49 @@ pub async fn by_ids(ids: &[String]) -> Result<Vec<Agent>, HostError> {
 }
 
 /// Store the index snapshot (compressed by the host).
-pub async fn save_index(blob: &[u8], max_rowid: i64) -> Result<(), HostError> {
+/// Store a snapshot: its pieces (see `Index::snapshot_chunks`), each
+/// compressed by the host, then the row that says where it stops. The
+/// pieces go first, so a snapshot cut short leaves the row pointing at
+/// a set that will not read whole, and the next load rebuilds.
+pub async fn save_index(chunks: &[Vec<u8>], max_rowid: i64) -> Result<(), HostError> {
+    db_exec("DELETE FROM search_chunks", params![]).await?;
+    for (i, c) in chunks.iter().enumerate() {
+        db_exec(
+            "INSERT INTO search_chunks (n, blob) VALUES (?1, ?2)",
+            &[DbValue::from(i as i64 + 1), zstd_ref(c)],
+        )
+        .await?;
+    }
     db_exec(
-        "INSERT INTO search_index (id, blob, max_rowid) VALUES (1, ?1, ?2) \
-         ON CONFLICT(id) DO UPDATE SET blob = excluded.blob, \
+        "INSERT INTO search_index (id, blob, max_rowid) VALUES (1, x'', ?1) \
+         ON CONFLICT(id) DO UPDATE SET blob = x'', \
             max_rowid = excluded.max_rowid",
-        &[zstd_ref(blob), DbValue::from(max_rowid)],
+        &[DbValue::from(max_rowid)],
     )
     .await?;
     Ok(())
 }
 
-/// The stored index snapshot, inflated, if there is one.
+/// The stored index snapshot, inflated and in one piece, if there is
+/// one: the pieces joined, or the one-row blob a plugin before v13
+/// wrote. `None` for no snapshot, or one that will not fit in memory.
 pub async fn load_index() -> Result<Option<Vec<u8>>, HostError> {
     let rows = db_query("SELECT blob FROM search_index WHERE id = 1", params![]).await?;
     match rows.scalar() {
-        Some(DbValue::Blob(b)) => Ok(db_decompress(b).ok().map(|o| o.to_vec())),
+        Some(DbValue::Blob(b)) if !b.is_empty() => Ok(db_decompress(b).ok().map(|o| o.to_vec())),
+        Some(DbValue::Blob(_)) => {
+            let rows = db_query("SELECT blob FROM search_chunks ORDER BY n", params![]).await?;
+            let mut out: Vec<u8> = Vec::new();
+            for r in rows.iter() {
+                let Some(DbValue::Blob(b)) = r.get_named("blob") else { return Ok(None) };
+                let Ok(piece) = db_decompress(b) else { return Ok(None) };
+                if out.try_reserve(piece.len()).is_err() {
+                    return Ok(None);
+                }
+                out.extend_from_slice(&piece);
+            }
+            Ok((!out.is_empty()).then_some(out))
+        }
         _ => Ok(None),
     }
 }

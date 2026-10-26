@@ -107,6 +107,8 @@ thread_local! {
     static PENDING: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
     /// Documents added since the last snapshot.
     static SINCE_SNAPSHOT: RefCell<usize> = const { RefCell::new(0) };
+    /// A skipped snapshot was logged; quiet until one fits again.
+    static SNAPSHOT_SKIPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Per agent: the serial of the latest request, and whether any
     /// request in the burst said the agent ended. The task that wakes
     /// with the latest serial does the read; the others do nothing.
@@ -244,11 +246,25 @@ async fn fill(mut ix: Index) {
 
 /// Write the index to the store.
 pub async fn snapshot() {
-    let (blob, max_rowid) = with_index(|ix| {
+    let (chunks, max_rowid, kb) = with_index(|ix| {
         ix.compact();
-        (ix.serialize(), ix.max_rowid)
+        (ix.snapshot_chunks(), ix.max_rowid, ix.approx_bytes() / 1024)
     });
-    if let Err(e) = store::save_index(&blob, max_rowid).await {
+    let Some(chunks) = chunks else {
+        // No room beside the index for its bytes: this snapshot is
+        // skipped, not died for. The index stays in memory and answers;
+        // the turns are in the store, and the next load catches up from
+        // the last snapshot that fit. Said once until one fits again.
+        if !SNAPSHOT_SKIPPED.with(|s| s.replace(true)) {
+            log(&format!(
+                "agents: search index snapshot skipped: no room in the plugin's memory beside an index of ~{kb} KB; \
+                 the index still answers, the store keeps the turns"
+            ));
+        }
+        return;
+    };
+    SNAPSHOT_SKIPPED.with(|s| s.set(false));
+    if let Err(e) = store::save_index(&chunks, max_rowid).await {
         log(&format!("agents: search index snapshot: {}", e.message));
     }
     SINCE_SNAPSHOT.with(|c| *c.borrow_mut() = 0);
