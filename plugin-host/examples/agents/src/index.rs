@@ -34,7 +34,10 @@ pub struct Hit {
     pub score: f32,
 }
 
+/// Six bytes, not eight: with millions of postings the padding alone
+/// was megabytes of a guest heap that has a hard ceiling.
 #[derive(Clone, Copy, Debug)]
+#[repr(C, packed)]
 struct Posting {
     doc: u32,
     /// Occurrences in the prose, saturating.
@@ -142,6 +145,21 @@ impl Index {
         self.postings.iter().map(|p| p.len() * 6).sum::<usize>()
             + self.dict.keys().map(|k| k.len() + 8).sum::<usize>()
             + self.docs.len() * 16
+    }
+
+    /// Give back the growth slack. A posting list grows by doubling as
+    /// documents arrive, so half of what the lists hold can be empty
+    /// capacity; the guest heap is capped, and a snapshot needs room
+    /// beside the index for its bytes.
+    pub fn compact(&mut self) {
+        for pl in &mut self.postings {
+            pl.shrink_to_fit();
+        }
+        self.postings.shrink_to_fit();
+        self.docs.shrink_to_fit();
+        self.agents.shrink_to_fit();
+        self.removed.shrink_to_fit();
+        self.score = Vec::new();
     }
 
     fn agent_idx(&mut self, id: &str) -> u32 {
@@ -303,7 +321,10 @@ impl Index {
     /// Serialize to one blob. Terms in dictionary order, postings as
     /// document deltas; all integers as varints.
     pub fn serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.approx_bytes() / 2 + 64);
+        // Sized exactly first: a vector growing by doubling under a
+        // snapshot this size would hold old and new copies at once,
+        // which is what ran the guest heap into its ceiling.
+        let mut out = Vec::with_capacity(self.serialized_len());
         out.extend_from_slice(b"AGIX");
         out.push(1);
         put_i64(&mut out, self.max_rowid);
@@ -333,6 +354,31 @@ impl Index {
             }
         }
         out
+    }
+
+    /// The byte count [`serialize`] writes, by the same walk.
+    fn serialized_len(&self) -> usize {
+        let mut n = 4 + 1 + vlen_i64(self.max_rowid) + vlen(self.total_len);
+        n += vlen(self.agents.len() as u64);
+        for a in &self.agents {
+            n += vlen(a.len() as u64) + a.len() + 1;
+        }
+        n += vlen(self.docs.len() as u64);
+        for d in &self.docs {
+            n += vlen(d.agent as u64) + vlen_i64(d.seq) + vlen(d.len as u64);
+        }
+        n += vlen(self.dict.len() as u64);
+        for (term, &tid) in &self.dict {
+            let pl = &self.postings[tid as usize];
+            n += vlen(term.len() as u64) + term.len() + vlen(pl.len() as u64);
+            let mut prev = 0u32;
+            for p in pl {
+                let doc = p.doc;
+                n += vlen((doc - prev) as u64) + 2;
+                prev = doc;
+            }
+        }
+        n
     }
 
     /// The inverse of [`serialize`]. `None` for anything that is not a
@@ -435,6 +481,16 @@ fn put_u64(out: &mut Vec<u8>, mut v: u64) {
         v >>= 7;
     }
     out.push(v as u8);
+}
+
+/// Bytes [`put_u64`] writes for `v`.
+fn vlen(v: u64) -> usize {
+    (64 - v.leading_zeros() as usize).max(1).div_ceil(7)
+}
+
+/// Bytes [`put_i64`] writes for `v`.
+fn vlen_i64(v: i64) -> usize {
+    vlen(((v << 1) ^ (v >> 63)) as u64)
 }
 
 fn put_i64(out: &mut Vec<u8>, v: i64) {
@@ -567,6 +623,7 @@ mod tests {
         // A merged agent's tombstone survives the round trip.
         ix.rename_agent("claude:c", "claude:a");
         let blob = ix.serialize();
+        assert_eq!(blob.len(), blob.capacity(), "the snapshot is sized exactly, not grown");
         let mut back = Index::deserialize(&blob).expect("deserialize");
         assert_eq!(back.max_rowid, 77);
         assert_eq!(back.doc_count(), 4);
@@ -577,6 +634,53 @@ mod tests {
         assert_eq!(back.search("remote", 10)[0].id, "claude:a");
         assert!(Index::deserialize(b"nope").is_none());
         assert!(Index::deserialize(&blob[..blob.len() - 3]).is_none());
+    }
+
+    #[test]
+    fn varint_lengths_match_the_writer() {
+        for v in [0u64, 1, 127, 128, 16383, 16384, 1 << 35, u64::MAX] {
+            let mut out = Vec::new();
+            put_u64(&mut out, v);
+            assert_eq!(out.len(), vlen(v), "{v}");
+        }
+        for v in [0i64, -1, 1, -64, 64, i64::MIN, i64::MAX] {
+            let mut out = Vec::new();
+            put_i64(&mut out, v);
+            assert_eq!(out.len(), vlen_i64(v), "{v}");
+        }
+    }
+
+    #[test]
+    fn compact_keeps_the_answers() {
+        let mut ix = sample();
+        let before = ix.search("dflash2 drafter", 10);
+        ix.compact();
+        assert_eq!(ix.search("dflash2 drafter", 10), before);
+        assert!(ix.postings.iter().all(|p| p.capacity() == p.len()));
+    }
+
+    /// A snapshot off a real store (`AGENTS_INDEX_BLOB=<path to the
+    /// inflated search_index blob> cargo test -- --ignored`): the walk
+    /// that sizes it agrees with the walk that writes it, byte for byte.
+    #[test]
+    #[ignore]
+    fn real_snapshot_sizes_exactly() {
+        let path = std::env::var("AGENTS_INDEX_BLOB").expect("AGENTS_INDEX_BLOB");
+        let blob = std::fs::read(path).expect("read");
+        let mut ix = Index::deserialize(&blob).expect("deserialize");
+        let again = ix.serialize();
+        assert_eq!(again.len(), again.capacity());
+        assert_eq!(again, blob);
+        ix.compact();
+        assert_eq!(ix.serialize(), blob);
+        eprintln!(
+            "{} docs, {} terms, {} agents, {} bytes, ~{} KB in memory",
+            ix.doc_count(),
+            ix.term_count(),
+            ix.agent_count(),
+            blob.len(),
+            ix.approx_bytes() / 1024
+        );
     }
 
     #[test]

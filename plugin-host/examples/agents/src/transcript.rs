@@ -244,7 +244,10 @@ async fn fill(mut ix: Index) {
 
 /// Write the index to the store.
 pub async fn snapshot() {
-    let (blob, max_rowid) = with_index(|ix| (ix.serialize(), ix.max_rowid));
+    let (blob, max_rowid) = with_index(|ix| {
+        ix.compact();
+        (ix.serialize(), ix.max_rowid)
+    });
     if let Err(e) = store::save_index(&blob, max_rowid).await {
         log(&format!("agents: search index snapshot: {}", e.message));
     }

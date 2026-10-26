@@ -92,3 +92,11 @@ paths = [
   # message to an opencode session is posted.
   "~/.local/state/opencode",
 ]
+
+# The transcript search index lives in the guest heap: a few million
+# postings over every conversation on the roster. The host's default
+# ceiling (64 MB) was reached with ~300 agents, and a snapshot of the
+# index then trapped the plugin under an open picker. A host that knows
+# `[limits]` raises the ceiling to this; an older one ignores the table.
+[limits]
+memory_mb = 256
