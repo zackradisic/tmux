@@ -26,10 +26,11 @@
 //! byte is parsed on the main thread; the formats live in the host
 //! (`host/src/transcript.rs`).
 //!
-//! The index (see `index.rs`) is fed as turns are stored, one document
-//! per user turn. It is snapshotted to the store when an agent ends and
-//! every so many documents, and loaded at start with a catch-up over the
-//! turns stored since the snapshot.
+//! The search index is fed as turns are stored, one document per user
+//! turn, written straight to the on-disk FTS5 table (see
+//! `store::add_document`). There is no in-memory index to load or
+//! snapshot; a fresh upgrade backfills the table once from the stored
+//! turns (`backfill_docs`).
 //!
 //! Cost on the main thread: decoding the turn block and encoding the
 //! store batch, microseconds per call; a turn-end read is one call.
@@ -40,7 +41,7 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use tmux_plugin_sdk::prelude::*;
 
-use crate::index::{self, Index};
+use crate::index;
 use crate::store::{self, NewTurn, TurnRow};
 
 /// The harnesses the host can extract a transcript for (see
@@ -78,12 +79,9 @@ impl TurnKind {
 /// An agent that ended within this long may still have unread tail (the
 /// server was down when it died); older ones stopped writing long ago.
 pub const RECENT_MS: i64 = 24 * 3600 * 1000;
-/// A snapshot is written after this many documents since the last one,
-/// so a catch-up at start stays short even if no agent has ended.
-const SNAPSHOT_EVERY: usize = 200;
-/// Turns loaded per page while catching up. One page is one wake of the
-/// guest; 500 turns tokenize in a few milliseconds under wasm.
-const CATCH_UP_PAGE: i64 = 500;
+/// Turns read per page while backfilling the FTS table from the stored
+/// turns. One page is one wake of the guest.
+const BACKFILL_PAGE: i64 = 500;
 /// How many hits a search returns at most.
 pub const HITS_MAX: usize = 50;
 /// How many turns after the hit's user turn a snippet may look through
@@ -100,15 +98,10 @@ pub const DEBOUNCE_MS: u64 = 500;
 const SLOW_MS: u64 = 50;
 
 thread_local! {
-    static INDEX: RefCell<Option<Index>> = const { RefCell::new(None) };
     /// Agents with an ingest in flight, and the ones asked for again
     /// meanwhile (run once more when the current one finishes).
     static INGESTING: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
     static PENDING: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
-    /// Documents added since the last snapshot.
-    static SINCE_SNAPSHOT: RefCell<usize> = const { RefCell::new(0) };
-    /// A skipped snapshot was logged; quiet until one fits again.
-    static SNAPSHOT_SKIPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Per agent: the serial of the latest request, and whether any
     /// request in the burst said the agent ended. The task that wakes
     /// with the latest serial does the read; the others do nothing.
@@ -127,25 +120,70 @@ pub struct TranscriptHit {
     pub snippet: String,
 }
 
-/// Run `f` on the index, creating an empty one if none is loaded yet.
-pub fn with_index<R>(f: impl FnOnce(&mut Index) -> R) -> R {
-    INDEX.with(|cell| {
-        let mut b = cell.borrow_mut();
-        let ix = b.get_or_insert_with(Index::new);
-        f(ix)
-    })
+/// The best document of one agent for a query: which agent, which turn to
+/// open the preview on, and how well it matched.
+#[derive(Debug, Clone)]
+pub struct Hit {
+    pub id: String,
+    pub seq: i64,
+    pub score: f32,
 }
 
-/// Search this server's index. Synchronous: this is the keystroke path.
-pub fn search(query: &str, limit: usize) -> Vec<index::Hit> {
-    with_index(|ix| ix.search(query, limit))
+/// The FTS5 MATCH expression for a query, or `None` when the query has no
+/// usable terms. Each term is a quoted string (so a token can never be
+/// read as an FTS operator), the terms AND together, and the last one is
+/// a prefix (`"term"*`) while it is still being typed.
+fn fts_match(query: &str) -> Option<String> {
+    let (terms, prefix) = index::query_terms(query);
+    if terms.is_empty() {
+        return None;
+    }
+    let last = terms.len() - 1;
+    let mut out = String::new();
+    for (i, t) in terms.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        out.push('"');
+        // Tokens are alphanumeric runs (see `index::tokenize`): no quote
+        // to escape.
+        out.push_str(t);
+        out.push('"');
+        if prefix && i == last {
+            out.push('*');
+        }
+    }
+    Some(out)
+}
+
+/// Search this server's on-disk index for the best document of each
+/// matching agent. One FTS5 query on the host's worker pool.
+pub async fn search(query: &str, limit: usize) -> Vec<Hit> {
+    let Some(m) = fts_match(query) else { return Vec::new() };
+    // FTS5 ranks per document, not per agent. Fetch more raw rows than the
+    // agent limit (one chatty agent can own many matching documents), then
+    // keep the best document of each agent: the rows arrive best-first, so
+    // the first time an id is seen is its top-scoring document.
+    let raw_cap = limit.saturating_mul(40).clamp(limit, 4000);
+    let rows = store::search_fts(&m, raw_cap).await.unwrap_or_default();
+    let mut seen = HashSet::new();
+    let mut hits = Vec::with_capacity(limit);
+    for (id, seq, score) in rows {
+        if seen.insert(id.clone()) {
+            hits.push(Hit { id, seq, score });
+            if hits.len() >= limit {
+                break;
+            }
+        }
+    }
+    hits
 }
 
 /// Search, then fetch one snippet per hit from the stored turns. The
 /// document is the user turn at `seq` and the agent's reply after it, so
 /// the snippet comes from whichever of those turns holds a term.
 pub async fn hits_with_snippets(query: &str, limit: usize) -> Vec<TranscriptHit> {
-    let hits = search(query, limit);
+    let hits = search(query, limit).await;
     if hits.is_empty() {
         return Vec::new();
     }
@@ -183,36 +221,30 @@ pub fn snippet_for(turns: &[TurnRow], id: &str, seq: i64, terms: &[String]) -> S
 }
 
 // ---------------------------------------------------------------------------
-// index lifecycle
+// index backfill
 // ---------------------------------------------------------------------------
 
-/// Load the snapshot and catch up on the turns stored since. Runs once,
-/// at provider start, before anything is ingested.
-pub async fn load() {
-    let ix = match store::load_index().await {
-        Ok(Some(blob)) => Index::deserialize(&blob).unwrap_or_else(|| {
-            log("agents: search index snapshot unreadable; rebuilding");
-            Index::new()
-        }),
-        _ => Index::new(),
-    };
-    fill(ix).await;
-}
+/// A finished document, as the [`Grouper`] hands it over: the agent, the
+/// user turn it started at, its prose, and the paths its tools touched.
+type Doc = (String, i64, String, Vec<String>);
 
-/// Throw the index away and build it again from every stored turn: after
-/// retention pruned agents (their documents must stop answering), or a
-/// snapshot that would not load.
-pub async fn rebuild() {
-    fill(Index::new()).await;
-}
-
-/// Add the turns stored after `ix.max_rowid` to `ix`, page by page, then
-/// install it and snapshot it if anything was added.
-async fn fill(mut ix: Index) {
-    let mut rowid = ix.max_rowid;
-    let mut added = 0usize;
+/// Build the on-disk FTS index from the stored turns, once. Runs at
+/// start; a no-op unless `docs` is empty while `turns` is not - i.e. the
+/// first start after the v14 upgrade (the old in-memory index left no
+/// `docs` behind). Idempotent: `add_document` replaces per `(id, seq)`,
+/// so a restart mid-backfill simply resumes.
+pub async fn backfill_docs() {
+    if !store::docs_is_empty().await.unwrap_or(false) {
+        return;
+    }
+    if !store::turns_any().await.unwrap_or(false) {
+        return;
+    }
+    let mut rowid = 0i64;
+    let mut docs = 0usize;
+    let mut grouper = Grouper::default();
     loop {
-        let page = match store::turns_after(rowid, CATCH_UP_PAGE).await {
+        let page = match store::turns_after(rowid, BACKFILL_PAGE).await {
             Ok(p) => p,
             Err(_) => break,
         };
@@ -220,100 +252,77 @@ async fn fill(mut ix: Index) {
             break;
         }
         rowid = page.last().map(|t| t.rowid).unwrap_or(rowid);
-        let mut grouper = Grouper::default();
         for t in &page {
             let Some(kind) = TurnKind::parse(&t.kind) else { continue };
-            added += grouper.push(&mut ix, &t.id, t.seq, kind, &t.text, t.path.as_deref());
+            grouper.push(&t.id, t.seq, kind, &t.text, t.path.as_deref());
         }
-        added += grouper.flush(&mut ix);
-        if (page.len() as i64) < CATCH_UP_PAGE {
+        docs += write_docs(grouper.drain_done()).await;
+        if (page.len() as i64) < BACKFILL_PAGE {
             break;
         }
     }
-    ix.max_rowid = rowid;
-    log(&format!(
-        "agents: search index: {} docs, {} terms, {} agents, ~{} KB (+{added} caught up)",
-        ix.doc_count(),
-        ix.term_count(),
-        ix.agent_count(),
-        ix.approx_bytes() / 1024
-    ));
-    INDEX.with(|c| *c.borrow_mut() = Some(ix));
-    if added > 0 {
-        snapshot().await;
+    docs += write_docs(grouper.take()).await;
+    if docs > 0 {
+        log(&format!("agents: search index backfilled {docs} documents from stored turns"));
     }
 }
 
-/// Write the index to the store.
-pub async fn snapshot() {
-    let (chunks, max_rowid, kb) = with_index(|ix| {
-        ix.compact();
-        (ix.snapshot_chunks(), ix.max_rowid, ix.approx_bytes() / 1024)
-    });
-    let Some(chunks) = chunks else {
-        // No room beside the index for its bytes: this snapshot is
-        // skipped, not died for. The index stays in memory and answers;
-        // the turns are in the store, and the next load catches up from
-        // the last snapshot that fit. Said once until one fits again.
-        if !SNAPSHOT_SKIPPED.with(|s| s.replace(true)) {
-            log(&format!(
-                "agents: search index snapshot skipped: no room in the plugin's memory beside an index of ~{kb} KB; \
-                 the index still answers, the store keeps the turns"
-            ));
+/// Write finished documents to the FTS index; returns how many landed.
+async fn write_docs(docs: Vec<Doc>) -> usize {
+    let mut n = 0;
+    for (id, seq, prose, paths) in docs {
+        let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+        if store::add_document(&id, seq, &prose, &refs).await.is_ok() {
+            n += 1;
         }
-        return;
-    };
-    SNAPSHOT_SKIPPED.with(|s| s.set(false));
-    if let Err(e) = store::save_index(&chunks, max_rowid).await {
-        log(&format!("agents: search index snapshot: {}", e.message));
     }
-    SINCE_SNAPSHOT.with(|c| *c.borrow_mut() = 0);
-}
-
-/// An agent's id moved (provisional to durable): its documents follow.
-pub fn on_rename(old: &str, new: &str) {
-    with_index(|ix| ix.rename_agent(old, new));
+    n
 }
 
 /// Groups consecutive turns of one agent into documents: a user turn
 /// starts one; the assistant's text and tool lines join the open one.
+/// Finished documents collect in `done` until drained.
 #[derive(Default)]
 struct Grouper {
-    cur: Option<(String, i64, String, Vec<String>)>,
+    cur: Option<Doc>,
+    done: Vec<Doc>,
 }
 
 impl Grouper {
-    fn push(&mut self, ix: &mut Index, id: &str, seq: i64, kind: TurnKind, text: &str, path: Option<&str>) -> usize {
-        let mut added = 0;
+    fn push(&mut self, id: &str, seq: i64, kind: TurnKind, text: &str, path: Option<&str>) {
         let open_for_other = self.cur.as_ref().is_some_and(|(cid, ..)| cid != id);
         if kind == TurnKind::User || open_for_other || self.cur.is_none() {
-            added += self.flush(ix);
+            self.close();
             self.cur = Some((id.to_string(), seq, String::new(), Vec::new()));
         }
-        let Some((_, _, prose, paths)) = self.cur.as_mut() else { return added };
-        match kind {
-            TurnKind::Tool => {
-                if let Some(p) = path {
-                    paths.push(p.to_string());
-                }
-                // The tool line's words (the tool name, a command's
-                // description) are prose too.
-                prose.push('\n');
-                prose.push_str(text);
-            }
-            _ => {
-                prose.push('\n');
-                prose.push_str(text);
+        let Some((_, _, prose, paths)) = self.cur.as_mut() else { return };
+        if kind == TurnKind::Tool {
+            if let Some(p) = path {
+                paths.push(p.to_string());
             }
         }
-        added
+        // The tool line's words (the tool name, a command's description)
+        // are prose too.
+        prose.push('\n');
+        prose.push_str(text);
     }
 
-    fn flush(&mut self, ix: &mut Index) -> usize {
-        let Some((id, seq, prose, paths)) = self.cur.take() else { return 0 };
-        let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
-        ix.add_doc(&id, seq, &prose, &refs);
-        1
+    /// Close the open document into `done`.
+    fn close(&mut self) {
+        if let Some(doc) = self.cur.take() {
+            self.done.push(doc);
+        }
+    }
+
+    /// Take the documents finished so far, leaving the open one pending.
+    fn drain_done(&mut self) -> Vec<Doc> {
+        std::mem::take(&mut self.done)
+    }
+
+    /// Close the open document and take every finished one.
+    fn take(&mut self) -> Vec<Doc> {
+        self.close();
+        std::mem::take(&mut self.done)
     }
 }
 
@@ -374,6 +383,9 @@ pub async fn request_pane(pane: u32) {
 pub async fn catch_up() {
     backfill().await;
     backfill_facts().await;
+    // After the v14 upgrade, build the FTS index from the stored turns
+    // once before anything new is ingested on top.
+    backfill_docs().await;
     let now = now_ms() as i64;
     let targets = store::ingest_targets(now, RECENT_MS).await.unwrap_or_default();
     for a in targets {
@@ -408,7 +420,6 @@ async fn backfill() {
     }
     if found > 0 {
         log(&format!("agents: transcripts found for {found} rows from before the upgrade"));
-        snapshot().await;
     }
 }
 
@@ -466,16 +477,15 @@ async fn claude_transcripts() -> Option<std::collections::HashMap<String, String
 }
 
 /// Read what the transcript has past the cursor, store the turns, feed
-/// the index. `ended` says the agent is done, which is when the index is
-/// snapshotted. Re-entrant per agent: a second call while one runs is
-/// queued and runs once after it.
-pub async fn ingest(id: &str, ended: bool) {
+/// the FTS index. `_ended` is kept for the caller's intent but no longer
+/// drives anything (there is no snapshot to write). Re-entrant per agent:
+/// a second call while one runs is queued and runs once after it.
+pub async fn ingest(id: &str, _ended: bool) {
     let first = INGESTING.with(|s| s.borrow_mut().insert(id.to_string()));
     if !first {
         PENDING.with(|s| s.borrow_mut().insert(id.to_string()));
         return;
     }
-    let mut ended = ended;
     loop {
         let r = ingest_once(id).await;
         INGESTING.with(|s| s.borrow_mut().remove(id));
@@ -484,11 +494,6 @@ pub async fn ingest(id: &str, ended: bool) {
             break;
         }
         INGESTING.with(|s| s.borrow_mut().insert(id.to_string()));
-        ended = ended || store::by_id(id).await.ok().flatten().is_some_and(|a| !a.live());
-    }
-    let due = SINCE_SNAPSHOT.with(|c| *c.borrow() >= SNAPSHOT_EVERY);
-    if ended || due {
-        snapshot().await;
     }
 }
 
@@ -504,6 +509,14 @@ async fn ingest_once(id: &str) -> Result<(), ()> {
     let Some(mut path) = a.transcript_path.clone() else { return Err(()) };
     let started = now_ms();
     let start_cursor = a.transcript_cursor.max(0) as u64;
+    // A read from the very start re-reads the whole transcript. Drop any
+    // turns and documents already stored for this agent first, so `seq`
+    // restarts at 0 and the re-read replaces rather than duplicates - the
+    // bug that let one transcript pile up hundreds of thousands of turns.
+    if start_cursor == 0 {
+        let _ = store::delete_turns(id).await;
+        let _ = store::delete_docs(id).await;
+    }
     let (mut calls, mut turns_stored) = (0u32, 0usize);
     let mut cursor = start_cursor;
     let mut seq = store::next_seq(id).await.map_err(|_| ())?;
@@ -566,41 +579,28 @@ async fn ingest_once(id: &str) -> Result<(), ()> {
             branch: got.branch.as_deref(),
             model: got.model.as_deref(),
         };
-        match store::insert_turns(id, &rows, got.cursor as i64, &facts).await {
-            Ok(max_rowid) => {
-                let added = with_index(|ix| {
-                    let mut added = 0;
-                    for (i, t) in got.turns.iter().enumerate() {
-                        added += grouper.push(
-                            ix,
-                            id,
-                            seq + i as i64,
-                            TurnKind::from_abi(t.kind),
-                            &t.text,
-                            t.path.as_deref(),
-                        );
-                    }
-                    if max_rowid > ix.max_rowid {
-                        ix.max_rowid = max_rowid;
-                    }
-                    added
-                });
-                SINCE_SNAPSHOT.with(|c| *c.borrow_mut() += added);
-                seq += n as i64;
-                turns_stored += n;
-            }
-            Err(e) => {
-                log(&format!("agents: transcript {id}: store: {}", e.message));
-                return Err(());
-            }
+        if let Err(e) = store::insert_turns(id, &rows, got.cursor as i64, &facts).await {
+            log(&format!("agents: transcript {id}: store: {}", e.message));
+            return Err(());
         }
+        for (i, t) in got.turns.iter().enumerate() {
+            grouper.push(
+                id,
+                seq + i as i64,
+                TurnKind::from_abi(t.kind),
+                &t.text,
+                t.path.as_deref(),
+            );
+        }
+        write_docs(grouper.drain_done()).await;
+        seq += n as i64;
+        turns_stored += n;
         cursor = got.cursor;
         if got.eof {
             break;
         }
     }
-    let added = with_index(|ix| grouper.flush(ix));
-    SINCE_SNAPSHOT.with(|c| *c.borrow_mut() += added);
+    write_docs(grouper.take()).await;
     let took = now_ms().saturating_sub(started);
     if took >= SLOW_MS || calls > 2 {
         log(&format!(
@@ -900,21 +900,32 @@ mod tests {
 
     #[test]
     fn grouper_documents() {
-        let mut ix = Index::new();
         let mut g = Grouper::default();
-        let mut n = 0;
-        n += g.push(&mut ix, "a", 0, TurnKind::User, "first prompt", None);
-        n += g.push(&mut ix, "a", 1, TurnKind::Tool, "Read x", Some("/x/view.rs"));
-        n += g.push(&mut ix, "a", 2, TurnKind::Assistant, "done with view", None);
-        n += g.push(&mut ix, "a", 3, TurnKind::User, "second prompt", None);
+        g.push("a", 0, TurnKind::User, "first prompt", None);
+        g.push("a", 1, TurnKind::Tool, "Read x", Some("/x/view.rs"));
+        g.push("a", 2, TurnKind::Assistant, "done with view", None);
+        g.push("a", 3, TurnKind::User, "second prompt", None);
         // Another agent's turn closes the open document.
-        n += g.push(&mut ix, "b", 0, TurnKind::Assistant, "orphan reply", None);
-        n += g.flush(&mut ix);
-        assert_eq!(n, 3);
-        assert_eq!(ix.doc_count(), 3);
-        let hits = ix.search("view", 10);
-        assert_eq!(hits.len(), 1);
-        assert_eq!((hits[0].id.as_str(), hits[0].seq), ("a", 0));
-        assert_eq!(ix.search("orphan", 10)[0].id, "b");
+        g.push("b", 0, TurnKind::Assistant, "orphan reply", None);
+        let docs = g.take();
+        assert_eq!(docs.len(), 3);
+        // Document starts: agent `a` at seq 0 and 3, agent `b` at seq 0.
+        let starts: Vec<(&str, i64)> = docs.iter().map(|(id, seq, ..)| (id.as_str(), *seq)).collect();
+        assert_eq!(starts, vec![("a", 0), ("a", 3), ("b", 0)]);
+        // The first document carries the tool's path and the prose of all
+        // its turns.
+        let (_, _, prose, paths) = &docs[0];
+        assert_eq!(paths, &vec!["/x/view.rs".to_string()]);
+        assert!(prose.contains("first prompt") && prose.contains("done with view"));
+    }
+
+    #[test]
+    fn fts_match_builds_and_prefixes() {
+        // Content words, quoted and AND-ed, last one a prefix while typing.
+        assert_eq!(fts_match("the working picker").as_deref(), Some("\"working\" \"picker\"*"));
+        // A trailing space completes the last word: no prefix star.
+        assert_eq!(fts_match("working picker ").as_deref(), Some("\"working\" \"picker\""));
+        // Nothing usable.
+        assert_eq!(fts_match("  "), None);
     }
 }

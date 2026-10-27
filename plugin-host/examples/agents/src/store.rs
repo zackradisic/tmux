@@ -20,7 +20,7 @@
 use serde::{Deserialize, Serialize};
 use tmux_plugin_sdk::prelude::*;
 
-pub const USER_VERSION: i64 = 13;
+pub const USER_VERSION: i64 = 14;
 
 /// The server a row belongs to. A provider only ever writes rows for its
 /// own server, so every stored row says "local"; the view stamps the link
@@ -93,16 +93,27 @@ CREATE TABLE IF NOT EXISTS turns (
   PRIMARY KEY (id, seq),
   FOREIGN KEY(id) REFERENCES agents(id)
     ON DELETE CASCADE ON UPDATE CASCADE);
--- The search index snapshot (see index.rs): one row for where it
--- stops, its bytes in pieces (an empty blob here says: see the pieces).
-CREATE TABLE IF NOT EXISTS search_index (
-  id INTEGER PRIMARY KEY CHECK (id = 1),
-  blob BLOB NOT NULL,
-  max_rowid INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS search_chunks (
-  n INTEGER PRIMARY KEY,
-  blob BLOB NOT NULL);
-PRAGMA user_version = 12;";
+-- Full-text search lives on disk (see `search_fts`), not in the guest
+-- heap. One `docs` row per document (a user turn plus the reply and tool
+-- lines until the next user turn); `docs.rowid` is the FTS rowid. The FTS
+-- table is contentless (`content=''`): it keeps only the inverted index,
+-- never a second copy of the prose - snippets come from `turns`. A
+-- deleted `docs` row takes its FTS entry with it via the trigger, so an
+-- agent pruned from `agents` (ON DELETE CASCADE to `docs`) drops out of
+-- search too.
+CREATE TABLE IF NOT EXISTS docs (
+  rowid INTEGER PRIMARY KEY,
+  id TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  UNIQUE(id, seq),
+  FOREIGN KEY(id) REFERENCES agents(id)
+    ON DELETE CASCADE ON UPDATE CASCADE);
+CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts
+  USING fts5(prose, content='', contentless_delete=1, tokenize='unicode61');
+CREATE TRIGGER IF NOT EXISTS docs_ad AFTER DELETE ON docs BEGIN
+  DELETE FROM docs_fts WHERE rowid = old.rowid;
+END;
+PRAGMA user_version = 14;";
 
 /// The v1 -> v2 upgrade: the resolved columns did not exist in v1.
 const MIGRATE_V2: &str = "
@@ -234,13 +245,39 @@ const MIGRATE_V12: &str = "
 ALTER TABLE agents ADD COLUMN project TEXT;
 PRAGMA user_version = 12;";
 
-/// v13: the search index snapshot in pieces (see `save_index`). The
-/// one-row snapshot is still read until the first piecewise one lands.
+/// v13: the (now removed) in-memory search index snapshotted into pieces
+/// rather than one blob. Superseded by v14, which drops the snapshot
+/// tables for an on-disk FTS index; this step only matters when upgrading
+/// a v12 store through to v14.
 const MIGRATE_V13: &str = "
 CREATE TABLE IF NOT EXISTS search_chunks (
   n INTEGER PRIMARY KEY,
   blob BLOB NOT NULL);
 PRAGMA user_version = 13;";
+
+/// v14: full-text search moves off the guest heap and onto disk. The old
+/// in-memory inverted index (snapshotted into `search_index`/
+/// `search_chunks`) grew past the plugin's linear-memory ceiling and
+/// trapped it; it is replaced by a SQLite FTS5 table over the turns (see
+/// `search_fts`). The snapshot tables are dropped; `docs`/`docs_fts` are
+/// created and backfilled once, asynchronously, from the stored turns
+/// (see `transcript::backfill_docs`).
+const MIGRATE_V14: &str = "
+DROP TABLE IF EXISTS search_index;
+DROP TABLE IF EXISTS search_chunks;
+CREATE TABLE IF NOT EXISTS docs (
+  rowid INTEGER PRIMARY KEY,
+  id TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  UNIQUE(id, seq),
+  FOREIGN KEY(id) REFERENCES agents(id)
+    ON DELETE CASCADE ON UPDATE CASCADE);
+CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts
+  USING fts5(prose, content='', contentless_delete=1, tokenize='unicode61');
+CREATE TRIGGER IF NOT EXISTS docs_ad AFTER DELETE ON docs BEGIN
+  DELETE FROM docs_fts WHERE rowid = old.rowid;
+END;
+PRAGMA user_version = 14;";
 
 const COLS: &str = "id, kind, status, life, pane, session, window, task, \
                     note, name, name_ms, user_name, user_name_ms, \
@@ -485,6 +522,10 @@ pub fn migrate_sync() -> Result<(), String> {
         }
         if version <= 12 {
             db_exec_sync(MIGRATE_V13, params![])
+                .map_err(|e| format!("db: {e}"))?;
+        }
+        if version <= 13 {
+            db_exec_sync(MIGRATE_V14, params![])
                 .map_err(|e| format!("db: {e}"))?;
         }
     }
@@ -1284,13 +1325,12 @@ pub struct Facts<'a> {
 /// Store a batch of turns and advance the transcript cursor, atomically:
 /// a crash between the two would otherwise re-read (duplicate) or skip
 /// (lose) the batch. The facts the batch learned are recorded with it.
-/// Returns the rowid of the last turn inserted (for the index).
 pub async fn insert_turns(
     id: &str,
     turns: &[NewTurn<'_>],
     cursor: i64,
     facts: &Facts<'_>,
-) -> Result<i64, HostError> {
+) -> Result<(), HostError> {
     const INSERT: &str = "INSERT OR REPLACE INTO turns \
         (id, seq, kind, ts_ms, text, path, offset, len) \
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
@@ -1333,8 +1373,7 @@ pub async fn insert_turns(
         owned[turns.len()].as_slice(),
     ));
     db_batch(&stmts).await?;
-    let rows = db_query("SELECT COALESCE(MAX(rowid), 0) AS m FROM turns", params![]).await?;
-    Ok(rows.scalar().and_then(DbValue::as_i64).unwrap_or(0))
+    Ok(())
 }
 
 /// One agent's turns in `[from, to)` by seq, in order.
@@ -1350,8 +1389,9 @@ pub async fn turns_range(id: &str, from: i64, to: i64) -> Result<Vec<TurnRow>, H
     Ok(turns_from(&rows))
 }
 
-/// Turns stored after `rowid`, oldest first, at most `limit`: what the
-/// index has to catch up on after loading a snapshot.
+/// Turns stored after `rowid`, oldest first, at most `limit`: how the
+/// one-time FTS backfill pages through the existing turns (see
+/// `transcript::backfill_docs`).
 pub async fn turns_after(rowid: i64, limit: i64) -> Result<Vec<TurnRow>, HostError> {
     let rows = db_query(
         &format!(
@@ -1399,50 +1439,108 @@ pub async fn by_ids(ids: &[String]) -> Result<Vec<Agent>, HostError> {
     Ok(agents_from(&rows))
 }
 
-/// Store the index snapshot (compressed by the host).
-/// Store a snapshot: its pieces (see `Index::snapshot_chunks`), each
-/// compressed by the host, then the row that says where it stops. The
-/// pieces go first, so a snapshot cut short leaves the row pointing at
-/// a set that will not read whole, and the next load rebuilds.
-pub async fn save_index(chunks: &[Vec<u8>], max_rowid: i64) -> Result<(), HostError> {
-    db_exec("DELETE FROM search_chunks", params![]).await?;
-    for (i, c) in chunks.iter().enumerate() {
-        db_exec(
-            "INSERT INTO search_chunks (n, blob) VALUES (?1, ?2)",
-            &[DbValue::from(i as i64 + 1), zstd_ref(c)],
-        )
-        .await?;
+// ---------------------------------------------------------------------------
+// full-text search: the FTS5 index over documents, on disk
+// ---------------------------------------------------------------------------
+
+/// Index one document (a user turn plus the reply and tool lines after
+/// it) for search. `prose` is the document's text; `paths` are the files
+/// its tools touched, indexed alongside so "the agent that edited view.rs"
+/// finds the session through the edit. Idempotent per `(id, seq)`: a
+/// re-ingest of the same document replaces its entry rather than piling
+/// another on. The `docs` row is deleted and re-inserted so the trigger
+/// clears the old FTS entry; the fresh row's rowid carries the new one.
+pub async fn add_document(
+    id: &str,
+    seq: i64,
+    prose: &str,
+    paths: &[&str],
+) -> Result<(), HostError> {
+    let mut text = prose.to_string();
+    for p in paths {
+        text.push(' ');
+        text.push_str(p);
     }
-    db_exec(
-        "INSERT INTO search_index (id, blob, max_rowid) VALUES (1, x'', ?1) \
-         ON CONFLICT(id) DO UPDATE SET blob = x'', \
-            max_rowid = excluded.max_rowid",
-        &[DbValue::from(max_rowid)],
-    )
+    let key: &[DbValue] = &[DbValue::from(id), DbValue::from(seq)];
+    let ins: &[DbValue] = &[DbValue::from(id), DbValue::from(seq), DbValue::from(text.as_str())];
+    db_batch(&[
+        // Dropping any existing row fires `docs_ad`, retiring its FTS
+        // entry; the fresh insert gets a rowid the FTS row is keyed on.
+        ("DELETE FROM docs WHERE id = ?1 AND seq = ?2", key),
+        ("INSERT INTO docs (id, seq) VALUES (?1, ?2)", key),
+        (
+            "INSERT INTO docs_fts (rowid, prose) \
+             SELECT rowid, ?3 FROM docs WHERE id = ?1 AND seq = ?2",
+            ins,
+        ),
+    ])
     .await?;
     Ok(())
 }
 
-/// The stored index snapshot, inflated and in one piece, if there is
-/// one: the pieces joined, or the one-row blob a plugin before v13
-/// wrote. `None` for no snapshot, or one that will not fit in memory.
-pub async fn load_index() -> Result<Option<Vec<u8>>, HostError> {
-    let rows = db_query("SELECT blob FROM search_index WHERE id = 1", params![]).await?;
-    match rows.scalar() {
-        Some(DbValue::Blob(b)) if !b.is_empty() => Ok(db_decompress(b).ok().map(|o| o.to_vec())),
-        Some(DbValue::Blob(_)) => {
-            let rows = db_query("SELECT blob FROM search_chunks ORDER BY n", params![]).await?;
-            let mut out: Vec<u8> = Vec::new();
-            for r in rows.iter() {
-                let Some(DbValue::Blob(b)) = r.get_named("blob") else { return Ok(None) };
-                let Ok(piece) = db_decompress(b) else { return Ok(None) };
-                if out.try_reserve(piece.len()).is_err() {
-                    return Ok(None);
-                }
-                out.extend_from_slice(&piece);
-            }
-            Ok((!out.is_empty()).then_some(out))
-        }
-        _ => Ok(None),
+/// Drop every document of an agent from the search index (the trigger
+/// clears the FTS entries). Used before a cursor-0 re-ingest, so a
+/// re-read cannot leave stale documents behind.
+pub async fn delete_docs(id: &str) -> Result<(), HostError> {
+    db_exec("DELETE FROM docs WHERE id = ?1", params![id]).await?;
+    Ok(())
+}
+
+/// Drop every stored turn of an agent. Used before a cursor-0 re-ingest
+/// so `seq` restarts at 0 and the re-read cannot duplicate turns.
+pub async fn delete_turns(id: &str) -> Result<(), HostError> {
+    db_exec("DELETE FROM turns WHERE id = ?1", params![id]).await?;
+    Ok(())
+}
+
+/// Whether the `docs` index is empty: the one-time backfill's guard.
+pub async fn docs_is_empty() -> Result<bool, HostError> {
+    let rows = db_query("SELECT NOT EXISTS(SELECT 1 FROM docs) AS e", params![]).await?;
+    Ok(rows.scalar().and_then(DbValue::as_i64).unwrap_or(1) != 0)
+}
+
+/// Whether any turns are stored: the other half of the backfill's guard.
+pub async fn turns_any() -> Result<bool, HostError> {
+    let rows = db_query("SELECT EXISTS(SELECT 1 FROM turns) AS e", params![]).await?;
+    Ok(rows.scalar().and_then(DbValue::as_i64).unwrap_or(0) != 0)
+}
+
+/// Search the FTS index for `match_query` (an FTS5 MATCH expression, built
+/// by `transcript::fts_match`), returning the best document of each agent:
+/// `(id, seq, score)`, best first, at most `limit` agents. `score` is
+/// `-bm25`, so a larger value is a better match (SQLite's bm25 is
+/// negative, best nearest `-inf`). The `GROUP BY` with `min(bm25)` takes
+/// `seq` from the row that scored the minimum - SQLite's bare-column rule
+/// for a min/max aggregate - so one row per agent names its best turn.
+pub async fn search_fts(
+    match_query: &str,
+    limit: usize,
+) -> Result<Vec<(String, i64, f32)>, HostError> {
+    if match_query.is_empty() {
+        return Ok(Vec::new());
     }
+    // bm25() is an FTS5 auxiliary function: it is only legal in the SELECT
+    // and ORDER BY of the query that MATCHes the table. It CANNOT be wrapped
+    // in an aggregate (`min(bm25(...))` fails "unable to use function bm25 in
+    // the requested context") nor referenced through a subquery/GROUP BY. So
+    // this returns the matching documents best-first (lower bm25 = better),
+    // one row per document, and the caller keeps the best document per agent.
+    // `limit` here is a raw-row cap, not an agent count.
+    let rows = db_query(
+        "SELECT d.id AS id, d.seq AS seq, bm25(docs_fts) AS score \
+         FROM docs_fts JOIN docs d ON d.rowid = docs_fts.rowid \
+         WHERE docs_fts MATCH ?1 \
+         ORDER BY bm25(docs_fts) LIMIT ?2",
+        params![match_query, limit as i64],
+    )
+    .await?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            let id = s(r.get_named("id"))?;
+            let seq = i(r.get_named("seq"))?;
+            let score = r.get_named("score").and_then(DbValue::as_f64).unwrap_or(0.0);
+            Some((id, seq, -score as f32))
+        })
+        .collect())
 }

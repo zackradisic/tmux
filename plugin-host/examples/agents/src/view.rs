@@ -3776,35 +3776,43 @@ fn transcript_search(p: &mut Picker, needle: &str) {
     p.transcript_query = needle.to_string();
     p.transcript_hits.clear();
     p.hit_rows.clear();
-    let hits = transcript::search(needle, transcript::HITS_MAX);
-    let missing: Vec<String> = hits
-        .iter()
-        .filter(|h| !p.rows.iter().any(|a| a.is_local() && a.id == h.id))
-        .map(|h| h.id.clone())
-        .collect();
-    let windows: Vec<(String, i64, i64)> = hits
-        .iter()
-        .map(|h| (h.id.clone(), h.seq, h.seq + transcript::DOC_WINDOW))
-        .collect();
-    for h in hits {
-        p.transcript_hits.insert(
-            store::row_key(LOCAL, &h.id),
-            TranscriptHit { id: h.id, seq: h.seq, score: h.score, snippet: String::new() },
-        );
-    }
-    if !windows.is_empty() {
-        local_hit_details(needle.to_string(), missing, windows);
-    }
+    // The search itself is now a host round-trip (FTS5 on disk), so the
+    // local hits, their snippets and the rows the roster lacks all arrive
+    // together a moment later, off the keystroke.
+    local_hit_details(needle.to_string());
     remote_search(p, needle);
 }
 
-/// Fetch what the local hits still need - the rows the roster did not
-/// hold, and one snippet each - and fold them into the picker if it is
+/// Search the local FTS index, fetch each hit's snippet and any row the
+/// roster did not already hold, and fold them into the picker if it is
 /// still on the same query.
-fn local_hit_details(needle: String, missing: Vec<String>, windows: Vec<(String, i64, i64)>) {
+fn local_hit_details(needle: String) {
     spawn(async move {
-        let rows = store::by_ids(&missing).await.unwrap_or_default();
+        let hits = transcript::search(&needle, transcript::HITS_MAX).await;
+        if hits.is_empty() {
+            // The query may have had hits before it changed; a reshow
+            // clears the stale ones.
+            PICKER.with(|cell| {
+                if let Some(picker) = cell.borrow().clone() {
+                    let mut b = picker.borrow_mut();
+                    if let Some(p) = b.as_mut() {
+                        if p.transcript_query == needle {
+                            let keep = p.keep();
+                            pick_reshow(p, keep, false);
+                            pick_render(p);
+                        }
+                    }
+                }
+            });
+            return;
+        }
+        let ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
+        let windows: Vec<(String, i64, i64)> = hits
+            .iter()
+            .map(|h| (h.id.clone(), h.seq, h.seq + transcript::DOC_WINDOW))
+            .collect();
         let turns = store::turns_windows(&windows).await.unwrap_or_default();
+        let fetched = store::by_ids(&ids).await.unwrap_or_default();
         let (terms, _) = index::query_terms(&needle);
         PICKER.with(|cell| {
             let Some(picker) = cell.borrow().clone() else { return };
@@ -3813,15 +3821,21 @@ fn local_hit_details(needle: String, missing: Vec<String>, windows: Vec<(String,
             if p.transcript_query != needle {
                 return;
             }
-            for a in rows {
-                if !p.hit_rows.iter().any(|r| r.key() == a.key()) {
-                    p.hit_rows.push(a);
-                }
+            for h in &hits {
+                let snippet = transcript::snippet_for(&turns, &h.id, h.seq, &terms);
+                p.transcript_hits.insert(
+                    store::row_key(LOCAL, &h.id),
+                    TranscriptHit { id: h.id.clone(), seq: h.seq, score: h.score, snippet },
+                );
             }
-            for (id, seq, _) in &windows {
-                let key = store::row_key(LOCAL, id);
-                if let Some(h) = p.transcript_hits.get_mut(&key) {
-                    h.snippet = transcript::snippet_for(&turns, id, *seq, &terms);
+            // Rows the roster did not hold (hits on agents not in the live
+            // set the picker was built from).
+            for a in fetched {
+                if a.is_local()
+                    && !p.rows.iter().any(|r| r.is_local() && r.id == a.id)
+                    && !p.hit_rows.iter().any(|r| r.key() == a.key())
+                {
+                    p.hit_rows.push(a);
                 }
             }
             let keep = p.keep();

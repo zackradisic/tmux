@@ -657,7 +657,12 @@ async fn apply(a: &mut Agent, mut r: Resolved) {
         a.source_path = Some(v);
     }
     if let Some(tp) = r.transcript_path {
-        if a.transcript_path.as_deref() != Some(tp.as_str()) {
+        if a.transcript_path.is_none() {
+            // Only the first path sticks. A later resolve re-deriving a
+            // different string for the same session must NOT overwrite it:
+            // that reset the cursor every render and made ingest re-read
+            // (and duplicate) the whole transcript. `ingest` corrects a
+            // wrong first guess once, via `locate_claude`.
             let _ = store::set_transcript(&a.id, &tp).await;
             a.transcript_path = Some(tp);
             // The conversation so far: a harness with no hooks (a Codex
@@ -758,7 +763,9 @@ async fn migrate_id(a: &mut Agent, real: &str) {
     };
     match moved {
         Ok(()) => {
-            transcript::on_rename(&a.id, real);
+            // `docs.id` has ON UPDATE CASCADE, so `rename_id`/`merge_id`
+            // already moved this agent's documents with the row; search
+            // needs nothing more here.
             a.id = real.to_string();
         }
         Err(e) => {
@@ -991,23 +998,18 @@ pub async fn reconcile(cfg: Rc<Config>) {
     if !claim_store().await {
         return;
     }
-    // The index first, so nothing ingested below is missed by it.
-    transcript::load().await;
     let panes = list_panes().unwrap_or_default();
     for p in &panes {
         classify(p.id, Rc::clone(&cfg)).await;
     }
     sweep_gone().await;
-    let pruned = store::prune(cfg.keep_days, cfg.history_days, now_ms() as i64)
-        .await
-        .unwrap_or(0);
-    if pruned > 0 {
-        // Their turns went with them; the index must not keep answering
-        // for agents that are gone.
-        transcript::rebuild().await;
-    }
-    // Transcripts that grew while the server was down (an agent that died
-    // meanwhile has a tail nobody read).
+    // Their turns and documents cascade-delete with the row, and the
+    // `docs` trigger drops them from the FTS index, so a prune needs no
+    // index rebuild.
+    let _ = store::prune(cfg.keep_days, cfg.history_days, now_ms() as i64).await;
+    // Build the FTS index (once, after the upgrade) and read transcripts
+    // that grew while the server was down - an agent that died meanwhile
+    // has a tail nobody read.
     spawn(transcript::catch_up());
 }
 
