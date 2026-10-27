@@ -1028,13 +1028,35 @@ pub async fn sweep_gone() -> usize {
     let now = now_ms() as i64;
     let mut gone = 0;
     for a in live {
-        if let Some(pane) = a.pane {
-            if !panes.iter().any(|p| p.id as i64 == pane) {
-                let _ = store::end_by_pane(pane, now, "gone").await;
-                if a.transcript_path.is_some() {
-                    transcript::request(a.id.clone(), true);
+        match a.pane {
+            Some(pane) => {
+                if !panes.iter().any(|p| p.id as i64 == pane) {
+                    let _ = store::end_by_pane(pane, now, "gone").await;
+                    if a.transcript_path.is_some() {
+                        transcript::request(a.id.clone(), true);
+                    }
+                    gone += 1;
                 }
-                gone += 1;
+            }
+            None => {
+                // A local, unended row with no pane is not running: the
+                // healthy lifecycle always revives a resumed agent WITH a
+                // pane, and `end_by_pane` clears the pane only together with
+                // `ended_ms`. A row reaches this state only out of band - a
+                // manual revive after a crash that nulled `ended_ms` without
+                // giving it a pane (the zombie class) - and the pane check
+                // above can never see it, so nothing else would retire it.
+                // Retire it once it has been idle past a grace window, so a
+                // row briefly between creation and its pane is left alone.
+                // Remote rows are their own server's provider to retire.
+                let idle = a.last_active_ms.map_or(true, |t| now - t > PANELESS_GRACE_MS);
+                if a.is_local() && idle {
+                    let _ = store::end_by_id(&a.id, now, "gone").await;
+                    if a.transcript_path.is_some() {
+                        transcript::request(a.id.clone(), true);
+                    }
+                    gone += 1;
+                }
             }
         }
     }
@@ -1043,6 +1065,11 @@ pub async fn sweep_gone() -> usize {
 
 /// How often the provider sweeps for rows whose pane is gone.
 pub const SWEEP_MS: u64 = 30_000;
+
+/// How long a local unended row may carry no pane before the sweep retires
+/// it. Long enough that a row seen between its creation and its pane being
+/// bound is never mistaken for a zombie.
+const PANELESS_GRACE_MS: i64 = 60_000;
 
 /// The periodic sweep: forever, while the instance lives.
 pub async fn sweep_loop() {
