@@ -355,6 +355,10 @@ pub enum PickAfter {
     /// Kill this local pane. `kill-pane` on a shadow runs on the remote
     /// server (see tmux.1, REMOTE SESSIONS), so it kills the real pane.
     KillPane(Vec<u32>),
+    /// Retire these local rows (by id): kill pressed on agents that are
+    /// already gone — no live pane to kill, so finalize the row instead of
+    /// erroring, dropping the zombie out of the live roster.
+    Retire(Vec<String>),
     /// The accounts panel for this server (the row's), over the picker.
     Accounts(String),
     /// Type this key into the local pane the preview shows: the keyboard
@@ -581,7 +585,7 @@ fn key_table(k: &PickKeys) -> KeyTable {
         .with("copy", "c", "rows", "copy the agent id")
         .with("message", "m", "rows", "message the agent")
         .with("interrupt", "x", "rows", "interrupt (C-c) the agent")
-        .with("kill", "X", "rows", "kill its pane (asks)")
+        .with("kill", "X", "rows", "kill its pane (asks); retire the row if already gone")
         .with("new", "n", "rows", "new agent, prefilled from the row")
         .with("fork", "f", "rows", "fork this agent (a copy of its session, its own name)")
         .with("accounts", "@", "rows", "the logins on the row's server (accounts panel)")
@@ -1342,6 +1346,25 @@ pub async fn apply_life(
     // view must not empty the remote half of it until the next tick.
     let req = list_req_of(&picker);
     fetch_remotes_now(Rc::clone(&picker), Rc::clone(&remotes), req).await;
+    reload_picker(picker, remotes, false).await;
+}
+
+/// Retire local rows that are already gone (kill pressed on a pane-less
+/// agent): set `ended_ms` so they leave the live roster. Local only — a
+/// remote zombie is its own server's to retire — and reversible in effect,
+/// since resolve recreates a row it still finds alive on the next tick.
+pub async fn apply_retire(
+    picker: Rc<RefCell<Option<Picker>>>,
+    remotes: Rc<RefCell<Remotes>>,
+    ids: Vec<String>,
+) {
+    let now = now_ms() as i64;
+    for id in &ids {
+        let _ = store::end_by_id(id, now, "gone").await;
+    }
+    if let Some(p) = picker.borrow_mut().as_mut() {
+        p.engine.clear_marks();
+    }
     reload_picker(picker, remotes, false).await;
 }
 
@@ -2305,8 +2328,22 @@ fn dispatch_key(
                     // press must be on the same pane the first one named.
                     let panes = live_panes_of_targets(p);
                     if panes.is_empty() {
-                        let why = unreachable_reason(p);
-                        p.status(why);
+                        // Nothing live to kill. A local row with no live pane
+                        // is already gone (its pane died without a
+                        // pane-destroyed event): retire it so it leaves the
+                        // roster, which is what X is reaching for. A remote
+                        // row this server does not mirror still just explains.
+                        let dead_local: Vec<String> =
+                            p.targets().iter().filter(|a| a.is_local()).map(|a| a.id.clone()).collect();
+                        if dead_local.is_empty() {
+                            p.status(unreachable_reason(p));
+                        } else {
+                            p.status(match dead_local.len() {
+                                1 => "already gone — retired".to_string(),
+                                n => format!("{n} already gone — retired"),
+                            });
+                            after = PickAfter::Retire(dead_local);
+                        }
                     } else if kill_pending.as_deref() == Some(panes.as_slice()) {
                         p.status(match panes.as_slice() {
                             [pane] => format!("killing %{pane}"),
@@ -2603,6 +2640,9 @@ fn dispatch_key(
                 }
                 reload_picker(picker, remotes, false).await;
             });
+        }
+        PickAfter::Retire(ids) => {
+            ctx.spawn(apply_retire(Rc::clone(picker), Rc::clone(remotes), ids));
         }
         PickAfter::Message(server, id, text) => {
             let picker = Rc::clone(picker);

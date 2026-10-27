@@ -899,6 +899,23 @@ pub async fn end_by_pane(
     Ok(())
 }
 
+/// Retire a live agent by id: the human's "it's already gone" from the
+/// picker, for a row whose pane died without a pane-destroyed event (a
+/// zombie that stayed `live()` with no pane). Keyed by id, since there is
+/// no pane to key on. A row that resolve still finds alive is recreated on
+/// the next tick, so this is safe and self-correcting.
+pub async fn end_by_id(id: &str, now_ms: i64, reason: &str) -> Result<(), HostError> {
+    db_exec(
+        "UPDATE agents SET ended_ms = ?2, reason = ?3, \
+         status = CASE WHEN status = 'working' THEN 'done' ELSE status END, \
+         last_pane = COALESCE(pane, last_pane), pane = NULL \
+         WHERE id = ?1 AND ended_ms IS NULL",
+        params![id, now_ms, reason],
+    )
+    .await?;
+    Ok(())
+}
+
 /// Mark a turn done and end the agent (a shim's `done`). Keeps the pane
 /// column NULL so the unique-pane index frees the pane immediately.
 pub async fn finish_by_pane(pane: i64, now_ms: i64) -> Result<(), HostError> {
