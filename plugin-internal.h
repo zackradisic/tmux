@@ -88,6 +88,10 @@ int	 plugin_vtable_clipboard_read(const char *, int32_t *, uint32_t *,
 int	 plugin_vtable_get_option(int, u_int, const char *, pgh_sink, void *);
 int	 plugin_vtable_set_option(int, u_int, const char *, const char *);
 int	 plugin_vtable_display_message(int, const char *, const char *);
+void	 plugin_vtable_command_reply(uint64_t, const char *, uintptr_t);
+void	 plugin_vtable_command_done(uint64_t);
+void	 plugin_command_reply(uint64_t, const char *, size_t);
+void	 plugin_command_done(uint64_t);
 void	 plugin_vtable_state_changed(const char *, const char *,
 	     const char *);
 

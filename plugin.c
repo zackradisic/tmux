@@ -90,6 +90,8 @@ plugin_init(void)
 	vt.mode_resize = plugin_vtable_mode_resize;
 	vt.bridge_send = plugin_vtable_bridge_send;
 	vt.clipboard_read = plugin_vtable_clipboard_read;
+	vt.command_reply = plugin_vtable_command_reply;
+	vt.command_done = plugin_vtable_command_done;
 
 	if (pgh_init(&vt) != 0) {
 		log_debug("%s: plugin host failed to initialize", __func__);
@@ -143,10 +145,22 @@ plugin_enabled(void)
 void
 plugin_schedule_drain(void)
 {
+	struct timeval	tv = { 0, 0 };
+
 	if (!plugin_initialized || plugin_drain_scheduled)
 		return;
 	plugin_drain_scheduled = 1;
 	cmdq_append(NULL, cmdq_get_callback(plugin_drain_cb, NULL));
+	/*
+	 * The global queue is only looked at by server_loop, which stops
+	 * iterating as soon as a pass runs no item - and a command that
+	 * returned CMD_RETURN_WAIT (plugin-command, update-plugins) counts
+	 * as none. Nothing else would then wake the event loop until the
+	 * next key or client, and the command would wait that long. A zero
+	 * timer makes the loop come round at once; the callback finds the
+	 * drain already scheduled and does nothing more.
+	 */
+	evtimer_add(&plugin_drain_timer, &tv);
 }
 
 static enum cmd_retval

@@ -41,9 +41,10 @@ tmux2 plugin-command mailbox 'inbox training-aa'
 tmux2 show-options -s -v @mailbox_training-aa   # the JSON messages
 ```
 
-The option round trip is v1. A command that writes the messages to the
-caller's stdout is the ergonomic follow-up; it needs the host to let a
-plugin-command return output to its client, which it cannot yet.
+The option round trip is v1. A plugin can now answer a `plugin-command`
+on its caller's terminal (the SDK's `reply`, from inside the handler), which
+is how `plugin-command agents help` prints; writing the inbox that way is
+the ergonomic follow-up.
 
 ## Across a link
 

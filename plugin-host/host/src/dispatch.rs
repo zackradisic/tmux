@@ -15,6 +15,7 @@
 //! is dead. OutBuf results are written directly into guest memory by the
 //! C sink.
 
+use std::cell::Cell;
 use std::ffi::c_void;
 
 use tmux_plugin_abi::{
@@ -701,12 +702,42 @@ pub fn host_message(msg: &str) {
     }
 }
 
+/// The client id a guest passes to `display_message` to answer the
+/// plugin-command it is handling instead of writing to a status line:
+/// the SDK's `reply`. Printed on the terminal of whoever ran the command.
+pub(crate) const REPLY_CLIENT: i32 = -2;
+
+thread_local! {
+    /// The `reply` id of the plugin-command event being delivered, set
+    /// around a guest's `on_event` for it. `None` outside: a reply from a
+    /// task that outlives the handler has no command left to answer.
+    pub static CURRENT_REPLY: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+/// The plugin-command event with this reply id has been offered to every
+/// plugin it was for: let the command print and continue.
+pub fn command_done(reply: u64) {
+    if let Ok(vt) = vtable() {
+        unsafe { (vt.command_done)(reply) };
+    }
+}
+
 pub fn display_message(
     mem: &mut GuestMem<'_, '_>,
     client: i32,
     msg_ptr: i32,
     msg_len: i32,
 ) -> Result<(), HostError> {
+    if client == REPLY_CLIENT {
+        // Answering the caller needs no capability: it is their command.
+        let Some(reply) = CURRENT_REPLY.with(Cell::get) else {
+            return Err(err(ErrorCode::NoSuchObject, "no plugin-command to answer"));
+        };
+        let vt = vtable()?;
+        let msg = mem.c_str(msg_ptr, msg_len)?;
+        unsafe { (vt.command_reply)(reply, msg, msg_len.max(0) as usize) };
+        return Ok(());
+    }
     check_cap(mem, crate::caps::DISPLAY_MESSAGE)?;
     let vt = vtable()?;
     let plugin = std::ffi::CString::new(mem.data().plugin.clone())

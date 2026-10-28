@@ -151,5 +151,20 @@ sleep 1
 after=$($TMUX list-windows -a | wc -l)
 [ "$before" = "$after" ] || fail "a bare new made a window"
 
+# --- help: a plugin answers on the caller's terminal -----------------------
+$TMUX plugin-command agents help | grep -q 'new \[flags\]' || fail "agents help printed nothing"
+$TMUX plugin-command agents 'help new' | grep -q -- '--new-session' || fail "help new printed nothing"
+$TMUX plugin-command agents 'new --project x --help' | grep -q -- '--new-session' || fail "new --help printed nothing"
+$TMUX plugin-command agents 'project --help' | grep -q 'project -w' || fail "project --help printed nothing"
+$TMUX plugin-command agents 'bogus-verb' | grep -q 'unknown verb' || fail "an unknown verb did not answer"
+# A verb that answers nothing prints nothing, and a command for a plugin
+# that is not loaded still returns (the wait is one drain, not forever).
+[ -z "$($TMUX plugin-command -t "$PC" agents 'working')" ] || fail "a silent verb printed something"
+( $TMUX plugin-command nosuch x >/dev/null 2>&1; echo "rc=$?" >"$HOME/nosuch.rc" ) &
+W=$!
+( sleep 4; kill $W 2>/dev/null ) &
+wait $W
+[ -f "$HOME/nosuch.rc" ] || fail "plugin-command for an unloaded plugin hung"
+
 echo "PASS"
 exit 0

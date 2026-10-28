@@ -545,6 +545,24 @@ pub fn pane_pid(pane: PaneId) -> Result<Option<u32>, HostError> {
     }
 }
 
+/// Answer the `plugin-command` being handled: the text is printed, line
+/// by line, on the terminal of whoever ran `tmux2 plugin-command <plugin>
+/// "..."` once the handler returns - the way a `--help` or a status
+/// report is expected to come back. Only from inside the handler of the
+/// `plugin-command` event, before it returns: a reply from a task spawned
+/// there finds no command left to answer (E_NO_SUCH_OBJECT). A handler
+/// that never replies prints nothing, as before. On a host older than
+/// this call the text goes to the status line instead.
+pub fn reply(text: impl AsTmuxStr) -> Result<(), HostError> {
+    let text = text.to_tmux();
+    let (p, l) = text.parts();
+    check(unsafe { raw::display_message(REPLY_CLIENT, p, l) })
+}
+
+/// The `display_message` client id that means "the caller of the
+/// plugin-command being handled" (see [`reply`]).
+const REPLY_CLIENT: i32 = -2;
+
 /// Show a status-line message on all attached clients (and the message log).
 pub fn display_message(msg: impl AsTmuxStr) -> Result<(), HostError> {
     let msg = msg.to_tmux();

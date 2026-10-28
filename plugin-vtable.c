@@ -1210,3 +1210,20 @@ missing:
 	plugin_buf_free(pb);
 	return (-1);
 }
+
+/*
+ * A plugin's answer to the plugin-command being delivered, and the
+ * host's word that the delivery is over: both land on the waiting
+ * command in cmd-plugin.c.
+ */
+void
+plugin_vtable_command_reply(uint64_t reply, const char *text, uintptr_t len)
+{
+	plugin_command_reply(reply, text, len);
+}
+
+void
+plugin_vtable_command_done(uint64_t reply)
+{
+	plugin_command_done(reply);
+}

@@ -248,6 +248,12 @@ impl Ctx {
         api::display_message(msg)
     }
 
+    /// Answer the `plugin-command` being handled on its caller's
+    /// terminal; see [`api::reply`].
+    pub fn reply(&self, text: &str) -> Result<(), HostError> {
+        api::reply(text)
+    }
+
     /// The role this instance runs: `Provider` on a remote server that
     /// received the plugin by push, `Both` on the local server (the
     /// default), `View` when loaded with `-r view`. `Both` if the host

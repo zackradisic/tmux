@@ -264,6 +264,7 @@ use std::rc::Rc;
 use serde::Deserialize;
 use tmux_plugin_sdk::prelude::*;
 
+mod help;
 mod index;
 mod newagent;
 mod provider;
@@ -766,6 +767,20 @@ impl Agents {
     fn on_command(&self, ctx: &Ctx, event: &Event) {
         let text = event.get_str("text").unwrap_or("").trim().to_string();
         let verb = text.split_whitespace().next().unwrap_or("").to_string();
+        // "help [verb]", "<verb> --help": the text comes back on the
+        // caller's terminal (`reply`), which is where a shell - or an
+        // agent in one - reads it. `new --help` anywhere in the flags,
+        // since its own parser would only call it an unknown flag.
+        let is_help = |w: &str| w == "--help" || w == "-h";
+        let second = text.split_whitespace().nth(1).unwrap_or("");
+        if verb.is_empty() || verb == "help" || is_help(&verb) {
+            let _ = reply(help::topic(Some(second).filter(|s| !s.is_empty())));
+            return;
+        }
+        if is_help(second) || (verb == "new" && text.split_whitespace().any(is_help)) {
+            let _ = reply(help::topic(Some(&verb)));
+            return;
+        }
         if verb == "pick" {
             if !self.role.views() {
                 let _ = display_message("agents: a provider has no picker");
@@ -1072,8 +1087,9 @@ impl Agents {
             });
             return;
         }
+        let _ = reply(&format!("agents: unknown verb {verb:?} - `agents help` lists them"));
         let _ = display_message(&format!(
-            "agents: unknown verb {verb:?} (pick|project|working|needs_input|waiting|done)"
+            "agents: unknown verb {verb:?} (pick|new|open|message|project|working|needs_input|waiting|done)"
         ));
     }
 }

@@ -646,20 +646,27 @@ fn fail(plugin: &str, what: &str) {
     });
 }
 
-/// For a plugin-command event, read the target plugin name from the field
-/// block (the one field the host ever reads out of an event).
-fn plugin_command_target(bytes: &[u8]) -> Option<String> {
-    let (_, cursor) = EventHeader::parse(bytes).ok()?;
+/// For a plugin-command event, read the target plugin name and the reply
+/// id from the field block (the only fields the host ever reads out of
+/// an event). The reply id is what the command waits under in tmux: the
+/// host hands it back through `command_done` once the event has been
+/// offered to every plugin it was for.
+fn plugin_command_fields(bytes: &[u8]) -> (Option<String>, Option<u64>) {
+    let mut target = None;
+    let mut reply = None;
+    let Ok((_, cursor)) = EventHeader::parse(bytes) else { return (None, None) };
     let plugin_key = interner::intern("plugin");
-    for field in FieldReader::from_cursor(cursor).ok()? {
-        let (key, value) = field.ok()?;
-        if key == KeyRef::Id(plugin_key) {
-            if let ValueRef::Str(s) = value {
-                return Some(s.to_string());
-            }
+    let reply_key = interner::intern("reply");
+    let Ok(fields) = FieldReader::from_cursor(cursor) else { return (None, None) };
+    for field in fields {
+        let Ok((key, value)) = field else { break };
+        match value {
+            ValueRef::Str(s) if key == KeyRef::Id(plugin_key) => target = Some(s.to_string()),
+            ValueRef::I64(v) if key == KeyRef::Id(reply_key) && v > 0 => reply = Some(v as u64),
+            _ => {}
         }
     }
-    None
+    (target, reply)
 }
 
 /// Fan an event out to matching, subscribed instances.
@@ -667,14 +674,20 @@ fn route_event(header: &EventHeader, bytes: &[u8]) {
     let implicit = interner::implicit(header.event_id);
     // plugin-command events are addressed to one plugin by name; others
     // must not see them even when subscribed.
-    let command_target = if header.event_id == interner::intern("plugin-command")
-    {
-        match plugin_command_target(bytes) {
-            Some(t) => Some(t),
-            None => return, // malformed: no target, deliver to nobody
+    let (command_target, reply) = if header.event_id == interner::intern("plugin-command") {
+        match plugin_command_fields(bytes) {
+            (Some(t), r) => (Some(t), r),
+            (None, r) => {
+                // Malformed: no target, deliver to nobody - but never
+                // leave the command waiting.
+                if let Some(r) = r {
+                    crate::dispatch::command_done(r);
+                }
+                return;
+            }
         }
     } else {
-        None
+        (None, None)
     };
     // A notification from a shadow pane also fires on the remote server,
     // where the pane really is. A plugin the remote runs too gets it
@@ -720,7 +733,9 @@ fn route_event(header: &EventHeader, bytes: &[u8]) {
 
         let mut trapped = false;
         if subscribed {
+            crate::dispatch::CURRENT_REPLY.with(|c| c.set(reply));
             let outcome = inst.guest.call_on_event(bytes);
+            crate::dispatch::CURRENT_REPLY.with(|c| c.set(None));
             inst.stats.record(&outcome);
             trapped = outcome.trapped();
             if let Err(e) = &outcome.result {
@@ -731,5 +746,10 @@ fn route_event(header: &EventHeader, bytes: &[u8]) {
             }
         }
         check_in(key, inst, trapped);
+    }
+    // Delivered (to every instance it was for, or to none): the command
+    // prints what was answered and goes on.
+    if let Some(r) = reply {
+        crate::dispatch::command_done(r);
     }
 }

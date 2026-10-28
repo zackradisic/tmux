@@ -253,6 +253,13 @@ pub struct pgh_host_vtable {
         height: *mut u32,
         len: *mut u64,
     ) -> c_int,
+    /// Text a plugin answers to the plugin-command being delivered
+    /// (`reply` is the event's `reply` field): kept for the caller.
+    pub command_reply: unsafe extern "C" fn(reply: u64, text: *const c_char, len: usize),
+    /// The plugin-command event with this reply id reached every plugin it
+    /// was for: print what they answered on the caller's terminal and
+    /// continue the command. Called once per plugin-command, answered or not.
+    pub command_done: unsafe extern "C" fn(reply: u64),
 }
 
 // Function pointers are Send + Sync; the vtable is stored in a OnceLock.

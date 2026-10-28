@@ -540,6 +540,9 @@ set_option(name: &str, value: &str)                     // @-options only
 format_expand(target, "#{window_layout} ...") -> Result<String, _>
     // any #{...} format against a scope; #() jobs disabled
 display_message(msg: &str)                              // status line + log
+reply(text: &str)        // answer the plugin-command being handled, on its
+                         // caller's terminal (a --help); only inside on_event
+                         // for "plugin-command", before it returns
 log(msg: &str)                                          // plugin-log only
 intern(name) -> u32 / intern_name(id) -> Option<String> // event/key name ids
 fs_root() -> Result<String, _>       // the plugin's private data dir

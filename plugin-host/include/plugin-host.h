@@ -129,9 +129,27 @@
 #define CLAUDE_NOTIFY (1 << 23)
 
 /**
+ * Read the system clipboard, written as a file (an image as PNG, text
+ * as UTF-8) into the plugin's data directory (`clipboard_read`). The
+ * clipboard can hold anything the user copied, so a plugin asks for it
+ * by name.
+ */
+#define CLIPBOARD (1 << 24)
+
+/**
  * Granted to every plugin without being asked for.
  */
 #define DEFAULT_CAPS ((READ_STATE | DISPLAY_MESSAGE) | TIMERS)
+
+/**
+ * Per-instance linear memory cap without a sidecar asking otherwise.
+ */
+#define DEFAULT_MEMORY_LIMIT ((64 * 1024) * 1024)
+
+/**
+ * The most a sidecar may ask for.
+ */
+#define MAX_MEMORY_LIMIT ((512 * 1024) * 1024)
 
 /**
  * Epoch tick granularity.
@@ -477,14 +495,27 @@ typedef struct {
    */
   int (*bridge_send)(uint32_t peer, const uint8_t *data, uintptr_t len);
   /**
-   * Write what is on the system clipboard to `base` + ".png" (an image,
-   * `kind` 1, `width`/`height` its pixel size) or `base` + ".txt" (text as
-   * UTF-8, `kind` 2), and report the byte count. 0 ok, -1 nothing usable
-   * on the clipboard, -2 an image that could not be read or converted,
-   * -3 no clipboard on this platform, -4 the file could not be written.
+   * Write the clipboard to `base` + ".png" (kind 1, an image with its
+   * pixel size) or `base` + ".txt" (kind 2, text); the byte count
+   * comes back too. 0 ok, -1 nothing usable, -2 an unreadable image,
+   * -3 no clipboard on this platform, -4 unwritable.
    */
-  int (*clipboard_read)(const char *base, int32_t *kind, uint32_t *width,
-                        uint32_t *height, uint64_t *len);
+  int (*clipboard_read)(const char *base,
+                        int32_t *kind,
+                        uint32_t *width,
+                        uint32_t *height,
+                        uint64_t *len);
+  /**
+   * Text a plugin answers to the plugin-command being delivered
+   * (`reply` is the event's `reply` field): kept for the caller.
+   */
+  void (*command_reply)(uint64_t reply, const char *text, uintptr_t len);
+  /**
+   * The plugin-command event with this reply id reached every plugin it
+   * was for: print what they answered on the caller's terminal and
+   * continue the command. Called once per plugin-command, answered or not.
+   */
+  void (*command_done)(uint64_t reply);
 } pgh_host_vtable;
 
 /**

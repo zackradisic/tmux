@@ -195,6 +195,60 @@ cmd_plugin_print(struct cmdq_item *item, struct evbuffer *evb)
 	}
 }
 
+/*
+ * A plugin-command waits for the drain that hands its event to the
+ * plugin. What the plugin answers while handling it (the SDK's reply())
+ * reaches plugin_command_reply; when the host has delivered the event to
+ * every plugin it was for, plugin_command_done prints the answer on the
+ * caller's terminal and continues the command. A plugin that answers
+ * nothing prints nothing, as before - the wait is one drain, not a
+ * round trip to the plugin's own work, which stays asynchronous.
+ */
+struct cmd_plugin_wait {
+	uint64_t			 id;
+	struct cmdq_item		*item;
+	struct evbuffer			*evb;
+	TAILQ_ENTRY(cmd_plugin_wait)	 entry;
+};
+static TAILQ_HEAD(, cmd_plugin_wait) cmd_plugin_waits =
+    TAILQ_HEAD_INITIALIZER(cmd_plugin_waits);
+static uint64_t cmd_plugin_wait_id;
+
+static struct cmd_plugin_wait *
+cmd_plugin_wait_find(uint64_t id)
+{
+	struct cmd_plugin_wait	*w;
+
+	TAILQ_FOREACH(w, &cmd_plugin_waits, entry) {
+		if (w->id == id)
+			return (w);
+	}
+	return (NULL);
+}
+
+void
+plugin_command_reply(uint64_t id, const char *text, size_t len)
+{
+	struct cmd_plugin_wait	*w = cmd_plugin_wait_find(id);
+
+	if (w != NULL)
+		evbuffer_add(w->evb, text, len);
+}
+
+void
+plugin_command_done(uint64_t id)
+{
+	struct cmd_plugin_wait	*w = cmd_plugin_wait_find(id);
+
+	if (w == NULL)
+		return;
+	TAILQ_REMOVE(&cmd_plugin_waits, w, entry);
+	cmd_plugin_print(w->item, w->evb);
+	evbuffer_free(w->evb);
+	cmdq_continue(w->item);
+	free(w);
+}
+
 static enum cmd_retval
 cmd_show_plugins_exec(struct cmd *self, struct cmdq_item *item)
 {
@@ -341,15 +395,25 @@ cmd_plugin_command_exec(struct cmd *self, struct cmdq_item *item)
 	struct cmd_find_state	*target = cmdq_get_target(item);
 	struct client		*c = cmdq_get_client(item);
 	struct plugin_buf	*pb;
+	struct cmd_plugin_wait	*w;
 
 	if (!plugin_enabled()) {
 		cmdq_error(item, "plugin support not available");
 		return (CMD_RETURN_ERROR);
 	}
 
+	w = xcalloc(1, sizeof *w);
+	w->id = ++cmd_plugin_wait_id;
+	w->item = item;
+	w->evb = evbuffer_new();
+	if (w->evb == NULL)
+		fatalx("out of memory");
+	TAILQ_INSERT_TAIL(&cmd_plugin_waits, w, entry);
+
 	pb = plugin_event_create("plugin-command");
 	plugin_event_str(pb, "plugin", args_string(args, 0));
 	plugin_event_str(pb, "text", args_string(args, 1));
+	plugin_event_i64(pb, "reply", (long long)w->id);
 	if (c != NULL)
 		plugin_event_scope(pb, PGH_OBJ_CLIENT, c->id);
 	if (target->s != NULL)
@@ -359,7 +423,7 @@ cmd_plugin_command_exec(struct cmd *self, struct cmdq_item *item)
 	if (target->wp != NULL)
 		plugin_event_scope(pb, PGH_OBJ_PANE, target->wp->id);
 	plugin_event_send(pb);
-	return (CMD_RETURN_NORMAL);
+	return (CMD_RETURN_WAIT);
 }
 
 /*

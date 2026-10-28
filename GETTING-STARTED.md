@@ -449,8 +449,9 @@ tmux2 plugin-command -t "$TMUX_PANE" agents "new --command claude --name reviewe
 (`--window <w>` to pick the window), `--focus`; the caller pane's folder,
 session and `@project` are the defaults. The window is made in the
 background and the result is left in the caller pane's `@agents_new`
-option (`%pane @window session`, or `error: …`). The full table is in the
-mailbox skill (`tmux2 skill -t "$TMUX_PANE" show mailbox`).
+option (`%pane @window session`, or `error: …`). `tmux2 plugin-command
+agents help` lists every verb and `agents 'new --help'` every flag, printed
+on your terminal by the plugin itself.
 
 ### mailbox — cross-agent messages
 The delivery primitive behind `agents message`. Each agent id gets a box in a
