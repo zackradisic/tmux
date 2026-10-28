@@ -57,6 +57,16 @@
 //! on, so Enter runs `--resume <id> --fork-session` (Claude) or opens
 //! `opencode -s` on a copy the opencode service makes, and the copy gets
 //! a name of its own (the row's plus `fork`).
+//! The same start, no form, for an agent (or a script) starting another:
+//! `plugin-command -t $TMUX_PANE agents "new --resume <id> --project
+//! <tag>"` - any flag that says what to start or where (`--resume`,
+//! `--fork`, `--command`, `--folder`, `--session`, `--new-session`,
+//! `--name`, `--project`, `--split`, `--window`, `--focus`) runs it at
+//! once, in the background, with the caller pane's folder, session and
+//! `@project` as the defaults and the resumed row's folder, name and tag
+//! behind those. The answer is left in the caller pane's `@agents_new`
+//! option ("%pane @window session", or "error: <why>"), since a plugin
+//! command cannot print to its caller. See `newagent::direct`.
 //! `plugin-command agents "pick id <agent-id>"` opens on that agent
 //! wherever its row is - a linked server, the history, the archive - for
 //! a hotkey over an id seen on screen (a mailbox message names its
@@ -805,6 +815,51 @@ impl Agents {
             // in a window on that server.
             if !self.role.views() {
                 let _ = display_message("agents: a provider has no form");
+                return;
+            }
+            // "new --resume <id> --project <tag> ...": with any flag that
+            // says what to start or where, no form - the agent starts at
+            // once, in the background. This is how an agent starts
+            // another one from its own pane (`-t $TMUX_PANE` gives the
+            // defaults: its folder, session and project). The result
+            // lands in the caller pane's `@agents_new` option, since a
+            // plugin command cannot answer on the caller's stdout:
+            // "%pane @window session", or "error: <why>".
+            let words = newagent::words(&text);
+            if newagent::is_direct(&words) {
+                let pane = event.scope.pane;
+                let launchers = self.cfg.launchers.clone();
+                ctx.spawn(async move {
+                    let pane_target = pane.map(|p| formkit::text::quote(&format!("%{p}")));
+                    if let Some(t) = &pane_target {
+                        let _ = run_command(&format!("set-option -p -t {t} @agents_new pending")).await;
+                    }
+                    let r = newagent::direct(&words[1..], newagent::Caller { pane }, launchers).await;
+                    let note = match &r {
+                        Ok(l) => format!(
+                            "{} {} {}",
+                            l.pane.map(|p| format!("%{p}")).unwrap_or_default(),
+                            l.window.map(|w| format!("@{w}")).unwrap_or_default(),
+                            l.target
+                        ),
+                        Err(e) => format!("error: {e}"),
+                    };
+                    if let Some(t) = &pane_target {
+                        let _ = run_command(&format!(
+                            "set-option -p -t {t} @agents_new {}",
+                            formkit::text::quote(&note)
+                        ))
+                        .await;
+                    }
+                    match r {
+                        Ok(l) => {
+                            let _ = display_message(&format!("agent started: {} in {}", l.command, l.target));
+                        }
+                        Err(e) => {
+                            let _ = display_message(&format!("agents: {e}"));
+                        }
+                    }
+                });
                 return;
             }
             let mut remote = None;

@@ -179,6 +179,13 @@ no roster yet (a message right after linking) the view fetches the rosters
 once, then routes. Each server's mailbox is asked for its unread counts,
 and a row with unread shows an envelope badge with the number.
 
+An agent can also start another agent: `plugin-command -t "$TMUX_PANE"
+agents "new --resume <id> --project <tag>"` (and `--command`, `--folder`,
+`--session`, `--new-session`, `--name`, `--split`, `--focus`) runs the
+new-agent form's start with no form, in the background, defaulting to the
+caller's folder, session and `@project`; the result goes to the caller
+pane's `@agents_new` option. The mailbox skill documents the flags.
+
 ## The guide an agent reads
 
 `tmux2 skill -t "$TMUX_PANE" show mailbox` prints the how-to for all of

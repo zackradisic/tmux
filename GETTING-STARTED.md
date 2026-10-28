@@ -435,7 +435,22 @@ plugin's SQLite store.
 
 It's a view + provider plugin, so over a remote link one picker shows agents
 on **every linked server**. `plugin-command agents 'message <agent-id> <text>'`
-messages an agent by id — on this machine or another.
+messages an agent by id — on this machine or another. The same verb that
+opens the form starts an agent outright when given flags, which is how an
+agent starts another one from its own pane:
+
+```bash
+tmux2 plugin-command -t "$TMUX_PANE" agents "new --resume <id> --project 'Ooga booga'"
+tmux2 plugin-command -t "$TMUX_PANE" agents "new --command claude --name reviewer --session work"
+```
+
+`--resume <id>` (`--fork` for a copy), `--command`, `--folder`, `--session`
+(`--new-session` for one of its own), `--name`, `--project`, `--split`
+(`--window <w>` to pick the window), `--focus`; the caller pane's folder,
+session and `@project` are the defaults. The window is made in the
+background and the result is left in the caller pane's `@agents_new`
+option (`%pane @window session`, or `error: …`). The full table is in the
+mailbox skill (`tmux2 skill -t "$TMUX_PANE" show mailbox`).
 
 ### mailbox — cross-agent messages
 The delivery primitive behind `agents message`. Each agent id gets a box in a

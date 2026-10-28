@@ -146,6 +146,51 @@ the user to paste an id from it, or to open it on a known id with
 **Ids on screen**: a message names its sender by id, so a reply address is
 usually already in the turn that asked you.
 
+## Start an agent
+
+The same verb that opens the user's new-agent form starts an agent at once
+when you give it flags. Run it from your own pane: `-t "$TMUX_PANE"` is
+where the defaults come from (your folder, your session, your `@project`).
+
+```bash
+tmux2 plugin-command -t "$TMUX_PANE" agents "new --resume <id> --project 'Ooga booga'"
+tmux2 plugin-command -t "$TMUX_PANE" agents "new --command claude --name reviewer"
+```
+
+| flag | meaning | default |
+|---|---|---|
+| `--resume <id>` | resume that harness session (`claude:<uuid>`, or the bare id) | start fresh |
+| `--fork` | as a copy of it (`--fork-session`; opencode forks in its service) | |
+| `--command <line>` | what to run: a launcher's name or a whole line | the harness, through its launcher |
+| `--folder <dir>` | where it runs | the resumed row's folder, else yours |
+| `--session <name>` | which session the window goes in | yours |
+| `--new-session` | a session of its own, named after `--name` | |
+| `--name <name>` | the window's name | the row's name, else the folder's |
+| `--project <tag>` | its `@project` | yours, else the row's tag |
+| `--split` | a pane beside you instead of a window | |
+| `--window <w>` | with `--split`: in that window (index, name or `@id`) of the session | |
+| `--focus` | switch the user to it | made in the background |
+| `--profile <dir>` | `CLAUDE_CONFIG_DIR` for it | |
+| `@<host>` | on that linked server | this one |
+
+The window is made in the background and the user is not moved. Quote a
+value with spaces inside the verb's text (`--project 'Ooga booga'`), as
+the whole verb is one shell argument.
+
+### Check the result
+
+`plugin-command` cannot print to you, so the answer is left in your pane's
+`@agents_new` option: `pending` while it works, then `%pane @window session`,
+or `error: <why>` (no such session, no such folder, an unknown flag).
+
+```bash
+tmux2 plugin-command -t "$TMUX_PANE" agents "new --resume <id>"
+sleep 1; tmux2 show-options -pqv -t "$TMUX_PANE" @agents_new
+```
+
+A resumed agent keeps its durable id, so the roster re-points the old row
+at the new pane and you can message it by the id you resumed.
+
 ## Remote links
 
 A remote link is `tmux2 remote-attach -t <session> <host>`. It mirrors one

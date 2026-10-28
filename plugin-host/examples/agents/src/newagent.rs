@@ -414,6 +414,21 @@ mod tests {
     }
 
     #[test]
+    fn verb_words_split_like_a_shell() {
+        let w = |s: &str| words(s);
+        assert_eq!(
+            w("new --resume abc --project 'Ooga booga'"),
+            vec!["new", "--resume", "abc", "--project", "Ooga booga"]
+        );
+        assert_eq!(w(r#"new --command "sh -c 'exec cat'" -n x"#), vec!["new", "--command", "sh -c 'exec cat'", "-n", "x"]);
+        assert_eq!(w("new --name a\\ b ''"), vec!["new", "--name", "a b", ""]);
+        assert_eq!(w("  new   "), vec!["new"]);
+        assert!(is_direct(&w("new --project x")));
+        assert!(is_direct(&w("new --resume=abc")));
+        assert!(!is_direct(&w("new @boat --client c0 --profile /tmp/p")));
+    }
+
+    #[test]
     fn resume_flag_per_harness() {
         assert_eq!(resume_command("claude", "claude", "x"), "claude --resume x");
         assert_eq!(resume_command("codex", "codex --yolo", "x"), "codex --yolo resume x");
@@ -901,104 +916,27 @@ async fn submit() {
     // A per-window login: the assignments go before the expanded line,
     // so the launcher's own flags stay.
     let command = if env.is_empty() { command } else { format!("{env} {command}") };
-    let fork = fork_on(&get("fork")) && !get("resume").is_empty();
-    // opencode's fork is the service's: the copy exists before the
-    // window opens, and the window resumes the copy.
-    let resume = if fork && harness == "opencode" {
-        match crate::resolve::opencode_fork(&get("resume")).await {
-            Ok(id) => id,
-            Err(e) => {
-                form::fail(&st, mode, format!("fork failed: {e}"));
-                return;
-            }
-        }
-    } else {
-        get("resume")
-    };
-    let command = match resume.as_str() {
-        "" => command,
-        id => {
-            let c = resume_command(&harness, &command, id);
-            // Claude's fork: a copy of the conversation in a new session.
-            if fork && harness == "claude" {
-                format!("{c} --fork-session")
-            } else {
-                c
-            }
+    let landed = launch(Launch {
+        dir,
+        name,
+        command,
+        harness,
+        resume: get("resume"),
+        fork: fork_on(&get("fork")),
+        session: get("session"),
+        project: get("project").trim().to_string(),
+        remote_host,
+        focus: true,
+        split: None,
+    })
+    .await;
+    let landed = match landed {
+        Ok(l) => l,
+        Err(e) => {
+            form::fail(&st, mode, e);
+            return;
         }
     };
-    let session = get("session");
-    let project = get("project").trim().to_string();
-    // The project rides on the new window (or the new session) as its
-    // `@project` option, chained onto the command: `new-window` makes
-    // the new window the session's current one, so that is what the
-    // `-t session:` of the `set-option` finds. A remote session's shadow
-    // window would only get a local option, so the remote is asked to
-    // set it on its own window instead, below.
-    let tag = |target: &str, window: bool| -> String {
-        if project.is_empty() || remote {
-            return String::new();
-        }
-        format!(
-            " ; set-option {}-t {} @project {}",
-            if window { "-w " } else { "" },
-            quote(target),
-            quote(&project)
-        )
-    };
-    let (cmd, target) = if !session.is_empty() {
-        (
-            format!(
-                "new-window -t {} -c {} -n {} {}{}",
-                quote(&format!("{session}:")),
-                quote(&dir),
-                quote(&name),
-                quote(&command),
-                tag(&format!("{session}:"), true)
-            ),
-            session.clone(),
-        )
-    } else {
-        let sess = session_name(&name);
-        (
-            format!(
-                "new-session -d -s {} -c {} {}{}",
-                quote(&sess),
-                quote(&dir),
-                quote(&command),
-                tag(&sess, false)
-            ),
-            sess,
-        )
-    };
-    if fork {
-        // The copy is named before it appears: the roster applies this
-        // to whatever agent shows up in that window.
-        let sess = if session.is_empty() { session_name(&name) } else { session.clone() };
-        crate::provider::name_window_when_seen(&sess, &name, &name);
-    }
-    if let Err(e) = run_command(&cmd).await {
-        form::fail(&st, mode, e.message.clone());
-        return;
-    }
-    // A remote session: the new window's shadow is here, the window
-    // itself over there; its provider sets the option by the id there.
-    if let (Some(host), false) = (&remote_host, project.is_empty()) {
-        let wid = list_sessions()
-            .unwrap_or_default()
-            .into_iter()
-            .find(|s| s.name == target)
-            .and_then(|s| s.current_window)
-            .and_then(|w| format_expand(OptionTarget::Window(WindowId(w)), "#{window_remote_id}").ok())
-            .filter(|id| !id.is_empty());
-        let r = match wid {
-            Some(id) => crate::view::act_remote(host, &id, "project_window", Some(&project)).await,
-            None => Err("the new window's remote id is not known yet".to_string()),
-        };
-        if let Err(why) = r {
-            let _ = display_message(&format!("project not set on {host}: {why}"));
-        }
-    }
     let _ = mode_close(mode);
     *st.borrow_mut() = None;
     // The picker too: the point of starting an agent is to talk to it.
@@ -1009,9 +947,465 @@ async fn submit() {
         let _ = run_command(&format!(
             "switch-client -c {} -t {}",
             quote(&client),
-            quote(&format!("{target}:"))
+            quote(&format!("{}:", landed.target))
         ))
         .await;
     }
-    let _ = display_message(&format!("agent started: {command} in {target}"));
+    let _ = display_message(&format!("agent started: {} in {}", landed.command, landed.target));
+}
+
+// ---------------------------------------------------------------------------
+// starting the agent: the form's Enter and the `new` verb's flags meet here
+// ---------------------------------------------------------------------------
+
+/// What starts an agent, however it was asked for: the form's Enter or
+/// the flags of `plugin-command agents "new ..."`. `command` is the line
+/// as it runs, already expanded through the launchers with any
+/// per-window environment ahead of it; `resume` and `fork` add the
+/// harness's own flags to it.
+pub struct Launch {
+    pub dir: String,
+    pub name: String,
+    pub command: String,
+    pub harness: String,
+    pub resume: String,
+    pub fork: bool,
+    /// The session the window opens in; empty makes a session of its
+    /// own, named after `name`.
+    pub session: String,
+    /// The `@project` the new window (the pane of a split, the new
+    /// session) is tagged with; empty leaves it to the session's option
+    /// and the directory.
+    pub project: String,
+    /// The linked server the session is mirrored from, when it is.
+    pub remote_host: Option<String>,
+    /// Make the new window the session's current one (a split's pane
+    /// the active one). The form does: whoever pressed Enter wants to
+    /// talk to the agent. The verb only on `--focus`: the one who ran it
+    /// is usually an agent, and the user is reading something else.
+    pub focus: bool,
+    /// Split this pane instead of opening a window.
+    pub split: Option<u32>,
+}
+
+/// Where the agent landed.
+pub struct Landed {
+    /// The session, for a `switch-client -t`.
+    pub target: String,
+    /// The line that runs there.
+    pub command: String,
+    pub window: Option<u32>,
+    pub pane: Option<u32>,
+}
+
+pub async fn launch(l: Launch) -> Result<Landed, String> {
+    let fork = l.fork && !l.resume.is_empty();
+    // opencode's fork is the service's: the copy exists before the
+    // window opens, and the window resumes the copy.
+    let resume = if fork && l.harness == "opencode" {
+        crate::resolve::opencode_fork(&l.resume)
+            .await
+            .map_err(|e| format!("fork failed: {e}"))?
+    } else {
+        l.resume.clone()
+    };
+    let command = match resume.as_str() {
+        "" => l.command.clone(),
+        id => {
+            let c = resume_command(&l.harness, &l.command, id);
+            // Claude's fork: a copy of the conversation in a new session.
+            if fork && l.harness == "claude" {
+                format!("{c} --fork-session")
+            } else {
+                c
+            }
+        }
+    };
+    let detach = if l.focus { "" } else { "-d " };
+    // The ids there before, so the new window (or pane) can be told
+    // from the old ones after: made with `-d` it is nobody's current
+    // window, so nothing else names it.
+    let windows_before: Vec<u32> =
+        list_windows().unwrap_or_default().into_iter().map(|w| w.id).collect();
+    let panes_before: Vec<u32> =
+        list_panes().unwrap_or_default().into_iter().map(|p| p.id).collect();
+    let (cmd, target) = match l.split {
+        Some(p) => (
+            format!(
+                "split-window {detach}-t {} -c {} {}",
+                quote(&format!("%{p}")),
+                quote(&l.dir),
+                quote(&command)
+            ),
+            format_expand(OptionTarget::Pane(PaneId(p)), "#{session_name}").unwrap_or_default(),
+        ),
+        None if !l.session.is_empty() => (
+            format!(
+                "new-window {detach}-t {} -c {} -n {} {}",
+                quote(&format!("{}:", l.session)),
+                quote(&l.dir),
+                quote(&l.name),
+                quote(&command)
+            ),
+            l.session.clone(),
+        ),
+        None => {
+            let sess = session_name(&l.name);
+            (
+                format!("new-session -d -s {} -c {} {}", quote(&sess), quote(&l.dir), quote(&command)),
+                sess,
+            )
+        }
+    };
+    if fork {
+        // The copy is named before it appears: the roster applies this
+        // to whatever agent shows up in that window.
+        crate::provider::name_window_when_seen(&target, &l.name, &l.name);
+    }
+    run_command(&cmd).await.map_err(|e| e.message.clone())?;
+    let (window, pane) = match l.split {
+        Some(_) => {
+            let pane = list_panes()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|p| !panes_before.contains(&p.id));
+            (pane.as_ref().map(|p| p.window), pane.map(|p| p.id))
+        }
+        None => {
+            let window = list_windows()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|w| !windows_before.contains(&w.id));
+            (window.as_ref().map(|w| w.id), window.and_then(|w| w.active_pane))
+        }
+    };
+    // The project rides on what was made - a new session, the pane of a
+    // split, else the window - as its `@project` option. A remote
+    // session's shadow window would only get a local option, so its
+    // provider is asked to set it on the window there instead.
+    if !l.project.is_empty() {
+        let set = match (&l.remote_host, l.split, window) {
+            (Some(host), _, w) => {
+                let wid = w
+                    .and_then(|w| {
+                        format_expand(OptionTarget::Window(WindowId(w)), "#{window_remote_id}").ok()
+                    })
+                    .filter(|id| !id.is_empty());
+                let r = match wid {
+                    Some(id) => {
+                        crate::view::act_remote(host, &id, "project_window", Some(&l.project)).await
+                    }
+                    None => Err("the new window's remote id is not known yet".to_string()),
+                };
+                if let Err(why) = r {
+                    let _ = display_message(&format!("project not set on {host}: {why}"));
+                }
+                None
+            }
+            (None, None, _) if l.session.is_empty() => Some(format!("-t {}", quote(&target))),
+            (None, Some(_), _) => pane.map(|p| format!("-p -t {}", quote(&format!("%{p}")))),
+            (None, None, Some(w)) => Some(format!("-w -t {}", quote(&format!("@{w}")))),
+            _ => None,
+        };
+        if let Some(set) = set {
+            let _ = run_command(&format!("set-option {set} @project {}", quote(&l.project))).await;
+        }
+    }
+    Ok(Landed { target, command, window, pane })
+}
+
+// ---------------------------------------------------------------------------
+// the `new` verb with flags: an agent starting another agent, no form
+// ---------------------------------------------------------------------------
+
+/// The flags that make `new` start the agent itself: anything that says
+/// what to start, or where. `@host`, `--client` and `--profile` alone
+/// still open the form (the accounts panel's `n` asks that way).
+const DIRECT_FLAGS: &[&str] = &[
+    "--resume",
+    "--fork",
+    "--project",
+    "-p",
+    "--session",
+    "-s",
+    "--new-session",
+    "--name",
+    "-n",
+    "--folder",
+    "-c",
+    "--command",
+    "--split",
+    "--window",
+    "-w",
+    "--focus",
+];
+
+pub fn is_direct(words: &[String]) -> bool {
+    words
+        .iter()
+        .any(|w| DIRECT_FLAGS.contains(&w.split('=').next().unwrap_or("")))
+}
+
+/// The verb's text as words, split the way a shell splits a line:
+/// blanks separate, single or double quotes hold a word together
+/// (`--project 'Ooga booga'`), a backslash keeps the next character
+/// outside single quotes. The verb itself is the first word.
+pub fn words(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_word = false;
+    let mut quote: Option<char> = None;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some('\''), c) => cur.push(c),
+            (Some(_), '\\') => cur.push(chars.next().unwrap_or('\\')),
+            (Some(_), c) => cur.push(c),
+            (None, '\'') | (None, '"') => {
+                quote = Some(c);
+                in_word = true;
+            }
+            (None, '\\') => {
+                in_word = true;
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+            }
+            (None, c) if c.is_whitespace() => {
+                if in_word {
+                    out.push(std::mem::take(&mut cur));
+                    in_word = false;
+                }
+            }
+            (None, c) => {
+                in_word = true;
+                cur.push(c);
+            }
+        }
+    }
+    if in_word {
+        out.push(cur);
+    }
+    out
+}
+
+/// The pane the verb was run against (`-t $TMUX_PANE`): its folder,
+/// session and `@project` are the defaults, and it is the pane a
+/// `--split` divides.
+pub struct Caller {
+    pub pane: Option<u32>,
+}
+
+fn value<'a>(
+    flag: &str,
+    inline: Option<String>,
+    it: &mut impl Iterator<Item = &'a String>,
+) -> Result<String, String> {
+    inline
+        .or_else(|| it.next().cloned())
+        .ok_or_else(|| format!("new: {flag} needs a value"))
+}
+
+/// Start an agent from the verb's words (after `new`), no form:
+///
+///   --resume <id>      resume that harness session (`claude:<uuid>`
+///                      or the bare id; the roster row behind it gives
+///                      the harness, folder, name and tag defaults)
+///   --fork             as a copy of it
+///   --command <line>   what to run: a launcher's name or a line
+///                      (default: the harness, through its launcher)
+///   --folder <dir>     where (default: the row's, else the caller's)
+///   --session <name>   which session (default: the caller's)
+///   --new-session      a session of its own, named after --name
+///   --name <name>      the window's name (default: the row's name,
+///                      else the folder's)
+///   --project <tag>    its @project (default: the caller's)
+///   --split            a pane beside the caller instead of a window
+///   --window <w>       with --split: in that window (index, name, @id)
+///   --focus            switch to it (default: made in the background)
+///   --profile <dir>    CLAUDE_CONFIG_DIR for it
+///   @host              on that linked server
+pub async fn direct(
+    words: &[String],
+    caller: Caller,
+    launchers: Vec<(String, String)>,
+) -> Result<Landed, String> {
+    let mut resume: Option<String> = None;
+    let mut fork = false;
+    let mut project: Option<String> = None;
+    let mut session: Option<String> = None;
+    let mut own_session = false;
+    let mut name: Option<String> = None;
+    let mut folder: Option<String> = None;
+    let mut command: Option<String> = None;
+    let mut split = false;
+    let mut window: Option<String> = None;
+    let mut focus = false;
+    let mut profile: Option<String> = None;
+    let mut remote: Option<String> = None;
+    let mut it = words.iter();
+    while let Some(w) = it.next() {
+        let (flag, inline) = match w.split_once('=') {
+            Some((f, v)) if f.starts_with('-') => (f, Some(v.to_string())),
+            _ => (w.as_str(), None),
+        };
+        match flag {
+            "--resume" => resume = Some(value(flag, inline, &mut it)?),
+            "--fork" => fork = true,
+            "--project" | "-p" => project = Some(value(flag, inline, &mut it)?),
+            "--session" | "-s" => session = Some(value(flag, inline, &mut it)?),
+            "--new-session" => own_session = true,
+            "--name" | "-n" => name = Some(value(flag, inline, &mut it)?),
+            "--folder" | "-c" => folder = Some(value(flag, inline, &mut it)?),
+            "--command" => command = Some(value(flag, inline, &mut it)?),
+            "--split" => split = true,
+            "--window" | "-w" => {
+                window = Some(value(flag, inline, &mut it)?);
+                split = true;
+            }
+            "--focus" => focus = true,
+            "--profile" => profile = Some(value(flag, inline, &mut it)?),
+            // The form's: a client to open on. Nothing opens here.
+            "--client" => {
+                value(flag, inline, &mut it)?;
+            }
+            f if f.starts_with('@') && f.len() > 1 => remote = Some(f[1..].to_string()),
+            f => return Err(format!("new: unknown flag {f}")),
+        }
+    }
+    // The row behind the id, when the roster has it: its harness, its
+    // folder, its name and its tag are the defaults.
+    let (harness_hint, id) = match resume.as_deref() {
+        Some(r) => match (r.split_once(':'), resumable_id(r)) {
+            (Some((k, _)), Some(id)) => (Some(k.to_string()), Some(id)),
+            _ => (None, Some(r.to_string())),
+        },
+        None => (None, None),
+    };
+    let row = match &id {
+        Some(id) => {
+            let ids: Vec<String> =
+                ["claude", "codex", "opencode"].iter().map(|k| format!("{k}:{id}")).collect();
+            crate::store::by_ids(&ids).await.unwrap_or_default().into_iter().next()
+        }
+        None => None,
+    };
+    // The caller's pane: folder, session, project.
+    let here = caller
+        .pane
+        .and_then(|p| {
+            format_expand(
+                OptionTarget::Pane(PaneId(p)),
+                "#{pane_current_path}\u{1}#{session_name}\u{1}#{@project}",
+            )
+            .ok()
+        })
+        .unwrap_or_default();
+    let mut here = here.split('\u{1}').map(|s| Some(s.trim().to_string()).filter(|s| !s.is_empty()));
+    let (here_dir, here_session, here_project) = (here.next().flatten(), here.next().flatten(), here.next().flatten());
+    let nonempty = |s: Option<String>| s.filter(|s| !s.trim().is_empty());
+
+    let harness = harness_hint
+        .or_else(|| row.as_ref().map(|a| a.kind.clone()))
+        .or_else(|| {
+            command
+                .as_deref()
+                .and_then(|c| c.split_whitespace().next())
+                .map(basename)
+                .filter(|w| matches!(w.as_str(), "claude" | "codex" | "opencode"))
+        })
+        .unwrap_or_else(|| "claude".to_string());
+    let command = expand_command(&launchers, command.as_deref().unwrap_or(&harness));
+    let command = match profile {
+        Some(dir) => format!("CLAUDE_CONFIG_DIR={} {command}", quote(&dir)),
+        None => command,
+    };
+    let dir = nonempty(folder)
+        .or_else(|| nonempty(row.as_ref().and_then(|a| a.cwd.clone())))
+        .or(here_dir)
+        .ok_or("new: no folder - give --folder, or run it with -t <pane>")?;
+    if remote.is_none() {
+        match git::ensure_dir(&dir, false).await? {
+            Ensured::Ready => {}
+            Ensured::Missing => return Err(format!("new: no folder {dir}")),
+        }
+    }
+    let session = if own_session {
+        String::new()
+    } else {
+        nonempty(session)
+            .or_else(|| {
+                let host = remote.as_ref()?;
+                list_sessions()
+                    .ok()?
+                    .into_iter()
+                    .map(|s| s.name)
+                    .find(|n| n.starts_with(&format!("{host}/")))
+            })
+            .or(here_session)
+            .ok_or("new: no session - give --session, or run it with -t <pane>")?
+    };
+    if !session.is_empty() && !session_exists(&session) {
+        return Err(format!("new: no session '{session}'"));
+    }
+    let name = nonempty(name)
+        .or_else(|| nonempty(row.as_ref().map(crate::view::display_name)))
+        .unwrap_or_else(|| basename(&dir));
+    if session.is_empty() && session_exists(&session_name(&name)) {
+        return Err(format!("new: session '{}' already exists", session_name(&name)));
+    }
+    let project = nonempty(project)
+        .or(here_project)
+        .or_else(|| nonempty(row.as_ref().and_then(|a| a.project.clone())))
+        .unwrap_or_default();
+    let split = if split {
+        Some(match window {
+            Some(w) => window_pane(&session, &w)?,
+            None => caller.pane.ok_or("new: --split needs -t <pane>")?,
+        })
+    } else {
+        None
+    };
+    launch(Launch {
+        dir,
+        name,
+        command,
+        harness,
+        resume: id.unwrap_or_default(),
+        fork,
+        session,
+        project,
+        remote_host: remote,
+        focus,
+        split,
+    })
+    .await
+}
+
+/// The active pane of a window named by index, name or `@id` in a
+/// session, for `--window`.
+fn window_pane(session: &str, target: &str) -> Result<u32, String> {
+    let sessions = list_sessions().map_err(|e| e.message.clone())?;
+    let windows = list_windows().map_err(|e| e.message.clone())?;
+    let s = sessions
+        .iter()
+        .find(|s| s.name == session)
+        .ok_or_else(|| format!("new: no session '{session}'"))?;
+    let id = if let Some(n) = target.strip_prefix('@') {
+        n.parse::<u32>().ok().filter(|id| s.windows.iter().any(|(_, w)| w == id))
+    } else if let Ok(i) = target.parse::<u32>() {
+        s.windows.iter().find(|(idx, _)| *idx == i).map(|(_, id)| *id)
+    } else {
+        s.windows
+            .iter()
+            .map(|(_, id)| *id)
+            .find(|id| windows.iter().any(|w| w.id == *id && w.name == target))
+    };
+    let id = id.ok_or_else(|| format!("new: no window '{target}' in {session}"))?;
+    windows
+        .iter()
+        .find(|w| w.id == id)
+        .and_then(|w| w.active_pane)
+        .ok_or_else(|| format!("new: window '{target}' has no pane"))
 }
