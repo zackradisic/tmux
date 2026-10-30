@@ -8,7 +8,8 @@ use std::rc::Rc;
 
 use listkit::keys::KeyTable;
 use listkit::lines::{clamp_dim, default_size, SizeBox};
-use listkit::styled::{plain_cells, Styled, ST_BOLD, ST_BRIGHT, ST_CYAN, ST_DIM, ST_RED};
+use listkit::styled::{plain_cells, wrap_cells, Styled, ST_BOLD, ST_BRIGHT, ST_CYAN, ST_DIM, ST_INVERT, ST_RED};
+use listkit::text::{keyname, menu_item, menu_safe};
 use listkit::{Engine, Node, Outcome, Preview, SigilSpec};
 use tmux_plugin_sdk::prelude::*;
 
@@ -61,6 +62,7 @@ pub fn keys() -> KeyTable {
         .with("open_app", "o", "rows", "open the channel in the Slack app")
         .with("mark", "m", "rows", "mark the channel read")
         .with("compose", "n", "rows", "compose a message to the channel")
+        .with("menu", "Space", "rows", "the action menu")
         .with("view", "v", "picker", "sections / unread / all")
         .with("refresh", "R", "picker", "fetch channels, sections, users and badges again")
         .with("fold", "z", "moving", "fold / unfold the section under the cursor")
@@ -147,13 +149,17 @@ pub fn refresh(st: &Shared) {
 }
 
 pub fn render(side: &mut Sidebar) {
+    // Refresh (`R`) is on the `?` card and in the menu, not here: the
+    // footer is for the keys pressed every time the sidebar is open.
+    // The search box line above names `/` itself.
+    let k = |action: &str| keyname(side.engine.keys.key_of(action)).to_string();
     side.engine.footer = format!(
-        "Enter open · {} read · {} compose · {} app · {} view · {} refresh · / search · ? help · q close",
-        side.engine.keys.key_of("mark"),
-        side.engine.keys.key_of("compose"),
-        side.engine.keys.key_of("open_app"),
-        side.engine.keys.key_of("view"),
-        side.engine.keys.key_of("refresh"),
+        "Enter open · {} read · {} compose · {} app · {} view · {} menu · ? help · q close",
+        k("mark"),
+        k("compose"),
+        k("open_app"),
+        k("view"),
+        k("menu"),
     );
     let (out, rect) = side.engine.render();
     let _ = mode_write(side.engine.mode, out.as_bytes());
@@ -184,6 +190,25 @@ fn rank(c: &Channel) -> (u8, std::cmp::Reverse<String>, String) {
     (band, std::cmp::Reverse(c.latest.clone().unwrap_or_default()), c.name.to_lowercase())
 }
 
+/// The badge: the channel's state as one glyph, the agents picker's
+/// way. A mention is the one coloured block in the list (`!`, red,
+/// inverted), so it cannot be missed at a glance; unread is a bright
+/// cyan dot; read and muted a dim one.
+fn badge_cells(c: &Channel) -> Styled {
+    if c.is_muted {
+        ('·', ST_DIM)
+    } else if c.mentions > 0 {
+        ('!', ST_BOLD | ST_RED | ST_BRIGHT | ST_INVERT)
+    } else if c.has_unreads {
+        ('●', ST_BOLD | ST_BRIGHT | ST_CYAN)
+    } else {
+        ('·', ST_DIM)
+    }
+}
+
+/// One channel as a row: the badge, then the glyph and the name (bold
+/// while unread, red when mentioned, with the mention count after it;
+/// dim when read or muted), the star when starred.
 fn row_left(s: &State, c: &Channel) -> Vec<Styled> {
     let label = s.channel_label(c);
     let (glyph, rest) = label.split_at(1);
@@ -191,34 +216,31 @@ fn row_left(s: &State, c: &Channel) -> Vec<Styled> {
         Kind::Private => "*",
         _ => glyph,
     };
-    let mut style = 0;
-    if c.is_muted {
-        style |= ST_DIM;
+    let style = if c.is_muted {
+        ST_DIM
     } else if c.mentions > 0 {
-        style |= ST_BOLD | ST_RED;
+        ST_BOLD | ST_RED
     } else if c.has_unreads {
-        style |= ST_BOLD;
-    }
-    let mut cells: Vec<Styled> = plain_cells(glyph, ST_DIM | (style & ST_RED));
+        ST_BOLD
+    } else {
+        ST_DIM
+    };
+    let mut cells: Vec<Styled> = vec![badge_cells(c), (' ', 0)];
+    cells.extend(plain_cells(glyph, ST_DIM | (style & ST_RED)));
     cells.extend(plain_cells(rest, style));
+    if c.mentions > 0 && !c.is_muted {
+        cells.extend(plain_cells(&format!("  @{}", c.mentions.min(99)), ST_DIM | ST_RED));
+    }
     if c.is_starred {
         cells.extend(plain_cells(" ★", ST_DIM));
     }
     cells
 }
 
+/// The right column: how long ago the channel last spoke.
 fn row_right(c: &Channel, now: u64) -> Vec<Styled> {
-    let badge: Vec<Styled> = if c.mentions > 0 {
-        plain_cells(&format!("{:>3}", format!("●{}", c.mentions.min(99))), ST_RED | ST_BOLD)
-    } else if c.has_unreads && !c.is_muted {
-        plain_cells("  ●", ST_BRIGHT | ST_CYAN)
-    } else {
-        plain_cells("   ", 0)
-    };
     let age = c.latest.as_deref().map(|t| timefmt::age(t, now)).unwrap_or_default();
-    let mut out = badge;
-    out.extend(plain_cells(&format!(" {age:>4}"), ST_DIM));
-    out
+    plain_cells(&format!("{age:>4}"), ST_DIM)
 }
 
 fn preview_for(s: &State, side: &Sidebar, c: &Channel, width: usize) -> Preview {
@@ -246,15 +268,31 @@ fn preview_for(s: &State, side: &Sidebar, c: &Channel, width: usize) -> Preview 
                     row.append(&mut l);
                     lines.push(row);
                 }
+                // Attachments under the text, as the channel view draws
+                // them: a bot's post is often nothing but its card.
+                for a in &m.attachments {
+                    for raw in a.lines() {
+                        let text = s.names.with(|n| mrkdwn::inline(raw, ST_DIM, n));
+                        for mut w in wrap_cells(&text, width.saturating_sub(4).max(10)) {
+                            let mut row = plain_cells("  │ ", ST_DIM);
+                            row.append(&mut w);
+                            lines.push(row);
+                        }
+                    }
+                }
                 for f in &m.files {
                     lines.push(plain_cells(&format!("  📎 {f}"), ST_DIM));
                 }
                 lines.push(Vec::new());
             }
+            // The preview opens at its end: no blank last line there.
+            if lines.last().is_some_and(|l| l.is_empty()) {
+                lines.pop();
+            }
         }
         None => lines.push(plain_cells("loading…", ST_DIM)),
     }
-    Preview::Text(lines)
+    Preview::TextTail(lines)
 }
 
 fn group_node(key: &str, name: &str, count: usize, unread: usize) -> Node {
@@ -477,6 +515,65 @@ fn ensure_preview(st: &Shared) {
 }
 
 // ---------------------------------------------------------------------------
+// the action menu
+// ---------------------------------------------------------------------------
+
+/// The Space menu: every sidebar action for the highlighted row, the
+/// ones that do not apply dimmed, as a tmux `display-menu` on the client
+/// that pressed the key. The items do nothing themselves: each hands its
+/// key back through `plugin-command slack 'menu-key <key>'`, which
+/// `replay_key` presses into the engine, so the menu is a view of the
+/// keymap and cannot disagree with it.
+fn open_menu(st: &Shared) {
+    let (title, items, client) = {
+        let s = st.borrow();
+        let Some(side) = s.side.as_ref() else { return };
+        let k = |action: &str| side.engine.keys.key_of(action).to_string();
+        let sel = side.engine.selected_key().and_then(|key| s.channel(&key).cloned());
+        let row = sel.is_some();
+        let unread = sel.as_ref().is_some_and(|c| c.has_unreads || c.mentions > 0);
+        let title = match &sel {
+            Some(c) => menu_safe(&s.channel_label(c), 30),
+            None => NAME.to_string(),
+        };
+        let mut items = String::new();
+        items.push_str(&menu_item(NAME, "open", &k("activate"), row));
+        items.push_str(&menu_item(NAME, "mark read", &k("mark"), row && unread));
+        items.push_str(&menu_item(NAME, "compose", &k("compose"), row));
+        items.push_str(&menu_item(NAME, "open in the Slack app", &k("open_app"), row));
+        items.push_str(" ''");
+        items.push_str(&menu_item(NAME, &format!("view: {}", side.view.next().label()), &k("view"), true));
+        items.push_str(&menu_item(NAME, "fold the section", &k("fold"), side.view != View::Unread));
+        items.push_str(&menu_item(NAME, "refresh", &k("refresh"), true));
+        items.push_str(" ''");
+        items.push_str(&menu_item(NAME, "help", "?", true));
+        items.push_str(&menu_item(NAME, "close", "q", true));
+        (title, items, side.client)
+    };
+    // The client that pressed the key, by name; without one tmux picks
+    // "the current client", which is right only while one is attached.
+    let target = client
+        .and_then(|cid| list_clients().ok()?.into_iter().find(|c| u64::from(c.id) == cid))
+        .map(|c| c.name)
+        .filter(|n| n.chars().all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c)))
+        .map(|n| format!(" -c '{n}'"))
+        .unwrap_or_default();
+    // No -x/-y: the menu centres on the client's window, where the
+    // sidebar floats.
+    let cmd = format!("display-menu{target} -T ' {title} '{items}");
+    let st2 = Rc::clone(st);
+    spawn(async move {
+        if let Err(e) = run_command(&cmd).await {
+            let mut s = st2.borrow_mut();
+            if let Some(side) = s.side.as_mut() {
+                side.engine.status = Some(format!("menu failed: {}", e.message));
+                render(side);
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // events
 // ---------------------------------------------------------------------------
 
@@ -555,6 +652,7 @@ fn execute(st: &Shared, outcome: Outcome) {
         OpenApp(Vec<Channel>),
         Mark(Vec<String>),
         Refresh,
+        Menu,
         Close,
     }
     let after = {
@@ -611,6 +709,7 @@ fn execute(st: &Shared, outcome: Outcome) {
                         }
                         After::Refresh
                     }
+                    "menu" => After::Menu,
                     _ => return,
                 }
             }
@@ -645,6 +744,7 @@ fn execute(st: &Shared, outcome: Outcome) {
                 });
             }
         }
+        After::Menu => open_menu(st),
         After::Refresh => {
             let st2 = Rc::clone(st);
             spawn(async move {

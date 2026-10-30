@@ -32,14 +32,18 @@ pub const PICK: &str = "\
 pick: the sidebar, as a floating picker.
 
   Enter       open the channel view        m   mark read
-  v           sections / unread / all      o   open in the Slack app
-  R           refresh everything           n   compose to this channel
-  j/k h/l     move, fold                   /   search (# channel, @ user,
-  ?           every key                        ! unread|mention|dm|muted)
+  Space       the action menu              o   open in the Slack app
+  v           sections / unread / all      n   compose to this channel
+  j/k h/l     move, fold (z: a section)    /   search (# channel, @ user,
+  ?           every key (R: refresh)           ! unread|mention|dm|muted)
 
-A row is bold while it has unread messages, red with a count when you
-were mentioned, dim when muted. The right column is how long ago the
-channel last spoke. The preview shows its recent messages.";
+Each row starts with its badge: a red `!` block when you were mentioned
+(the name red, the count after it as @3), a cyan dot while it has
+unread messages (the name bold), a dim dot when read or muted. The
+right column is how long ago the channel last spoke. The preview shows
+the channel's recent messages, newest at the bottom, attachments under
+their text; [ and ] scroll it. Space opens a menu of every action for
+the row, dimmed where one does not apply; each item is the key itself.";
 
 pub const OPEN: &str = "\
 open: the channel view.

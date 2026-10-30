@@ -28,6 +28,11 @@ pub enum Preview {
     PaneBelow(PaneId, Vec<Vec<Styled>>),
     /// Pre-styled lines (a capture, an info card).
     Text(Vec<Vec<Styled>>),
+    /// Pre-styled lines that open at their END (a conversation, a log):
+    /// the last line is on screen when the cursor lands on the row, and
+    /// stays there when the content grows while the cursor rests, until
+    /// `[` scrolls up; `]` back to the bottom pins it again.
+    TextTail(Vec<Vec<Styled>>),
     /// Markdown, rendered at the preview's width.
     Markdown(String),
 }
