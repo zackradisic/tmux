@@ -18,6 +18,7 @@ usage: tmux2 plugin-command slack '<verb> [args...]'
   bind <#chan>[/thread_ts] <agent-id>
                             push new messages there into an agent's session
   unbind <#chan>[/thread_ts]
+  notify <title> | <body>   a line in the notification feed (hooks, tests)
   close                     close any open view
   help [verb]               this text
 

@@ -158,15 +158,25 @@ async fn handle(st: &Shared, v: Value) {
             sidebar::refresh(st);
         }
         "desktop_notification" => {
+            // What Slack itself would have shown, already filtered by the
+            // user's notification preferences: title is the sender (and
+            // the channel), content the text.
             let title = s(&v, "title").unwrap_or_default();
             let content = s(&v, "content").unwrap_or_default();
             let subtitle = s(&v, "subtitle").unwrap_or_default();
-            let line = if subtitle.is_empty() || title.contains(&subtitle) {
-                format!("Slack {title}: {content}")
+            let title = if subtitle.is_empty() || title.contains(&subtitle) { title } else { format!("{title} ({subtitle})") };
+            let channel = s(&v, "channel").unwrap_or_default();
+            let thread = s(&v, "thread_ts").filter(|t| !t.is_empty());
+            let action = if channel.is_empty() {
+                None
             } else {
-                format!("Slack {title} ({subtitle}): {content}")
+                Some(match &thread {
+                    Some(t) => format!("plugin-command slack 'open {channel} {t}'"),
+                    None => format!("plugin-command slack 'open {channel}'"),
+                })
             };
-            let _ = display_message(&listkit::text::clip(&listkit::text::one_line(&line), 180));
+            let key = format!("slack:{channel}{}", thread.map(|t| format!("/{t}")).unwrap_or_default());
+            crate::notify(&title, &content, Some(&key), action.as_deref()).await;
         }
         "reaction_added" | "reaction_removed" => {
             let Some(item) = v.get("item") else { return };

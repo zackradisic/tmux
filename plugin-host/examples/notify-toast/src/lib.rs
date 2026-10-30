@@ -1,16 +1,37 @@
 //! Notification toasts as floating panes.
 //!
-//! Listens for `pane-notification` events (OSC 9 "message" or OSC 777
-//! "notify;title;body" emitted by a program in any pane - e.g. a coding
-//! agent's stop hook running `printf '\e]9;done\a'`) and shows them in a
-//! floating notification pane in the top-right corner.
+//! A server-global feed of notifications, shown in a floating pane in
+//! the top-right corner. Two sources feed it:
+//!
+//! - **Other plugins**, through the `notify` service method this plugin
+//!   registers (the Slack plugin is the first caller). Request JSON:
+//!     { "source": "slack",                       required: who sent it
+//!       "key": "slack:C123/1699.42",             optional, see below
+//!       "title": "#general · Tejas",
+//!       "body": "the text, one line",
+//!       "action": "plugin-command slack 'open C123 1699.42'",
+//!       "ttl_ms": 15000 }                        optional
+//!   Reply: { "ok": true, "id": <row id> }; a request with no source
+//!   (or neither title nor body) fails with a message. A call whose
+//!   `key` matches a live row (same source and key) REPLACES that row
+//!   and bumps its count; without a key every call is a new row.
+//!   `action` is a tmux command run when the user activates the row;
+//!   a row without one just dismisses. `ttl_ms` overrides `duration_ms`
+//!   for that row (0 = never expires).
+//! - **Panes**, through `pane-notification` events (OSC 9 "message" or
+//!   OSC 777 "notify;title;body" from a program in any pane - e.g. a
+//!   coding agent's stop hook running `printf '\e]9;done\a'`). Off by
+//!   default; `pane_notifications=1` turns it on.
 //!
 //! The feed is server-global; the panes are just views of it. One line
 //! per notifying pane -
 //!   <session>: <pane title> [xN]
 //! - naming the pane by what it was doing when it pinged (its title, or
-//! the notification text when the program never set one). A pane that
-//! pings again replaces its own line and bumps the count, so one pane
+//! the notification text when the program never set one), and one line
+//! per service row -
+//!   <source> <title>: <body> [xN]
+//! - with the source dim. A pane that pings again (or a caller reusing
+//! its key) replaces its own line and bumps the count, so one source
 //! never fills the feed. Lines expire on their own after `duration_ms`.
 //! The view follows the
 //! user: it is rendered in every attached session's *current* window and
@@ -27,23 +48,30 @@
 //! tree, drawn like `choose-tree` (prefix + w). A window holding one
 //! notification is drawn as a single row, since a row of its own would
 //! only repeat what the notification says; the level appears as soon as
-//! it groups more than one. The panel carries a live preview of
-//! what the selected row points at. `j`/`k` (or arrows) move over every
-//! row, `h`/`l` fold and unfold the session or window under the cursor
-//! (`M--`/`M-+` fold and unfold all), `1`-`9` or `Enter` jump to a
-//! notification's source pane (and drop the entry), `d` dismisses one -
-//! or, on a session or window row, everything under it, folded away or
-//! not - and `q`/`Escape` closes the panel.
+//! it groups more than one. Service rows sit under a top-level group
+//! named after their source ("slack"). The panel carries a live preview
+//! of what the selected row points at: the pane, or for a service row
+//! its title, body, source and age. `j`/`k` (or arrows) move over every
+//! row, `h`/`l` fold and unfold the group under the cursor (`M--`/`M-+`
+//! fold and unfold all), `1`-`9` or `Enter` activate a notification -
+//! jump to a pane row's source pane, run a service row's action - and
+//! drop the entry (a click on a service row does the same), `d`
+//! dismisses one - or, on a grouping row, everything under it, folded
+//! away or not - and `q`/`Escape` closes the panel.
 //!
 //! Load (tmux.conf):
-//!   load-plugin -s server -c run-command -c mode \
+//!   load-plugin -s server -c run-command -c mode -c service-serve \
 //!       ~/.tmux/plugins/notify_toast.wasm
+//! (`service-serve` is what the `notify` method needs; without the grant
+//! the plugin still loads and shows pane rows.)
 //!
 //! Options (-o): duration_ms (default 6000; 0 or "infinite" = lines never
 //! expire), width (default 44), show_when_visible (default 1; 0 =
-//! suppress in the source window), chooser_width / chooser_height
-//! (chooser panel size: cells, or "NN%" of the window; default: most of
-//! the window width capped at 90, height sized to the feed).
+//! suppress in the source window), pane_notifications (default 0; 1 =
+//! also listen for `pane-notification` events and the notifications
+//! linked servers forward), chooser_width / chooser_height (chooser
+//! panel size: cells, or "NN%" of the window; default: most of the
+//! window width capped at 90, height sized to the feed).
 //!
 //! Sets one option of its own, `@notify_toast_scratch`, on a notifying
 //! pane: `set -F` is how a plugin expands a tmux format (`pane_format`).
@@ -68,6 +96,12 @@ struct Config {
     /// (default is to show them everywhere).
     #[serde(default)]
     show_when_visible: Option<String>,
+    /// "1" also takes `pane-notification` events (OSC 9/777 from
+    /// programs in panes). Off by default: the service method is the
+    /// source this plugin is for now, and a pane source nobody asked for
+    /// fills the feed with stop hooks.
+    #[serde(default)]
+    pane_notifications: Option<String>,
     /// Chooser panel size: a cell count or "NN%" of the window. Values
     /// arrive as strings from -o and as native numbers from a manifest,
     /// so these accept any JSON value.
@@ -116,7 +150,7 @@ const MAX_LINES: usize = 6;
 /// a snapshot the new code cannot read fails the migration, and a failed
 /// migration keeps the OLD instance running - so a plugin that drops
 /// compatibility here can no longer be reloaded until its feed empties.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Entry {
     seq: u64,
     src_window: Option<u64>,
@@ -142,6 +176,25 @@ struct Entry {
     /// row however often it fires; 0 in a snapshot from before counting.
     #[serde(default)]
     count: u32,
+    /// Who sent a service row (the `notify` method); empty for a pane
+    /// row. A service row keeps its title in `title` and its body in
+    /// `msg`, and its `src_pane` is a synthetic id no pane can match.
+    #[serde(default)]
+    source: String,
+    /// The caller's replacement key: a later `notify` with the same
+    /// source and key takes this row's place. Empty = none.
+    #[serde(default)]
+    key: String,
+    /// tmux command run when the row is activated; None just dismisses.
+    #[serde(default)]
+    action: Option<String>,
+    /// Per-row expiry in ms (0 = never) overriding `duration_ms`.
+    #[serde(default)]
+    ttl_ms: Option<u64>,
+    /// Arrival on the host clock (ms); 0 for a pane row or an old
+    /// snapshot, which the preview then leaves unaged.
+    #[serde(default)]
+    at_ms: u64,
 }
 
 impl Entry {
@@ -162,6 +215,128 @@ impl Entry {
             n => format!(" \u{d7}{n}"),
         }
     }
+
+    fn is_service(&self) -> bool {
+        !self.source.is_empty()
+    }
+
+    /// Does `new` take this row's place? One row per pane for pane rows;
+    /// for service rows one per (source, key), and never for a keyless
+    /// row. A pane row and a service row never replace each other.
+    fn replaced_by(&self, new: &Entry) -> bool {
+        match (self.is_service(), new.is_service()) {
+            (false, false) => self.src_pane == new.src_pane,
+            (true, true) => {
+                !new.key.is_empty()
+                    && self.source == new.source
+                    && self.key == new.key
+            }
+            _ => false,
+        }
+    }
+
+    /// How long this row lives: its own ttl when the caller set one
+    /// (0 = never), else the configured duration (None = never).
+    fn expiry(&self, default: Option<u64>) -> Option<u64> {
+        match self.ttl_ms {
+            Some(0) => None,
+            Some(ms) => Some(ms),
+            None => default,
+        }
+    }
+
+    /// Who the log names: the pane for a pane row, the source otherwise.
+    fn origin(&self) -> String {
+        if self.is_service() {
+            self.source.clone()
+        } else {
+            format!("%{}", self.src_pane)
+        }
+    }
+}
+
+/// A `notify` request as a caller sends it. Every field but `source`
+/// has a default so a caller can send the little it knows.
+#[derive(Deserialize, Default)]
+struct NotifyReq {
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    key: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    action: Option<String>,
+    #[serde(default)]
+    ttl_ms: Option<u64>,
+}
+
+/// Synthetic pane ids for service rows, clear of real pane ids and of
+/// the forwarded-notification range.
+const SERVICE_PANE_BASE: u64 = 1 << 41;
+
+impl NotifyReq {
+    /// Validate and turn into a feed row numbered `seq`, arriving at
+    /// `now`. Title and body are cut to their first line: the toast is
+    /// one line per row, and the chooser wraps the body itself.
+    fn into_entry(self, seq: u64, now: u64) -> Result<Entry, String> {
+        let source = self.source.trim().to_string();
+        if source.is_empty() {
+            return Err("notify: \"source\" is required".into());
+        }
+        let first_line =
+            |s: &str| s.lines().next().unwrap_or("").trim().to_string();
+        let title = first_line(&self.title);
+        let body = first_line(&self.body);
+        if title.is_empty() && body.is_empty() {
+            return Err("notify: a \"title\" or a \"body\" is required".into());
+        }
+        // Same bounds as duration_ms, so a caller cannot ask for a flash
+        // too short to read; 0 keeps its "never" meaning.
+        let ttl_ms = self
+            .ttl_ms
+            .map(|ms| if ms == 0 { 0 } else { ms.clamp(1_000, 300_000) });
+        Ok(Entry {
+            seq,
+            src_window: None,
+            src_pane: SERVICE_PANE_BASE | seq,
+            msg: body,
+            cmd: String::new(),
+            title,
+            session_name: String::new(),
+            window_name: String::new(),
+            count: 0,
+            source,
+            key: self.key.trim().to_string(),
+            action: self
+                .action
+                .map(|a| a.trim().to_string())
+                .filter(|a| !a.is_empty()),
+            ttl_ms,
+            at_ms: now,
+        })
+    }
+}
+
+/// Put `entry` into the feed under the one-row-per-origin rule: the row
+/// it replaces (same pane, or same source and key) goes, carrying its
+/// tally over, and the oldest rows fall off past MAX_LINES. The old
+/// row's expiry task fires later, finds its seq gone and does nothing.
+/// Returns the count the new row shows.
+fn insert_entry(entries: &mut VecDeque<Entry>, entry: Entry) -> u32 {
+    let count = entries
+        .iter()
+        .find(|e| e.replaced_by(&entry))
+        .map_or(0, |e| e.count.max(1));
+    entries.retain(|e| !e.replaced_by(&entry));
+    let count = count + 1;
+    entries.push_back(Entry { count, ..entry });
+    while entries.len() > MAX_LINES {
+        entries.pop_front();
+    }
+    count
 }
 
 /// Expand a tmux format against a pane. There is no host call for format
@@ -251,6 +426,9 @@ struct NotifyToast {
     show_when_visible: bool,
     chooser_width: Option<SizeSpec>,
     chooser_height: Option<SizeSpec>,
+    /// Whether `pane-notification` events (and the ones linked servers
+    /// forward) feed the toast at all.
+    pane_notifications: bool,
     seq: u64,
     state: State,
 }
@@ -428,6 +606,9 @@ fn locate(topo: &Topo, e: &Entry) -> Located {
 /// pane width. The chooser's tree carries everything else. The tally is
 /// kept out of the truncation, since it is the part that changes.
 fn toast_line(e: &Entry, topo: &Topo, width: u64) -> String {
+    if e.is_service() {
+        return service_line(e, width);
+    }
     let loc = locate(topo, e);
     let session = if loc.session_name.is_empty() {
         "?"
@@ -439,6 +620,31 @@ fn toast_line(e: &Entry, topo: &Topo, width: u64) -> String {
         .saturating_sub(4 + tally.chars().count())
         .max(8);
     format!("{}{tally}", sanitize(&format!("{session}: {}", e.label()), room))
+}
+
+/// A service row's feed line: "<source> <title>: <body>", the source
+/// dim. The body is rendered through `printf %b`, so `\033` here becomes
+/// an escape in the pane; sanitize keeps the caller's text free of
+/// escapes of its own.
+fn service_line(e: &Entry, width: u64) -> String {
+    let source = sanitize(&e.source, 16);
+    let tally = e.tally();
+    let room = (width as usize)
+        .saturating_sub(5 + tally.chars().count() + source.chars().count())
+        .max(8);
+    format!(
+        "\\033[2m{source}\\033[0m {}{tally}",
+        sanitize(&service_text(e), room)
+    )
+}
+
+/// "<title>: <body>", or whichever half the caller sent.
+fn service_text(e: &Entry) -> String {
+    match (e.title.is_empty(), e.msg.is_empty()) {
+        (false, false) => format!("{}: {}", e.title, e.msg),
+        (true, _) => e.msg.clone(),
+        (_, true) => e.title.clone(),
+    }
 }
 
 /// The windows the feed should currently be rendered in: every attached
@@ -703,6 +909,7 @@ fn chooser_list_width(width: u32) -> u32 {
 struct Seg(&'static str, String);
 
 const DIM: &str = "2";
+const BOLD: &str = "1";
 const RED: &str = "31";
 const GREEN: &str = "32";
 
@@ -713,12 +920,17 @@ const GREEN: &str = "32";
 enum NodeId {
     Session(String),
     Window(String, Option<u64>, String),
+    /// The top-level group of one service's rows, by source name.
+    Source(String),
     Note(u64),
 }
 
-/// One drawn row of the tree. `depth` 0 = session, 1 = window, 2 = the
-/// notification itself.
+/// One drawn row of the tree. `depth` 0 = session (or source group),
+/// 1 = window (or a service row), 2 = the notification itself.
 struct Row {
+    /// A source group or one of its rows: no pane behind it, and its
+    /// name column is a title, not an index to right-align with.
+    service: bool,
     depth: u32,
     /// Last among its siblings: picks the branch glyph.
     last: bool,
@@ -749,6 +961,14 @@ fn node_notes(id: &NodeId, entries: &VecDeque<Entry>, topo: &Topo) -> Vec<u64> {
     entries
         .iter()
         .filter(|e| {
+            if let NodeId::Note(seq) = id {
+                return e.seq == *seq;
+            }
+            // A service row has no place in the session tree, and a
+            // pane row none under a source.
+            if e.is_service() {
+                return matches!(id, NodeId::Source(s) if e.source == *s);
+            }
             let loc = locate(topo, e);
             match id {
                 NodeId::Session(name) => loc.session_name == *name,
@@ -757,7 +977,7 @@ fn node_notes(id: &NodeId, entries: &VecDeque<Entry>, topo: &Topo) -> Vec<u64> {
                         && loc.window == *wid
                         && loc.window_name == *wname
                 }
-                NodeId::Note(seq) => e.seq == *seq,
+                NodeId::Source(_) | NodeId::Note(_) => false,
             }
         })
         .map(|e| e.seq)
@@ -797,9 +1017,41 @@ fn build_rows(
         preview: Option<u64>,
         windows: Vec<Win>,
     }
+    /// A service row: "<title>: <body>" plus the tally.
+    struct SNote {
+        seq: u64,
+        title: String,
+        body: String,
+        count: u32,
+    }
+    /// Every row one source sent; a top-level group beside the sessions.
+    struct Group {
+        name: String,
+        notes: Vec<SNote>,
+    }
     let mut tree: Vec<Sess> = Vec::new();
+    let mut groups: Vec<Group> = Vec::new();
 
     for e in entries {
+        if e.is_service() {
+            let gi = match groups.iter().position(|g| g.name == e.source) {
+                Some(i) => i,
+                None => {
+                    groups.push(Group {
+                        name: e.source.clone(),
+                        notes: Vec::new(),
+                    });
+                    groups.len() - 1
+                }
+            };
+            groups[gi].notes.push(SNote {
+                seq: e.seq,
+                title: e.title.clone(),
+                body: e.msg.clone(),
+                count: e.count.max(1),
+            });
+            continue;
+        }
         let loc = locate(topo, e);
         // Sessions group by name (tmux keeps those unique), so an entry
         // whose pane has died - which resolves to no session id, only
@@ -850,6 +1102,12 @@ fn build_rows(
     }
 
     tree.sort_by(|a, b| a.name.cmp(&b.name));
+    groups.sort_by(|a, b| a.name.cmp(&b.name));
+    for g in groups.iter_mut() {
+        // Arrival order: a replaced row took a fresh seq, so it moves
+        // to the bottom like a new one.
+        g.notes.sort_by_key(|n| n.seq);
+    }
     for s in tree.iter_mut() {
         s.windows.sort_by_key(|w| (w.index, w.id));
         for w in s.windows.iter_mut() {
@@ -889,8 +1147,11 @@ fn build_rows(
         }
         let sid = NodeId::Session(s.name.clone());
         let session_open = !folded.contains(&sid);
-        let session_last = i + 1 == nsessions;
+        // The source groups follow the sessions, so the last session is
+        // only the last top-level row when there are none.
+        let session_last = i + 1 == nsessions && groups.is_empty();
         rows.push(Row {
+            service: false,
             depth: 0,
             last: session_last,
             parent_last: true,
@@ -933,6 +1194,7 @@ fn build_rows(
                 text.push(Seg(DIM, ": ".into()));
                 text.extend(n.text);
                 rows.push(Row {
+                    service: false,
                     depth: 1,
                     last: window_last,
                     parent_last: session_last,
@@ -954,6 +1216,7 @@ fn build_rows(
             }
 
             rows.push(Row {
+                service: false,
                 depth: 1,
                 last: window_last,
                 parent_last: session_last,
@@ -973,6 +1236,7 @@ fn build_rows(
             let nnotes = w.notes.len();
             for (k, n) in w.notes.into_iter().enumerate() {
                 rows.push(Row {
+                    service: false,
                     depth: 2,
                     last: k + 1 == nnotes,
                     parent_last: window_last,
@@ -993,7 +1257,159 @@ fn build_rows(
             }
         }
     }
+
+    // Service rows: one group per source, its rows beneath. A row is
+    // drawn "<title>: <body>" by putting the title where a window index
+    // would go - the name column - and the body in the text.
+    let ngroups = groups.len();
+    for (i, g) in groups.into_iter().enumerate() {
+        let count: u32 = g.notes.iter().map(|n| n.count).sum();
+        let gid = NodeId::Source(g.name.clone());
+        let open = !folded.contains(&gid);
+        let group_last = i + 1 == ngroups;
+        rows.push(Row {
+            service: true,
+            depth: 0,
+            last: group_last,
+            parent_last: true,
+            has_children: true,
+            expanded: open,
+            key: None,
+            name: g.name.clone(),
+            text: vec![Seg(
+                DIM,
+                format!(
+                    "{count} notification{}",
+                    if count == 1 { "" } else { "s" }
+                ),
+            )],
+            id: gid.clone(),
+            parent: None,
+            preview: None,
+            note: None,
+        });
+        if !open {
+            continue;
+        }
+        let nnotes = g.notes.len();
+        for (k, n) in g.notes.into_iter().enumerate() {
+            // A row with only a body shows that as its name, so the
+            // colon never leads nothing.
+            let (name, body) = if n.title.is_empty() {
+                (n.body, String::new())
+            } else {
+                (n.title, n.body)
+            };
+            let mut text = Vec::new();
+            if !body.is_empty() {
+                text.push(Seg("", body));
+            }
+            match n.count {
+                0 | 1 => {}
+                c => text.push(Seg(DIM, format!(" \u{d7}{c}"))),
+            }
+            rows.push(Row {
+                service: true,
+                depth: 1,
+                last: k + 1 == nnotes,
+                parent_last: group_last,
+                has_children: false,
+                expanded: false,
+                key: (key <= 9).then(|| {
+                    let k = key;
+                    key += 1;
+                    k
+                }),
+                name,
+                text,
+                id: NodeId::Note(n.seq),
+                parent: Some(gid.clone()),
+                preview: None,
+                note: Some(n.seq),
+            });
+        }
+    }
     rows
+}
+
+/// A row's age for the preview: coarse, since the panel is redrawn on
+/// feed changes rather than on a clock. Empty when the arrival time is
+/// unknown (a row from before it was recorded).
+fn age(now: u64, at: u64) -> String {
+    if at == 0 || now < at {
+        return String::new();
+    }
+    let secs = (now - at) / 1000;
+    match secs {
+        0..=4 => "just now".into(),
+        5..=59 => format!("{secs}s ago"),
+        60..=3599 => format!("{}m ago", secs / 60),
+        3600..=86_399 => format!("{}h ago", secs / 3600),
+        _ => format!("{}d ago", secs / 86_400),
+    }
+}
+
+/// Word-wrap `text` to `width` characters; a word longer than the width
+/// is cut rather than overflowing the preview column.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let wlen = word.chars().count();
+        let llen = line.chars().count();
+        if llen > 0 && llen + 1 + wlen > width {
+            lines.push(std::mem::take(&mut line));
+        }
+        if wlen > width {
+            let mut rest: Vec<char> = word.chars().collect();
+            while rest.len() > width {
+                let head: String = rest.drain(..width).collect();
+                if !line.is_empty() {
+                    lines.push(std::mem::take(&mut line));
+                }
+                lines.push(head);
+            }
+            line = rest.into_iter().collect();
+            continue;
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+/// What the preview column shows for a service row, where a pane row
+/// shows its pane: the title, the body wrapped, then source and age dim.
+/// One Seg per line, at most `height` of them.
+fn service_preview(e: &Entry, now: u64, width: usize, height: usize) -> Vec<Seg> {
+    let mut lines: Vec<Seg> = Vec::new();
+    if !e.title.is_empty() {
+        lines.push(Seg(BOLD, e.title.clone()));
+        lines.push(Seg("", String::new()));
+    }
+    for l in wrap(&e.msg, width) {
+        lines.push(Seg("", l));
+    }
+    if !e.msg.is_empty() {
+        lines.push(Seg("", String::new()));
+    }
+    let when = age(now, e.at_ms);
+    lines.push(Seg(
+        DIM,
+        if when.is_empty() {
+            e.source.clone()
+        } else {
+            format!("{} \u{b7} {when}", e.source)
+        },
+    ));
+    lines.truncate(height);
+    lines
 }
 
 /// What a notification row says: the pane title in quotes, or the
@@ -1160,9 +1576,11 @@ fn chooser_render(ch: &mut Chooser, entries: &VecDeque<Entry>) {
         .max()
         .unwrap_or(0);
     // choose-tree right-aligns the window and pane indexes per level.
+    // Service rows carry a title there, which would pad every index to
+    // its length: they are measured on their own.
     let name_width = |depth: u32| {
         rows.iter()
-            .filter(|r| r.depth == depth)
+            .filter(|r| r.depth == depth && !r.service)
             .map(|r| r.name.chars().count())
             .max()
             .unwrap_or(0)
@@ -1175,10 +1593,15 @@ fn chooser_render(ch: &mut Chooser, entries: &VecDeque<Entry>) {
     }
     for (i, row) in rows.iter().enumerate().skip(ch.offset).take(visible) {
         out.push_str(&format!("\x1b[{};1H", i - ch.offset + 1));
+        let name_width = if row.service {
+            row.name.chars().count()
+        } else {
+            widths[row.depth as usize]
+        };
         out.push_str(&draw_row(
             row,
             key_width,
-            widths[row.depth as usize],
+            name_width,
             sel == Some(i),
             list_w,
         ));
@@ -1190,6 +1613,31 @@ fn chooser_render(ch: &mut Chooser, entries: &VecDeque<Entry>) {
                 col = list_w + 1
             ));
         }
+        // A service row has no pane to mirror: its preview is text,
+        // drawn where the pane preview would sit (one column in from
+        // the divider).
+        let service_note = sel
+            .map(|i| &rows[i])
+            .filter(|r| r.service)
+            .and_then(|r| r.note)
+            .and_then(|seq| entries.iter().find(|e| e.seq == seq));
+        if let Some(e) = service_note {
+            let col = list_w + 3;
+            let pw = (ch.width as usize).saturating_sub(col).max(1);
+            let lines = service_preview(e, now_ms(), pw, visible);
+            for (i, Seg(style, text)) in lines.iter().enumerate() {
+                let text: String = text.chars().take(pw).collect();
+                let sgr = if style.is_empty() {
+                    String::new()
+                } else {
+                    format!("\x1b[{style}m")
+                };
+                out.push_str(&format!(
+                    "\x1b[{};{col}H{sgr}{text}\x1b[0m",
+                    i + 1
+                ));
+            }
+        }
     }
     out.push_str(&format!(
         "\x1b[{height};1H\x1b[2m j/k move \u{b7} h/l fold \u{b7} \
@@ -1200,11 +1648,12 @@ fn chooser_render(ch: &mut Chooser, entries: &VecDeque<Entry>) {
     let _ = mode_preview(ch.mode, chooser_preview_rect(ch, &rows).as_ref());
 }
 
-/// Config -> (duration, width, show_when_visible, chooser_w, chooser_h);
-/// shared by init and on_config_changed so both parse identically.
+/// Config -> (duration, width, show_when_visible, chooser_w, chooser_h,
+/// pane_notifications); shared by init and on_config_changed so both
+/// parse identically.
 fn parse_config(
     config: &Config,
-) -> (Option<u64>, u64, bool, Option<SizeSpec>, Option<SizeSpec>) {
+) -> (Option<u64>, u64, bool, Option<SizeSpec>, Option<SizeSpec>, bool) {
     let duration = match config.duration_ms.as_deref() {
         Some("0") | Some("infinite") => None,
         other => Some(
@@ -1226,6 +1675,12 @@ fn parse_config(
         config.show_when_visible.as_deref() != Some("0"),
         SizeSpec::parse(config.chooser_width.as_ref()),
         SizeSpec::parse(config.chooser_height.as_ref()),
+        // Opt-in, unlike the others: off means the plugin never even
+        // subscribes to the pane source.
+        matches!(
+            config.pane_notifications.as_deref(),
+            Some("1") | Some("on") | Some("yes") | Some("true")
+        ),
     )
 }
 
@@ -1321,12 +1776,24 @@ impl NotifyToast {
     fn chooser_jump(&mut self, ctx: &Ctx, seq: u64, client: Option<u64>) {
         let target = {
             let st = self.state.borrow();
-            st.entries
-                .iter()
-                .find(|e| e.seq == seq)
-                .map(|e| (e.src_window, e.src_pane))
+            st.entries.iter().find(|e| e.seq == seq).map(|e| {
+                (e.src_window, e.src_pane, e.is_service().then(|| e.action.clone()))
+            })
         };
-        let Some((src_window, src_pane)) = target else { return };
+        let Some((src_window, src_pane, service)) = target else { return };
+        // A service row has no pane to go to: activating it runs the
+        // caller's action and drops the row.
+        if let Some(action) = service {
+            self.close_chooser();
+            self.state.borrow_mut().chooser = None;
+            let state = Rc::clone(&self.state);
+            let (width, keeper_secs, show_when_visible) = self.view_params();
+            ctx.spawn(async move {
+                activate(&state, seq, action, width, keeper_secs, show_when_visible)
+                    .await;
+            });
+            return;
+        }
         // Entries saved before the event carried a window scope have
         // none: fall back to the window the pane sits in right now.
         let src_window = src_window.or_else(|| {
@@ -1555,7 +2022,13 @@ impl NotifyToast {
                             ch.offset + mouse_row.unwrap_or(0) as usize;
                         if mouse_row.is_some() && idx < n {
                             select(ch, idx);
-                            Act::Redraw
+                            // A service row is a link: clicking it runs
+                            // its action. Pane rows keep click = select,
+                            // since a jump moves the user's focus.
+                            match rows[idx].note.filter(|_| rows[idx].service) {
+                                Some(seq) => Act::Jump(seq),
+                                None => Act::Redraw,
+                            }
                         } else {
                             Act::Nothing
                         }
@@ -1584,7 +2057,20 @@ impl NotifyToast {
     }
 
     fn view_params(&self) -> (u64, u64, bool) {
-        let keeper_secs = match self.duration {
+        // The keeper is the toast pane's own lifetime: it must outlive
+        // the longest-lived line on it, and a row's ttl can exceed the
+        // configured duration (or be "never").
+        let mut longest = self.duration;
+        for e in self.state.borrow().entries.iter() {
+            match (longest, e.expiry(self.duration)) {
+                (Some(a), Some(b)) => longest = Some(a.max(b)),
+                _ => {
+                    longest = None;
+                    break;
+                }
+            }
+        }
+        let keeper_secs = match longest {
             Some(d) => d.div_ceil(1000) * (MAX_LINES as u64) + 60,
             None => 2_147_483_647,
         };
@@ -1601,12 +2087,17 @@ impl Plugin for NotifyToast {
         if me.scope_kind != KIND_SERVER {
             return Err("notify-toast must be loaded with -s server".into());
         }
-        let (duration, width, show_when_visible, chooser_width, chooser_height) =
-            parse_config(&config);
+        let (
+            duration,
+            width,
+            show_when_visible,
+            chooser_width,
+            chooser_height,
+            pane_notifications,
+        ) = parse_config(&config);
 
         let role = ctx.role();
-        ctx.subscribe(&[
-            "pane-notification",
+        let mut events = vec![
             // A linked server appeared: follow its notifications.
             "link-up",
             // The view follows the user: repaint on anything that
@@ -1622,13 +2113,30 @@ impl Plugin for NotifyToast {
             // Re-anchor the toast when its window changes size (tmux
             // does not reposition floating panes on resize).
             "window-resized",
-        ])
-        .map_err(|e| e.message.clone())?;
+        ];
+        // The pane source is opt-in: not subscribed means the host never
+        // wakes us for a stop hook's OSC 9.
+        if pane_notifications {
+            events.push("pane-notification");
+        }
+        ctx.subscribe(&events).map_err(|e| e.message.clone())?;
 
         if role.views() {
-            for s in service::servers().unwrap_or_default() {
-                if !s.local && s.up {
-                    follow(&s.name);
+            // The `notify` method other plugins call. Needs service-serve;
+            // a manifest without the grant still gets the pane source,
+            // so the failure is logged rather than failing init.
+            if let Err(e) = service::register(NOTIFY_METHOD) {
+                log(&format!(
+                    "service::register({NOTIFY_METHOD}) failed: {} \
+                     (grant service-serve to accept notifications)",
+                    e.message
+                ));
+            }
+            if pane_notifications {
+                for s in service::servers().unwrap_or_default() {
+                    if !s.local && s.up {
+                        follow(&s.name);
+                    }
                 }
             }
         }
@@ -1640,6 +2148,7 @@ impl Plugin for NotifyToast {
             show_when_visible,
             chooser_width,
             chooser_height,
+            pane_notifications,
             seq: 0,
             state: State::default(),
         })
@@ -1649,14 +2158,31 @@ impl Plugin for NotifyToast {
     /// panes (only our views map knows about them) and drop the feed.
     /// Already-armed expiry timers keep their old duration; new entries
     /// use the new one.
-    fn on_config_changed(&mut self, _ctx: &Ctx, config: Config) -> bool {
+    fn on_config_changed(&mut self, ctx: &Ctx, config: Config) -> bool {
+        let was_on = self.pane_notifications;
         (
             self.duration,
             self.width,
             self.show_when_visible,
             self.chooser_width,
             self.chooser_height,
+            self.pane_notifications,
         ) = parse_config(&config);
+        // Turning the pane source on needs the subscription init skipped;
+        // turning it off is gated in on_event (events still arrive, and
+        // are dropped).
+        if self.pane_notifications && !was_on {
+            if let Err(e) = ctx.subscribe(&["pane-notification"]) {
+                log(&format!("subscribe pane-notification: {}", e.message));
+            }
+            if self.role.views() {
+                for s in service::servers().unwrap_or_default() {
+                    if !s.local && s.up {
+                        follow(&s.name);
+                    }
+                }
+            }
+        }
         log("config absorbed");
         true
     }
@@ -1684,12 +2210,13 @@ impl Plugin for NotifyToast {
         state: serde_json::Value,
     ) -> Option<Self> {
         let snap: Snapshot = serde_json::from_value(state).ok()?;
-        // One row per pane is the feed's invariant, so restore it rather
-        // than assume it: a snapshot taken before the rule existed holds
-        // a row per ping. Newest wins, counts add up.
+        // One row per origin (pane, or source and key) is the feed's
+        // invariant, so restore it rather than assume it: a snapshot
+        // taken before the rule existed holds a row per ping. Newest
+        // wins, counts add up.
         let mut entries: VecDeque<Entry> = VecDeque::new();
         for e in snap.entries {
-            match entries.iter().position(|x| x.src_pane == e.src_pane) {
+            match entries.iter().position(|x| x.replaced_by(&e)) {
                 Some(i) => {
                     let count = entries.remove(i).map_or(0, |x| x.count.max(1));
                     entries.push_back(Entry {
@@ -1721,23 +2248,23 @@ impl Plugin for NotifyToast {
         };
 
         // The old instance's expiry tasks died with it: re-arm one per
-        // restored entry (each gets a fresh full duration; the elapsed
-        // part is not carried), then reconcile the adopted panes once.
+        // restored entry (each gets a fresh full duration - its own ttl
+        // or the configured one; the elapsed part is not carried), then
+        // reconcile the adopted panes once.
         let (width, keeper_secs, show_when_visible) = me.view_params();
         let ctx = Ctx::new();
-        if let Some(duration_ms) = me.duration {
-            for e in me.state.borrow().entries.iter() {
-                let seq = e.seq;
-                let state = Rc::clone(&me.state);
-                ctx.spawn(async move {
-                    if sleep_ms(duration_ms).await.is_err() {
-                        return;
-                    }
-                    state.borrow_mut().entries.retain(|x| x.seq != seq);
-                    sync_views(&state, width, keeper_secs, show_when_visible)
-                        .await;
-                });
-            }
+        for e in me.state.borrow().entries.iter() {
+            let Some(duration_ms) = e.expiry(me.duration) else { continue };
+            let seq = e.seq;
+            let state = Rc::clone(&me.state);
+            ctx.spawn(async move {
+                if sleep_ms(duration_ms).await.is_err() {
+                    return;
+                }
+                state.borrow_mut().entries.retain(|x| x.seq != seq);
+                sync_views(&state, width, keeper_secs, show_when_visible)
+                    .await;
+            });
         }
         let state = Rc::clone(&me.state);
         ctx.spawn(async move {
@@ -1751,9 +2278,12 @@ impl Plugin for NotifyToast {
         let state = Rc::clone(&self.state);
 
         match event.name().as_str() {
+            // Still delivered after the option is turned off at runtime
+            // (there is no unsubscribe on this path), hence the gate.
+            "pane-notification" if !self.pane_notifications => return,
             "pane-notification" => {}
             "link-up" => {
-                if self.role.views() {
+                if self.role.views() && self.pane_notifications {
                     if let Some(server) = event.get_str("server") {
                         follow(server);
                     }
@@ -1991,6 +2521,11 @@ impl Plugin for NotifyToast {
                     session_name: String::new(),
                     window_name: String::new(),
                     count: 0,
+                    source: String::new(),
+                    key: String::new(),
+                    action: None,
+                    ttl_ms: None,
+                    at_ms: now_ms(),
                 };
                 let loc = locate(&Topo::fetch(), &probe);
                 Entry {
@@ -2020,26 +2555,40 @@ impl Plugin for NotifyToast {
             return;
         }
         let Ok(mut entry) = ev.json::<Entry>() else { return };
+        // Forwarded pane notifications are the pane source too.
+        if !entry.is_service() && !self.pane_notifications {
+            return;
+        }
         let (width, keeper_secs, show_when_visible) = self.view_params();
         let state = Rc::clone(&self.state);
         self.seq += 1;
         let seq = self.seq;
-        let duration = self.duration;
-        // The pane the notification names is on the other server. When a
-        // shadow pane mirrors it here, the toast points at that (so the
-        // chooser can jump to it); otherwise it keeps a synthetic id
-        // that no local pane can match.
-        match mirror_of(&ev.server, entry.src_pane) {
-            Some((pane, window)) => {
-                entry.src_pane = pane;
-                entry.src_window = Some(window);
+        let duration = entry.expiry(self.duration);
+        if entry.is_service() {
+            // A service row from a provider: no pane to mirror, and its
+            // action would run on the wrong server, so it only dismisses.
+            entry.src_pane = SERVICE_PANE_BASE | seq;
+            entry.src_window = None;
+            entry.source = format!("{}/{}", ev.server, entry.source);
+            entry.action = None;
+        } else {
+            // The pane the notification names is on the other server.
+            // When a shadow pane mirrors it here, the toast points at
+            // that (so the chooser can jump to it); otherwise it keeps a
+            // synthetic id that no local pane can match.
+            match mirror_of(&ev.server, entry.src_pane) {
+                Some((pane, window)) => {
+                    entry.src_pane = pane;
+                    entry.src_window = Some(window);
+                }
+                None => {
+                    entry.src_pane = REMOTE_PANE_BASE | entry.src_pane;
+                    entry.src_window = None;
+                }
             }
-            None => {
-                entry.src_pane = REMOTE_PANE_BASE | entry.src_pane;
-                entry.src_window = None;
-            }
+            entry.session_name =
+                format!("{}/{}", ev.server, entry.session_name);
         }
-        entry.session_name = format!("{}/{}", ev.server, entry.session_name);
         entry.seq = seq;
         entry.count = 0;
         ctx.spawn(async move {
@@ -2047,10 +2596,58 @@ impl Plugin for NotifyToast {
                 .await;
         });
     }
+
+    /// Another plugin calls `notify`: validate, answer with the row id,
+    /// and put the row into the feed like a pane notification.
+    fn on_service_request(&mut self, ctx: &Ctx, req: ServiceRequest) {
+        if req.method != NOTIFY_METHOD {
+            let _ = req.fail("unknown method");
+            return;
+        }
+        if !self.role.views() {
+            let _ = req.fail("notify-toast: this instance shows nothing");
+            return;
+        }
+        let raw: NotifyReq = match req.json() {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = req.fail(&format!("notify: {}", e.message));
+                return;
+            }
+        };
+        // The seq is the row id the caller gets back; a keyed repeat
+        // takes a fresh one, like a pane that pings again.
+        let seq = self.seq + 1;
+        let entry = match raw.into_entry(seq, now_ms()) {
+            Ok(e) => e,
+            Err(msg) => {
+                let _ = req.fail(&msg);
+                return;
+            }
+        };
+        self.seq = seq;
+        let _ = req.reply_json(&serde_json::json!({ "ok": true, "id": seq }));
+
+        // Inserted before view_params so the keeper accounts for this
+        // row's ttl; the repaint and the expiry run as a task.
+        let duration = entry.expiry(self.duration);
+        let origin = entry.origin();
+        insert_entry(&mut self.state.borrow_mut().entries, entry);
+        log(&format!("notification from {origin}: added to feed"));
+        let (width, keeper_secs, show_when_visible) = self.view_params();
+        let state = Rc::clone(&self.state);
+        ctx.spawn(async move {
+            settle(&state, seq, duration, width, keeper_secs, show_when_visible)
+                .await;
+        });
+    }
 }
 
 /// The service topic a provider forwards notifications on.
 const TOPIC: &str = "notify";
+
+/// The service method other plugins call to put a row in the feed.
+const NOTIFY_METHOD: &str = "notify";
 
 /// Synthetic pane ids for forwarded notifications whose pane has no local
 /// mirror, clear of any real pane id.
@@ -2086,29 +2683,24 @@ async fn add_entry(
     keeper_secs: u64,
     show_when_visible: bool,
 ) {
-    let src_pane = entry.src_pane;
-    {
-        let mut st = state.borrow_mut();
-        // A pane holds one row however often it pings: a repeat
-        // replaces the old entry, carrying its tally and taking
-        // a fresh seq. The old entry's expiry task fires later,
-        // finds that seq gone and does nothing.
-        let count = st
-            .entries
-            .iter()
-            .find(|e| e.src_pane == src_pane)
-            .map_or(0, |e| e.count.max(1));
-        st.entries.retain(|e| e.src_pane != src_pane);
-        st.entries.push_back(Entry { count: count + 1, ..entry });
-        while st.entries.len() > MAX_LINES {
-            st.entries.pop_front();
-        }
-    }
-    log(&format!("notification from %{src_pane}: added to feed"));
-    sync_views(state, width, keeper_secs, show_when_visible).await;
+    let origin = entry.origin();
+    insert_entry(&mut state.borrow_mut().entries, entry);
+    log(&format!("notification from {origin}: added to feed"));
+    settle(state, seq, duration, width, keeper_secs, show_when_visible).await;
+}
 
-    // Expire this line, then reconcile again. With an infinite
-    // duration the line stays until the pane is dismissed.
+/// Show the feed with row `seq` just added, then expire that row after
+/// `duration` and show it again. With no duration the row stays until
+/// the user dismisses it.
+async fn settle(
+    state: &State,
+    seq: u64,
+    duration: Option<u64>,
+    width: u64,
+    keeper_secs: u64,
+    show_when_visible: bool,
+) {
+    sync_views(state, width, keeper_secs, show_when_visible).await;
     let Some(duration_ms) = duration else { return };
     if sleep_ms(duration_ms).await.is_err() {
         return; // instance torn down
@@ -2117,4 +2709,196 @@ async fn add_entry(
     sync_views(state, width, keeper_secs, show_when_visible).await;
 }
 
+/// Activate a service row: run the caller's action, if it set one, then
+/// drop the row. The row goes even when the command fails - the user
+/// asked for it, and a broken action is the caller's to fix (logged).
+async fn activate(
+    state: &State,
+    seq: u64,
+    action: Option<String>,
+    width: u64,
+    keeper_secs: u64,
+    show_when_visible: bool,
+) {
+    if let Some(cmd) = action {
+        if let Err(e) = run_command(&cmd).await {
+            log(&format!("action {cmd:?} failed: {}", e.message));
+        }
+    }
+    state.borrow_mut().entries.retain(|e| e.seq != seq);
+    sync_views(state, width, keeper_secs, show_when_visible).await;
+}
+
 tmux_plugin!(NotifyToast);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req(json: &str) -> Result<Entry, String> {
+        let raw: NotifyReq = serde_json::from_str(json).expect("json");
+        raw.into_entry(7, 1_000_000)
+    }
+
+    #[test]
+    fn request_defaults_fill_what_the_caller_left_out() {
+        let e = req(r##"{"source":"slack","title":"#general · Tejas","body":"hi"}"##)
+            .unwrap();
+        assert_eq!(e.source, "slack");
+        assert_eq!(e.title, "#general · Tejas");
+        assert_eq!(e.msg, "hi");
+        assert!(e.key.is_empty());
+        assert_eq!(e.action, None);
+        assert_eq!(e.ttl_ms, None);
+        assert_eq!(e.expiry(Some(6_000)), Some(6_000));
+        assert_eq!(e.at_ms, 1_000_000);
+        assert_eq!(e.seq, 7);
+        assert!(e.is_service());
+        // Clear of any real pane id.
+        assert!(e.src_pane >= SERVICE_PANE_BASE);
+        assert_eq!(e.src_window, None);
+        assert_eq!(service_text(&e), "#general · Tejas: hi");
+    }
+
+    #[test]
+    fn request_reads_every_field() {
+        let e = req(
+            r#"{"source":"slack","key":"slack:C1/1.2","title":"t",
+                "body":"first line\nsecond","action":" plugin-command slack 'open C1 1.2' ",
+                "ttl_ms":15000}"#,
+        )
+        .unwrap();
+        assert_eq!(e.key, "slack:C1/1.2");
+        assert_eq!(e.msg, "first line", "the toast is one line per row");
+        assert_eq!(e.action.as_deref(), Some("plugin-command slack 'open C1 1.2'"));
+        assert_eq!(e.ttl_ms, Some(15_000));
+        assert_eq!(e.expiry(None), Some(15_000), "ttl beats an infinite default");
+        // ttl 0 = never, even against a finite default; tiny ttls are
+        // raised to the duration_ms floor.
+        let never = req(r#"{"source":"s","body":"b","ttl_ms":0}"#).unwrap();
+        assert_eq!(never.expiry(Some(6_000)), None);
+        let short = req(r#"{"source":"s","body":"b","ttl_ms":10}"#).unwrap();
+        assert_eq!(short.ttl_ms, Some(1_000));
+        // An empty action is no action.
+        let blank = req(r#"{"source":"s","body":"b","action":"  "}"#).unwrap();
+        assert_eq!(blank.action, None);
+    }
+
+    #[test]
+    fn request_without_a_source_fails() {
+        let err = req(r#"{"title":"t","body":"b"}"#).unwrap_err();
+        assert!(err.contains("source"), "{err}");
+        let err = req(r#"{"source":"  ","body":"b"}"#).unwrap_err();
+        assert!(err.contains("source"), "{err}");
+        // Nothing to show is also a bad request.
+        let err = req(r#"{"source":"slack"}"#).unwrap_err();
+        assert!(err.contains("title"), "{err}");
+        // Garbage is a decode error, not a panic.
+        assert!(serde_json::from_str::<NotifyReq>("[1,2]").is_err());
+    }
+
+    #[test]
+    fn same_key_replaces_the_row_and_bumps_the_count() {
+        let mut feed = VecDeque::new();
+        let mk = |seq: u64, key: &str| {
+            NotifyReq {
+                source: "slack".into(),
+                key: key.into(),
+                body: format!("msg {seq}"),
+                ..NotifyReq::default()
+            }
+            .into_entry(seq, seq * 1000)
+            .unwrap()
+        };
+        assert_eq!(insert_entry(&mut feed, mk(1, "a")), 1);
+        assert_eq!(insert_entry(&mut feed, mk(2, "a")), 2);
+        assert_eq!(feed.len(), 1, "a keyed repeat holds one row");
+        let row = feed.back().unwrap();
+        assert_eq!((row.seq, row.count, row.msg.as_str()), (2, 2, "msg 2"));
+
+        // A different key, or no key at all, is a row of its own; a
+        // keyless repeat never collapses.
+        assert_eq!(insert_entry(&mut feed, mk(3, "b")), 1);
+        assert_eq!(insert_entry(&mut feed, mk(4, "")), 1);
+        assert_eq!(insert_entry(&mut feed, mk(5, "")), 1);
+        assert_eq!(feed.len(), 4);
+
+        // The same key from another source is another row.
+        let other = NotifyReq {
+            source: "mail".into(),
+            key: "a".into(),
+            body: "x".into(),
+            ..NotifyReq::default()
+        }
+        .into_entry(6, 0)
+        .unwrap();
+        assert_eq!(insert_entry(&mut feed, other), 1);
+        assert_eq!(feed.len(), 5);
+    }
+
+    #[test]
+    fn pane_rows_keep_one_row_per_pane_and_never_mix_with_service_rows() {
+        let pane = |seq: u64, pane: u64| Entry {
+            seq,
+            src_window: Some(1),
+            src_pane: pane,
+            msg: "done".into(),
+            cmd: String::new(),
+            title: String::new(),
+            session_name: "main".into(),
+            window_name: "w".into(),
+            count: 0,
+            source: String::new(),
+            key: String::new(),
+            action: None,
+            ttl_ms: None,
+            at_ms: 0,
+        };
+        let mut feed = VecDeque::new();
+        assert_eq!(insert_entry(&mut feed, pane(1, 5)), 1);
+        assert_eq!(insert_entry(&mut feed, pane(2, 5)), 2);
+        assert_eq!(insert_entry(&mut feed, pane(3, 6)), 1);
+        assert_eq!(feed.len(), 2);
+        // A service row whose synthetic id happened to collide could
+        // not replace a pane row: identity is by kind first.
+        let mut svc = NotifyReq {
+            source: "slack".into(),
+            key: "k".into(),
+            body: "b".into(),
+            ..NotifyReq::default()
+        }
+        .into_entry(4, 0)
+        .unwrap();
+        svc.src_pane = 5;
+        assert_eq!(insert_entry(&mut feed, svc), 1);
+        assert_eq!(feed.len(), 3);
+        assert!(!feed[0].is_service() && feed[2].is_service());
+    }
+
+    #[test]
+    fn toast_and_preview_text() {
+        let e = req(r##"{"source":"slack","title":"#general · Tejas","body":"the text, one line"}"##)
+            .unwrap();
+        let line = service_line(&e, 44);
+        assert!(line.starts_with("\\033[2mslack\\033[0m #general"), "{line}");
+        // Clipped to the width: source + text never exceed it.
+        let long = req(&format!(r#"{{"source":"slack","body":"{}"}}"#, "x".repeat(200)))
+            .unwrap();
+        let visible: String = service_line(&long, 44)
+            .replace("\\033[2m", "")
+            .replace("\\033[0m", "");
+        assert!(visible.chars().count() <= 44, "{visible}");
+
+        assert_eq!(age(1_000_000, 0), "");
+        assert_eq!(age(1_000_000, 999_000), "just now");
+        assert_eq!(age(1_000_000, 940_000), "1m ago");
+        assert_eq!(age(10_000_000, 1_000_000), "2h ago");
+        assert_eq!(wrap("aa bb cc", 5), vec!["aa bb", "cc"]);
+        assert_eq!(wrap("abcdefgh", 3), vec!["abc", "def", "gh"]);
+
+        let lines = service_preview(&e, 1_005_000, 40, 10);
+        assert_eq!(lines[0].1, "#general · Tejas");
+        assert_eq!(lines[2].1, "the text, one line");
+        assert_eq!(lines.last().unwrap().1, "slack \u{b7} 5s ago");
+    }
+}
