@@ -480,6 +480,17 @@ fn ensure_preview(st: &Shared) {
 // events
 // ---------------------------------------------------------------------------
 
+/// A key arriving by another road than the mode (the Space menu's
+/// `menu-key`): handled exactly as a press, with no mouse position.
+pub fn replay_key(st: &Shared, key: &str) {
+    let outcome = {
+        let mut s = st.borrow_mut();
+        let Some(side) = s.side.as_mut() else { return };
+        side.engine.handle_key(key, None)
+    };
+    execute(st, outcome);
+}
+
 pub fn on_mode_event(st: &Shared, name: &str, event: &Event) {
     match name {
         "mode-key" => {

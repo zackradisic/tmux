@@ -877,6 +877,21 @@ enum After {
     Older,
 }
 
+/// A key arriving by another road than the mode (the Space menu's
+/// `menu-key`): handled exactly as a press, with no mouse position.
+pub fn replay_key(st: &Shared, key: &str) {
+    let after = {
+        let mut s = st.borrow_mut();
+        if s.chat.is_none() {
+            return;
+        }
+        let after = handle_key(&mut s, key, None);
+        paint(&s);
+        after
+    };
+    run(st, after);
+}
+
 pub fn on_mode_event(st: &Shared, name: &str, event: &Event) {
     match name {
         "mode-key" => {

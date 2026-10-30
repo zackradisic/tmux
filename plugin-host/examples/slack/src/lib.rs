@@ -736,6 +736,22 @@ fn on_command(st: &Shared, event: &Event) {
             sidebar::close(st);
             chat::close(st);
         }
+        // "menu-key <key>": an item of a view's Space menu (display-menu)
+        // handing its key back, so the menu is a mirror of the keymap and
+        // never a second code path. The channel view has the focus when
+        // it is open; else the sidebar.
+        "menu-key" => {
+            let key = rest.split_whitespace().next().unwrap_or("").to_string();
+            if key.is_empty() {
+                return;
+            }
+            let chat_open = st.borrow().chat.is_some();
+            if chat_open {
+                chat::replay_key(st, &key);
+            } else {
+                sidebar::replay_key(st, &key);
+            }
+        }
         _ => {
             let _ = reply(&format!("slack: unknown verb {verb:?} - `slack help` lists them"));
         }
