@@ -28,8 +28,18 @@
 #     the "new messages" rule before the first unread message that is not
 #     ours; the Slack Connect author U3 (not in users.list) is named
 #     through users.info, once; a bot card with no text shows its
-#     fields; `i`, typed text, Enter posts to the fake and the view
-#     shows it; `q` closes;
+#     fields; `i`, typed text, Enter posts to the fake and the view shows
+#     it; Enter on that message (no replies yet) opens its thread, `i`
+#     then Enter posts there with its thread_ts and the reply shows;
+#     Escape goes back to the timeline, Escape again to the sidebar;
+#     `q` closes;
+#   `open #general <ts>` shows the thread directly and Escape opens the
+#     channel's timeline rather than closing; `menu-key Enter`/`Escape`
+#     (the Space menu's road back) drive the same keys; `q` closes from
+#     a thread outright;
+#   Space draws the action menu, titled with the channel, on a real tty
+#     client (a second server attached to this one, as in
+#     plugin-agents-menu.sh), with the items that do not apply dimmed;
 #   `send @Tejas ...` posts to the DM; `mark #general` reaches
 #     conversations.mark; `bind`/`unbind` answer; the plugin is still
 #     alive at the end.
@@ -78,7 +88,7 @@ fail() {
 		$TMUX capture-pane -M -p -t "$FORM" 2>/dev/null | sed '/^ *$/d' >&2
 	fi
 	if [ -n "$VIEW" ]; then
-		echo "--- what the client sees:" >&2
+		echo "--- what the tty client sees:" >&2
 		$OUTER capture-pane -p -t "$VIEW" 2>/dev/null | sed '/^ *$/d' >&2
 	fi
 	echo "--- fake log (tail):" >&2
@@ -97,10 +107,17 @@ ncalls() {
 m = sys.argv[1]; f = sys.argv[2] if len(sys.argv) > 2 else None; v = sys.argv[3] if len(sys.argv) > 3 else None
 print(sum(1 for c in json.load(sys.stdin) if c[0] == m and (f is None or c[1].get(f) == v)))' "$@"
 }
-# How many messages with text $2 were posted to channel $1.
+# How many messages with text $2 were posted to channel $1 (in thread $3,
+# when given).
 nposted() {
 	fetch "$BASE/_posted" | python3 -c 'import json, sys
-print(sum(1 for p in json.load(sys.stdin) if p["channel"] == sys.argv[1] and p["text"] == sys.argv[2]))' "$1" "$2"
+t = sys.argv[3] if len(sys.argv) > 3 else None
+print(sum(1 for p in json.load(sys.stdin) if p["channel"] == sys.argv[1] and p["text"] == sys.argv[2] and (t is None or p["thread_ts"] == t)))' "$@"
+}
+# The ts of the message with text $2 posted to channel $1.
+posted_ts() {
+	fetch "$BASE/_posted" | python3 -c 'import json, sys
+print(next(p["ts"] for p in json.load(sys.stdin) if p["channel"] == sys.argv[1] and p["text"] == sys.argv[2]))' "$1" "$2"
 }
 # Run `$2...` every quarter second until it succeeds, at most $1 times.
 until_ok() {
@@ -121,11 +138,18 @@ seen_has() { seen | grep -q -- "$1"; }
 # The pane in plugin mode, if any.
 mode_pane() { $TMUX list-panes -a -F '#{pane_id} #{pane_mode}' | awk '/plugin-mode/ { print $1; exit }'; }
 mode_open() { [ -n "$(mode_pane)" ]; }
+# Whichever pane is in plugin mode shows $1.
+mode_shows() { p=$(mode_pane); [ -n "$p" ] && $TMUX capture-pane -M -p -t "$p" | grep -q -- "$1"; }
 mode_closed() { [ -z "$(mode_pane)" ]; }
 keys() { $TMUX send-keys -t "$FORM" "$@"; sleep 0.4; }
 slack() { $TMUX plugin-command slack "$*"; }
 status_ready() { slack status | grep -q 'zack on Morph'; }
-posted() { [ "$(nposted "$1" "$2")" -ge 1 ]; }
+posted() { [ "$(nposted "$@")" -ge 1 ]; }
+# What the tty client's terminal renders, overlays (a menu) included.
+seen() { $OUTER capture-pane -p -t "$VIEW" | sed '/^ *$/d'; }
+seen_has() { seen | grep -q -- "$1"; }
+seen_lacks() { ! seen_has "$1"; }
+VIEW=
 marks_grew() { [ "$(ncalls conversations.mark channel C1)" -gt "$1" ]; }
 FORM=
 VIEW=
@@ -148,7 +172,7 @@ done
 [ "$(fetch "$BASE/_calls")" = "[]" ] || fail "the fake answers oddly: $(fetch "$BASE/_calls")"
 
 # Watchdog: nothing below may hang.
-( sleep 150; echo "FAIL: watchdog" >&2; $TMUX kill-server 2>/dev/null; kill $$ 2>/dev/null ) &
+( sleep 300; echo "FAIL: watchdog" >&2; $OUTER kill-server 2>/dev/null; $TMUX kill-server 2>/dev/null; kill $$ 2>/dev/null ) &
 WATCHDOG=$!
 
 # --- the server and the plugin ----------------------------------------------
@@ -279,9 +303,111 @@ keys Enter
 until_ok 40 posted C1 'hello there' || fail "the post did not reach the fake: $(fetch "$BASE/_posted")"
 until_ok 40 screen_has 'hello there' || fail "the posted message is not shown"
 screen | grep -q 'posting' && fail "the posting status stayed"
+ROOT=$(posted_ts C1 'hello there')
+# Enter opens the thread of the message under the cursor - the one we
+# just posted, which has no replies - and does not compose.
+keys Enter
+until_ok 40 screen_has '· thread' || fail "Enter did not open the thread"
+until_ok 40 screen_lacks 'morning' || fail "the thread still shows the timeline"
+screen_has 'hello there' || fail "the thread lacks its root"
+screen | grep -q '› ' && fail "Enter opened the compose box"
+# i then Enter is "reply in this thread": the post carries the root's ts.
+keys i
+$TMUX send-keys -t "$FORM" -l 'in the thread'; sleep 0.4
+screen_has 'reply › in the thread' || fail "the thread compose box is not a reply box"
+keys Enter
+until_ok 40 posted C1 'in the thread' "$ROOT" || fail "the reply did not carry thread_ts=$ROOT: $(fetch "$BASE/_posted")"
+until_ok 40 screen_has 'in the thread' || fail "the reply is not shown in the thread"
+# Escape: back to the timeline, then back to the sidebar.
+keys Escape
+until_ok 40 screen_has 'morning' || fail "Escape did not return to the timeline"
+screen_lacks '· thread' || fail "the title still says thread after Escape"
+screen_has '1 reply' || fail "the root shows no reply marker in the timeline"
+# The sidebar is a float of its own: find the mode pane again.
+keys Escape
+until_ok 40 mode_shows 'slack Morph' || fail "Escape in the timeline did not open the sidebar"
+FORM=$(mode_pane)
 keys q
-until_ok 40 mode_closed || fail "q did not close the channel view"
+until_ok 40 mode_closed || fail "q did not close the sidebar"
 FORM=
+
+# --- a thread opened directly, the menu-key door, q from a thread -----------
+$TMUX plugin-command -t "$PANE" slack "open #general $ROOT" || fail "plugin-command open with a ts"
+until_ok 40 mode_open || fail "open with a ts opened no plugin mode"
+FORM=$(mode_pane)
+until_ok 60 screen_has 'in the thread' || fail "open with a ts did not show the thread"
+screen_has '· thread' || fail "the directly opened thread is not titled as one"
+# Escape here opens the channel's timeline instead of closing.
+keys Escape
+until_ok 40 screen_has 'morning' || fail "Escape from a directly opened thread did not open the timeline"
+mode_open || fail "Escape from a directly opened thread closed the view"
+# The Space menu's items come back through `menu-key <key>`: the same
+# keys, the same view. The cursor follows the bottom: the root.
+slack 'menu-key Enter'
+until_ok 40 screen_has '· thread' || fail "menu-key Enter did not open the thread"
+slack 'menu-key Escape'
+until_ok 40 screen_has 'morning' || fail "menu-key Escape did not return to the timeline"
+slack 'menu-key Enter'
+until_ok 40 screen_has '· thread' || fail "menu-key Enter did not reopen the thread"
+# q closes outright, thread or not.
+keys q
+until_ok 40 mode_closed || fail "q did not close the channel view from a thread"
+FORM=
+
+# --- Space draws the menu -------------------------------------------------------
+# A menu is a client overlay on a real tty: the control client cannot
+# draw one. A second server's pane attaches to this one as a genuine
+# pty client, and capturing that pane is what the user would see.
+$OUTER kill-server 2>/dev/null
+$OUTER -f/dev/null new-session -d -x 160 -y 45 "$TEST_TMUX -Lslack-test attach -t main" || fail "outer new-session"
+until_ok 40 sh -c "$TMUX list-clients -F '#{client_tty}' | grep -q ." || fail "no tty client attached"
+VIEW=$($OUTER list-panes -F '#{pane_id}' | head -1)
+[ -n "$VIEW" ] || fail "no viewer pane"
+$TMUX plugin-command -t "$PANE" slack 'open #general' || fail "plugin-command open (menu)"
+until_ok 40 mode_open || fail "open (menu) opened no plugin mode"
+FORM=$(mode_pane)
+until_ok 60 screen_has 'morning' || fail "the channel view never showed the history (menu)"
+screen_has 'Space menu' || fail "the footer does not point at the menu"
+keys Space
+until_ok 40 seen_has 'open thread' || fail "Space drew no menu"
+seen_has 'general' || fail "the menu is not titled with the channel"
+seen_has 'back to sidebar' || fail "the menu lacks the back-to-sidebar item"
+seen | grep 'open thread' | grep -q '(Enter)' || fail "open thread shows no key"
+seen | grep 'load older' | grep -q '(L)' || fail "load older shows no key"
+screen | grep -q '› ' && fail "Space opened the compose box"
+# The menu is the client's: dismiss it by typing on the tty, not the
+# pane. Every item's key is also its shortcut (Escape and q would run
+# "back" and "close"), so C-g is the plain dismissal.
+$OUTER send-keys -t "$VIEW" C-g
+until_ok 40 seen_lacks 'open thread' || fail "C-g did not dismiss the menu"
+mode_open || fail "dismissing the menu closed the view"
+screen_has 'morning' || fail "dismissing the menu changed the view"
+# In a thread the thread item is dimmed (tmux draws it without its key)
+# and back goes to the channel.
+keys Enter
+until_ok 40 screen_has '· thread' || fail "Enter did not open the thread (menu)"
+keys Space
+until_ok 40 seen_has 'back to channel' || fail "the thread menu lacks back-to-channel"
+seen | grep 'open thread' | grep -q '(Enter)' && fail "open thread offered a key inside a thread"
+seen | grep 'load older' | grep -q '(L)' && fail "load older offered a key inside a thread"
+# An item's key typed in the menu runs it: Escape is "back to channel",
+# so the menu agrees with the keymap by construction.
+$OUTER send-keys -t "$VIEW" Escape
+until_ok 40 seen_lacks 'back to channel' || fail "Escape did not take the thread menu down"
+until_ok 40 screen_has 'morning' || fail "Escape chosen in the menu did not return to the timeline"
+# While composing, Space types a space and Escape drops the text.
+keys i
+keys Space
+$TMUX send-keys -t "$FORM" -l 'x'; sleep 0.4
+screen_has '›  x' || fail "Space while composing did not type a space: $(screen | tail -2)"
+keys Escape
+screen | grep -q '›  x' && fail "Escape did not drop the composed text"
+mode_open || fail "Escape while composing left the view"
+keys q
+until_ok 40 mode_closed || fail "q did not close the channel view (menu)"
+FORM=
+$OUTER kill-server 2>/dev/null
+VIEW=
 
 # --- send, mark, bind ---------------------------------------------------------
 R=$(slack 'send @Tejas see you at 3')

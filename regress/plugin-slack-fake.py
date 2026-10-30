@@ -29,6 +29,7 @@ ME = "U1"
 LOCK = threading.Lock()
 CALLS = []   # [method, {field: value}]
 POSTED = []  # {"channel", "ts", "text", "thread_ts"}
+REPLIES = []  # thread replies, as messages plus "channel": what conversations.replies returns
 MARKS = {}   # channel -> ts
 
 USERS = [
@@ -163,7 +164,8 @@ def handle(method, f):
         root = [m for m in HISTORY.get(cid, []) if m["ts"] == ts]
         if not root:
             return err("thread_not_found")
-        return ok(messages=root, has_more=False)
+        replies = sorted((m for m in REPLIES if m["channel"] == cid and m["thread_ts"] == ts), key=lambda m: m["ts"])
+        return ok(messages=root + [{k: v for k, v in m.items() if k != "channel"} for m in replies], has_more=False)
     if method == "conversations.mark":
         cid, ts = f.get("channel", ""), f.get("ts", "")
         if cid not in COUNTS:
@@ -181,6 +183,12 @@ def handle(method, f):
         m = {"type": "message", "user": ME, "text": f.get("text", ""), "ts": fresh_ts()}
         if f.get("thread_ts"):
             m["thread_ts"] = f["thread_ts"]
+            REPLIES.append(dict(m, channel=cid))
+            # As Slack does: the root in the history grows a reply count.
+            for root in HISTORY[cid]:
+                if root["ts"] == f["thread_ts"]:
+                    root["reply_count"] = root.get("reply_count", 0) + 1
+                    root["latest_reply"] = m["ts"]
         else:
             HISTORY[cid].insert(0, m)
             COUNTS[cid]["latest"] = m["ts"]

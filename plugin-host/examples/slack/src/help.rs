@@ -48,13 +48,20 @@ the row, dimmed where one does not apply; each item is the key itself.";
 pub const OPEN: &str = "\
 open: the channel view.
 
-  j/k  move over messages      i / Enter  compose    Escape  cancel / back
-  J/K  page                    r          reply in the message's thread
-  g/G  top / bottom            t          open the message's thread
+  j/k  move over messages      Enter / t  open the message's thread
+  J/K  page                    i          compose (Enter sends)
+  g/G  top / bottom            r          reply in the message's thread
   L    load older              e          react (type :name: then Enter)
   o    open in the Slack app   y          copy the permalink (tmux buffer)
-  m    mark read               b          back to the sidebar
-  R    refetch                 q          close
+  m    mark read               Space      the action menu (every key)
+  R    refetch                 Escape     back: thread, channel, sidebar
+  b    back to the sidebar     q          close
+
+Enter opens the thread of any message, with or without replies, so
+Enter then i is \"reply in this thread\". Escape steps back one level:
+from a thread to its channel (however the thread was opened), from
+the channel to the sidebar; q closes the view outright. Space lists
+every action as a menu; what does not apply is dimmed.
 
 While composing, keys type; Enter sends, Escape drops the text, a paste
 goes in as is (newlines kept).";
