@@ -51,7 +51,8 @@ sleep 0.5
 # variable inherited from whoever runs this test does not make it an
 # agent too. The agent in window 1 prints 300 numbered lines, so its
 # pane has history well beyond the screen, then waits. The one in
-# window 2 asks for mouse input and echoes what it gets, visibly.
+# window 2 asks for mouse input and echoes what it gets, visibly; the
+# one in window 3 does too, in SGR encoding (1006), as Claude Code does.
 $TMUX -f/dev/null new-session -d -s alpha -x 200 -y 50 'env -i PATH=/bin:/usr/bin sleep 600' || fail "new-session"
 $TMUX new-window -d -t alpha:1 \
     "sh -c 'AI_AGENT=claude; export AI_AGENT; seq 1 300 | sed s/^/line-/; exec sleep 600'" ||
@@ -59,10 +60,14 @@ $TMUX new-window -d -t alpha:1 \
 $TMUX new-window -d -t alpha:2 \
     "sh -c 'AI_AGENT=claude; export AI_AGENT; printf \"\\033[?1000h\"; exec cat -v'" ||
     fail "new-window 2"
+$TMUX new-window -d -t alpha:3 \
+    "sh -c 'AI_AGENT=claude; export AI_AGENT; printf \"\\033[?1000h\\033[?1006h\"; exec cat -v'" ||
+    fail "new-window 3"
 $TMUX set -g mouse on
 sleep 1
 PLAIN=$($TMUX list-panes -t alpha:1 -F '#{pane_id}')
 MOUSY=$($TMUX list-panes -t alpha:2 -F '#{pane_id}')
+SGR=$($TMUX list-panes -t alpha:3 -F '#{pane_id}')
 
 $TMUX load-plugin -s server -o trust_env=1 -c capture-pane -c run-command -c mode \
     -c db -c env-read -c pane-fds -c send-keys "$DEPLOY/agents.wasm" \
@@ -77,7 +82,7 @@ FORM=$($TMUX list-panes -a -F '#{pane_id} #{pane_mode}' | awk '/plugin-mode/ { p
 [ -n "$FORM" ] || fail "picker did not open"
 i=0
 while [ "$i" -lt 20 ]; do
-	screen | grep -q 'agents (2 live)' && break
+	screen | grep -q 'agents (3 live)' && break
 	sleep 0.4; i=$((i + 1))
 done
 
@@ -112,13 +117,31 @@ screen | grep -q 'line-300' || fail "the preview did not return to the pane's bo
 
 # The application that takes the mouse gets the notch itself: cat -v
 # echoes the encoded sequence.
-keys j
-sleep 0.4
-screen | grep -q 'line-300' && keys j
-wheel WheelUpPane 2
+# The rows' order is the roster's: step until a notch reaches it.
+keys g; keys g
+n=0
+while [ "$n" -lt 3 ]; do
+	wheel WheelUpPane 2
+	$TMUX capture-pane -p -t "$MOUSY" | grep -q '\^\[\[M' && break
+	keys j; n=$((n + 1))
+done
 shot mousy
 [ "$(in_mode "$MOUSY")" = 0 ] || fail "a pane that takes the mouse was put in copy mode"
 $TMUX capture-pane -p -t "$MOUSY" | grep -q '\^\[\[M' || fail "the application did not receive the wheel event"
+
+# In SGR encoding the notch must say it is a wheel: button 64 (up), not
+# a button-1 press with a NUL where the M belongs.
+# The rows' order is the roster's: step down until a notch reaches it.
+keys g; keys g
+n=0
+while [ "$n" -lt 3 ]; do
+	wheel WheelUpPane 1
+	$TMUX capture-pane -p -t "$SGR" | grep -q '\^\[\[<' && break
+	keys j; n=$((n + 1))
+done
+shot sgr
+$TMUX capture-pane -p -t "$SGR" | grep -q '\^\[\[<64;[0-9]*;[0-9]*M' ||
+	fail "the SGR application got $($TMUX capture-pane -p -t "$SGR" | head -3), not a wheel-up"
 
 cleanup
 echo "ok"

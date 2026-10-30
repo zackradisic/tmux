@@ -446,6 +446,14 @@ plugin_vtable_pane_mouse(u_int pane_id, const char *name, u_int x, u_int y,
 		y = wp->sy - 1;
 	m->valid = 1;
 	m->key = key;
+	/*
+	 * As a terminal reporting in SGR would send it: an application that
+	 * asked for SGR (Claude Code does) is answered in it, from sgr_b and
+	 * sgr_type, so left zeroed it got a button-1 press with a NUL for
+	 * the final byte instead of a wheel notch.
+	 */
+	m->sgr_type = 'M';
+	m->sgr_b = m->b;
 	m->statusat = -1;
 	m->x = m->lx = wp->xoff + x;
 	m->y = m->ly = wp->yoff + y;
