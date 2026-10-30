@@ -16,7 +16,7 @@ use std::rc::Rc;
 
 use listkit::lines::{clamp_dim, default_size, SizeBox};
 use listkit::styled::{emit_cells, fit_cells, plain_cells, wrap_cells, Styled, ST_BOLD, ST_BRIGHT, ST_CYAN, ST_DIM, ST_GREEN, ST_INVERT, ST_RED};
-use listkit::text::clip;
+use listkit::text::{clip, menu_item, menu_safe};
 use tmux_plugin_sdk::prelude::*;
 
 use crate::store::{Channel, Message};
@@ -59,7 +59,9 @@ pub struct Chat {
     pub channel: Channel,
     /// The root ts when the view shows a thread.
     pub thread: Option<String>,
-    /// The thread was opened with `t` from the timeline: q goes back.
+    /// The thread was opened with Enter from the timeline rather than
+    /// by `open <chan> <ts>`. Escape goes back to the timeline either
+    /// way; this only records how we got here.
     pub from_timeline: bool,
     pub client: Option<u64>,
     pub pane: Option<u32>,
@@ -294,7 +296,7 @@ fn relayout(s: &mut State) {
 // ---------------------------------------------------------------------------
 
 fn hints() -> &'static str {
-    "j/k move · i compose · r reply · t thread · e react · o app · y link · m read · L older · b sidebar · ? help · q close"
+    "j/k move · Enter thread · i compose · r reply · e react · y link · m read · L older · Space menu · Esc back · ? help · q close"
 }
 
 fn rule(width: usize) -> String {
@@ -862,12 +864,16 @@ fn switch(st: &Shared, thread: Option<String>, from_timeline: bool) {
 // ---------------------------------------------------------------------------
 
 /// What a key asks for once the borrow is dropped.
+#[derive(Clone, Debug, PartialEq)]
 enum After {
     None,
     Close,
+    /// Back from a thread to its channel's timeline.
     Back,
     Sidebar,
     Switch(Option<String>, bool),
+    /// The Space menu.
+    Menu,
     Post(String, Option<String>),
     React(String, String),
     OpenApp(String),
@@ -882,10 +888,8 @@ enum After {
 pub fn replay_key(st: &Shared, key: &str) {
     let after = {
         let mut s = st.borrow_mut();
-        if s.chat.is_none() {
-            return;
-        }
-        let after = handle_key(&mut s, key, None);
+        let Some(c) = s.chat.as_mut() else { return };
+        let after = handle_key(c, key, None);
         paint(&s);
         after
     };
@@ -902,10 +906,8 @@ pub fn on_mode_event(st: &Shared, name: &str, event: &Event) {
             };
             let after = {
                 let mut s = st.borrow_mut();
-                if s.chat.is_none() {
-                    return;
-                }
-                let after = handle_key(&mut s, &key, mouse);
+                let Some(c) = s.chat.as_mut() else { return };
+                let after = handle_key(c, &key, mouse);
                 paint(&s);
                 after
             };
@@ -1029,8 +1031,11 @@ fn compose_key(c: &mut Chat, key: &str) -> After {
     }
 }
 
-fn handle_key(s: &mut State, key: &str, mouse: Option<(u32, u32)>) -> After {
-    let Some(c) = s.chat.as_mut() else { return After::None };
+/// The keymap. Enter opens the thread of the message under the cursor
+/// (any message, replies or not), Escape steps back one level (thread
+/// -> timeline -> sidebar), q closes outright, Space opens the menu,
+/// which comes back here through `replay_key`.
+fn handle_key(c: &mut Chat, key: &str, mouse: Option<(u32, u32)>) -> After {
     if c.compose.is_some() {
         return compose_key(c, key);
     }
@@ -1093,7 +1098,7 @@ fn handle_key(s: &mut State, key: &str, mouse: Option<(u32, u32)>) -> After {
             c.set_cursor_idx(last);
             After::None
         }
-        "i" | "Enter" => {
+        "i" => {
             c.compose = Some(Compose { kind: ComposeKind::Message(c.thread.clone()), text: String::new() });
             After::None
         }
@@ -1104,7 +1109,9 @@ fn handle_key(s: &mut State, key: &str, mouse: Option<(u32, u32)>) -> After {
             c.compose = Some(Compose { kind: ComposeKind::Message(Some(root)), text: String::new() });
             After::None
         }
-        "t" => {
+        // Enter opens the thread of any message, with or without replies
+        // (Enter then i is "reply in this thread"); t is its alias.
+        "Enter" | "t" => {
             if c.thread.is_some() {
                 c.status = Some("already in the thread".into());
                 return After::None;
@@ -1139,13 +1146,17 @@ fn handle_key(s: &mut State, key: &str, mouse: Option<(u32, u32)>) -> After {
         }
         "L" => After::Older,
         "b" => After::Sidebar,
-        "q" | "Escape" => {
-            if c.thread.is_some() && c.from_timeline {
+        // Escape steps back one level: a thread (however it was opened)
+        // to its channel's timeline, the timeline to the sidebar.
+        "Escape" => {
+            if c.thread.is_some() {
                 After::Back
             } else {
-                After::Close
+                After::Sidebar
             }
         }
+        "q" => After::Close,
+        "Space" => After::Menu,
         "?" => {
             c.status = Some(hints().to_string());
             After::None
@@ -1177,6 +1188,59 @@ fn handle_key(s: &mut State, key: &str, mouse: Option<(u32, u32)>) -> After {
     }
 }
 
+/// The Space menu's items for the view as it stands: every key of the
+/// keymap, the ones that do not apply dimmed. Each item hands its key
+/// back through `plugin-command slack 'menu-key <key>'`, so the menu is
+/// a mirror of the keymap with no logic of its own.
+fn menu_items(c: &Chat) -> String {
+    let on_msg = c.cursor_idx().is_some();
+    let in_thread = c.thread.is_some();
+    let mut items = String::new();
+    items.push_str(&menu_item(NAME, "open thread", "Enter", on_msg && !in_thread));
+    items.push_str(&menu_item(NAME, "compose", "i", true));
+    items.push_str(&menu_item(NAME, "reply in thread", "r", on_msg));
+    items.push_str(&menu_item(NAME, "react", "e", on_msg));
+    items.push_str(&menu_item(NAME, "copy permalink", "y", on_msg));
+    items.push_str(&menu_item(NAME, "open in Slack app", "o", true));
+    items.push_str(" ''");
+    items.push_str(&menu_item(NAME, "mark read", "m", true));
+    items.push_str(&menu_item(NAME, "load older", "L", !in_thread));
+    items.push_str(" ''");
+    let back = if in_thread { "back to channel" } else { "back to sidebar" };
+    items.push_str(&menu_item(NAME, back, "Escape", true));
+    items.push_str(&menu_item(NAME, "help", "?", true));
+    items.push_str(&menu_item(NAME, "close", "q", true));
+    items
+}
+
+/// The action menu (Space): a `display-menu` on the client that pressed
+/// the key, titled with the channel, one item per key.
+async fn open_menu(st: Shared) {
+    let Some((title, items, client)) = ({
+        let s = st.borrow();
+        s.chat.as_ref().map(|c| (menu_safe(&s.channel_label(&c.channel), 30), menu_items(c), c.client))
+    }) else {
+        return;
+    };
+    let target = client
+        .and_then(|cid| list_clients().ok()?.into_iter().find(|c| u64::from(c.id) == cid))
+        .map(|c| c.name)
+        .filter(|n| n.chars().all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c)))
+        .map(|n| format!(" -c '{n}'"))
+        .unwrap_or_default();
+    // No -x/-y: display-menu then centres on the client's window, where
+    // the view floats. The `--` matters: a dimmed item is spelled
+    // `-label`, and when it comes first tmux would read it as a flag.
+    let cmd = format!("display-menu{target} -T ' {title} ' --{items}");
+    if let Err(e) = run_command(&cmd).await {
+        let mut s = st.borrow_mut();
+        if let Some(c) = s.chat.as_mut() {
+            c.status = Some(format!("menu failed: {}", e.message));
+        }
+        paint(&s);
+    }
+}
+
 /// The session, channel and generation of the open view, for an API
 /// call made on its behalf.
 fn view_ctx(st: &Shared) -> Option<(crate::store::Identity, String, u64)> {
@@ -1197,6 +1261,12 @@ fn run(st: &Shared, after: After) {
             sidebar::open(st, client, pane);
         }
         After::Switch(thread, from_timeline) => switch(st, thread, from_timeline),
+        After::Menu => {
+            let st2 = Rc::clone(st);
+            spawn(async move {
+                open_menu(st2).await;
+            });
+        }
         After::Post(text, thread) => {
             let Some(channel) = st.borrow().chat.as_ref().map(|c| c.channel.id.clone()) else { return };
             let st2 = Rc::clone(st);
@@ -1439,6 +1509,143 @@ mod tests {
         let t: Vec<&str> = msgs.iter().map(|m| m.text.as_str()).collect();
         assert_eq!(t, vec!["a2", "b", "c"]);
         assert!(msgs[0].edited);
+    }
+
+    /// A timeline view of two messages with the cursor on the last.
+    fn chat() -> Chat {
+        let channel = Channel {
+            id: "C1".into(),
+            name: "general".into(),
+            kind: crate::store::Kind::Public,
+            user_id: None,
+            topic: String::new(),
+            purpose: String::new(),
+            is_member: true,
+            is_muted: false,
+            is_starred: false,
+            is_archived: false,
+            is_open: true,
+            last_read: None,
+            latest: None,
+            has_unreads: false,
+            mentions: 0,
+            updated_ms: 0,
+        };
+        let msgs = vec![msg(NOON, "U2", "root"), msg(NOON + 10, "U1", "second")];
+        let mut c = Chat {
+            mode: ModeId(1),
+            channel,
+            thread: None,
+            from_timeline: false,
+            client: None,
+            pane: None,
+            width: 80,
+            height: 20,
+            msgs,
+            lines: Vec::new(),
+            top: 0,
+            cursor: None,
+            follow: true,
+            has_more: false,
+            last_read: None,
+            compose: None,
+            status: None,
+            gen: 1,
+            poll: None,
+            fetching: false,
+            marked_ms: 0,
+            loaded: true,
+        };
+        c.set_cursor_idx(1);
+        c
+    }
+
+    fn in_thread(from_timeline: bool) -> Chat {
+        let mut c = chat();
+        c.thread = Some(c.msgs[0].ts.clone());
+        c.from_timeline = from_timeline;
+        c
+    }
+
+    #[test]
+    fn enter_opens_the_thread_and_i_composes() {
+        let mut c = chat();
+        let second = c.msgs[1].ts.clone();
+        // Enter on a message without replies still opens its thread.
+        assert_eq!(handle_key(&mut c, "Enter", None), After::Switch(Some(second.clone()), true));
+        assert!(c.compose.is_none(), "Enter no longer composes");
+        // t is the alias.
+        assert_eq!(handle_key(&mut c, "t", None), After::Switch(Some(second), true));
+        // A reply opens its root's thread.
+        c.msgs[1].thread_ts = Some(c.msgs[0].ts.clone());
+        assert_eq!(handle_key(&mut c, "Enter", None), After::Switch(Some(c.msgs[0].ts.clone()), true));
+        // Only i composes, to the open conversation.
+        assert_eq!(handle_key(&mut c, "i", None), After::None);
+        assert_eq!(c.compose.as_ref().map(|cp| cp.kind.clone()), Some(ComposeKind::Message(None)));
+        // Inside the thread Enter has nothing to open; i replies there.
+        let mut t = in_thread(true);
+        assert_eq!(handle_key(&mut t, "Enter", None), After::None);
+        assert_eq!(t.status.as_deref(), Some("already in the thread"));
+        handle_key(&mut t, "i", None);
+        assert_eq!(t.compose.as_ref().map(|cp| cp.kind.clone()), Some(ComposeKind::Message(t.thread.clone())));
+    }
+
+    #[test]
+    fn escape_steps_back_and_q_closes() {
+        // Timeline: Escape (and b) to the sidebar, q closes.
+        let mut c = chat();
+        assert_eq!(handle_key(&mut c, "Escape", None), After::Sidebar);
+        assert_eq!(handle_key(&mut c, "b", None), After::Sidebar);
+        assert_eq!(handle_key(&mut c, "q", None), After::Close);
+        // A thread: Escape back to the timeline however it was opened.
+        assert_eq!(handle_key(&mut in_thread(true), "Escape", None), After::Back);
+        assert_eq!(handle_key(&mut in_thread(false), "Escape", None), After::Back);
+        assert_eq!(handle_key(&mut in_thread(false), "q", None), After::Close);
+    }
+
+    #[test]
+    fn space_is_the_menu_outside_the_compose_box() {
+        let mut c = chat();
+        assert_eq!(handle_key(&mut c, "Space", None), After::Menu);
+        // Composing: Space types, Enter sends, Escape drops the text.
+        handle_key(&mut c, "i", None);
+        handle_key(&mut c, "h", None);
+        assert_eq!(handle_key(&mut c, "Space", None), After::None);
+        handle_key(&mut c, "i", None);
+        assert_eq!(c.compose.as_ref().map(|cp| cp.text.as_str()), Some("h i"));
+        assert_eq!(handle_key(&mut c, "Enter", None), After::Post("h i".into(), None));
+        assert!(c.compose.is_none());
+        handle_key(&mut c, "i", None);
+        handle_key(&mut c, "x", None);
+        assert_eq!(handle_key(&mut c, "Escape", None), After::None);
+        assert!(c.compose.is_none(), "Escape drops the text");
+    }
+
+    #[test]
+    fn menu_mirrors_the_keymap() {
+        let items = menu_items(&chat());
+        assert!(items.contains(" 'open thread' 'Enter' \"plugin-command slack 'menu-key Enter'\""), "{items}");
+        assert!(items.contains(" 'compose' 'i' \"plugin-command slack 'menu-key i'\""), "{items}");
+        assert!(items.contains(" 'back to sidebar' 'Escape' "), "{items}");
+        assert!(items.contains(" 'load older' 'L' "), "{items}");
+        assert!(items.contains(" 'close' 'q' "), "{items}");
+        assert!(!items.contains("'-"), "everything applies on a message in a timeline: {items}");
+        // In a thread: no thread to open, nothing older to load, back
+        // goes to the channel.
+        let items = menu_items(&in_thread(false));
+        assert!(items.contains(" '-open thread' 'Enter' "), "{items}");
+        assert!(items.contains(" '-load older' 'L' "), "{items}");
+        assert!(items.contains(" 'back to channel' 'Escape' "), "{items}");
+        assert!(items.contains(" 'reply in thread' 'r' "), "{items}");
+        // No cursor (an empty view): the per-message actions are dimmed.
+        let mut c = chat();
+        c.msgs.clear();
+        c.cursor = None;
+        let items = menu_items(&c);
+        for label in ["open thread", "reply in thread", "react", "copy permalink"] {
+            assert!(items.contains(&format!(" '-{label}' ")), "{label}: {items}");
+        }
+        assert!(items.contains(" 'compose' 'i' "), "{items}");
     }
 
     #[test]
