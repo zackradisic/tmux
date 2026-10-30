@@ -519,14 +519,22 @@ client uses, so there is no bot, no app and nothing to configure beyond the
 workspace name. Everything the desktop client can do, the plugin can.
 
 The **sidebar** (`prefix + C-s`) is a picker over your conversations, grouped
-as your own Slack sidebar is (its sections, then channels, then DMs). A row is
-bold while unread, red with a count when you were mentioned, dim when muted;
-the right column says how long ago the channel last spoke, and the preview
-shows its recent messages. `Enter` opens the **channel view**: a transcript
-with day separators, the new-messages line, threads in place (`t`), reactions,
-and a compose line (`i`, `r` to reply in a thread, `e` to react, `o` opens the
-message in the Slack app, `y` copies its permalink). `v` cycles sections /
-unread / all; `/` searches with `#channel`, `@user` and `!unread` tokens.
+as your own Slack sidebar is (its sections, then channels, then DMs). Rows look
+like the agents picker's: the badge comes first (`!` on a red block and the
+count when you were mentioned, a cyan `●` while unread, a dim `·` once read),
+an unread name is bold, a read or muted one dim, and the right column says how
+long ago the channel last spoke. The preview shows the channel's recent
+messages, newest at the bottom. `Enter` opens the **channel view**: a
+transcript with day separators, the new-messages line, reactions and emoji
+drawn as glyphs (Slack's names, skin tones and your workspace's custom aliases
+included), bot cards with their fields, and every author by name, Slack
+Connect guests too. `Enter` on a message opens its thread (with or without
+replies yet), `Escape` steps back: thread to channel, channel to sidebar; `q`
+closes outright. `i` composes, `r` replies in the message's thread, `e`
+reacts, `o` opens the message in the Slack app, `y` copies its permalink.
+`Space` opens an action menu in either view, the same items as the keys. `v`
+cycles sections / unread / all; `/` searches with `#channel`, `@user` and
+`!unread` tokens.
 
 Updates are live: the plugin holds Slack's own RTM websocket through the
 host's `net` capability. A message shows the moment it is posted, a channel

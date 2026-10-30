@@ -647,8 +647,10 @@ fn on_command(st: &Shared, event: &Event) {
             let s = st.borrow();
             let text = match (&s.ident, &s.auth_error) {
                 (Some(id), _) => {
-                    let unread = s.channels.iter().filter(|c| c.has_unreads && !c.is_muted).count();
-                    let mentions: i64 = s.channels.iter().map(|c| c.mentions).sum();
+                    // The same sums the status line shows (publish): muted
+                    // channels left out, mentions in threads counted in.
+                    let unread = s.channels.iter().filter(|c| c.has_unreads && !c.is_muted && !c.is_archived).count();
+                    let mentions: i64 = s.channels.iter().filter(|c| !c.is_muted).map(|c| c.mentions).sum::<i64>() + s.thread_mentions;
                     let age = |ms: u64| if ms == 0 { "never".to_string() } else { listkit::text::fmt_age((now_ms().saturating_sub(ms)) / 1000) + " ago" };
                     let feed = match (&s.feed, &s.feed_error) {
                         (Some(_), _) => format!("live feed up {}", age(s.feed_since_ms).trim_end_matches(" ago")),
