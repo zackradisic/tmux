@@ -1,10 +1,13 @@
 //! Slack's `mrkdwn` as styled cells: `*bold*`, `_italic_`, `~strike~`,
 //! `` `code` ``, ```fences```, `>` quotes, and the angle-bracket tokens
 //! (`<@U…>`, `<#C…|name>`, `<!here>`, `<url|label>`), with `&amp;`
-//! style entities undone. Names come from the caller (the user and
-//! channel caches); an id nobody knows is drawn as itself.
+//! style entities undone, `:emoji:` shortcodes drawn as the glyph
+//! (outside code). Names come from the caller (the user and channel
+//! caches); an id nobody knows is drawn as itself.
 
-use listkit::styled::{hard_wrap, wrap_cells, Styled, ST_BOLD, ST_CODE, ST_CYAN, ST_DIM, ST_ITALIC, ST_UNDER};
+use listkit::styled::{cells_text, hard_wrap, wrap_cells, Styled, ST_BOLD, ST_CODE, ST_CYAN, ST_DIM, ST_ITALIC, ST_UNDER};
+
+use crate::emoji;
 
 /// How ids become names.
 pub struct Names<'a> {
@@ -23,10 +26,13 @@ fn unescape(s: &str) -> String {
 }
 
 fn push_text(out: &mut Vec<Styled>, text: &str, style: u16) {
-    for c in unescape(text).chars() {
-        if !c.is_control() {
-            out.push((c, style));
-        }
+    let text = unescape(text);
+    if style & ST_CODE != 0 {
+        // Code is literal: no shortcodes, and a wide glyph in it is on
+        // its own (a filler cell would show as a gap in the run).
+        out.extend(text.chars().filter(|c| !c.is_control()).map(|c| (c, style)));
+    } else {
+        emoji::push_text(out, &text, style);
     }
 }
 
@@ -196,8 +202,7 @@ pub fn render(text: &str, width: usize, base: u16, names: &Names) -> Vec<Vec<Sty
 pub fn plain(text: &str, names: &Names) -> String {
     let flat = text.replace("```", " ").replace('\n', " ");
     let cells = inline(&flat, 0, names);
-    let s: String = cells.iter().map(|c| c.0).collect();
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+    cells_text(&cells).split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]
@@ -241,5 +246,16 @@ mod tests {
         assert_eq!(texts[1].trim(), "let x = 1;");
         assert!(texts[2].starts_with("▎ quoted"));
         assert_eq!(plain("hi <@U1>\n*there*", &names()), "hi @zack there");
+    }
+
+    #[test]
+    fn shortcodes_become_glyphs_outside_code() {
+        let c = inline("ok :+1: at 12:30 `:+1:` :nope:", 0, &names());
+        assert_eq!(cells_text(&c), "ok \u{1F44D} at 12:30 :+1: :nope:");
+        // The glyph is one cell plus its filler; the code span is literal.
+        assert_eq!(c.len(), "ok ** at 12:30 :+1: :nope:".len());
+        assert_eq!(plain("*:raised_hands:* <@U1>", &names()), "\u{1F64C} @zack");
+        let lines = render("```\n:+1:\n```", 20, 0, &names());
+        assert_eq!(cells_text(&lines[0]).trim(), ":+1:");
     }
 }

@@ -883,6 +883,7 @@ name = "listkit"
 version = "0.1.0"
 dependencies = [
  "tmux-plugin-sdk",
+ "unicode-width",
 ]
 
 [[package]]

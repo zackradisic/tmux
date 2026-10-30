@@ -34,6 +34,8 @@ use tmux_plugin_sdk::prelude::*;
 mod api;
 mod auth;
 mod chat;
+mod emoji;
+mod emoji_table;
 mod feed;
 mod help;
 mod http;
@@ -318,6 +320,7 @@ async fn load_cache(st: &Shared) {
 
 async fn boot(st: Shared) {
     load_cache(&st).await;
+    emoji::load_custom().await;
     let cfg = st.borrow().cfg.clone();
     match auth::ensure(&cfg).await {
         Ok(id) => {
@@ -383,6 +386,9 @@ async fn full_sync_inner(st: &Shared, id: &Identity) -> Result<(), String> {
     }
     let counts = api::counts(id).await?;
     store::apply_counts(&counts.channels).await.map_err(|e| e.message.clone())?;
+    if let Err(e) = emoji::refresh_custom(id).await {
+        log(&format!("slack: emoji.list: {e}"));
+    }
     load_cache(st).await;
     {
         let mut s = st.borrow_mut();

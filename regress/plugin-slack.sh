@@ -15,10 +15,12 @@
 #     its mention badge, the DM by display name, "by sections"; `v`
 #     switches to the unread view (no read channel in it); `q` closes;
 #   `open #general`: the channel view with the topic, the history with
-#     mrkdwn resolved (<@U1> -> @zack, *this* -> this) and the
-#     "new messages" rule before the first unread message that is not
-#     ours; `i`, typed text, Enter posts to the fake and the view shows
-#     it; `q` closes;
+#     mrkdwn resolved (<@U1> -> @zack, *this* -> this), emoji drawn as
+#     glyphs (:raised_hands: in the text, the `fire` reaction, a custom
+#     alias from emoji.list; an image-only custom emoji stays :morph:)
+#     and the "new messages" rule before the first unread message that
+#     is not ours; `i`, typed text, Enter posts to the fake and the view
+#     shows it; `q` closes;
 #   `send @Tejas ...` posts to the DM; `mark #general` reaches
 #     conversations.mark; `bind`/`unbind` answer; the plugin is still
 #     alive at the end.
@@ -155,6 +157,7 @@ echo "$ST" | grep -q '3 channels' || fail "status does not count 3 channels: $ST
 echo "$ST" | grep -q 'test.slack.com' || fail "status does not name the workspace: $ST"
 [ "$(ncalls auth.test)" -ge 1 ] || fail "auth.test was not called"
 [ "$(ncalls users.conversations)" -ge 1 ] || fail "users.conversations was not called"
+[ "$(ncalls emoji.list)" -ge 1 ] || fail "emoji.list was not called"
 grep -q 'Authorization' "$HOME/fake.log" && fail "the fake logged a header"
 
 # --- unread and the status-line options ------------------------------------
@@ -199,6 +202,11 @@ screen_has '#general' || fail "the channel view lacks its title"
 screen_has 'the town square' || fail "the channel view lacks the topic"
 screen_has '@zack look at this' || fail "mrkdwn was not resolved"
 screen_has '── new messages ──' || fail "no new-messages rule"
+# Emoji: the shortcode and the reaction name as glyphs, the custom alias
+# through emoji.list, the image-only custom emoji literal.
+screen_has 'shipped 🙌 🎉 :morph:' || fail "emoji shortcodes were not rendered: $(screen | grep shipped)"
+screen_has '🔥 1' || fail "the fire reaction was not rendered: $(screen | grep -n 1 | grep -v shipped | tail -3)"
+screen | grep -q -e ':raised_hands:' -e ':fire:' -e ':party:' && fail "a shortcode stayed literal"
 NEW=$(screen | grep -n 'new messages' | head -1 | cut -d: -f1)
 HEY=$(screen | grep -n 'look at this' | head -1 | cut -d: -f1)
 FINE=$(screen | grep -n 'fine' | head -1 | cut -d: -f1)

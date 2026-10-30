@@ -5,6 +5,10 @@
 //! headings, emphasis, inline and fenced code, lists, quotes, rules,
 //! links and pipe tables.
 
+use std::cell::RefCell;
+
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
 use crate::text::clip;
 
 pub const ST_BOLD: u16 = 1;
@@ -26,11 +30,126 @@ pub const ST_BRIGHT: u16 = 2048;
 pub const ST_ORANGE: u16 = 4096;
 
 /// One cell of a rendered line: a character and its style bits.
+///
+/// A cell is one terminal column. A glyph two columns wide (an emoji,
+/// a CJK character) takes its own cell and a [`FILL`] cell after it,
+/// so `len()` stays the column count. A glyph of several scalars (a
+/// ZWJ sequence, an emoji with FE0F or a skin tone, a flag's two
+/// regional indicators) is one cell too: a registered grapheme (see
+/// [`grapheme_cell`]) that [`emit_cells`] expands back to its text; the
+/// terminal (tmux's `screen_write_combine`) draws the sequence as one
+/// glyph. [`push_glyph`] builds such cells from text.
 pub type Styled = (char, u16);
+
+/// The second column of a wide glyph: drawn as nothing.
+pub const FILL: char = '\u{10FFFF}';
+
+/// Registered graphemes are addressed from plane 16's private use area,
+/// which no font and no text uses.
+const GRAPHEME_BASE: u32 = 0x10_0000;
+const GRAPHEME_MAX: u32 = 0xFFFD;
+
+thread_local! {
+    static GRAPHEMES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A multi-scalar grapheme as one cell's char. The same text always
+/// gives the same char; when the registry is full (unlikely: 65533
+/// distinct sequences) the first scalar stands in.
+pub fn grapheme_cell(text: &str) -> char {
+    let mut chars = text.chars();
+    let first = chars.next().unwrap_or(' ');
+    if chars.next().is_none() {
+        return first;
+    }
+    GRAPHEMES.with(|g| {
+        let mut g = g.borrow_mut();
+        let i = match g.iter().position(|s| s == text) {
+            Some(i) => i,
+            None if g.len() as u32 >= GRAPHEME_MAX => return first,
+            None => {
+                g.push(text.to_string());
+                g.len() - 1
+            }
+        };
+        char::from_u32(GRAPHEME_BASE + i as u32).unwrap_or(first)
+    })
+}
+
+/// The text a registered grapheme cell stands for.
+pub fn grapheme_text(c: char) -> Option<String> {
+    let u = c as u32;
+    if !(GRAPHEME_BASE..GRAPHEME_BASE + GRAPHEME_MAX).contains(&u) {
+        return None;
+    }
+    GRAPHEMES.with(|g| g.borrow().get((u - GRAPHEME_BASE) as usize).cloned())
+}
+
+/// Append `text` as cells, with wide and multi-scalar glyphs as the cell
+/// model wants them (see [`Styled`]). Control characters are dropped.
+pub fn push_glyph(out: &mut Vec<Styled>, text: &str, style: u16) {
+    let chars: Vec<char> = text.chars().filter(|c| !c.is_control()).collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let mut j = i + 1;
+        // Everything that attaches to the base: variation selectors,
+        // skin tones, keycap, combining marks, a ZWJ and what follows it,
+        // a second regional indicator.
+        while j < chars.len() {
+            let c = chars[j];
+            if c == '\u{200D}' {
+                j += 2;
+                continue;
+            }
+            let attaches = matches!(c, '\u{FE0E}' | '\u{FE0F}' | '\u{20E3}' | '\u{1F3FB}'..='\u{1F3FF}')
+                || c.width() == Some(0)
+                || (is_regional(c) && j == i + 1 && is_regional(chars[i]));
+            if !attaches {
+                break;
+            }
+            j += 1;
+        }
+        let j = j.min(chars.len());
+        let s: String = chars[i..j].iter().collect();
+        let width = if j - i > 1 && !s.chars().any(|c| c.width().unwrap_or(0) > 0) {
+            // Only combining pieces (no base): shown as is, one column.
+            1
+        } else {
+            s.width().clamp(1, 2)
+        };
+        out.push((grapheme_cell(&s), style));
+        if width == 2 {
+            out.push((FILL, style));
+        }
+        i = j;
+    }
+}
+
+fn is_regional(c: char) -> bool {
+    ('\u{1F1E6}'..='\u{1F1FF}').contains(&c)
+}
+
+/// `text` as cells (as [`plain_cells`]) with the cell model's wide and
+/// multi-scalar glyphs.
+pub fn glyph_cells(text: &str, style: u16) -> Vec<Styled> {
+    let mut out = Vec::with_capacity(text.len());
+    push_glyph(&mut out, text, style);
+    out
+}
 
 /// The visible text of a line.
 pub fn cells_text(cells: &[Styled]) -> String {
-    cells.iter().map(|c| c.0).collect()
+    let mut out = String::with_capacity(cells.len());
+    for &(c, _) in cells {
+        if c == FILL {
+            continue;
+        }
+        match grapheme_text(c) {
+            Some(s) => out.push_str(&s),
+            None => out.push(c),
+        }
+    }
+    out
 }
 
 /// The line cut to `width` cells, an ellipsis at the end when something
@@ -39,7 +158,12 @@ pub fn fit_cells(cells: &[Styled], width: usize) -> Vec<Styled> {
     if cells.len() <= width {
         return cells.to_vec();
     }
-    let mut out: Vec<Styled> = cells[..width.saturating_sub(1)].to_vec();
+    let mut keep = width.saturating_sub(1);
+    // Never cut a wide glyph from its second column.
+    if keep > 0 && cells.get(keep).is_some_and(|c| c.0 == FILL) {
+        keep -= 1;
+    }
+    let mut out: Vec<Styled> = cells[..keep].to_vec();
     if width > 0 {
         out.push(('…', cells.last().map(|c| c.1).unwrap_or(0)));
     }
@@ -405,7 +529,18 @@ pub fn hard_wrap(cells: &[Styled], width: usize) -> Vec<Vec<Styled>> {
     if cells.is_empty() {
         return vec![Vec::new()];
     }
-    cells.chunks(width).map(|c| c.to_vec()).collect()
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < cells.len() {
+        let mut j = (i + width).min(cells.len());
+        // A wide glyph's two cells stay on one line.
+        if j < cells.len() && j > i + 1 && cells[j].0 == FILL {
+            j -= 1;
+        }
+        out.push(cells[i..j].to_vec());
+        i = j;
+    }
+    out
 }
 
 /// Mark every occurrence of a term in the line (case-insensitively, on
@@ -445,6 +580,9 @@ pub fn emit_cells(line: &[Styled], current: bool) -> String {
     let mut out = String::with_capacity(line.len() + 16);
     let mut cur: Option<u16> = None;
     for &(c, st) in line {
+        if c == FILL {
+            continue;
+        }
         if cur != Some(st) {
             out.push_str("\x1b[0");
             if st & ST_BOLD != 0 {
@@ -481,7 +619,10 @@ pub fn emit_cells(line: &[Styled], current: bool) -> String {
             out.push('m');
             cur = Some(st);
         }
-        out.push(c);
+        match grapheme_text(c) {
+            Some(s) => out.push_str(&s),
+            None => out.push(c),
+        }
     }
     if cur.is_some() {
         out.push_str("\x1b[0m");
@@ -570,5 +711,36 @@ mod render_tests {
         assert!(out.contains("\x1b[0;30;43m") && out.ends_with("\x1b[0m"));
         assert!(emit_cells(&line, true).contains("\x1b[0;1;30;103m"));
         assert_eq!(strip_sgr(&out), "The DFlash2 bench and dflash2 again");
+    }
+
+    #[test]
+    fn wide_glyphs_take_two_cells() {
+        // One scalar, two columns.
+        let c = glyph_cells("a\u{1F64C}b", 0);
+        assert_eq!(c.len(), 4);
+        assert_eq!(c[2].0, FILL);
+        assert_eq!(cells_text(&c), "a\u{1F64C}b");
+        assert_eq!(emit_cells(&c, false), "\x1b[0ma\u{1F64C}b\x1b[0m");
+        // Several scalars, one cell: a ZWJ sequence, FE0F, a skin tone, a flag.
+        for s in ["\u{1F926}\u{200D}\u{2642}\u{FE0F}", "\u{2764}\u{FE0F}", "\u{1F44D}\u{1F3FD}", "\u{1F1E8}\u{1F1E6}", "#\u{FE0F}\u{20E3}"] {
+            let c = glyph_cells(s, ST_DIM);
+            assert_eq!(c.len(), 2, "{s:?}");
+            assert_eq!(c[1].0, FILL);
+            assert_eq!(cells_text(&c), s);
+            assert!(emit_cells(&c, false).contains(s));
+            assert_eq!(grapheme_cell(s), c[0].0);
+        }
+        // CJK is wide too; a combining mark rides on its base.
+        assert_eq!(glyph_cells("\u{65E5}\u{672C}", 0).len(), 4);
+        assert_eq!(glyph_cells("e\u{301}x", 0).len(), 2);
+        // Wrapping and clipping never split a glyph from its filler.
+        let c = glyph_cells("\u{1F64C}\u{1F64C}\u{1F64C}", 0);
+        let w = hard_wrap(&c, 3);
+        assert_eq!(w.len(), 3);
+        assert!(w.iter().all(|l| l.len() == 2));
+        let f = fit_cells(&c, 4);
+        assert_eq!(cells_text(&f), "\u{1F64C}…");
+        let w = wrap_cells(&glyph_cells("\u{1F64C} ab \u{1F64C}\u{1F64C}", 0), 5);
+        assert_eq!(w.iter().map(|l| cells_text(l)).collect::<Vec<_>>(), vec!["\u{1F64C} ab", "\u{1F64C}\u{1F64C}"]);
     }
 }

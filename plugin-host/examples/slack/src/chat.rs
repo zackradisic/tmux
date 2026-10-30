@@ -20,7 +20,7 @@ use listkit::text::clip;
 use tmux_plugin_sdk::prelude::*;
 
 use crate::store::{Channel, Message};
-use crate::{api, mrkdwn, sidebar, store, timefmt, NameMap, Shared, State, NAME};
+use crate::{api, emoji, mrkdwn, sidebar, store, timefmt, NameMap, Shared, State, NAME};
 
 /// Two posts by the same author this close together share one header.
 const GROUP_SECS: i64 = 5 * 60;
@@ -247,7 +247,7 @@ pub fn layout(
         if !m.reactions.is_empty() {
             let text = m.reactions.iter().map(|(n, c)| format!(":{n}: {c}")).collect::<Vec<_>>().join(" · ");
             let mut cells = indent();
-            cells.extend(plain_cells(&text, ST_DIM));
+            emoji::push_text(&mut cells, &text, ST_DIM);
             out.push(Line { cells, msg: Some(i) });
         }
         if !in_thread && m.reply_count > 0 {
@@ -1414,7 +1414,7 @@ mod tests {
         let (f0, l0) = lines_of(&lines, 0).unwrap();
         assert_eq!(f0, 1);
         assert_eq!(t[l0], "  ↳ 3 replies · 30m");
-        assert_eq!(t[l0 - 1], "  :+1: 3 · :tada: 1");
+        assert_eq!(t[l0 - 1], "  \u{1F44D} 3 · \u{1F389} 1");
         assert!(lines[f0 + 1..l0 - 1].iter().all(|l| l.cells.len() <= 23), "{t:?}");
         let (f1, l1) = lines_of(&lines, 1).unwrap();
         assert_eq!(f1, l0 + 1);
