@@ -1,0 +1,35 @@
+# Reference capability sidecar for the slack plugin.
+#
+# Only consulted in restrictive mode, where it must sit next to the
+# deployed slack.wasm as `slack.toml`. Effective caps = these requests
+# intersected with the user's `load-plugin -c ...` grants.
+
+[caps]
+requests = [
+  # The sidebar and the channel view are plugin UI modes.
+  "mode",
+  # The cache: channels, sections, users, messages, the identity.
+  "db",
+  # Request bodies and responses go by file under the plugin's data dir
+  # (a curl job writes the response there; the plugin reads it back).
+  "fs-read",
+  "fs-write",
+  # curl for the Slack web API, `security` and `sqlite3` for the desktop
+  # app's session cookie, `open` for slack:// links.
+  "run-process",
+  # set-buffer for permalinks, the agents picker hand-off.
+  "run-command",
+  # #{@slack_unread} / #{@slack_mentions} / #{@slack_dms} for the status
+  # line.
+  "write-options",
+  "timers",
+  # A mention or DM addressed to a bound agent is pushed into its Claude
+  # session as a user turn (the agent bridge).
+  "claude-notify",
+  # The host's HTTP and websocket imports (the `net` branch): the live
+  # RTM feed. Without it the plugin polls through curl.
+  "net",
+]
+
+[caps.net]
+hosts = ["slack.com", "*.slack.com"]

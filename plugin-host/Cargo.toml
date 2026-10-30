@@ -20,6 +20,7 @@ members = [
     "examples/agents",
     "examples/mailbox",
     "examples/accounts",
+    "examples/slack",
     "examples/services-probe",
     "tools/index",
 ]
