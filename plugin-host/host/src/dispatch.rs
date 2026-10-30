@@ -1842,6 +1842,79 @@ pub fn timer_start(mem: &mut GuestMem<'_, '_>, ms: i64) -> Result<i64, HostError
 }
 
 // ---------------------------------------------------------------------------
+// Network (capability net, see net.rs): HTTP requests and websockets on
+// the host's own threads. Inputs are copied out of guest memory at call
+// time, so nothing here pins; results come back as completions (HTTP,
+// ws_open) and as addressed `ws-*` events (frames).
+// ---------------------------------------------------------------------------
+
+pub fn http_request(
+    mem: &mut GuestMem<'_, '_>,
+    req_ptr: i32,
+    req_len: i32,
+) -> Result<i64, HostError> {
+    check_cap(mem, crate::caps::NET)?;
+    if req_len <= 0 || req_len as usize > tmux_plugin_abi::net::MAX_REQUEST {
+        return Err(err(ErrorCode::Limit, "request block empty or over 8 MiB"));
+    }
+    let block = mem.read(req_ptr, req_len)?;
+    let req = tmux_plugin_abi::net::HttpRequestWire::decode(&block)
+        .map_err(|e| err(ErrorCode::BadRequest, format!("bad request block: {e}")))?;
+    crate::net::check_url(&mem.data().caps, &req.url, crate::net::UrlKind::Http)?;
+    let token = alloc_token(mem);
+    crate::net::http_start(token, req);
+    Ok(token as i64)
+}
+
+pub fn ws_open(
+    mem: &mut GuestMem<'_, '_>,
+    url_ptr: i32,
+    url_len: i32,
+    hdr_ptr: i32,
+    hdr_len: i32,
+) -> Result<i64, HostError> {
+    check_cap(mem, crate::caps::NET)?;
+    let url = mem.read_str(url_ptr, url_len)?;
+    let headers = if hdr_len == 0 { String::new() } else { mem.read_str(hdr_ptr, hdr_len)? };
+    crate::net::check_url(&mem.data().caps, &url, crate::net::UrlKind::Ws)?;
+    let owner = owner_of_caller(mem);
+    let token = alloc_token(mem);
+    if let Err(e) = crate::net::ws_open(owner, token, url, headers) {
+        crate::tokens::discard(token);
+        return Err(e);
+    }
+    Ok(token as i64)
+}
+
+pub fn ws_send(
+    mem: &mut GuestMem<'_, '_>,
+    socket: i64,
+    data_ptr: i32,
+    data_len: i32,
+    text: i32,
+) -> Result<(), HostError> {
+    check_cap(mem, crate::caps::NET)?;
+    if socket <= 0 {
+        return Err(err(ErrorCode::BadRequest, "bad socket handle"));
+    }
+    if data_len < 0 || data_len as usize > tmux_plugin_abi::net::MAX_FRAME {
+        return Err(err(ErrorCode::Limit, "frame over 8 MiB"));
+    }
+    let data = if data_len == 0 { Vec::new() } else { mem.read(data_ptr, data_len)? };
+    let owner = owner_of_caller(mem);
+    crate::net::ws_send(&owner, socket as u64, data, text != 0)
+}
+
+pub fn ws_close(mem: &mut GuestMem<'_, '_>, socket: i64) -> Result<(), HostError> {
+    check_cap(mem, crate::caps::NET)?;
+    if socket <= 0 {
+        return Err(err(ErrorCode::BadRequest, "bad socket handle"));
+    }
+    let owner = owner_of_caller(mem);
+    crate::net::ws_close(&owner, socket as u64)
+}
+
+// ---------------------------------------------------------------------------
 // Services: plugin-to-plugin calls and topics, local or over a bridge
 // peer. The host copies payloads and never parses them; delivery is
 // queued (services.rs), never re-entrant.

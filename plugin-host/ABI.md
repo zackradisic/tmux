@@ -263,6 +263,85 @@ connection denies `ATTACH`/`DETACH` (authorizer + `SQLITE_LIMIT_ATTACHED
 = 0`), runs with `SQLITE_DBCONFIG_DEFENSIVE`, refuses `VACUUM` (`VACUUM
 INTO` writes anywhere) and has no extension loading.
 
+## Network
+
+Capability `net`: outbound HTTP and websockets through the host's own
+stack (`ureq` and `tungstenite` over rustls with bundled roots: no
+system TLS library, so the same build runs on a bare Linux box). Wasm
+cannot open a socket, and `curl` as a tmux job cannot stream, so this
+is how a plugin talks to a web service (`host/src/net.rs`).
+
+A URL must be `http://`, `https://`, `ws://` or `wss://` (the HTTP and
+websocket imports each accept their own pair; anything else is
+`E_BAD_REQUEST`), and its host must pass the plugin's allowlist at call
+time:
+
+```toml
+[caps]
+requests = ["net"]
+[caps.net]
+hosts = ["slack.com", "*.slack.com"]   # omitted = any host
+```
+
+`*.slack.com` matches `slack.com` and every subdomain; a bare name is an
+exact, case-insensitive match. A host not on the list is `E_CAP_DENIED`
+before anything is sent. Under trust-the-user (no sidecar) any host is
+allowed. Redirects are not followed - a 3xx is a result - so a reply
+cannot lead the host somewhere the list did not name.
+
+`http_request` takes a field block with inline string keys (the
+config-block form, so neither side interns), copied out of guest
+memory at the call:
+
+```
+method      str    "GET", "POST", ...
+url         str
+headers     str    one "Name: value" per line (may be empty)
+body        bytes  may be empty
+timeout_ms  i64    0 = 30000; capped at 300000
+```
+
+The request runs on a thread of its own and completes with `v0` = the
+HTTP status, `v1` = the byte length of the response-header block and
+`data` = that block (`name: value\n` lines, names lower-case, a
+repeated header once per value) immediately followed by the body. A
+non-2xx status is a completion, not an error. A transport failure
+(DNS, TLS, refused, timeout) is an error completion (`E_HOST`, or
+`E_TIMEOUT` for the deadline) whose data is the message; a body over
+8 MiB is `E_LIMIT`. The request block itself is capped at 8 MiB.
+
+`ws_open(url, headers)` connects (30 s connect and handshake ceilings)
+and completes with `v0` = a socket handle, > 0 and unique for the
+server lifetime, once the handshake succeeds. From then on the socket's
+frames are **events** to the owning instance, addressed like mode
+events but delivered only if the instance subscribed to them (the SDK's
+`ws_open` subscribes):
+
+- `ws-message` — fields `socket` i64, `text` i64 (1 = text frame, 0 =
+  binary), `data` bytes (the payload, ≤ 8 MiB).
+- `ws-closed` — fields `socket` i64, `code` i64 (the peer's close code,
+  or 0 for a transport error), `reason` str (the close reason, or the
+  error text). Terminal: the handle is dead afterwards.
+
+Ping frames are answered by the host; neither pings nor pongs reach the
+guest. `ws_send` queues a frame (a bounded queue of 256; `E_LIMIT` when
+full) for the socket's thread, which writes it between reads;
+`ws_close` starts a graceful close, and `ws-closed` follows when the
+peer answers (or after a 5 s grace). A handle belongs to the instance
+that opened it: another instance, or a later generation of the same
+scope, gets `E_NO_SUCH_OBJECT`. Instance teardown (unload, reload,
+scope death) closes the instance's sockets; a frame that was already on
+its way is dropped by the same generation check that drops a stale
+async completion.
+
+Threads: none of this runs on the fs executor (a slow TLS handshake must
+never starve file jobs). Each HTTP request is a thread for its
+duration; each websocket is one thread that reads with a short socket
+timeout and drains its outgoing queue between reads. They touch no host
+state and hand results back over the worker doorbell, one FIFO for
+completions and frames, so a socket's "opened" completion is never
+overtaken by its first frame.
+
 ## Interning
 
 Event names and payload field keys are u32 ids, interned in one host table
@@ -357,6 +436,8 @@ an inbound peer's calls are always allowed).
 | `home_dir` | `(out, cap, len_out) -> i32` — the server user's home directory | none |
 | `fs_write_sync` | `(path, data Bytes, append) -> i64` (bytes written) | fs-write |
 | `fs_read_sync` | `(path, offset: i64, out, cap, len_out, eof_out) -> i32` | fs-read |
+| `ws_send` | `(socket: i64, data Bytes, text) -> i32` — queue one frame (text = 1 for a UTF-8 text frame, 0 binary) on a socket `ws_open` returned; `E_NO_SUCH_OBJECT` for a socket that is not the caller's, unknown or closing, `E_LIMIT` when 256 frames are already queued or the frame is over 8 MiB; see **Network** | net |
+| `ws_close` | `(socket: i64) -> i32` — start a graceful close; `ws-closed` still follows | net |
 | `claude_notify` | `(path Str, text Str) -> i64` — deliver `text` as one queued user turn into the Claude Code session listening on the inbox socket at `path` (the `messagingSocketPath` of its `~/.claude/sessions/<pid>.json`). Not keystrokes: a half-typed prompt is untouched; an idle session starts a turn with it. The path must be a socket inside a `cc-socks` directory; non-blocking, so a stalled reader fails instead of holding the loop | claude-notify |
 | `db_exec_sync` | `(sql Bytes, params Bytes, out_ptr) -> i32` — out = 16-byte exec struct; main thread, 500 ms cap | db |
 | `db_query_sync` | `(sql Bytes, params Bytes, owned_out) -> i32` — OwnedBuf = rows block | db |
@@ -400,6 +481,8 @@ guest frees (the error message bytes when `err != 0`; empty = none).
 | `db_exec` | `(sql Bytes, params Bytes) -> i64` | v0 = changes, v1 = last_insert_rowid | db |
 | `db_query` | `(sql Bytes, params Bytes) -> i64` | v0 = nrows, v1 = ncols, data = rows block | db |
 | `db_batch` | `(block Bytes) -> i64` — one transaction | v0 = total changes, v1 = last_insert_rowid | db |
+| `http_request` | `(req Bytes) -> i64` — one HTTP request, `req` a field block with inline keys (`method` str, `url` str, `headers` str, `body` bytes, `timeout_ms` i64); see **Network** | v0 = HTTP status, v1 = byte length of the response-header block, data = `Name: value\n` lines then the body (≤ 8 MiB, else `E_LIMIT`); a transport failure is an error completion with the message | net |
+| `ws_open` | `(url Str, headers Str?) -> i64` — open a `ws://`/`wss://` socket with extra handshake headers (`Name: value` lines); see **Network** | v0 = the socket handle (> 0) once the handshake succeeds; a failed handshake is an error completion. Frames then arrive as `ws-message` / `ws-closed` events | net |
 | `service_call` | `(target Str, method Str, payload Bytes) -> i64` — `target` is `plugin`, `plugin@server` or `@server` (the caller's own plugin, as loaded, on that server) | one completion per reply page: v0 = page index, v1 = flags (bit 0 MORE: the token stays alive for the next page), data = the payload; an ERROR reply completes with `err` = `E_HOST` and the message | service-call |
 
 A service call for a plugin that is loaded but has not registered the
@@ -511,6 +594,10 @@ plugin bridge comes up or goes down; they need `subscribe`. `peer-changed`
 when the row was deleted) fires when the peer grant table changes - a
 handshake that asks, or `plugin-peers allow|deny|revoke`; it needs
 `subscribe`, and `peers_list` reads the table.
+
+A websocket's `ws-message` and `ws-closed` events (see Network) are
+addressed to the instance that opened the socket and delivered only if
+it subscribed to them.
 
 Config (`pgh_init` / `pgh_on_config_changed`) is a bare field block with
 inline string keys; scalar values map directly, nested values (arrays /
@@ -693,6 +780,9 @@ allowlist), `pane-fds` (read the open-file paths of a pane's
 foreground process with `pane_fds`), `clipboard` (write the system
 clipboard, an image or text, into the data directory with
 `clipboard_read`),
+`net` (outbound HTTP and websockets with `http_request` and the
+`ws_*` imports, see Network; a `[caps.net] hosts = [...]` sidecar list
+narrows the hosts; not in the default grants for a pushed plugin),
 `service-serve` (register methods,
 reply, emit topics), `service-call` (call methods and follow topics, on
 this server or a linked one; a `[caps.services] call = ["agents@*"]`

@@ -22,6 +22,7 @@ members = [
     "examples/accounts",
     "examples/slack",
     "examples/services-probe",
+    "examples/net-probe",
     "tools/index",
 ]
 default-members = ["host"]

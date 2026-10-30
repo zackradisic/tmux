@@ -358,6 +358,11 @@ pub mod imports {
     pub const SERVICE_SUBSCRIBE: &str = "service_subscribe";
     pub const SERVERS: &str = "servers";
     pub const PEERS_LIST: &str = "peers_list";
+    /// Network (capability `net`, see the `net` module).
+    pub const HTTP_REQUEST: &str = "http_request";
+    pub const WS_OPEN: &str = "ws_open";
+    pub const WS_SEND: &str = "ws_send";
+    pub const WS_CLOSE: &str = "ws_close";
 }
 
 /// Flag bits of a service reply page (`service_reply` flags, and `v1` of
@@ -387,6 +392,120 @@ pub mod service_fields {
     pub const SERVER: &str = "server";
     pub const VERSION: &str = "version";
     pub const ROLE: &str = "role";
+}
+
+/// The network imports (capability `net`): the wire shapes shared by the
+/// host and the SDK.
+///
+/// An `http_request` carries its request as a field block with inline
+/// string keys (the config-block form, so neither side interns): `method`
+/// str, `url` str, `headers` str (one `Name: value` per line), `body`
+/// bytes, `timeout_ms` i64. The completion is `v0` = HTTP status, `v1` =
+/// the byte length of the response-header block, `data` = that block
+/// (`Name: value\n` lines) followed by the body.
+///
+/// A websocket's frames arrive as events to the owning instance:
+/// `ws-message` (`socket` i64, `text` i64, `data` bytes) and the terminal
+/// `ws-closed` (`socket` i64, `code` i64, `reason` str).
+pub mod net {
+    use super::{FieldReader, FieldWriter, KeyRef, ValueRef, WireError};
+
+    pub const EVENT_MESSAGE: &str = "ws-message";
+    pub const EVENT_CLOSED: &str = "ws-closed";
+
+    pub const F_METHOD: &str = "method";
+    pub const F_URL: &str = "url";
+    pub const F_HEADERS: &str = "headers";
+    pub const F_BODY: &str = "body";
+    pub const F_TIMEOUT_MS: &str = "timeout_ms";
+    pub const F_SOCKET: &str = "socket";
+    pub const F_TEXT: &str = "text";
+    pub const F_DATA: &str = "data";
+    pub const F_CODE: &str = "code";
+    pub const F_REASON: &str = "reason";
+
+    /// Timeout when the request names none.
+    pub const DEFAULT_TIMEOUT_MS: i64 = 30_000;
+    /// The most a request may ask for.
+    pub const MAX_TIMEOUT_MS: i64 = 300_000;
+    /// Response body ceiling; a longer body is an `E_LIMIT` completion.
+    pub const MAX_BODY: usize = 8 * 1024 * 1024;
+    /// Request block ceiling (headers + body).
+    pub const MAX_REQUEST: usize = 8 * 1024 * 1024;
+    /// Frames an outgoing websocket queue holds before `ws_send` fails.
+    pub const WS_QUEUE: usize = 256;
+    /// The largest frame `ws_send` accepts, and the largest the host
+    /// delivers.
+    pub const MAX_FRAME: usize = 8 * 1024 * 1024;
+
+    /// One HTTP request as it crosses the ABI.
+    #[derive(Debug, Clone, PartialEq, Eq, Default)]
+    pub struct HttpRequestWire {
+        pub method: String,
+        pub url: String,
+        /// `Name: value` lines, newline-separated.
+        pub headers: String,
+        pub body: Vec<u8>,
+        /// 0 = the default.
+        pub timeout_ms: i64,
+    }
+
+    impl HttpRequestWire {
+        pub fn encode(&self) -> Vec<u8> {
+            let mut w = FieldWriter::new();
+            w.str(KeyRef::Name(F_METHOD), &self.method);
+            w.str(KeyRef::Name(F_URL), &self.url);
+            w.str(KeyRef::Name(F_HEADERS), &self.headers);
+            w.bytes(KeyRef::Name(F_BODY), &self.body);
+            w.i64(KeyRef::Name(F_TIMEOUT_MS), self.timeout_ms);
+            w.finish()
+        }
+
+        /// Decode a request block. Unknown keys are ignored; a missing
+        /// `method` or `url` is a wire error.
+        pub fn decode(block: &[u8]) -> Result<Self, WireError> {
+            let mut req = HttpRequestWire::default();
+            let (mut have_method, mut have_url) = (false, false);
+            for field in FieldReader::new(block)? {
+                let (key, value) = field?;
+                let KeyRef::Name(name) = key else { continue };
+                match (name, value) {
+                    (F_METHOD, ValueRef::Str(s)) => {
+                        req.method = s.to_string();
+                        have_method = true;
+                    }
+                    (F_URL, ValueRef::Str(s)) => {
+                        req.url = s.to_string();
+                        have_url = true;
+                    }
+                    (F_HEADERS, ValueRef::Str(s)) => req.headers = s.to_string(),
+                    (F_BODY, ValueRef::Bytes(b)) => req.body = b.to_vec(),
+                    (F_TIMEOUT_MS, ValueRef::I64(v)) => req.timeout_ms = v,
+                    _ => {}
+                }
+            }
+            if !have_method || !have_url {
+                return Err(WireError::Truncated);
+            }
+            Ok(req)
+        }
+    }
+
+    /// Split a `Name: value` header block into pairs; blank lines and
+    /// lines without a colon are skipped.
+    pub fn parse_headers(block: &str) -> Vec<(String, String)> {
+        block
+            .lines()
+            .filter_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                let name = name.trim();
+                if name.is_empty() {
+                    return None;
+                }
+                Some((name.to_string(), value.trim().to_string()))
+            })
+            .collect()
+    }
 }
 
 /// A plugin's service version: the shape of its methods and topics, as

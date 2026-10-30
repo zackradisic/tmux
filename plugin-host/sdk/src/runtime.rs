@@ -146,6 +146,12 @@ pub(crate) mod raw {
         ) -> i32;
         pub fn servers(owned_out: i32) -> i32;
         pub fn peers_list(owned_out: i32) -> i32;
+        pub fn http_request(req_ptr: i32, req_len: i32) -> i64;
+        pub fn ws_open(
+            url_ptr: i32, url_len: i32, hdr_ptr: i32, hdr_len: i32,
+        ) -> i64;
+        pub fn ws_send(socket: i64, data_ptr: i32, data_len: i32, text: i32) -> i32;
+        pub fn ws_close(socket: i64) -> i32;
     }
 }
 
@@ -213,6 +219,10 @@ pub(crate) mod raw {
     pub unsafe fn service_subscribe(target_ptr: i32, target_len: i32, topic_ptr: i32, topic_len: i32) -> i32 { -7 }
     pub unsafe fn servers(owned_out: i32) -> i32 { -7 }
     pub unsafe fn peers_list(owned_out: i32) -> i32 { -7 }
+    pub unsafe fn http_request(req_ptr: i32, req_len: i32) -> i64 { -7 }
+    pub unsafe fn ws_open(url_ptr: i32, url_len: i32, hdr_ptr: i32, hdr_len: i32) -> i64 { -7 }
+    pub unsafe fn ws_send(socket: i64, data_ptr: i32, data_len: i32, text: i32) -> i32 { -7 }
+    pub unsafe fn ws_close(socket: i64) -> i32 { -7 }
 }
 
 /// ABI allocator: 8-aligned, size echoed back on free.

@@ -314,6 +314,10 @@ impl Registry {
             if n > 0 {
                 let _ = writeln!(out, "{n} download{} in flight", if n == 1 { "" } else { "s" });
             }
+            let n = crate::net::open_sockets();
+            if n > 0 {
+                let _ = writeln!(out, "{n} websocket{} open", if n == 1 { "" } else { "s" });
+            }
         }
         let mut names: Vec<&String> = self.plugins.keys().collect();
         names.sort();
