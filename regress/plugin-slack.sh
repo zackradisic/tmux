@@ -12,8 +12,15 @@
 #   `help`, `open --help`, an unknown verb answer on the caller's
 #     terminal;
 #   `pick`: the sidebar float shows the "Work" section, #general with
-#     its mention badge, the DM by display name, "by sections"; `v`
-#     switches to the unread view (no read channel in it); `q` closes;
+#     its mention badge (`!` first, `@1` after the name), the DM by
+#     display name with its unread dot, the read private channel with a
+#     dim dot, "by sections", the newest message in the preview, a
+#     footer that points at the Space menu and not at refresh; Space
+#     draws the action menu (a client overlay: seen on a real tty client,
+#     which a second server's pane provides by attaching) titled with
+#     the channel, "mark read" offered with its key on an unread row;
+#     `menu-key v` (the road every item takes back) switches to the
+#     unread view (no read channel in it); `q` closes;
 #   `open #general`: the channel view with the topic, the history with
 #     mrkdwn resolved (<@U1> -> @zack, *this* -> this) and the
 #     "new messages" rule before the first unread message that is not
@@ -35,6 +42,7 @@ unset TMUX TMUX_PANE AI_AGENT
 
 [ -z "$TEST_TMUX" ] && TEST_TMUX=$(readlink -f ../tmux)
 TMUX="$TEST_TMUX -Lslack-test"
+OUTER="$TEST_TMUX -Lslack-test-outer"
 WASM=$(dirname "$TEST_TMUX")/plugin-host/target/wasm32-unknown-unknown/release/slack.wasm
 FAKE=$(dirname "$0")/plugin-slack-fake.py
 FAKE=$(cd "$(dirname "$FAKE")" && pwd -P)/$(basename "$FAKE")
@@ -51,6 +59,7 @@ CTL=
 cleanup() {
 	exec 3>&- 2>/dev/null
 	[ -n "$CTL" ] && kill "$CTL" 2>/dev/null
+	$OUTER kill-server 2>/dev/null
 	$TMUX kill-server 2>/dev/null
 	[ -n "$WATCHDOG" ] && kill "$WATCHDOG" 2>/dev/null
 	[ -n "$FAKEPID" ] && kill "$FAKEPID" 2>/dev/null
@@ -63,6 +72,10 @@ fail() {
 	if [ -n "$FORM" ]; then
 		echo "--- screen:" >&2
 		$TMUX capture-pane -M -p -t "$FORM" 2>/dev/null | sed '/^ *$/d' >&2
+	fi
+	if [ -n "$VIEW" ]; then
+		echo "--- what the client sees:" >&2
+		$OUTER capture-pane -p -t "$VIEW" 2>/dev/null | sed '/^ *$/d' >&2
 	fi
 	echo "--- fake log (tail):" >&2
 	tail -20 "$HOME/fake.log" >&2 2>/dev/null
@@ -98,6 +111,9 @@ until_ok() {
 screen() { $TMUX capture-pane -M -p -t "$FORM" | sed '/^ *$/d'; }
 screen_has() { screen | grep -q -- "$1"; }
 screen_lacks() { ! screen_has "$1"; }
+# What the attached terminal renders, overlays (a menu) included.
+seen() { $OUTER capture-pane -p -t "$VIEW" | sed '/^ *$/d'; }
+seen_has() { seen | grep -q -- "$1"; }
 # The pane in plugin mode, if any.
 mode_pane() { $TMUX list-panes -a -F '#{pane_id} #{pane_mode}' | awk '/plugin-mode/ { print $1; exit }'; }
 mode_open() { [ -n "$(mode_pane)" ]; }
@@ -108,6 +124,7 @@ status_ready() { slack status | grep -q 'zack on Morph'; }
 posted() { [ "$(nposted "$1" "$2")" -ge 1 ]; }
 marks_grew() { [ "$(ncalls conversations.mark channel C1)" -gt "$1" ]; }
 FORM=
+VIEW=
 
 [ -f "$WASM" ] || fail "slack.wasm not built"
 [ -f "$FAKE" ] || fail "no $FAKE"
@@ -132,6 +149,7 @@ WATCHDOG=$!
 
 # --- the server and the plugin ----------------------------------------------
 $TMUX kill-server 2>/dev/null
+$OUTER kill-server 2>/dev/null
 sleep 0.5
 $TMUX -f/dev/null new-session -d -s main -x 160 -y 45 'sleep 600' || fail "new-session"
 PANE=$($TMUX list-panes -t main:0 -F '#{pane_id}')
@@ -172,17 +190,46 @@ slack 'open --help' | grep -q 'j/k' || fail "open --help printed nothing"
 slack bogus | grep -q 'unknown verb' || fail "an unknown verb did not answer"
 
 # --- the sidebar -------------------------------------------------------------
-$TMUX plugin-command -t "$PANE" slack pick || fail "plugin-command pick"
+# The Space menu is a client overlay on a real tty, which the control
+# client cannot draw. A second server's pane runs a genuine attach to
+# this one: capturing that pane shows what the user's terminal would,
+# menu and all. The sidebar is opened by a key pressed there, so the
+# plugin knows which client asked and the menu goes to it by name.
+$OUTER -f/dev/null new-session -d -x 160 -y 45 "$TEST_TMUX -Lslack-test attach -t main" || fail "outer new-session"
+VIEW=$($OUTER list-panes -F '#{pane_id}' | head -1)
+[ -n "$VIEW" ] || fail "no viewer pane"
+until_ok 40 sh -c "$TMUX list-clients -F '#{client_tty}' | grep -q /dev" || fail "no tty client attached"
+$TMUX bind-key -n F5 'plugin-command slack pick' || fail "bind-key"
+$OUTER send-keys -t "$VIEW" F5
 until_ok 40 mode_open || fail "pick opened no plugin mode"
 FORM=$(mode_pane)
 until_ok 40 screen_has 'Work' || fail "the sidebar shows no Work section"
 screen_has '#general' || fail "the sidebar lacks #general"
-screen_has '●1' || fail "the sidebar lacks the mention badge"
-screen_has '@Tejas' || fail "the sidebar lacks @Tejas"
-screen_has 'secret' || fail "the sections view lacks the private channel"
+# The row look: the badge first, then the name, the mention count after it.
+screen | grep -q '! #general  @1' || fail "the mention row is not '! #general  @1'"
+screen | grep -q '● @Tejas' || fail "the unread DM lacks its dot before the name"
+screen | grep -q '· \*secret' || fail "the read private channel lacks its dim dot"
+screen_has '●1' && fail "the old right-hand badge is still drawn"
 screen_has 'by sections' || fail "the sidebar is not tagged by sections"
-keys v
-until_ok 20 screen_has 'by unread' || fail "v did not switch to the unread view"
+screen_has 'Space menu' || fail "the footer does not point at the menu"
+screen_has 'refresh' && fail "the footer still lists refresh"
+# The preview opens at its end: the newest message is on screen.
+until_ok 40 screen_has 'look at this' || fail "the preview lacks the newest message"
+# Space draws the menu over the sidebar, titled with the channel; an
+# unread row offers "mark read" with its key.
+keys Space
+until_ok 20 seen_has 'mark read' || fail "Space drew no menu"
+seen_has 'open in the Slack app' || fail "the menu is missing its later items"
+# The title: the channel's name (menu_safe drops the `#`, which tmux
+# would format-expand).
+seen_has '─ general ─' || fail "the menu is not titled with the channel"
+seen | grep 'mark read' | grep -q '(m)' || fail "mark read has no key on an unread row"
+seen | grep 'refresh' | grep -q '(R)' || fail "refresh is not in the menu with its key"
+$OUTER send-keys -t "$VIEW" Escape; sleep 0.5
+seen_has 'open in the Slack app' && fail "Escape did not put the menu away"
+# Every item hands its key back through menu-key: the view switch by that road.
+$TMUX plugin-command slack 'menu-key v'
+until_ok 20 screen_has 'by unread' || fail "menu-key v did not switch to the unread view"
 screen_lacks 'secret' || fail "the unread view lists the read channel"
 screen_has '#general' || fail "the unread view lacks #general"
 screen_has '@Tejas' || fail "the unread view lacks @Tejas"
