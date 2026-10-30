@@ -218,12 +218,14 @@ impl Engine {
                 self.draw_help(&mut out, x, pw, ph);
             } else if let Some(n) = self.selected() {
                 let lines: Option<Vec<Vec<Styled>>> = match &n.preview {
-                    Preview::Text(l) => Some(l.clone()),
+                    Preview::Text(l) | Preview::TextTail(l) => Some(l.clone()),
                     Preview::Markdown(s) => Some(markdown_lines(s, pw, 0)),
                     _ => None,
                 };
                 if let Some(lines) = lines {
-                    let top = self.preview_top.min(lines.len().saturating_sub(ph));
+                    // A pinned tail preview opens at its last line and
+                    // follows the content when it grows.
+                    let top = self.preview_top();
                     self.preview_top = top;
                     for (i, line) in lines.iter().skip(top).take(ph).enumerate() {
                         let cells = fit_cells(line, pw);

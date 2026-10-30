@@ -125,6 +125,11 @@ pub struct Engine {
     pub separator_lit: bool,
     /// Scroll position of a text or Markdown preview.
     pub(crate) preview_top: usize,
+    /// A `Preview::TextTail` is pinned to its last line: the render
+    /// takes the top from the content's length, so new lines keep the
+    /// end in view. Scrolling up unpins; scrolling back to the end (or
+    /// moving the cursor) pins again.
+    pub(crate) preview_tail: bool,
     /// The list column's share of the width, in thousandths, once the
     /// separator has been dragged; `None` is the default 60%.
     pub split: Option<u32>,
@@ -172,6 +177,7 @@ impl Engine {
             show_help: false,
             separator_lit: false,
             preview_top: 0,
+            preview_tail: true,
             split: None,
             split_drag: false,
             filtered: false,
@@ -1302,15 +1308,41 @@ impl Engine {
     /// shows one.
     fn text_preview_len(&self) -> Option<usize> {
         match self.selected().map(|n| &n.preview) {
-            Some(Preview::Text(l)) => Some(l.len()),
+            Some(Preview::Text(l)) | Some(Preview::TextTail(l)) => Some(l.len()),
             Some(Preview::Markdown(s)) => Some(s.lines().count()),
             _ => None,
         }
     }
 
+    /// The highlighted node's preview opens at its end.
+    pub(crate) fn preview_is_tail(&self) -> bool {
+        matches!(self.selected().map(|n| &n.preview), Some(Preview::TextTail(_)))
+    }
+
+    /// The lines the preview column has for text: the height less the
+    /// footer line.
+    pub(crate) fn preview_page_h(&self) -> usize {
+        (self.height as usize).saturating_sub(1)
+    }
+
+    /// The first line the text preview shows, as the render draws it:
+    /// the scroll position clamped to the content, or the content's end
+    /// while a tail preview is pinned there.
+    pub fn preview_top(&self) -> usize {
+        let max = self.text_preview_len().unwrap_or(0).saturating_sub(self.preview_page_h());
+        if self.preview_is_tail() && self.preview_tail {
+            max
+        } else {
+            self.preview_top.min(max)
+        }
+    }
+
     pub fn scroll_preview(&mut self, delta: i32) {
-        let t = self.preview_top as i32 + delta;
-        self.preview_top = t.max(0) as usize;
+        let max = self.text_preview_len().unwrap_or(0).saturating_sub(self.preview_page_h());
+        let t = (self.preview_top() as i32 + delta).clamp(0, max as i32) as usize;
+        self.preview_top = t;
+        // Back at the end: a tail preview follows new lines again.
+        self.preview_tail = t >= max;
     }
 
     /// Reset the text preview's scroll when the cursor moved to another
@@ -1319,6 +1351,7 @@ impl Engine {
         let k = self.selected_key();
         if k != self.last_sel_key {
             self.preview_top = 0;
+            self.preview_tail = true;
             self.last_sel_key = k;
         }
     }
@@ -1611,6 +1644,56 @@ mod tests {
         assert_eq!(e.handle_key("z", None), Outcome::Key("z".into()));
         assert_eq!(e.handle_key("Enter", None), Outcome::Activate("a/s1".into()));
         assert_eq!(e.handle_key("+", None), Outcome::Resize(132, 44));
+    }
+
+    /// A tail preview opens at its end, follows new lines while the
+    /// cursor rests on the row, lets `[` scroll up (and then stays put
+    /// when lines arrive), and pins again once `]` reaches the end.
+    #[test]
+    fn tail_preview_opens_at_the_end_and_follows() {
+        let tail = |n: usize| Preview::TextTail((0..n).map(|i| plain_cells(&format!("line {i}"), 0)).collect());
+        let with = |n: usize| {
+            let mut t = tree();
+            t[1].preview = tail(n);
+            t
+        };
+        let mut e = engine();
+        e.set_nodes(with(60));
+        e.select_key("a/s1");
+        // 40 rows high: 39 lines of preview, so the top is 60 - 39.
+        e.render();
+        assert_eq!(e.preview_top(), 21);
+        // The content grows under the cursor: still the end.
+        e.set_nodes(with(70));
+        e.render();
+        assert_eq!(e.preview_top(), 31);
+        // `[` scrolls up half a page and unpins; new lines no longer move it.
+        assert_eq!(e.handle_key("[", None), Outcome::Redraw);
+        e.render();
+        assert_eq!(e.preview_top(), 12);
+        e.set_nodes(with(80));
+        e.render();
+        assert_eq!(e.preview_top(), 12);
+        // `]` twice reaches the end (clamped) and pins it again.
+        e.handle_key("]", None);
+        e.handle_key("]", None);
+        e.render();
+        assert_eq!(e.preview_top(), 41);
+        e.set_nodes(with(90));
+        e.render();
+        assert_eq!(e.preview_top(), 51);
+        // Moving away and back lands at the end again; a plain text
+        // preview still opens at line 0.
+        e.handle_key("[", None);
+        let mut t = with(90);
+        t[4].preview = Preview::Text((0..60).map(|i| plain_cells(&format!("l{i}"), 0)).collect());
+        e.set_nodes(t);
+        e.select_key("a/s2");
+        e.render();
+        assert_eq!(e.preview_top(), 0);
+        e.select_key("a/s1");
+        e.render();
+        assert_eq!(e.preview_top(), 51);
     }
 
     #[test]
