@@ -15,8 +15,10 @@
 #     its mention badge, the DM by display name, "by sections"; `v`
 #     switches to the unread view (no read channel in it); `q` closes;
 #   `open #general`: the channel view with the topic, the history with
-#     mrkdwn resolved (<@U1> -> @zack, *this* -> this) and the
-#     "new messages" rule before the first unread message that is not
+#     mrkdwn resolved (<@U1> -> @zack, *this* -> this), emoji drawn as
+#     glyphs (:raised_hands: in the text, the `fire` reaction, a custom
+#     alias from emoji.list; an image-only custom emoji stays :morph:),
+#     the "new messages" rule before the first unread message that is not
 #     ours; the Slack Connect author U3 (not in users.list) is named
 #     through users.info, once; a bot card with no text shows its
 #     fields; `i`, typed text, Enter posts to the fake and the view
@@ -157,6 +159,7 @@ echo "$ST" | grep -q '3 channels' || fail "status does not count 3 channels: $ST
 echo "$ST" | grep -q 'test.slack.com' || fail "status does not name the workspace: $ST"
 [ "$(ncalls auth.test)" -ge 1 ] || fail "auth.test was not called"
 [ "$(ncalls users.conversations)" -ge 1 ] || fail "users.conversations was not called"
+[ "$(ncalls emoji.list)" -ge 1 ] || fail "emoji.list was not called"
 grep -q 'Authorization' "$HOME/fake.log" && fail "the fake logged a header"
 
 # --- unread and the status-line options ------------------------------------
@@ -211,6 +214,11 @@ screen_lacks 'U3 ' || fail "the channel view shows the raw id U3"
 screen_has 'Demo App' || fail "the bot post lacks its username"
 screen_has 'Status: deploy green' || fail "the fields-only attachment shows no field"
 screen_lacks 'no preview' || fail "the useless fallback is shown"
+# Emoji: the shortcode and the reaction name as glyphs, the custom alias
+# through emoji.list, the image-only custom emoji literal.
+screen_has 'shipped 🙌 🎉 :morph:' || fail "emoji shortcodes were not rendered: $(screen | grep shipped)"
+screen_has '🔥 1' || fail "the fire reaction was not rendered: $(screen | grep -n 1 | grep -v shipped | tail -3)"
+screen | grep -q -e ':raised_hands:' -e ':fire:' -e ':party:' && fail "a shortcode stayed literal"
 NEW=$(screen | grep -n 'new messages' | head -1 | cut -d: -f1)
 HEY=$(screen | grep -n 'look at this' | head -1 | cut -d: -f1)
 FINE=$(screen | grep -n 'fine' | head -1 | cut -d: -f1)

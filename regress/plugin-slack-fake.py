@@ -53,6 +53,10 @@ CHANNELS = [
 # Newest first, as Slack returns a history page.
 HISTORY = {
     "C1": [
+        # Emoji: shortcodes in the text (a standard one, a custom alias to a
+        # standard one, an image-only custom one), a reaction by name.
+        {"type": "message", "user": "U2", "text": "shipped :raised_hands: :party: :morph:", "ts": "1700000400.000100",
+         "reactions": [{"name": "fire", "count": 1, "users": ["U1"]}]},
         {"type": "message", "user": "U2", "text": "hey <@U1> look at *this*", "ts": "1700000300.000100"},
         {"type": "message", "user": "U1", "text": "fine", "ts": "1700000200.000100"},
         {"type": "message", "user": "U2", "text": "morning", "ts": "1700000100.000100"},
@@ -71,7 +75,7 @@ HISTORY = {
 # What client.counts says; conversations.mark and chat.postMessage move it.
 COUNTS = {
     # Read up to "morning": the "fine" after it is ours, the "hey" is news.
-    "C1": {"has_unreads": True, "mention_count": 1, "latest": "1700000300.000100", "last_read": "1700000100.000100"},
+    "C1": {"has_unreads": True, "mention_count": 1, "latest": "1700000400.000100", "last_read": "1700000100.000100"},
     "G1": {"has_unreads": False, "mention_count": 0, "latest": "1699990000.000100", "last_read": "1699990000.000100"},
     "D1": {"has_unreads": True, "mention_count": 0, "latest": "1700000050.000100", "last_read": "1700000000.000000"},
 }
@@ -130,6 +134,11 @@ def handle(method, f):
             if u["id"] == uid:
                 return ok(user=u)
         return err("user_not_found")
+    if method == "emoji.list":
+        # The workspace's custom emoji: an image, an alias to a standard
+        # emoji, an alias to that alias.
+        return ok(emoji={"morph": "https://emoji.slack-edge.com/T1/morph/abc.png",
+                         "party": "alias:tada", "yay": "alias:party"})
     if method == "client.counts":
         return ok(channels=[count_row("C1"), count_row("G1")], mpims=[], ims=[count_row("D1")],
                   threads={"has_unreads": False, "mention_count": 0})
