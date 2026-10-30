@@ -466,15 +466,15 @@ pub struct User {
 
 impl User {
     /// What Slack shows: the display name, else the full name, else
-    /// the handle.
+    /// the handle; the id when the record has none of them (a Slack
+    /// Connect user from another workspace comes with `real_name` null
+    /// and often only a handle).
     pub fn label(&self) -> &str {
-        if !self.display_name.is_empty() {
-            &self.display_name
-        } else if !self.real_name.is_empty() {
-            &self.real_name
-        } else {
-            &self.name
-        }
+        [&self.display_name, &self.real_name, &self.name, &self.id]
+            .into_iter()
+            .map(|s| s.trim())
+            .find(|s| !s.is_empty())
+            .unwrap_or("")
     }
 }
 

@@ -17,8 +17,10 @@
 #   `open #general`: the channel view with the topic, the history with
 #     mrkdwn resolved (<@U1> -> @zack, *this* -> this) and the
 #     "new messages" rule before the first unread message that is not
-#     ours; `i`, typed text, Enter posts to the fake and the view shows
-#     it; `q` closes;
+#     ours; the Slack Connect author U3 (not in users.list) is named
+#     through users.info, once; a bot card with no text shows its
+#     fields; `i`, typed text, Enter posts to the fake and the view
+#     shows it; `q` closes;
 #   `send @Tejas ...` posts to the DM; `mark #general` reaches
 #     conversations.mark; `bind`/`unbind` answer; the plugin is still
 #     alive at the end.
@@ -181,6 +183,11 @@ screen_has '●1' || fail "the sidebar lacks the mention badge"
 screen_has '@Tejas' || fail "the sidebar lacks @Tejas"
 screen_has 'secret' || fail "the sections view lacks the private channel"
 screen_has 'by sections' || fail "the sidebar is not tagged by sections"
+# The preview of the selected channel names the stranger, lazily.
+until_ok 60 screen_has 'hello from gregor' || fail "the preview never showed the history"
+until_ok 60 screen_has 'gregor  ' || fail "the preview did not name U3"
+screen_lacks 'U3 ' || fail "the preview shows the raw id U3"
+[ "$(ncalls users.info user U3)" -ge 1 ] || fail "users.info was not asked for U3"
 keys v
 until_ok 20 screen_has 'by unread' || fail "v did not switch to the unread view"
 screen_lacks 'secret' || fail "the unread view lists the read channel"
@@ -199,6 +206,11 @@ screen_has '#general' || fail "the channel view lacks its title"
 screen_has 'the town square' || fail "the channel view lacks the topic"
 screen_has '@zack look at this' || fail "mrkdwn was not resolved"
 screen_has '── new messages ──' || fail "no new-messages rule"
+until_ok 60 screen_has 'gregor  ' || fail "the channel view did not name U3"
+screen_lacks 'U3 ' || fail "the channel view shows the raw id U3"
+screen_has 'Demo App' || fail "the bot post lacks its username"
+screen_has 'Status: deploy green' || fail "the fields-only attachment shows no field"
+screen_lacks 'no preview' || fail "the useless fallback is shown"
 NEW=$(screen | grep -n 'new messages' | head -1 | cut -d: -f1)
 HEY=$(screen | grep -n 'look at this' | head -1 | cut -d: -f1)
 FINE=$(screen | grep -n 'fine' | head -1 | cut -d: -f1)
@@ -232,6 +244,11 @@ R=$(slack 'send #nowhere x')
 
 # --- still alive ---------------------------------------------------------------
 slack status | grep -q 'zack on Morph' || fail "the plugin stopped answering"
+# Each unknown id was asked of users.info once, found or not, through
+# every refetch above.
+[ "$(ncalls users.info user U3)" -eq 1 ] || fail "users.info for U3 was asked $(ncalls users.info user U3) times"
+[ "$(ncalls users.info user U9)" -eq 1 ] || fail "users.info for U9 was asked $(ncalls users.info user U9) times"
+[ "$(ncalls users.list cursor p2)" -ge 1 ] || fail "the users.list cursor was not followed"
 $TMUX show-plugins | grep -q slack || fail "show-plugins lost the plugin"
 
 echo "PASS"

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """A fake Slack web API for regress/plugin-slack.sh: one workspace, three
 conversations, enough state to answer what the slack plugin asks.
+`users.list` comes in two pages (the cursor must be followed) and leaves
+out U3, a Slack Connect user from another workspace whom only `users.info`
+knows; U9 is nobody.
 
     python3 plugin-slack-fake.py PORT     (0 = pick a free port)
 
@@ -35,6 +38,10 @@ USERS = [
      "profile": {"display_name": "Tejas", "real_name": "Tejas K"}},
 ]
 
+# Not in users.list: another workspace's member in a shared channel.
+STRANGER = {"id": "U3", "team_id": "T2", "name": "gregor", "real_name": None, "tz_offset": 3600,
+            "profile": {"display_name": "gregor", "real_name": None}}
+
 CHANNELS = [
     {"id": "C1", "name": "general", "is_channel": True, "is_private": False,
      "is_member": True, "topic": {"value": "the town square"}, "purpose": {"value": ""}},
@@ -49,6 +56,13 @@ HISTORY = {
         {"type": "message", "user": "U2", "text": "hey <@U1> look at *this*", "ts": "1700000300.000100"},
         {"type": "message", "user": "U1", "text": "fine", "ts": "1700000200.000100"},
         {"type": "message", "user": "U2", "text": "morning", "ts": "1700000100.000100"},
+        # A bot card with no text: a fields-only legacy attachment.
+        {"type": "message", "subtype": "bot_message", "bot_id": "B1", "username": "Demo App", "text": "",
+         "ts": "1700000075.000100",
+         "attachments": [{"fallback": "[no preview available]", "id": 1, "mrkdwn_in": ["fields"],
+                          "fields": [{"title": "Status", "value": "deploy green", "short": True}]}]},
+        {"type": "message", "user": "U3", "text": "hello from gregor", "ts": "1700000050.000100"},
+        {"type": "message", "user": "U9", "text": "ghost", "ts": "1700000025.000100"},
     ],
     "G1": [],
     "D1": [],
@@ -106,7 +120,16 @@ def handle(method, f):
              "channel_ids_page": {"channel_ids": []}},
         ])
     if method == "users.list":
-        return ok(members=USERS, response_metadata={"next_cursor": ""})
+        # Two pages: the second only to a caller that follows the cursor.
+        if f.get("cursor") == "p2":
+            return ok(members=USERS[1:], response_metadata={"next_cursor": ""})
+        return ok(members=USERS[:1], response_metadata={"next_cursor": "p2"})
+    if method == "users.info":
+        uid = f.get("user", "")
+        for u in USERS + [STRANGER]:
+            if u["id"] == uid:
+                return ok(user=u)
+        return err("user_not_found")
     if method == "client.counts":
         return ok(channels=[count_row("C1"), count_row("G1")], mpims=[], ims=[count_row("D1")],
                   threads={"has_unreads": False, "mention_count": 0})

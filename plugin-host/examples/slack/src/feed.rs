@@ -216,6 +216,7 @@ async fn on_chat_message(st: &Shared, v: &Value) {
             let Some(inner) = v.get("message") else { return };
             let Some(m) = api::message_from(&channel, inner) else { return };
             let _ = store::upsert_messages(std::slice::from_ref(&m)).await;
+            crate::resolve_message_users(st, std::slice::from_ref(&m));
             chat::on_changed(st, m);
         }
         "message_deleted" => {

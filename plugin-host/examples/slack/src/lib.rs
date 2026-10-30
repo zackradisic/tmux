@@ -122,6 +122,13 @@ pub struct State {
     /// The ts of messages this plugin posted (an agent's reply): the
     /// bridge must not hand them back to the agent.
     pub own_posts: HashSet<String>,
+    /// User ids asked of `users.info` this process (in flight, found,
+    /// or refused): each is asked once. Slack Connect users are not in
+    /// `users.list`, so names arrive lazily as their messages do.
+    pub names_pending: HashSet<String>,
+    /// Ids waiting for a resolver worker, and how many workers run.
+    pub names_queue: Vec<String>,
+    pub names_inflight: usize,
 }
 
 pub type Shared = Rc<RefCell<State>>;
@@ -251,6 +258,9 @@ impl Plugin for Slack {
             feed_error: None,
             bindings: Vec::new(),
             own_posts: HashSet::new(),
+            names_pending: HashSet::new(),
+            names_queue: Vec::new(),
+            names_inflight: 0,
         }));
         ctx.spawn(boot(Rc::clone(&st)));
         Ok(Self { st })
@@ -395,6 +405,9 @@ async fn full_sync_inner(st: &Shared, id: &Identity) -> Result<(), String> {
     }
     sidebar::refresh(st);
     chat::refresh_names(st);
+    // DM peers `users.list` did not have (Slack Connect DMs).
+    let peers: Vec<String> = st.borrow().channels.iter().filter_map(|c| c.user_id.clone()).collect();
+    resolve_users(st, peers);
     Ok(())
 }
 
@@ -477,6 +490,7 @@ async fn announce(st: &Shared, id: &Identity, p: Ping) {
         format!("Slack {label} {who}: {text}")
     };
     let _ = display_message(&listkit::text::clip(&line, 160));
+    resolve_message_users(st, std::slice::from_ref(&m));
     let _ = store::upsert_messages(&[m]).await;
 }
 
@@ -847,10 +861,106 @@ pub async fn absorb(st: &Shared, channel: &str, msgs: &[Message]) {
     }
     let _ = store::upsert_messages(msgs).await;
     let newest = msgs.iter().map(|m| m.ts.as_str()).max().unwrap_or("").to_string();
-    let mut s = st.borrow_mut();
-    if let Some(c) = s.channels.iter_mut().find(|c| c.id == channel) {
-        if c.latest.as_deref().is_none_or(|l| l < newest.as_str()) {
-            c.latest = Some(newest);
+    {
+        let mut s = st.borrow_mut();
+        if let Some(c) = s.channels.iter_mut().find(|c| c.id == channel) {
+            if c.latest.as_deref().is_none_or(|l| l < newest.as_str()) {
+                c.latest = Some(newest);
+            }
+        }
+    }
+    resolve_message_users(st, msgs);
+}
+
+// ---------------------------------------------------------------------------
+// lazy names
+// ---------------------------------------------------------------------------
+
+/// How many `users.info` calls run at once.
+const NAME_WORKERS: usize = 3;
+
+/// The ids among `ids` that the name map lacks and nobody has asked
+/// for yet, each once.
+pub fn missing_user_ids<'a>(known: &HashMap<String, String>, pending: &HashSet<String>, ids: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for id in ids {
+        if id.is_empty() || known.contains_key(id) || pending.contains(id) || out.iter().any(|o| o == id) {
+            continue;
+        }
+        out.push(id.to_string());
+    }
+    out
+}
+
+/// The authors and mentions of `msgs` that have no name yet: ask for
+/// them.
+pub fn resolve_message_users(st: &Shared, msgs: &[Message]) {
+    let mut ids: Vec<String> = Vec::new();
+    for m in msgs {
+        for id in api::user_ids_of(m) {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    resolve_users(st, ids);
+}
+
+/// Fetch `users.info` for the ids the name map lacks (once per id per
+/// process, a few at a time), store them, rebuild the names and redraw
+/// the views. A refused id (deleted, hidden) is not asked again.
+pub fn resolve_users(st: &Shared, ids: Vec<String>) {
+    let spawn_n = {
+        let mut s = st.borrow_mut();
+        if s.ident.is_none() {
+            return;
+        }
+        let missing = missing_user_ids(&s.names.users, &s.names_pending, ids.iter().map(String::as_str));
+        if missing.is_empty() {
+            return;
+        }
+        for id in &missing {
+            s.names_pending.insert(id.clone());
+        }
+        s.names_queue.extend(missing);
+        let want = s.names_queue.len().min(NAME_WORKERS);
+        let n = want.saturating_sub(s.names_inflight);
+        s.names_inflight += n;
+        n
+    };
+    for _ in 0..spawn_n {
+        spawn(resolve_worker(Rc::clone(st)));
+    }
+}
+
+/// One resolver: pull ids off the queue until it is empty.
+async fn resolve_worker(st: Shared) {
+    loop {
+        let (id, uid) = {
+            let mut s = st.borrow_mut();
+            let Some(uid) = s.names_queue.pop() else {
+                s.names_inflight = s.names_inflight.saturating_sub(1);
+                return;
+            };
+            let Some(id) = s.ident.clone() else {
+                s.names_inflight = s.names_inflight.saturating_sub(1);
+                s.names_queue.clear();
+                return;
+            };
+            (id, uid)
+        };
+        match api::user_info(&id, &uid).await {
+            Ok(u) => {
+                let _ = store::upsert_users(std::slice::from_ref(&u)).await;
+                {
+                    let mut s = st.borrow_mut();
+                    s.users.insert(u.id.clone(), u);
+                    s.rebuild_names();
+                }
+                sidebar::refresh(&st);
+                chat::refresh_names(&st);
+            }
+            Err(e) => log(&format!("slack: users.info {uid}: {e}")),
         }
     }
 }
@@ -888,6 +998,9 @@ mod tests {
             feed_error: None,
             bindings: Vec::new(),
             own_posts: HashSet::new(),
+            names_pending: HashSet::new(),
+            names_queue: Vec::new(),
+            names_inflight: 0,
         }
     }
 
@@ -904,5 +1017,16 @@ mod tests {
         assert_eq!(s.resolve_channel("@Tejas K").map(|c| c.id), Some("D1".into()));
         assert_eq!(s.resolve_channel("D1").map(|c| c.id), Some("D1".into()));
         assert!(s.resolve_channel("#nope").is_none());
+    }
+
+    #[test]
+    fn missing_ids_are_unknown_unasked_and_unique() {
+        let mut s = state();
+        s.rebuild_names();
+        let mut pending = HashSet::new();
+        pending.insert("U5".to_string());
+        let got = missing_user_ids(&s.names.users, &pending, ["U2", "U5", "U9", "U9", "", "U7"]);
+        assert_eq!(got, vec!["U9".to_string(), "U7".to_string()]);
+        assert!(missing_user_ids(&s.names.users, &pending, ["U2", "U5"]).is_empty());
     }
 }

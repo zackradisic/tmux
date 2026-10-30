@@ -203,6 +203,182 @@ const NOISE: &[&str] = &[
     "joiner_notification_for_inviter",
 ];
 
+/// Slack's placeholder for an attachment it could not summarise.
+const NO_PREVIEW: &str = "[no preview available]";
+
+fn nonempty(v: Option<String>) -> Option<String> {
+    v.filter(|t| !t.trim().is_empty())
+}
+
+/// A legacy attachment (a link unfurl, an integration card) as the lines
+/// the views draw: pretext, author/title, text, each field as
+/// `title: value`, footer. The `fallback` only when nothing else is
+/// there, and never Slack's "[no preview available]".
+fn attachment_text(at: &Value) -> Option<String> {
+    let mut lines: Vec<String> = Vec::new();
+    fn push(lines: &mut Vec<String>, t: Option<String>) {
+        if let Some(t) = nonempty(t) {
+            lines.push(t.trim_end().to_string());
+        }
+    }
+    push(&mut lines, s(at, "pretext"));
+    let text = nonempty(s(at, "text"));
+    let head = nonempty(s(at, "author_name"));
+    let title = nonempty(s(at, "title"));
+    let head = match (head, title) {
+        (Some(a), Some(t)) => Some(format!("{a}: {t}")),
+        (a, t) => a.or(t),
+    };
+    if let Some(h) = head {
+        match nonempty(s(at, "title_link")).filter(|_| text.is_none()) {
+            Some(link) => push(&mut lines, Some(format!("{h} <{link}>"))),
+            None => push(&mut lines, Some(h)),
+        }
+    }
+    push(&mut lines, text);
+    for f in at.get("fields").and_then(Value::as_array).into_iter().flatten() {
+        let Some(value) = nonempty(s(f, "value")) else { continue };
+        match nonempty(s(f, "title")) {
+            Some(t) => push(&mut lines, Some(format!("{t}: {value}"))),
+            None => push(&mut lines, Some(value)),
+        }
+    }
+    if let Some(blocks) = at.get("blocks") {
+        push(&mut lines, Some(blocks_text(blocks)));
+    }
+    push(&mut lines, s(at, "footer"));
+    if lines.is_empty() {
+        push(&mut lines, nonempty(s(at, "fallback")).filter(|f| f.trim() != NO_PREVIEW));
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
+/// A Block Kit `blocks` array as mrkdwn text, one block per line
+/// (`header`, `section` with its fields, `context`, `rich_text`,
+/// `image`, a `divider` as a rule). The angle-bracket tokens stay as
+/// mrkdwn so the renderer resolves them.
+pub fn blocks_text(blocks: &Value) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for blk in blocks.as_array().into_iter().flatten() {
+        let kind = blk.get("type").and_then(Value::as_str).unwrap_or("");
+        let mut lines: Vec<String> = Vec::new();
+        match kind {
+            "header" | "section" => {
+                if let Some(t) = nonempty(blk.get("text").and_then(|t| s(t, "text"))) {
+                    lines.push(t);
+                }
+                for f in blk.get("fields").and_then(Value::as_array).into_iter().flatten() {
+                    if let Some(t) = nonempty(s(f, "text")) {
+                        lines.push(t);
+                    }
+                }
+            }
+            "context" => {
+                let parts: Vec<String> = blk
+                    .get("elements")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| nonempty(s(e, "text")).or_else(|| nonempty(s(e, "alt_text"))))
+                    .collect();
+                if !parts.is_empty() {
+                    lines.push(parts.join("  "));
+                }
+            }
+            "image" => {
+                if let Some(t) = nonempty(s(blk, "alt_text")).or_else(|| nonempty(blk.get("title").and_then(|t| s(t, "text")))) {
+                    lines.push(format!("[image: {t}]"));
+                }
+            }
+            "divider" => lines.push("──".to_string()),
+            "rich_text" => rich_text_lines(blk, "", &mut lines),
+            _ => {}
+        }
+        out.extend(lines.into_iter().filter(|l| !l.trim().is_empty()));
+    }
+    out.join("\n")
+}
+
+/// The lines of a `rich_text` block (or one of its containers): each
+/// `rich_text_section` is a line, a list's items get a bullet, a quote
+/// a `>`, preformatted text a fence.
+fn rich_text_lines(blk: &Value, prefix: &str, out: &mut Vec<String>) {
+    for el in blk.get("elements").and_then(Value::as_array).into_iter().flatten() {
+        match el.get("type").and_then(Value::as_str).unwrap_or("") {
+            "rich_text_section" => out.push(format!("{prefix}{}", rich_text_inline(el))),
+            "rich_text_list" => {
+                let ordered = el.get("style").and_then(Value::as_str) == Some("ordered");
+                for (n, item) in el.get("elements").and_then(Value::as_array).into_iter().flatten().enumerate() {
+                    let bullet = if ordered { format!("{}. ", n + 1) } else { "• ".to_string() };
+                    out.push(format!("{prefix}{bullet}{}", rich_text_inline(item)));
+                }
+            }
+            "rich_text_quote" => out.push(format!("{prefix}&gt; {}", rich_text_inline(el))),
+            "rich_text_preformatted" => {
+                out.push("```".to_string());
+                out.extend(rich_text_inline(el).lines().map(str::to_string));
+                out.push("```".to_string());
+            }
+            _ => {}
+        }
+    }
+}
+
+/// One rich_text section's elements as mrkdwn: text, `<url|label>`,
+/// `<@U..>`, `<#C..>`, `:emoji:`, `<!here>`.
+fn rich_text_inline(section: &Value) -> String {
+    let mut out = String::new();
+    for e in section.get("elements").and_then(Value::as_array).into_iter().flatten() {
+        match e.get("type").and_then(Value::as_str).unwrap_or("") {
+            "text" => out.push_str(&s(e, "text").unwrap_or_default()),
+            "link" => {
+                let url = s(e, "url").unwrap_or_default();
+                match nonempty(s(e, "text")).filter(|t| *t != url) {
+                    Some(t) => out.push_str(&format!("<{url}|{t}>")),
+                    None => out.push_str(&format!("<{url}>")),
+                }
+            }
+            "user" => out.push_str(&format!("<@{}>", s(e, "user_id").unwrap_or_default())),
+            "usergroup" => out.push_str(&format!("<!subteam^{}>", s(e, "usergroup_id").unwrap_or_default())),
+            "channel" => out.push_str(&format!("<#{}>", s(e, "channel_id").unwrap_or_default())),
+            "emoji" => {
+                // A unicode emoji arrives with its codepoints; Slack's own
+                // custom ones only by name.
+                let shown = s(e, "unicode")
+                    .and_then(|u| u.split('-').map(|h| u32::from_str_radix(h, 16).ok().and_then(char::from_u32)).collect::<Option<String>>())
+                    .unwrap_or_else(|| format!(":{}:", s(e, "name").unwrap_or_default()));
+                out.push_str(&shown);
+            }
+            "broadcast" => out.push_str(&format!("<!{}>", s(e, "range").unwrap_or_else(|| "here".into()))),
+            "date" => out.push_str(&s(e, "fallback").unwrap_or_default()),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The user ids a message names: its author and every `<@U..>` mention
+/// in its text (what the views need resolved to draw it).
+pub fn user_ids_of(m: &Message) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(u) = m.user.as_deref().filter(|u| u.starts_with('U') || u.starts_with('W')) {
+        out.push(u.to_string());
+    }
+    let mut rest = m.text.as_str();
+    while let Some(i) = rest.find("<@") {
+        rest = &rest[i + 2..];
+        let id: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+        if (id.starts_with('U') || id.starts_with('W')) && id.len() > 1 && !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    out
+}
+
 /// One message record as the views keep it. `None` for noise.
 pub fn message_from(channel: &str, m: &Value) -> Option<Message> {
     if m.get("type").and_then(Value::as_str) != Some("message") {
@@ -229,32 +405,25 @@ pub fn message_from(channel: &str, m: &Value) -> Option<Message> {
                 .collect()
         })
         .unwrap_or_default();
-    let attachments = m
+    let attachments: Vec<String> = m
         .get("attachments")
         .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(|at| {
-                    let title = s(at, "title").unwrap_or_default();
-                    let text = s(at, "text").or_else(|| s(at, "fallback")).unwrap_or_default();
-                    let line = match (title.is_empty(), text.is_empty()) {
-                        (true, true) => return None,
-                        (false, true) => title,
-                        (true, false) => text,
-                        (false, false) => format!("{title}\n{text}"),
-                    };
-                    Some(line)
-                })
-                .collect()
-        })
+        .map(|a| a.iter().filter_map(attachment_text).collect())
         .unwrap_or_default();
+    // A message with no text draws its blocks (a bot's header/section
+    // card, an app's rich_text). One with text has the same words in its
+    // blocks, so those are left alone.
+    let mut text = s(m, "text").unwrap_or_default();
+    if text.trim().is_empty() {
+        text = m.get("blocks").map(blocks_text).unwrap_or_default();
+    }
     Some(Message {
         channel: channel.to_string(),
         ts,
         thread_ts: s(m, "thread_ts"),
         user: s(m, "user"),
         username,
-        text: s(m, "text").unwrap_or_default(),
+        text,
         subtype,
         reply_count: i(m, "reply_count"),
         latest_reply: s(m, "latest_reply"),
@@ -421,6 +590,91 @@ mod tests {
         assert!(m.edited);
         assert_eq!(m.attachments, vec!["A link\nits text".to_string()]);
         assert!(!m.is_reply());
+    }
+
+    #[test]
+    fn flattens_a_fields_only_attachment() {
+        // A bot card with no text: fields, and Slack's useless fallback.
+        let v: Value = serde_json::from_str(
+            r#"{"type":"message","subtype":"bot_message","bot_id":"B1","username":"Demo App","text":"","ts":"1.1",
+                "attachments":[{"fallback":"[no preview available]","id":1,"mrkdwn_in":["fields"],
+                  "fields":[{"title":"Status","value":"deploy green","short":true},{"title":"","value":"3 pods","short":true},
+                             {"title":"Empty","value":"","short":false}]}]}"#,
+        )
+        .unwrap();
+        let m = message_from("C1", &v).unwrap();
+        assert_eq!(m.text, "");
+        assert_eq!(m.attachments, vec!["Status: deploy green\n3 pods".to_string()]);
+        // Pretext, author + title with its link, text, footer, in that order;
+        // the title link is dropped once there is a text.
+        let v: Value = serde_json::from_str(
+            r#"{"type":"message","text":"","ts":"1.2","attachments":[
+                {"pretext":"New PR","author_name":"octocat","title":"Fix it","title_link":"https://x/1","footer":"GitHub","fallback":"f"},
+                {"title":"Only a title","title_link":"https://x/2","text":"body"},
+                {"fallback":"just the fallback"},
+                {"fallback":"[no preview available]"}]}"#,
+        )
+        .unwrap();
+        let m = message_from("C1", &v).unwrap();
+        assert_eq!(
+            m.attachments,
+            vec!["New PR\noctocat: Fix it <https://x/1>\nGitHub".to_string(), "Only a title\nbody".to_string(), "just the fallback".to_string()]
+        );
+    }
+
+    #[test]
+    fn renders_blocks_when_text_is_empty() {
+        let v: Value = serde_json::from_str(
+            r#"{"type":"message","bot_id":"B1","text":"","ts":"1.3","blocks":[
+                {"type":"header","text":{"type":"plain_text","text":"Deploy finished"}},
+                {"type":"section","text":{"type":"mrkdwn","text":"*prod* is on <https://x/r/42|r42>"},
+                 "fields":[{"type":"mrkdwn","text":"*Region*\nus-east"},{"type":"mrkdwn","text":"*By*\n<@U7>"}]},
+                {"type":"divider"},
+                {"type":"context","elements":[{"type":"image","image_url":"https://x/i.png","alt_text":"ok"},{"type":"mrkdwn","text":"took 3m"}]}]}"#,
+        )
+        .unwrap();
+        let m = message_from("C1", &v).unwrap();
+        assert_eq!(m.text, "Deploy finished\n*prod* is on <https://x/r/42|r42>\n*Region*\nus-east\n*By*\n<@U7>\n──\nok  took 3m");
+        assert!(m.attachments.is_empty());
+        // With a text, the blocks are its duplicate and stay out.
+        let v: Value = serde_json::from_str(
+            r#"{"type":"message","user":"U1","text":"hello","ts":"1.4","blocks":[{"type":"rich_text","elements":[{"type":"rich_text_section","elements":[{"type":"text","text":"hello"}]}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(message_from("C1", &v).unwrap().text, "hello");
+        // An attachment's own blocks are its lines.
+        let v: Value = serde_json::from_str(
+            r#"{"type":"message","text":"","ts":"1.5","attachments":[{"fallback":"[no preview available]",
+                "blocks":[{"type":"section","text":{"type":"mrkdwn","text":"from the attachment"}}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(message_from("C1", &v).unwrap().attachments, vec!["from the attachment".to_string()]);
+    }
+
+    #[test]
+    fn renders_rich_text_with_a_mention() {
+        let v: Value = serde_json::from_str(
+            r#"{"type":"message","bot_id":"B2","text":"","ts":"1.6","blocks":[{"type":"rich_text","elements":[
+                {"type":"rich_text_section","elements":[
+                    {"type":"text","text":"cc "},{"type":"user","user_id":"U0854E66JD8"},{"type":"text","text":" see "},
+                    {"type":"link","url":"https://x/doc","text":"the doc"},{"type":"text","text":" in "},
+                    {"type":"channel","channel_id":"C9"},{"type":"text","text":" "},{"type":"emoji","name":"tada"},
+                    {"type":"text","text":" "},{"type":"broadcast","range":"here"}]},
+                {"type":"rich_text_list","style":"bullet","elements":[
+                    {"type":"rich_text_section","elements":[{"type":"text","text":"one"}]},
+                    {"type":"rich_text_section","elements":[{"type":"text","text":"two"}]}]},
+                {"type":"rich_text_quote","elements":[{"type":"text","text":"quoted"}]},
+                {"type":"rich_text_preformatted","elements":[{"type":"text","text":"let x = 1;"}]}]}]}"#,
+        )
+        .unwrap();
+        let m = message_from("C1", &v).unwrap();
+        assert_eq!(
+            m.text,
+            "cc <@U0854E66JD8> see <https://x/doc|the doc> in <#C9> :tada: <!here>\n• one\n• two\n&gt; quoted\n```\nlet x = 1;\n```"
+        );
+        assert_eq!(user_ids_of(&m), vec!["U0854E66JD8".to_string()]);
+        let m = Message { user: Some("U1".into()), text: "hi <@U2> and <@U1> and <@W3>, not <#C1> nor <!here>".into(), ..Default::default() };
+        assert_eq!(user_ids_of(&m), vec!["U1".to_string(), "U2".to_string(), "W3".to_string()]);
     }
 
     #[test]
