@@ -1149,7 +1149,7 @@ fn execute(picker: &Rc<RefCell<Option<Picker>>>, remotes: &Rc<RefCell<Remotes>>,
         let Some(p) = b.as_mut() else { return };
         match outcome {
             Outcome::Nothing => return,
-            Outcome::Redraw | Outcome::FilterChanged => {
+            Outcome::Redraw | Outcome::FilterChanged | Outcome::Split(_) => {
                 render(p);
                 return;
             }

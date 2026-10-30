@@ -555,6 +555,11 @@ pub async fn set_setting(key: &str, value: &str) -> Result<(), HostError> {
     Ok(())
 }
 
+pub async fn delete_setting(key: &str) -> Result<(), HostError> {
+    db_exec("DELETE FROM settings WHERE key = ?1", params![key]).await?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // membership + identity (async)
 // ---------------------------------------------------------------------------

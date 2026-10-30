@@ -38,9 +38,13 @@ use crate::store::{self, Agent, Stats, TurnRow, LOCAL};
 use crate::transcript::{self, TranscriptHit};
 use crate::{Config, PickKeys, HISTORY_MAX};
 
-/// The picker opens at a fraction of the window, clamped to this box. A
-/// manual resize (+/-) is remembered and overrides the default.
-const SIZE: SizeBox = SizeBox { min_w: 72, min_h: 16, max_w: 180, max_h: 54, fill_tenths: 9 };
+/// The picker opens the full width of the window and 9/10 of its height
+/// (at most `max_h`). A manual resize - +/-, or dragging the float's
+/// border - is remembered and overrides that, as is a dragged separator
+/// between the list and the preview; `0` forgets both. The box's max_w
+/// is no cap at all: the host clamps to the window, which is the only
+/// bound a wide display should hit.
+const SIZE: SizeBox = SizeBox { min_w: 72, min_h: 16, max_w: 1000, max_h: 54, fill_tenths: 9 };
 /// While the picker stays open, re-read the harness session files (and
 /// the remote rosters) on this cadence.
 const REFRESH_MS: u64 = 2000;
@@ -499,6 +503,15 @@ pub struct Picker {
     pub transcript_focus: bool,
     /// Show the info card for the highlighted row in the preview (`i`).
     pub show_info: bool,
+    /// The window the float is over, and its size when last seen: a
+    /// mode-resize while the window kept its size is the user resizing
+    /// the float (remembered); one that comes with a new window size is
+    /// the host clamping it (not).
+    pub window: WindowId,
+    pub window_size: (u32, u32),
+    /// `0` put the float back to the default size: its mode-resize is not
+    /// a size to remember.
+    pub resetting: bool,
     /// The card's fetched half, for the row it was fetched for.
     pub info: Option<InfoCard>,
 }
@@ -600,7 +613,9 @@ fn key_table(k: &PickKeys) -> KeyTable {
         .note("conversation (Tab)", "Esc", "back to the list")
         .with("close", "Escape", "picker", "close (Esc first puts a card or the marks away)")
         .with("group", "v", "picker", "group by project / by server / flat (bands only)")
-        .note("picker", "+ / -", "resize")
+        .note("picker", "+ / -", "resize (dragging the border too; kept)")
+        .note("picker", "drag │", "move the separator between the list and the preview (kept)")
+        .with("reset_size", "0", "picker", "back to the default size and separator")
         .note("picker", "?", "this card");
     for (action, key) in [
         ("activate", &k.jump),
@@ -835,6 +850,41 @@ fn is_multi(rows: &[Agent], fetching: &HashMap<String, u64>, now: u64) -> bool {
         || fetching.values().any(|t| now.saturating_sub(*t) >= SPIN_GRACE_MS)
 }
 
+/// The size the picker opens at with nothing remembered: the full width
+/// of the window, 9/10 of its height up to `SIZE.max_h`.
+fn pick_default_size(ww: u32, wh: u32) -> (u32, u32) {
+    let (_, h) = default_size(ww, wh, &SIZE);
+    (clamp_dim(ww, SIZE.min_w, ww), h)
+}
+
+/// The float changed size: the host's answer to +/- or `0`, a drag of
+/// its border, or a clamp when the window shrank under it. The first two
+/// are the user's choice, kept for the next open; a clamp is not (it
+/// would shrink the picker for good after one visit to a small display).
+pub fn on_mode_resize(picker: &Rc<RefCell<Option<Picker>>>, event: &Event) {
+    let mut b = picker.borrow_mut();
+    let Some(p) = b.as_mut() else { return };
+    if event.get_i64("mode") != Some(p.engine.mode.0 as i64) {
+        return;
+    }
+    let w = event.get_i64("width").map(|v| v as u32).unwrap_or(p.engine.width);
+    let h = event.get_i64("height").map(|v| v as u32).unwrap_or(p.engine.height);
+    p.engine.resize(w, h);
+    pick_render(p);
+    let size = resolve_window(p.window).map(|wi| (wi.width, wi.height)).ok();
+    let clamped = size.is_some_and(|s| s != p.window_size);
+    if let Some(s) = size {
+        p.window_size = s;
+    }
+    if std::mem::take(&mut p.resetting) || clamped {
+        return;
+    }
+    spawn(async move {
+        let _ = store::set_setting("pick_w", &w.to_string()).await;
+        let _ = store::set_setting("pick_h", &h.to_string()).await;
+    });
+}
+
 pub async fn pick_open(
     picker: Rc<RefCell<Option<Picker>>>,
     cfg: Rc<Config>,
@@ -863,7 +913,7 @@ pub async fn pick_open(
     let (ww, wh) = resolve_window(WindowId(window))
         .map(|wi| (wi.width, wi.height))
         .unwrap_or((SIZE.max_w, SIZE.max_h));
-    let (mut width, mut height) = default_size(ww, wh, &SIZE);
+    let (mut width, mut height) = pick_default_size(ww, wh);
     if let Ok(Some(v)) = store::get_setting("pick_w").await {
         if let Ok(n) = v.parse::<u32>() {
             width = clamp_dim(n, SIZE.min_w, ww);
@@ -952,6 +1002,9 @@ pub async fn pick_open(
     let multi = is_multi(&rows, &fetching, now_ms());
     let mut engine = Engine::new(mode, width, height, "agents", key_table(&cfg.keys), sigils());
     engine.size = SIZE;
+    if let Ok(Some(v)) = store::get_setting("pick_split").await {
+        engine.split = v.parse::<u32>().ok().filter(|v| (1..1000).contains(v));
+    }
     // The bands and servers folded last time stay folded: the fold keys
     // are a statement about what you want to see, not about this open.
     if let Ok(Some(v)) = store::get_setting("pick_folds").await {
@@ -1007,6 +1060,9 @@ pub async fn pick_open(
         transcript_focus: false,
         show_info: false,
         info: None,
+        window: WindowId(window),
+        window_size: (ww, wh),
+        resetting: false,
     };
     if let Some(id) = missing_id {
         p.status(format!("no agent {id} on any server"));
@@ -2039,7 +2095,12 @@ fn dispatch_key(
         let kill_pending = p.pending_kill.take();
         let is_down = matches!(key.as_str(), "Down" | "C-n" | "C-j");
         let is_up = matches!(key.as_str(), "Up" | "C-p" | "C-k");
-        let outcome = if is_mouse_key(&key) {
+        // A drag on the separator moves it, whatever side has the
+        // keyboard and whatever the preview shows.
+        let split = mouse.and_then(|(x, _)| p.engine.split_drag(&key, x));
+        let outcome = if let Some(o) = split {
+            o
+        } else if is_mouse_key(&key) {
             // The mouse means the same thing whatever has the keyboard: a
             // click lands where it lands. Without a cell (a mouse key
             // typed by name) there is nowhere for it to land.
@@ -2135,6 +2196,12 @@ fn dispatch_key(
                 pick_render(p);
                 after = PickAfter::Resize(p.engine.mode, w, h);
             }
+            Outcome::Split(split) => {
+                pick_render(p);
+                spawn(async move {
+                    let _ = store::set_setting("pick_split", &split.to_string()).await;
+                });
+            }
             Outcome::PreviewKey(pane, k) => {
                 after = match k.strip_prefix("\u{0}paste:") {
                     Some(text) => PickAfter::Paste(pane.0, text.to_string()),
@@ -2184,6 +2251,29 @@ fn dispatch_key(
                 _ => {}
             },
             Outcome::Action(name, _) => match name {
+                "reset_size" => {
+                    // Back to the default size and separator, for this
+                    // window: a size kept from a wider display is the
+                    // usual reason to want it.
+                    let (ww, wh) = resolve_window(p.window)
+                        .map(|wi| (wi.width, wi.height))
+                        .unwrap_or(p.window_size);
+                    p.window_size = (ww, wh);
+                    let (w, h) = pick_default_size(ww, wh);
+                    p.engine.split = None;
+                    if (w, h) != (p.engine.width, p.engine.height) {
+                        p.resetting = true;
+                        p.engine.resize(w, h);
+                        after = PickAfter::Resize(p.engine.mode, w, h);
+                    }
+                    p.status("default size");
+                    pick_render(p);
+                    spawn(async move {
+                        for k in ["pick_w", "pick_h", "pick_split"] {
+                            let _ = store::delete_setting(k).await;
+                        }
+                    });
+                }
                 "archive" => after = archive_after(p),
                 "unarchive" => {
                     // Undo the last archive: the rows it took come back
@@ -2565,12 +2655,10 @@ fn dispatch_key(
             });
         }
         PickAfter::Resize(mode, w, h) => {
-            // Resize the float now; remember the choice for next time.
+            // Resize the float now. The mode-resize it causes carries the
+            // size the host really gave it, and that is what is kept
+            // (`on_mode_resize`).
             let _ = mode_resize(mode, w, h);
-            ctx.spawn(async move {
-                let _ = store::set_setting("pick_w", &w.to_string()).await;
-                let _ = store::set_setting("pick_h", &h.to_string()).await;
-            });
         }
         PickAfter::RenameProject(old, new) => {
             ctx.spawn(apply_rename_project(Rc::clone(picker), Rc::clone(remotes), old, new));

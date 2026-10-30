@@ -119,8 +119,10 @@
 //! `waiting` row into the band when you know it needs you and no hook
 //! said so. It takes a marked selection too.
 //! Esc clears the selection before it closes the picker. `+`/`-` grow and
-//! shrink the popup; the size is remembered across opens. The popup opens
-//! at a fraction of the window by default. `R` renames the selected agent
+//! shrink the popup, as does dragging its border, and dragging the
+//! separator moves the line between the list and the preview; both are
+//! remembered across opens, and `0` puts them back to the default (the
+//! full width of the window). `R` renames the selected agent
 //! (Enter accepts, Esc cancels, empty reverts to the harness name); your
 //! name and the harness name compete by recency (see `display_name`).
 //! `C-f` toggles content search: the filter then also greps each live
@@ -679,17 +681,7 @@ impl Plugin for Agents {
                 view::on_mode_key(&self.picker, &self.busy, &self.remotes, ctx, &event)
             }
             "mode-nav" => view::on_mode_nav(&self.picker, &self.busy, ctx, &event),
-            "mode-resize" => {
-                let mut b = self.picker.borrow_mut();
-                let Some(p) = b.as_mut() else { return };
-                if event.get_i64("mode") != Some(p.engine.mode.0 as i64) {
-                    return;
-                }
-                let w = event.get_i64("width").map(|v| v as u32).unwrap_or(p.engine.width);
-                let h = event.get_i64("height").map(|v| v as u32).unwrap_or(p.engine.height);
-                p.engine.resize(w, h);
-                view::pick_render(p);
-            }
+            "mode-resize" => view::on_mode_resize(&self.picker, &event),
             "mode-closed" => {
                 let mut b = self.picker.borrow_mut();
                 if b.as_ref().is_some_and(|p| {

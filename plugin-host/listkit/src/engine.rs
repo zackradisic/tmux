@@ -58,6 +58,10 @@ pub enum Outcome {
     FilterChanged,
     /// `+`/`-`: resize the mode to this.
     Resize(u32, u32),
+    /// The separator was dragged: the list column is now this share of
+    /// the width, in thousandths (`Engine::split`). Already applied; the
+    /// consumer redraws and may remember it.
+    Split(u32),
 }
 
 /// One text entry sub-mode on the search line: a rename, a message.
@@ -121,6 +125,11 @@ pub struct Engine {
     pub separator_lit: bool,
     /// Scroll position of a text or Markdown preview.
     pub(crate) preview_top: usize,
+    /// The list column's share of the width, in thousandths, once the
+    /// separator has been dragged; `None` is the default 60%.
+    pub split: Option<u32>,
+    /// A drag that started on the separator is moving it.
+    split_drag: bool,
     /// The last rebuild had a filter on (folds are ignored then).
     filtered: bool,
     pending_g: bool,
@@ -163,6 +172,8 @@ impl Engine {
             show_help: false,
             separator_lit: false,
             preview_top: 0,
+            split: None,
+            split_drag: false,
             filtered: false,
             pending_g: false,
             status: None,
@@ -483,17 +494,45 @@ impl Engine {
     // -- geometry ---------------------------------------------------------
 
     /// The width of the list column; the preview takes the rest. 60% of
-    /// the width, but never let the clamp's min exceed its max: a narrow
-    /// mode (a split pane) would panic `clamp(30, <30)` and trap the
-    /// guest. Below ~50 cols give the list almost everything and skip
-    /// the side preview.
+    /// the width (or the dragged `split`), but never let the clamp's min
+    /// exceed its max: a narrow mode (a split pane) would panic
+    /// `clamp(30, <30)` and trap the guest. Below ~50 cols give the list
+    /// almost everything and skip the side preview.
     pub fn list_w(&self) -> usize {
         let w = self.width as usize;
         if w <= 50 {
             w.saturating_sub(2).max(1)
         } else {
-            (w * 6 / 10).clamp(30, w - 20)
+            (w * self.split.unwrap_or(600) as usize / 1000).clamp(30, w - 20)
         }
+    }
+
+    /// A drag of the separator between the list and the preview. A drag
+    /// that starts on it (or a cell either side: it is one column wide)
+    /// moves it with the pointer until the button goes up; tmux reports a
+    /// drag's first event at the cell it was pressed in. Any other mouse
+    /// key ends it. `None` when this key is not part of such a drag, so a
+    /// consumer routing the mouse itself can ask first.
+    pub fn split_drag(&mut self, key: &str, x: u32) -> Option<Outcome> {
+        let base = key.rsplit('-').next().unwrap_or(key);
+        if base != "MouseDrag1Pane" {
+            self.split_drag = false;
+            return None;
+        }
+        let w = self.width as usize;
+        if w <= 50 {
+            return None;
+        }
+        if !self.split_drag {
+            if (x as usize).abs_diff(self.list_w()) > 1 {
+                return None;
+            }
+            self.split_drag = true;
+        }
+        let col = (x as usize).clamp(30, w - 20);
+        let split = (col * 1000).div_ceil(w) as u32;
+        self.split = Some(split);
+        Some(Outcome::Split(split))
     }
 
     pub fn list_h(&self) -> usize {
@@ -1170,6 +1209,9 @@ impl Engine {
         let (x, y) = (x as usize, y as usize);
         let base = key.rsplit('-').next().unwrap_or(key);
         let in_list = x < list_w;
+        if let Some(o) = self.split_drag(key, x as u32) {
+            return o;
+        }
         match base {
             "MouseDown1Pane" | "DoubleClick1Pane" => {
                 if !in_list {
@@ -1569,6 +1611,27 @@ mod tests {
         assert_eq!(e.handle_key("z", None), Outcome::Key("z".into()));
         assert_eq!(e.handle_key("Enter", None), Outcome::Activate("a/s1".into()));
         assert_eq!(e.handle_key("+", None), Outcome::Resize(132, 44));
+    }
+
+    #[test]
+    fn separator_drag() {
+        let mut e = engine();
+        let w = e.width as usize;
+        let sep = e.list_w() as u32;
+        // A drag that starts in the list is not the separator's.
+        assert_eq!(e.split_drag("MouseDrag1Pane", 3), None);
+        // One that starts on it moves it with the pointer, past the
+        // column it started in.
+        assert!(matches!(e.split_drag("MouseDrag1Pane", sep), Some(Outcome::Split(_))));
+        assert!(matches!(e.handle_key("MouseDrag1Pane", Some((40, 5))), Outcome::Split(_)));
+        assert_eq!(e.list_w(), 40);
+        // Clamped so both sides keep some room.
+        e.handle_key("MouseDrag1Pane", Some((w as u32, 5)));
+        assert_eq!(e.list_w(), w - 20);
+        // The button going up (any other mouse key) ends it.
+        e.handle_key("MouseDown1Pane", Some((3, 5)));
+        assert_eq!(e.split_drag("MouseDrag1Pane", 3), None);
+        assert_eq!(e.list_w(), w - 20);
     }
 
     #[test]
