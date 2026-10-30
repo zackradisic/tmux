@@ -56,8 +56,13 @@ Everything here is quick and dirty on purpose. The real references are
 - **mailbox** — messages between agents, on this machine or a linked one.
   Stored as data, never typed into a pane, so it can't corrupt a half-written
   prompt.
-- **notify-toast** (`prefix + N`) — anything in a pane that emits a desktop
-  notification escape code pops up as a toast, with a browsable feed.
+- **slack** (`prefix + C-s`) — your Slack workspace in a float: the sidebar
+  with badges, a channel view that reads and posts, live over Slack's own
+  websocket, counts in the status line, and a bridge that lets a Slack thread
+  drive an agent. It is your signed-in desktop session: nothing to configure.
+- **notify-toast** (`prefix + N`) — a notification feed as a toast in the
+  corner, with a browsable tree. Slack is its first source; any plugin can
+  post to it.
 - **git-status** — per-pane branch and dirty flag for the status line, that
   follows whichever pane you're in.
 - **cron** — scheduled jobs that survive server restarts, with a picker.
@@ -128,11 +133,22 @@ manifest exists.)
 `~/.tmux/plugins.toml`:
 
 ```toml
-# Toast notifications (OSC 9 / OSC 777 from any program in a pane).
+# Slack: the sidebar, the channel view, the live feed, the status counts.
+# Acts as the Slack desktop app's signed-in user (Keychain + cookie store,
+# read once); `net` is the host's HTTP + websocket import.
+[plugins.slack]
+path = "~/.local/share/tmux2/plugins/slack.wasm"
+scope = "server"
+caps = ["mode", "db", "fs-read", "fs-write", "run-process", "run-command",
+        "write-options", "timers", "net", "service-call"]
+config = { workspace = "morphllm" }
+
+# Toast notifications: a feed any plugin posts to (Slack does); set
+# pane_notifications = "1" to also show OSC 9 / OSC 777 from programs.
 [plugins.notify_toast]
 path = "~/.local/share/tmux2/plugins/notify_toast.wasm"
 scope = "server"
-caps = ["run-command", "mode"]
+caps = ["run-command", "mode", "service-serve"]
 config = { duration_ms = "0", chooser_width = "90%", chooser_height = "60%" }
 
 # Per-pane git branch/dirty for the status line.
@@ -198,6 +214,7 @@ bind S   plugin-command session_creator new  # new session (folder)
 bind W   plugin-command session_creator worktree
 bind T   plugin-command scp copy             # copy files to/from a host
 bind N   plugin-command notify_toast chooser # notification tree
+bind C-s plugin-command slack pick           # Slack sidebar
 
 # S / W also from inside the prefix+w tree
 bind -T choose-tree S plugin-command session_creator new
@@ -494,13 +511,50 @@ place. The last field, `project`, follows the name and lands as the session's
 `@project` option, which the agents picker groups by; the sessions chooser
 shows it on the row and `p` there changes it (on a window too).
 
+### slack — `prefix + C-s`
+Your Slack workspace, in tmux. The plugin is the Slack desktop app's
+signed-in user: it reads the app's session cookie once (Keychain + cookie
+store, decrypted inside the plugin) and mints the same token the desktop
+client uses, so there is no bot, no app and nothing to configure beyond the
+workspace name. Everything the desktop client can do, the plugin can.
+
+The **sidebar** (`prefix + C-s`) is a picker over your conversations, grouped
+as your own Slack sidebar is (its sections, then channels, then DMs). A row is
+bold while unread, red with a count when you were mentioned, dim when muted;
+the right column says how long ago the channel last spoke, and the preview
+shows its recent messages. `Enter` opens the **channel view**: a transcript
+with day separators, the new-messages line, threads in place (`t`), reactions,
+and a compose line (`i`, `r` to reply in a thread, `e` to react, `o` opens the
+message in the Slack app, `y` copies its permalink). `v` cycles sections /
+unread / all; `/` searches with `#channel`, `@user` and `!unread` tokens.
+
+Updates are live: the plugin holds Slack's own RTM websocket through the
+host's `net` capability. A message shows the moment it is posted, a channel
+you read on your phone loses its badge here, and the notification Slack would
+have shown lands in the toast feed. The badges also reach the status line as
+`#{@slack_unread}`, `#{@slack_mentions}` and `#{@slack_dms}`.
+
+```sh
+tmux2 plugin-command slack help                       # every verb
+tmux2 plugin-command slack unread                     # channels with unread
+tmux2 plugin-command slack 'open #general'            # the channel view
+tmux2 plugin-command slack 'send @tejas on my way'    # post as you
+tmux2 plugin-command slack 'bind #ops/<thread_ts> claude:<id>'
+```
+
+`bind` is the agent bridge: every new message in that channel or thread is
+handed to the mailbox for the agent, with the `reply` command that answers in
+the same thread, so you can talk to an agent from your phone. The agent's own
+posts are not echoed back to it.
+
 ### notify-toast — `prefix + N`
-Any program that emits OSC 9 or OSC 777 (e.g. an agent's stop hook running
-`printf '\e]9;done\a'`) shows up as a toast in a floating pane, top-right, in
-whatever window you're looking at. One line per notifying pane, so a chatty
-pane can't flood it. `prefix + N` opens a `choose-tree`-style chooser of the
-feed with a live preview: `Enter` jumps to the source pane, `d` dismisses,
-`h`/`l` fold.
+A notification feed: a toast in a floating pane, top-right, in whatever window
+you're looking at, and `prefix + N` for a `choose-tree`-style chooser of the
+feed with a preview. Any plugin can post to it through its `notify` service
+(Slack does, on every notification Slack itself would have shown); `Enter`
+runs the row's action (open that channel), `d` dismisses, `h`/`l` fold. With
+`pane_notifications = "1"`, programs that emit OSC 9 or OSC 777 (an agent's
+stop hook running `printf '\e]9;done\a'`) show up too, one line per pane.
 
 ### git-status
 Pane-scoped. Publishes `@git_branch` / `@git_dirty` on its own pane, so
@@ -579,4 +633,5 @@ anything a bug — a failing link mostly looks like nothing happening.
 | `load-plugin` / `reload-plugin` / `unload-plugin` | one-off plugin control |
 | `show-plugins -v` / `plugin-log <name>` | is it running, and why not |
 | `plugin-command <plugin> '<verb …>'` | talk to a plugin |
+| `plugin-command slack 'open #chan'` / `unread` / `send` | Slack without leaving the terminal |
 | `plugin-peers allow <server> <plugin>` | let a linked server call back |
