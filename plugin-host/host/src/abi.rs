@@ -1240,5 +1240,25 @@ fn register_imports(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
         ret_i32(with_mem(&mut c, |mem| dispatch::peers_list(mem, owned_out)))
     })?;
 
+    linker.func_wrap(m, im::HTTP_REQUEST, |mut c: Caller<'_, StoreData>, req_ptr: i32, req_len: i32| -> i64 {
+        ret_i64(with_mem(&mut c, |mem| dispatch::http_request(mem, req_ptr, req_len)))
+    })?;
+
+    linker.func_wrap(m, im::WS_OPEN, |mut c: Caller<'_, StoreData>, url_ptr: i32, url_len: i32, hdr_ptr: i32, hdr_len: i32| -> i64 {
+        ret_i64(with_mem(&mut c, |mem| {
+            dispatch::ws_open(mem, url_ptr, url_len, hdr_ptr, hdr_len)
+        }))
+    })?;
+
+    linker.func_wrap(m, im::WS_SEND, |mut c: Caller<'_, StoreData>, socket: i64, data_ptr: i32, data_len: i32, text: i32| -> i32 {
+        ret_i32(with_mem(&mut c, |mem| {
+            dispatch::ws_send(mem, socket, data_ptr, data_len, text)
+        }))
+    })?;
+
+    linker.func_wrap(m, im::WS_CLOSE, |mut c: Caller<'_, StoreData>, socket: i64| -> i32 {
+        ret_i32(with_mem(&mut c, |mem| dispatch::ws_close(mem, socket)))
+    })?;
+
     Ok(())
 }

@@ -21,6 +21,7 @@ members = [
     "examples/mailbox",
     "examples/accounts",
     "examples/services-probe",
+    "examples/net-probe",
     "tools/index",
 ]
 default-members = ["host"]

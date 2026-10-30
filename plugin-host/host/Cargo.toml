@@ -43,6 +43,13 @@ rusqlite = { version = "0.32", features = ["bundled", "hooks", "limits"] }
 # Compress-on-write for ZSTD_REF blob parameters and `db_decompress`.
 # Already built for wasmtime's cache feature; confined to sqlite.rs.
 zstd = "0.13"
+# Network capability (`net`): HTTP through ureq, websockets through
+# tungstenite, both blocking, on threads of their own (never the fs
+# executor). rustls with ring and the bundled webpki roots, so no system
+# TLS library is assumed - the host also runs on bare Linux boxes. All
+# usage is confined to net.rs.
+ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
+tungstenite = { version = "0.28", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
 
 [dev-dependencies]
 wat = "1"

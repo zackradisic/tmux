@@ -21,6 +21,7 @@ mod hostlog;
 mod intern;
 mod manifest;
 mod modes;
+mod net;
 mod peers;
 mod registry;
 mod release;
@@ -120,6 +121,9 @@ pub unsafe extern "C" fn pgh_init(vt: *const pgh_host_vtable) -> c_int {
 #[no_mangle]
 pub extern "C" fn pgh_shutdown() {
     ffi_guard!((), {
+        // Tell every websocket thread to close (they hold no host state
+        // and post nothing once the worker state is gone).
+        net::forget_all();
         // Finish (and join) the worker pool first: its in-flight fs jobs
         // read and write pinned guest memory, so the stores must still be
         // alive here.

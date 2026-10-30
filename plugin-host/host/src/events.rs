@@ -151,6 +151,9 @@ pub fn drain(max_us: u32) -> u32 {
             Delivery::ServiceAccept { peer, plugin, bytes } => {
                 deliver_service_accept(peer, &plugin, &bytes);
             }
+            Delivery::Net { owner, socket, event } => {
+                crate::net::deliver(&owner, socket, event);
+            }
         }
 
         // Unloads queued by work above run in the same slice.
@@ -209,6 +212,7 @@ pub fn release_instance_resources(inst: &Instance) {
         inst.generation,
     );
     crate::services::purge_instance(&inst.plugin, inst.scope_id, inst.generation);
+    crate::net::purge_instance(&inst.plugin, inst.scope_id, inst.generation);
     let timers =
         crate::tokens::purge_instance(&inst.plugin, inst.scope_id, inst.generation);
     let modes =
@@ -320,13 +324,35 @@ fn checkout(plugin: &str, scope: ScopeId) -> Option<(usize, Instance)> {
 /// Deliver a complete event buffer to one instance only (a service
 /// request or topic event), generation-checked. No subscription is
 /// needed: the delivery is addressed.
-fn deliver_to_owner(owner: &crate::services::Owner, mut bytes: Vec<u8>, what: &str) {
+fn deliver_to_owner(owner: &crate::services::Owner, bytes: Vec<u8>, what: &str) {
+    deliver_owned_event(owner, bytes, what, false);
+}
+
+/// Deliver an addressed event buffer to `owner`, generation-checked;
+/// with `subscribed_only` the instance must also have subscribed to the
+/// event (the `ws-*` events: a plugin that did not ask for frames is
+/// not handed them).
+pub fn deliver_owned_event(
+    owner: &crate::services::Owner,
+    mut bytes: Vec<u8>,
+    what: &str,
+    subscribed_only: bool,
+) {
     let Some((key, mut inst)) = checkout(&owner.plugin, owner.scope) else {
         return;
     };
     if inst.generation != owner.generation {
         check_in(key, inst, false);
         return;
+    }
+    if subscribed_only {
+        let wanted = EventHeader::parse(&bytes)
+            .map(|(h, _)| inst.guest.store.data().subscriptions.contains(&h.event_id))
+            .unwrap_or(false);
+        if !wanted {
+            check_in(key, inst, false);
+            return;
+        }
     }
     let seq = EVENTS.with(|e| {
         let mut q = e.borrow_mut();

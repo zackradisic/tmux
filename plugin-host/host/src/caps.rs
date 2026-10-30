@@ -71,9 +71,16 @@ pub const CLAUDE_NOTIFY: u32 = 1 << 23;
 /// clipboard can hold anything the user copied, so a plugin asks for it
 /// by name.
 pub const CLIPBOARD: u32 = 1 << 24;
+/// Outbound network: HTTP requests and websockets (`http_request`,
+/// `ws_*`), through the host's own TLS stack, on dedicated threads. A
+/// `[caps.net] hosts = [...]` sidecar list narrows the hosts a URL may
+/// name; without one (or under trust-the-user) any host is allowed. Not
+/// in the default grants for a pushed plugin: a remote's plugin must not
+/// make this server its proxy.
+pub const NET: u32 = 1 << 25;
 
 /// Highest bit used above, for `describe`.
-const CAP_BITS: u32 = 25;
+const CAP_BITS: u32 = 26;
 
 /// Granted to every plugin without being asked for.
 pub const DEFAULT_CAPS: u32 = READ_STATE | DISPLAY_MESSAGE | TIMERS;
@@ -105,6 +112,7 @@ pub fn cap_from_name(name: &str) -> Option<u32> {
         "service-call" => SERVICE_CALL,
         "service-serve" => SERVICE_SERVE,
         "claude-notify" => CLAUDE_NOTIFY,
+        "net" => NET,
         _ => return None,
     })
 }
@@ -136,6 +144,7 @@ pub fn cap_name(flag: u32) -> &'static str {
         SERVICE_CALL => "service-call",
         SERVICE_SERVE => "service-serve",
         CLAUDE_NOTIFY => "claude-notify",
+        NET => "net",
         _ => "?",
     }
 }
@@ -162,6 +171,10 @@ pub struct EffectiveCaps {
     /// peer grants: a remote call for a method not here is denied before
     /// any grant is even consulted.
     pub serve_remote: Vec<String>,
+    /// Hosts `http_request`/`ws_open` may name (empty = any, if net is
+    /// granted). A `*.` prefix matches every subdomain and the bare
+    /// domain; anything else is an exact, case-insensitive match.
+    pub net_hosts: Vec<String>,
     /// Linear memory ceiling for each instance, from the sidecar's
     /// `[limits] memory_mb` (clamped), else the host default.
     pub memory_limit: usize,
@@ -189,6 +202,11 @@ impl EffectiveCaps {
                     Some(s) => s == server,
                 }
         })
+    }
+
+    /// May this plugin reach `host` over the network? See [`net_host_allowed`].
+    pub fn net_host_allowed(&self, host: &str) -> bool {
+        net_host_allowed(&self.net_hosts, host)
     }
 
     /// Human-readable list for show-plugins -v.
@@ -223,6 +241,12 @@ struct ManifestCapsFsRead {
 }
 
 #[derive(Debug, Deserialize, Default)]
+struct ManifestCapsNet {
+    #[serde(default)]
+    hosts: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
 struct ManifestCapsServices {
     #[serde(default)]
     call: Vec<String>,
@@ -246,6 +270,8 @@ struct ManifestCaps {
     fs_read: ManifestCapsFsRead,
     #[serde(default)]
     services: ManifestCapsServices,
+    #[serde(default)]
+    net: ManifestCapsNet,
 }
 
 /// `[limits]`: what the plugin asks of the host beyond capabilities.
@@ -277,6 +303,29 @@ fn memory_limit(memory_mb: Option<u64>) -> usize {
         Some(mb) => ((mb as usize) << 20).clamp(DEFAULT_MEMORY_LIMIT, MAX_MEMORY_LIMIT),
         None => DEFAULT_MEMORY_LIMIT,
     }
+}
+
+/// The `[caps.net] hosts` rule: an empty list allows every host; a
+/// pattern `*.example.com` matches `example.com` and any subdomain of
+/// it; any other pattern is the host itself. Case-insensitive, and a
+/// trailing dot on either side is ignored. The port is not part of it.
+pub fn net_host_allowed(patterns: &[String], host: &str) -> bool {
+    if patterns.is_empty() {
+        return true;
+    }
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    patterns.iter().any(|pat| {
+        let pat = pat.trim_end_matches('.').to_ascii_lowercase();
+        match pat.strip_prefix("*.") {
+            Some(base) => {
+                host == base
+                    || host
+                        .strip_suffix(base)
+                        .is_some_and(|rest| rest.ends_with('.') && rest.len() > 1)
+            }
+            None => host == pat,
+        }
+    })
 }
 
 fn parse_names(names: &[String], what: &str) -> Result<u32, String> {
@@ -313,6 +362,7 @@ pub fn compute(wasm_path: &Path, grants: &[String]) -> Result<EffectiveCaps, Str
             fs_allow: Vec::new(),
             services_allow: Vec::new(),
             serve_remote: Vec::new(),
+            net_hosts: Vec::new(),
             memory_limit: DEFAULT_MEMORY_LIMIT,
         }),
         Some(m) => {
@@ -325,6 +375,7 @@ pub fn compute(wasm_path: &Path, grants: &[String]) -> Result<EffectiveCaps, Str
                 fs_allow: m.caps.fs_read.paths,
                 services_allow: m.caps.services.call,
                 serve_remote: m.caps.services.serve_remote,
+                net_hosts: m.caps.net.hosts,
                 memory_limit: memory_limit(m.limits.memory_mb),
             })
         }
@@ -350,6 +401,42 @@ mod tests {
     #[test]
     fn unknown_grant_rejected() {
         assert!(compute(Path::new("/x.wasm"), &["frobnicate".into()]).is_err());
+    }
+
+    #[test]
+    fn net_hosts_match_exact_and_wildcard() {
+        let pats = vec!["*.slack.com".to_string(), "api.example.org".to_string()];
+        assert!(net_host_allowed(&pats, "slack.com"));
+        assert!(net_host_allowed(&pats, "Files.Slack.com"));
+        assert!(net_host_allowed(&pats, "a.b.slack.com."));
+        assert!(!net_host_allowed(&pats, "evil-slack.com"));
+        assert!(!net_host_allowed(&pats, "slack.com.evil.net"));
+        assert!(!net_host_allowed(&pats, "notslack.com"));
+        assert!(net_host_allowed(&pats, "api.example.org"));
+        assert!(!net_host_allowed(&pats, "www.api.example.org"));
+        assert!(!net_host_allowed(&pats, "example.org"));
+        assert!(net_host_allowed(&[], "anything.at.all"));
+    }
+
+    #[test]
+    fn sidecar_net_hosts_are_read() {
+        let dir = std::env::temp_dir().join(format!("caps-net-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wasm = dir.join("p.wasm");
+        std::fs::write(
+            dir.join("p.toml"),
+            "[caps]\nrequests = [\"net\"]\n[caps.net]\nhosts = [\"slack.com\", \"*.slack.com\"]\n",
+        )
+        .unwrap();
+        let caps = compute(&wasm, &["net".into()]).unwrap();
+        assert!(caps.has(NET));
+        assert_eq!(caps.net_hosts, vec!["slack.com".to_string(), "*.slack.com".to_string()]);
+        assert!(caps.net_host_allowed("edge.slack.com"));
+        assert!(!caps.net_host_allowed("example.com"));
+        // Granted but not requested: the sidecar wins.
+        std::fs::write(dir.join("p.toml"), "[caps]\nrequests = []\n").unwrap();
+        assert!(!compute(&wasm, &["net".into()]).unwrap().has(NET));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

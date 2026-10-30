@@ -50,6 +50,10 @@ pub enum Delivery {
     /// (a field block with server, version and role); the answer lands
     /// in the bridge's verdicts.
     ServiceAccept { peer: u32, plugin: String, bytes: Vec<u8> },
+    /// A websocket's state change or frame, from its socket thread (see
+    /// net.rs): turned into a completion or a `ws-*` event for `owner`
+    /// on the main thread, generation-checked.
+    Net { owner: crate::services::Owner, socket: u64, event: crate::net::WsEvent },
 }
 
 pub struct EventQueue {

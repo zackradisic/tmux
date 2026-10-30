@@ -598,6 +598,11 @@ db_batch(&[(sql, params![...]), ...]).await -> ExecResult // ONE transaction
 zstd_ref(&bytes) -> DbValue      // a parameter the host compresses on the
     // way in, read straight from your buffer; keep the buffer alive
     // until the db_exec / db_batch future completes
+http_request(&HttpRequest).await -> HttpResponse { status, headers, body }
+    // cap net; see "Network". A non-2xx status is a response, not an Err
+ws_open(url, &[(name, value)]).await -> WsId     // cap net; frames arrive as
+    // ws-message / ws-closed events (subscribed for you)
+ws_send_text(WsId, &str) / ws_send_binary(WsId, &[u8]) / ws_close(WsId) // sync
 ```
 
 Async tasks are spawned with `ctx.spawn(async move { ... })` in `init` (or
@@ -673,6 +678,7 @@ load-plugin -c send-keys -c run-process ... myplugin.wasm
 | `env-read` / `env-read-any` | `pane_env` (allowlisted / unrestricted) |
 | `pane-fds` | `pane_fds` (open-file paths of a pane's foreground process) |
 | `claude-notify` | `claude_notify` (one queued user turn into a Claude Code session, over its inbox socket; never granted to a pushed plugin by default) |
+| `net` | `http_request`, `ws_open`, `ws_send_*`, `ws_close` (outbound HTTP and websockets; a `[caps.net] hosts = ["slack.com", "*.slack.com"]` sidecar list narrows the hosts; never granted to a pushed plugin by default) |
 | `fs-read` + `[caps.fs-read] paths` | `fs_read`/`fs_list` under named prefixes only |
 
 Denied calls return `HostError { code: E_CAP_DENIED }` — handle errors, do
@@ -773,6 +779,69 @@ Rules: `zstd_ref` works with `db_exec` and `db_batch` only, the buffer
 must outlive the future, one buffer is capped at 64 MiB, and a stored
 frame still has to fit the 8 MiB result-set cap when you read it back, so
 chunk anything that might compress to more than that.
+
+## Network
+
+Capability `net`: HTTP requests and websockets, for a plugin that talks
+to a web service (the Slack plugin calls the web API and holds an RTM
+socket). The host does the I/O on threads of its own with its own TLS
+stack; the plugin sees futures and events.
+
+```rust
+let r = http_request(
+    &HttpRequest::post("https://slack.com/api/chat.postMessage")
+        .header("Authorization", &format!("Bearer {token}"))
+        .form(&[("channel", "C123"), ("text", "hi")]),   // or .json(&value)
+).await?;
+if r.ok() { let v: serde_json::Value = r.json()?; }       // r.status, r.text(),
+                                                          // r.header("retry-after")
+```
+
+`HttpRequest { method, url, headers, body, timeout_ms }` with
+`::get(url)`, `::post(url)`, `.header(k, v)`, `.body(bytes)`,
+`.form(&[(k, v)])` (url-encodes and sets the content type), `.json(&v)`,
+`.timeout_ms(ms)` (default 30 s, cap 300 s). The response holds the
+status, the headers (lower-case names, one entry per value) and the body
+(cap 8 MiB). Only transport failures fail the future: DNS, TLS, a refused
+connection, the timeout (`E_TIMEOUT`), a body over the cap (`E_LIMIT`).
+Redirects are not followed; a 3xx comes back as a response.
+
+A websocket is opened once and then speaks through events:
+
+```rust
+// in a task
+let ws = ws_open(&wss_url, &[("Authorization", "Bearer ...")]).await?;
+ws_send_text(ws, r#"{"type":"ping"}"#)?;
+
+// in on_event
+if let Some(m) = WsMessage::from_event(&event) {        // m.socket, m.text,
+    if let Ok(v) = m.json::<serde_json::Value>() { ... }  // m.data, m.as_text()
+}
+if let Some(c) = WsClosed::from_event(&event) {          // terminal: c.code is
+    reconnect_later(c.socket, c.code, &c.reason);         // the peer's code, or 0
+}                                                         // for a transport error
+```
+
+`ws_open` subscribes to `ws-message` and `ws-closed` for you. Pings are
+answered by the host and never surface. `ws_send_*` queues a frame (256
+deep; `E_LIMIT` when full, `E_NO_SUCH_OBJECT` once the socket is closed
+or closing); `ws_close` starts a graceful close and `ws-closed` still
+follows. Sockets die with the instance (unload, reload), so a plugin
+that must stay connected reopens in `init`.
+
+Reach: every URL must be `http(s)://` or `ws(s)://`, and a sidecar can
+pin the hosts:
+
+```toml
+[caps]
+requests = ["net"]
+[caps.net]
+hosts = ["slack.com", "*.slack.com"]   # omitted = any host
+```
+
+`*.slack.com` matches `slack.com` and every subdomain. A URL for another
+host fails with `E_CAP_DENIED` before anything is sent. Under
+trust-the-user (no sidecar) any host is allowed.
 
 ## UI modes: interactive panels
 

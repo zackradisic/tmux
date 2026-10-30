@@ -35,7 +35,11 @@
 //! syscalls on pre-validated inputs. All host bookkeeping happens on the
 //! main thread.
 //!
-//! Consumers: `fsworker` (the fs jobs) and `sqlite` (statements).
+//! Consumers: `fsworker` (the fs jobs) and `sqlite` (statements). The
+//! network threads (`net`) are not pool tasks but use the same doorbell:
+//! [`post`] for a request's completion and [`post_delivery`] for a
+//! websocket's frames, one FIFO channel for both so a socket's "opened"
+//! completion is never overtaken by its first frame.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -47,6 +51,7 @@ use std::thread::JoinHandle;
 use tmux_plugin_abi::ErrorCode;
 
 use crate::registry::ScopeId;
+use crate::state::Delivery;
 
 /// The instance a job belongs to, for teardown coordination.
 pub type InstKey = (String, ScopeId, u64);
@@ -74,9 +79,10 @@ struct Inflight {
 }
 
 struct State {
-    /// Every task posts its completion here.
-    done: crossbeam_channel::Sender<Completion>,
-    completions: crossbeam_channel::Receiver<Completion>,
+    /// Every task posts its completion here (as an `AsyncComplete`
+    /// delivery); the net threads post their frames on the same channel.
+    done: crossbeam_channel::Sender<Delivery>,
+    completions: crossbeam_channel::Receiver<Delivery>,
     /// Worker-thread log lines, drained onto the main-thread host log
     /// (which is thread-local, so a worker cannot write it directly).
     log_tx: crossbeam_channel::Sender<String>,
@@ -173,7 +179,7 @@ fn state() -> Result<Arc<State>, String> {
         return Ok(s.clone());
     }
     let (read_fd, write_fd) = make_doorbell()?;
-    let (done_tx, done_rx) = crossbeam_channel::unbounded::<Completion>();
+    let (done_tx, done_rx) = crossbeam_channel::unbounded::<Delivery>();
     let (log_tx, log_rx) = crossbeam_channel::unbounded::<String>();
     let (stop_tx, stop_rx) = async_channel::bounded::<()>(1);
     let mut threads = Vec::new();
@@ -268,9 +274,22 @@ pub fn spawn(fut: impl Future<Output = ()> + Send + 'static) {
 /// After [`shutdown`] has begun the completion is dropped: nothing will
 /// deliver it anyway.
 pub fn post(c: Completion) {
+    post_delivery(Delivery::AsyncComplete {
+        token: c.token,
+        err: c.err,
+        v0: c.v0,
+        v1: c.v1,
+        data: c.data,
+    });
+}
+
+/// Post any delivery to the main thread's queue, with the same doorbell
+/// rule as [`post`]. Callable from any thread; the net threads hand
+/// their websocket frames over this way. Dropped after [`shutdown`].
+pub fn post_delivery(d: Delivery) {
     let s = { STATE.lock().unwrap().clone() };
     let Some(s) = s else { return };
-    let _ = s.done.send(c);
+    let _ = s.done.send(d);
     if !ARMED.swap(true, Ordering::SeqCst) {
         ring(s.doorbell_write);
     }
@@ -336,18 +355,8 @@ pub fn drain() {
         while let Ok(line) = s.log_rx.try_recv() {
             crate::hostlog::error("host", &line);
         }
-        while let Ok(c) = s.completions.try_recv() {
-            crate::state::EVENTS.with(|e| {
-                e.borrow_mut().deliveries.push_back(
-                    crate::state::Delivery::AsyncComplete {
-                        token: c.token,
-                        err: c.err,
-                        v0: c.v0,
-                        v1: c.v1,
-                        data: c.data,
-                    },
-                );
-            });
+        while let Ok(d) = s.completions.try_recv() {
+            crate::state::EVENTS.with(|e| e.borrow_mut().deliveries.push_back(d));
         }
         // A producer armed after our clear: drain again now rather than
         // wait for the (already-consumed) doorbell. Otherwise we are done.
