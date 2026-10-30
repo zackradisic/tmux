@@ -22,6 +22,7 @@ use tmux_plugin_sdk::prelude::*;
 
 use crate::http::{self, sq};
 use crate::store::{self, Identity};
+use crate::Cfg;
 
 type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
 
@@ -168,7 +169,7 @@ pub async fn desktop_cookie() -> Result<String, String> {
 /// Load the workspace page with the cookie and read the session token
 /// Slack embeds in it.
 pub async fn mint_token(domain: &str, cookie: &str) -> Result<String, String> {
-    let (status, html) = http::get_with_cookie(&format!("https://{domain}.slack.com/"), cookie).await?;
+    let (status, html) = http::get_with_cookie(&format!("{}/", http::api_base(domain)), cookie).await?;
     let Some(i) = html.find("\"api_token\":\"") else {
         return Err(format!("{domain}.slack.com: HTTP {status}, no api_token in the page (not signed into this workspace?)"));
     };
@@ -195,9 +196,21 @@ async fn test(mut id: Identity) -> Result<Identity, String> {
     Ok(id)
 }
 
-/// The identity for `domain`: the stored one when Slack still accepts
-/// it, else derived afresh from the desktop app.
-pub async fn ensure(domain: &str) -> Result<Identity, String> {
+/// The identity for the configured workspace: the stored one when Slack
+/// still accepts it, else derived afresh from the desktop app. A session
+/// given in the config (`token` and `cookie`) is used as is, neither
+/// stored nor derived: only `auth.test` says who it is.
+pub async fn ensure(cfg: &Cfg) -> Result<Identity, String> {
+    let domain = cfg.workspace.as_str();
+    if !cfg.token.is_empty() && !cfg.cookie.is_empty() {
+        let id = Identity {
+            domain: domain.to_string(),
+            token: cfg.token.clone(),
+            cookie: cfg.cookie.clone(),
+            ..Default::default()
+        };
+        return test(id).await;
+    }
     if let Some(stored) = store::get_auth(domain).await {
         match test(stored.clone()).await {
             Ok(id) => return Ok(id),

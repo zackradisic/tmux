@@ -5,6 +5,8 @@
 //! does the transfer on a thread of its own; a non-2xx status comes back
 //! as a response, so a 429 can be retried after Slack's `Retry-After`.
 
+use std::cell::RefCell;
+
 use serde_json::Value;
 use tmux_plugin_sdk::prelude::*;
 
@@ -12,6 +14,27 @@ use crate::store::Identity;
 
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
 const TIMEOUT_MS: u64 = 25_000;
+
+thread_local! {
+    /// The workspace's origin (`https://<workspace>.slack.com`, or the
+    /// configured `api_base`), set once at init. The SDK is
+    /// single-threaded, so a thread-local is a plain global here.
+    static API_BASE: RefCell<String> = RefCell::new(String::new());
+}
+
+pub fn set_api_base(base: &str) {
+    API_BASE.with(|b| *b.borrow_mut() = base.trim_end_matches('/').to_string());
+}
+
+/// `https://<domain>.slack.com` unless `set_api_base` said otherwise.
+pub fn api_base(domain: &str) -> String {
+    let set = API_BASE.with(|b| b.borrow().clone());
+    if set.is_empty() {
+        format!("https://{domain}.slack.com")
+    } else {
+        set
+    }
+}
 
 /// Quote for `sh` (the few jobs the plugin still runs: `security`,
 /// `sqlite3`, `open`).
@@ -22,7 +45,7 @@ pub fn sq(s: &str) -> String {
 /// One web API method. Errors are Slack's `error` string (`ok: false`)
 /// or the transport's.
 pub async fn call(id: &Identity, method: &str, form: &[(&str, &str)]) -> Result<Value, String> {
-    let url = format!("https://{}.slack.com/api/{method}", id.domain);
+    let url = format!("{}/api/{method}", api_base(&id.domain));
     let mut attempt = 0;
     loop {
         attempt += 1;

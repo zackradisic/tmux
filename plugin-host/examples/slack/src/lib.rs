@@ -15,6 +15,12 @@
 //! Status line: `#{@slack_unread}` channels with unread messages,
 //! `#{@slack_mentions}` mentions, `#{@slack_dms}` unread DMs.
 //!
+//! For tests and for a workspace reached another way: `-o api_base=URL`
+//! sends every call to `URL/api/<method>` instead of
+//! `https://<workspace>.slack.com`, and `-o token=xoxc-… -o cookie=xoxd-…`
+//! together are the session as given, no desktop app, Keychain or stored
+//! identity consulted (only `auth.test` is asked who they are).
+//!
 //! `plugin-command slack help` lists every verb; `help <verb>` and
 //! `<verb> --help` the details.
 
@@ -40,7 +46,9 @@ use store::{Binding, Channel, Identity, Kind, Message, Section, User};
 
 pub const NAME: &str = "slack";
 
-/// `load-plugin -o workspace=<subdomain> -o poll_secs=10 -o pick_<action>=<key>`.
+/// `load-plugin -o workspace=<subdomain> -o poll_secs=10 -o pick_<action>=<key>`;
+/// `-o api_base=<url> -o token=<xoxc> -o cookie=<xoxd>` for a workspace
+/// reached another way (see the crate doc).
 #[derive(serde::Deserialize, Default)]
 #[serde(default)]
 struct Config {
@@ -48,6 +56,9 @@ struct Config {
     poll_secs: String,
     open_poll_secs: String,
     keep_days: String,
+    api_base: String,
+    token: String,
+    cookie: String,
     #[serde(flatten)]
     rest: HashMap<String, serde_json::Value>,
 }
@@ -58,6 +69,13 @@ pub struct Cfg {
     pub poll_ms: u64,
     pub open_poll_ms: u64,
     pub keep_days: i64,
+    /// Where `/api/<method>` lives: `https://<workspace>.slack.com` unless
+    /// configured.
+    pub api_base: String,
+    /// A session given outright (both or neither); empty means the
+    /// desktop app's.
+    pub token: String,
+    pub cookie: String,
 }
 
 /// Ids to the names the views draw, rebuilt after every sync.
@@ -187,12 +205,21 @@ impl Plugin for Slack {
             .map_err(|e| e.message.clone())?;
         store::migrate_sync()?;
         let num = |s: &str, d: u64| s.trim().parse::<u64>().ok().filter(|v| *v > 0).unwrap_or(d);
+        let workspace = if config.workspace.trim().is_empty() { "morphllm".to_string() } else { config.workspace.trim().to_string() };
+        let api_base = match config.api_base.trim().trim_end_matches('/') {
+            "" => format!("https://{workspace}.slack.com"),
+            b => b.to_string(),
+        };
         let cfg = Cfg {
-            workspace: if config.workspace.trim().is_empty() { "morphllm".into() } else { config.workspace.trim().to_string() },
+            workspace,
             poll_ms: num(&config.poll_secs, 10) * 1000,
             open_poll_ms: num(&config.open_poll_secs, 3) * 1000,
             keep_days: num(&config.keep_days, 30) as i64,
+            api_base,
+            token: config.token.trim().to_string(),
+            cookie: config.cookie.trim().to_string(),
         };
+        http::set_api_base(&cfg.api_base);
         let mut keys = sidebar::keys();
         for (k, v) in &config.rest {
             if let Some(action) = k.strip_prefix("pick_") {
@@ -291,8 +318,8 @@ async fn load_cache(st: &Shared) {
 
 async fn boot(st: Shared) {
     load_cache(&st).await;
-    let domain = st.borrow().cfg.workspace.clone();
-    match auth::ensure(&domain).await {
+    let cfg = st.borrow().cfg.clone();
+    match auth::ensure(&cfg).await {
         Ok(id) => {
             log(&format!("slack: {} on {} ({})", id.user_name, id.team_name, id.domain));
             st.borrow_mut().ident = Some(id);
@@ -471,9 +498,9 @@ async fn poll_loop(st: Shared) {
             log(&format!("slack: poll: {e}"));
             // A rejected session: derive again next time round.
             if e.contains("invalid_auth") || e.contains("not_authed") || e.contains("token_revoked") {
-                let domain = st.borrow().cfg.workspace.clone();
-                store::clear_auth(&domain).await;
-                match auth::ensure(&domain).await {
+                let cfg = st.borrow().cfg.clone();
+                store::clear_auth(&cfg.workspace).await;
+                match auth::ensure(&cfg).await {
                     Ok(id) => st.borrow_mut().ident = Some(id),
                     Err(e2) => {
                         let _ = display_message(&format!("slack: {e2}"));
@@ -642,9 +669,9 @@ fn on_command(st: &Shared, event: &Event) {
             let _ = reply("deriving the session from the desktop app…");
             let st2 = Rc::clone(st);
             spawn(async move {
-                let domain = st2.borrow().cfg.workspace.clone();
-                store::clear_auth(&domain).await;
-                match auth::ensure(&domain).await {
+                let cfg = st2.borrow().cfg.clone();
+                store::clear_auth(&cfg.workspace).await;
+                match auth::ensure(&cfg).await {
                     Ok(id) => {
                         let who = format!("{} on {}", id.user_name, id.team_name);
                         {
@@ -692,6 +719,19 @@ fn on_command(st: &Shared, event: &Event) {
                 st2.borrow_mut().bindings = b;
             });
         }
+        "notify" => {
+            // `notify <title> | <body>`: a line in the notification feed, the
+            // way a Slack notification arrives (for hooks and tests).
+            let (title, body) = rest.split_once('|').map(|(t, b)| (t.trim(), b.trim())).unwrap_or(("slack", rest.trim()));
+            if body.is_empty() && title.is_empty() {
+                let _ = reply("notify: `notify <title> | <body>`");
+                return;
+            }
+            let (title, body) = (title.to_string(), body.to_string());
+            spawn(async move {
+                notify(&title, &body, None, None).await;
+            });
+        }
         "close" => {
             sidebar::close(st);
             chat::close(st);
@@ -699,6 +739,27 @@ fn on_command(st: &Shared, event: &Event) {
         _ => {
             let _ = reply(&format!("slack: unknown verb {verb:?} - `slack help` lists them"));
         }
+    }
+}
+
+/// A line for the notification feed (the notify-toast plugin's `notify`
+/// service); the status line when that plugin is not there.
+pub async fn notify(title: &str, body: &str, key: Option<&str>, action: Option<&str>) {
+    #[derive(serde::Serialize)]
+    struct Req<'a> {
+        source: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        key: Option<&'a str>,
+        title: &'a str,
+        body: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        action: Option<&'a str>,
+    }
+    let req = Req { source: "slack", key, title, body, action };
+    if let Err(e) = service::call_json::<_, serde_json::Value>("notify_toast", "notify", &req).await {
+        log(&format!("slack: notify: {} (toast plugin not loaded?)", e.message));
+        let line = format!("Slack {title}: {body}");
+        let _ = display_message(&listkit::text::clip(&listkit::text::one_line(&line), 180));
     }
 }
 
@@ -784,7 +845,7 @@ mod tests {
 
     fn state() -> State {
         State {
-            cfg: Cfg { workspace: "w".into(), poll_ms: 1, open_poll_ms: 1, keep_days: 1 },
+            cfg: Cfg { workspace: "w".into(), poll_ms: 1, open_poll_ms: 1, keep_days: 1, api_base: "https://w.slack.com".into(), token: String::new(), cookie: String::new() },
             keys: sidebar::keys(),
             ident: Some(Identity { user_name: "zack".into(), ..Default::default() }),
             auth_error: None,
