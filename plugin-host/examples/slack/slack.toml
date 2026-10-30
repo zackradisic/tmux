@@ -23,9 +23,9 @@ requests = [
   # line.
   "write-options",
   "timers",
-  # A mention or DM addressed to a bound agent is pushed into its Claude
-  # session as a user turn (the agent bridge).
-  "claude-notify",
+  # A message in a conversation bound to an agent is handed to the
+  # mailbox plugin for that agent (the agent bridge).
+  "service-call",
   # The host's HTTP and websocket imports (the `net` branch): the live
   # RTM feed. Without it the plugin polls through curl.
   "net",

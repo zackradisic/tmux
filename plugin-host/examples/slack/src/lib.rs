@@ -19,7 +19,7 @@
 //! `<verb> --help` the details.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use listkit::keys::KeyTable;
@@ -28,6 +28,7 @@ use tmux_plugin_sdk::prelude::*;
 mod api;
 mod auth;
 mod chat;
+mod feed;
 mod help;
 mod http;
 mod mrkdwn;
@@ -35,7 +36,7 @@ mod sidebar;
 mod store;
 mod timefmt;
 
-use store::{Channel, Identity, Kind, Message, Section, User};
+use store::{Binding, Channel, Identity, Kind, Message, Section, User};
 
 pub const NAME: &str = "slack";
 
@@ -92,6 +93,17 @@ pub struct State {
     pub threads_unread: bool,
     pub thread_mentions: i64,
     pub last_error: Option<String>,
+    /// The RTM socket, while it is open.
+    pub feed: Option<WsId>,
+    pub feed_connecting: bool,
+    pub feed_backoff_ms: u64,
+    pub feed_since_ms: u64,
+    pub feed_error: Option<String>,
+    /// Conversations whose new messages go to an agent.
+    pub bindings: Vec<Binding>,
+    /// The ts of messages this plugin posted (an agent's reply): the
+    /// bridge must not hand them back to the agent.
+    pub own_posts: HashSet<String>,
 }
 
 pub type Shared = Rc<RefCell<State>>;
@@ -171,7 +183,7 @@ impl Plugin for Slack {
     type Config = Config;
 
     fn init(ctx: &Ctx, config: Self::Config) -> Result<Self, String> {
-        ctx.subscribe(&["plugin-command", "mode-key", "mode-nav", "mode-paste", "mode-resize", "mode-closed"])
+        ctx.subscribe(&["plugin-command", "mode-key", "mode-nav", "mode-paste", "mode-resize", "mode-closed", "ws-message", "ws-closed"])
             .map_err(|e| e.message.clone())?;
         store::migrate_sync()?;
         let num = |s: &str, d: u64| s.trim().parse::<u64>().ok().filter(|v| *v > 0).unwrap_or(d);
@@ -205,6 +217,13 @@ impl Plugin for Slack {
             threads_unread: false,
             thread_mentions: 0,
             last_error: None,
+            feed: None,
+            feed_connecting: false,
+            feed_backoff_ms: 0,
+            feed_since_ms: 0,
+            feed_error: None,
+            bindings: Vec::new(),
+            own_posts: HashSet::new(),
         }));
         ctx.spawn(boot(Rc::clone(&st)));
         Ok(Self { st })
@@ -214,6 +233,16 @@ impl Plugin for Slack {
         let name = event.name();
         match name.as_str() {
             "plugin-command" => on_command(&self.st, &event),
+            "ws-message" => {
+                if let Some(m) = WsMessage::from_event(&event) {
+                    feed::on_message(&self.st, &m);
+                }
+            }
+            "ws-closed" => {
+                if let Some(c) = WsClosed::from_event(&event) {
+                    feed::on_closed(&self.st, &c);
+                }
+            }
             "mode-key" | "mode-nav" | "mode-paste" | "mode-resize" | "mode-closed" => {
                 let mode = event.get_i64("mode");
                 let (is_side, is_chat) = {
@@ -236,6 +265,7 @@ impl Plugin for Slack {
     fn on_unload(&mut self, _ctx: &Ctx) {
         sidebar::close(&self.st);
         chat::close(&self.st);
+        feed::close(&self.st);
     }
 }
 
@@ -250,10 +280,12 @@ async fn load_cache(st: &Shared) {
     let channels = store::channels().await;
     let sections = store::sections().await;
     let users = store::users().await;
+    let bindings = store::bindings().await;
     let mut s = st.borrow_mut();
     s.channels = channels;
     s.sections = sections;
     s.users = users.into_iter().map(|u| (u.id.clone(), u)).collect();
+    s.bindings = bindings;
     s.rebuild_names();
 }
 
@@ -280,6 +312,7 @@ async fn boot(st: Shared) {
     }
     let keep = st.borrow().cfg.keep_days;
     store::sweep(keep).await;
+    spawn(feed::connect(Rc::clone(&st)));
     poll_loop(st).await;
 }
 
@@ -452,7 +485,7 @@ async fn poll_loop(st: Shared) {
 }
 
 /// The counts the status line reads.
-fn publish(s: &State) {
+pub fn publish(s: &State) {
     let unread = s.channels.iter().filter(|c| c.has_unreads && !c.is_muted && !c.is_archived).count();
     let mentions: i64 = s.channels.iter().filter(|c| !c.is_muted).map(|c| c.mentions).sum::<i64>() + s.thread_mentions;
     let dms = s.channels.iter().filter(|c| c.kind.is_dm() && c.has_unreads).count();
@@ -570,8 +603,13 @@ fn on_command(st: &Shared, event: &Event) {
                     let unread = s.channels.iter().filter(|c| c.has_unreads && !c.is_muted).count();
                     let mentions: i64 = s.channels.iter().map(|c| c.mentions).sum();
                     let age = |ms: u64| if ms == 0 { "never".to_string() } else { listkit::text::fmt_age((now_ms().saturating_sub(ms)) / 1000) + " ago" };
+                    let feed = match (&s.feed, &s.feed_error) {
+                        (Some(_), _) => format!("live feed up {}", age(s.feed_since_ms).trim_end_matches(" ago")),
+                        (None, Some(e)) => format!("live feed down ({e}), polling"),
+                        (None, None) => "live feed connecting".to_string(),
+                    };
                     format!(
-                        "{} on {} ({}.slack.com), tz {:+}h\n{} channels, {} users cached; {} unread, {} mentions{}\nbadges {}, full sync {}{}",
+                        "{} on {} ({}.slack.com), tz {:+}h\n{} channels, {} users cached; {} unread, {} mentions{}\nbadges {}, full sync {}, {feed}{}",
                         id.user_name,
                         id.team_name,
                         id.domain,
@@ -642,6 +680,7 @@ fn on_command(st: &Shared, event: &Event) {
             }
             let label = st.borrow().channel_label(&ch);
             let _ = reply(&format!("{} {label}{}", if verb == "bind" { "bound" } else { "unbound" }, if thread.is_empty() { String::new() } else { format!("/{thread}") }));
+            let st2 = Rc::clone(st);
             spawn(async move {
                 if let Some(a) = agent {
                     let since = ch.latest.clone().unwrap_or_default();
@@ -649,6 +688,8 @@ fn on_command(st: &Shared, event: &Event) {
                 } else {
                     store::unbind(&ch.id, &thread).await;
                 }
+                let b = store::bindings().await;
+                st2.borrow_mut().bindings = b;
             });
         }
         "close" => {
@@ -666,6 +707,13 @@ pub async fn post_message(st: &Shared, channel: &str, text: &str, thread_ts: Opt
     let Some(id) = st.borrow().ident.clone() else { return Err("no session".into()) };
     let m = api::post(&id, channel, text, thread_ts).await?;
     let ts = m.ts.clone();
+    {
+        let mut s = st.borrow_mut();
+        if s.own_posts.len() > 500 {
+            s.own_posts.clear();
+        }
+        s.own_posts.insert(ts.clone());
+    }
     let _ = store::upsert_messages(&[m.clone()]).await;
     store::note_message(channel, &ts, true, false).await;
     {
@@ -756,6 +804,13 @@ mod tests {
             threads_unread: false,
             thread_mentions: 0,
             last_error: None,
+            feed: None,
+            feed_connecting: false,
+            feed_backoff_ms: 0,
+            feed_since_ms: 0,
+            feed_error: None,
+            bindings: Vec::new(),
+            own_posts: HashSet::new(),
         }
     }
 
