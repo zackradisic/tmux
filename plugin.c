@@ -195,7 +195,31 @@ static void
 plugin_drain_timer_cb(__unused int fd, __unused short events,
     __unused void *data)
 {
-	plugin_schedule_drain();
+	u_int		 remaining;
+	struct timeval	 tv = { 0, 0 };
+
+	/*
+	 * The cmdq-queued plugin_drain_cb can be stuck behind a command on
+	 * the global queue that returned CMD_RETURN_WAIT and is itself
+	 * waiting on this drain to deliver its event and answer it: a
+	 * plugin-command (or update-plugins) a plugin issued through
+	 * run_command, which cmdq_appends onto the global queue ahead of the
+	 * drain callback. Calling plugin_schedule_drain() here would see
+	 * plugin_drain_scheduled still set and do nothing, so that wait would
+	 * never end and every later drain would be suppressed with it. Drain
+	 * straight from the timer instead - it fires between event-loop
+	 * passes, a safe point with no command part way through, the same
+	 * place plugin_fs_cb drains from - so the wait can never deadlock the
+	 * queue it depends on.
+	 */
+	if (!plugin_initialized || plugin_in_drain)
+		return;
+	plugin_drain_scheduled = 0;
+	plugin_in_drain = 1;
+	remaining = pgh_drain(PLUGIN_DRAIN_BUDGET_US);
+	plugin_in_drain = 0;
+	if (remaining > 0)
+		evtimer_add(&plugin_drain_timer, &tv);
 }
 
 static void
