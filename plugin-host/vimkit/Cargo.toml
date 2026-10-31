@@ -1,0 +1,12 @@
+[package]
+name = "vimkit"
+version = "0.1.0"
+edition.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+# The cell type the rows are rendered into (`Styled`, the `ST_*` flags,
+# wide-glyph cells), so a plugin draws them like any other listkit row.
+listkit = { path = "../listkit" }
