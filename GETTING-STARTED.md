@@ -544,7 +544,12 @@ plugin; `set -g @slack-images off` keeps the lines alone (iTerm2 would show
 blank blocks). `Enter` on a message opens its thread (with or without replies
 yet), `Escape` steps back: thread to channel, channel to sidebar; `q` closes
 outright. `i` composes, `r` replies in the message's thread, `e`
-reacts, `o` opens the message in the Slack app. `y` copies the message to the
+reacts, `o` opens the message in the Slack app. The compose box is a small
+vim: it opens in insert mode, `Enter` sends and keeps it open for the next
+message, `C-j` puts a newline inside a message, `Escape` switches to normal
+mode (`dd`, `cw`, `o`, `v`, `/` and friends edit the draft; `Enter` still
+sends) and `Escape` there closes it; the box grows with the draft up to six
+rows and shows `-- INSERT --` / `-- NORMAL --`. `y` copies the message to the
 clipboard as `Name (2026-10-30 14:02): text`, ready to paste into an agent;
 `v` starts a selection that `j`/`k` extend, so `y` copies a whole exchange;
 `Y` copies the permalink. `n` hands the message or the selection to a new

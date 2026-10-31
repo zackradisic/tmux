@@ -1070,6 +1070,17 @@ fn preview_after(st: &Shared, took: Took) {
             };
             spawn(crate::handoff::open(req));
         }
+        After::Clip(text) => {
+            let st2 = Rc::clone(st);
+            let cid = channel.id.clone();
+            spawn(async move {
+                let status = match chat::copy_text(&text, client).await {
+                    Ok(()) => "yanked to the clipboard".to_string(),
+                    Err(e) => format!("copy: {e}"),
+                };
+                preview_status(&st2, &cid, status);
+            });
+        }
         After::Copy(idxs) => {
             let text = {
                 let s = st.borrow();
@@ -1176,7 +1187,7 @@ pub fn on_mode_event(st: &Shared, name: &str, event: &Event) {
                 // keyboard and one is open (a reaction name).
                 if side.preview_focus {
                     if let Some(cp) = side.preview.as_mut().and_then(|c| c.compose.as_mut()) {
-                        cp.text.push_str(&text);
+                        cp.editor.paste(&text);
                         render(&mut s);
                         return;
                     }
