@@ -554,9 +554,14 @@ pub struct Message {
     /// (emoji name, count)
     #[serde(default)]
     pub reactions: Vec<(String, i64)>,
-    /// File names.
+    /// The files shared with the message (a name at least; an image
+    /// also what the channel view needs to show it).
     #[serde(default)]
-    pub files: Vec<String>,
+    pub files: Vec<FileRef>,
+    /// Pictures outside the files: an attachment's or a block's image (a
+    /// Giphy post, a link unfurl). Their caption is in `attachments`.
+    #[serde(default)]
+    pub pictures: Vec<FileRef>,
     #[serde(default)]
     pub edited: bool,
     /// Attachment fallbacks / texts (link unfurls, integration cards).
@@ -564,6 +569,83 @@ pub struct Message {
     pub attachments: Vec<String>,
     #[serde(default)]
     pub deleted: bool,
+}
+
+/// A file on a message. Cached rows from before the image support hold
+/// a bare name string in `files`; the deserializer takes either form,
+/// so old caches load (as files with no id, which the view lists by
+/// name and never fetches).
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct FileRef {
+    /// Slack's file id (`F…`); empty for a row cached before ids were kept.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    /// The title, else the file name: what the `📎` line says.
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mimetype: String,
+    /// Pixel size, when Slack said (`original_w` / `original_h`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<(u32, u32)>,
+    /// The best thumbnail for the view (static for a GIF), with the
+    /// session cookie and token as every `files.slack.com` URL needs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumb: Option<String>,
+    /// The file itself (`url_private`), the fallback when there is no
+    /// thumbnail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+impl FileRef {
+    pub fn named(name: &str) -> Self {
+        FileRef { name: name.to_string(), ..Default::default() }
+    }
+
+    /// A picture the terminal can show: a raster image with an id and a
+    /// URL to fetch it from. SVG stays a `📎` line (no converter draws it
+    /// reliably).
+    pub fn is_image(&self) -> bool {
+        !self.id.is_empty()
+            && self.mimetype.starts_with("image/")
+            && !self.mimetype.contains("svg")
+            && (self.thumb.is_some() || self.url.is_some())
+    }
+
+    /// The URL to fetch for the view.
+    pub fn fetch_url(&self) -> Option<&str> {
+        self.thumb.as_deref().or(self.url.as_deref())
+    }
+}
+
+impl<'de> Deserialize<'de> for FileRef {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Full {
+            #[serde(default)]
+            id: String,
+            #[serde(default)]
+            name: String,
+            #[serde(default)]
+            mimetype: String,
+            #[serde(default)]
+            size: Option<(u32, u32)>,
+            #[serde(default)]
+            thumb: Option<String>,
+            #[serde(default)]
+            url: Option<String>,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Name(String),
+            Full(Full),
+        }
+        Ok(match Wire::deserialize(d)? {
+            Wire::Name(name) => FileRef::named(&name),
+            Wire::Full(f) => FileRef { id: f.id, name: f.name, mimetype: f.mimetype, size: f.size, thumb: f.thumb, url: f.url },
+        })
+    }
 }
 
 impl Message {

@@ -75,10 +75,10 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use base64::Engine;
 use formkit::complete::Source;
 use formkit::form::{self, field, Action, Field, Form, Model, Shared};
 use formkit::text::{expand_home, last_line, quote, scan_base};
+use listkit::image::{cell_aspect, kitty_delete, kitty_transmit, kitty_transmit_file, placeholder_row, png_size, preview_fit};
 use tmux_plugin_sdk::prelude::*;
 use tmux_plugin_sdk::abi::ErrorCode;
 
@@ -132,7 +132,6 @@ const PREVIEW_MAX_COLS: u32 = FORM_WIDTH - 4;
 /// few hundred KB however large the screenshot.
 const PREVIEW_PX: u32 = 900;
 /// Cell height over cell width when the window cannot say.
-const DEFAULT_CELL_ASPECT: f64 = 2.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Run {
@@ -541,22 +540,6 @@ fn dir_prefill(cwd: &str) -> String {
     }
 }
 
-/// Cell height over cell width for a window, from the terminal's report;
-/// the default when it has none.
-fn cell_aspect(window: u32) -> f64 {
-    let Ok(line) = format_expand(
-        OptionTarget::Window(WindowId(window)),
-        "#{window_cell_width}\t#{window_cell_height}",
-    ) else {
-        return DEFAULT_CELL_ASPECT;
-    };
-    let mut it = line.split('\t').map(|v| v.trim().parse::<f64>().unwrap_or(0.0));
-    match (it.next(), it.next()) {
-        (Some(w), Some(h)) if w > 0.0 && h > 0.0 => h / w,
-        _ => DEFAULT_CELL_ASPECT,
-    }
-}
-
 /// Context gathering + form open, run asynchronously after the
 /// plugin-command event. `kind` is the tab to open on; with `Files`, an
 /// image on the clipboard switches to the clipboard tab when the probe
@@ -802,36 +785,11 @@ function run(argv) {
   return 'ok';
 }"#;
 
-/// A PNG's pixel size, from its IHDR (the first chunk, by the spec).
-fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
-    if bytes.len() < 24 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" || &bytes[12..16] != b"IHDR" {
-        return None;
-    }
-    let be = |i: usize| u32::from_be_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
-    Some((be(16), be(20)))
-}
-
 /// The preview block for an image of `w`×`h` pixels: as many rows as
 /// allowed, narrower when the image is tall; as wide as allowed, fewer
 /// rows when it is wide. `cell_aspect` is cell height over cell width.
 fn preview_box(w: u32, h: u32, cell_aspect: f64) -> (u32, u32) {
     preview_fit(w, h, cell_aspect, PREVIEW_MAX_COLS, PREVIEW_MAX_ROWS)
-}
-
-/// The same for any box of `max_cols`×`max_rows` cells.
-fn preview_fit(w: u32, h: u32, cell_aspect: f64, max_cols: u32, max_rows: u32) -> (u32, u32) {
-    if w == 0 || h == 0 {
-        return (1, 1);
-    }
-    // Columns per row for the image's shape, in cells.
-    let ratio = (w as f64 / h as f64) * cell_aspect;
-    let mut rows = max_rows.max(1);
-    let mut cols = (rows as f64 * ratio).round() as u32;
-    if cols > max_cols.max(1) {
-        cols = max_cols.max(1);
-        rows = (cols as f64 / ratio).round() as u32;
-    }
-    (cols.max(1), rows.max(1))
 }
 
 /// Read the clipboard off the form's path, then tell the form what was
@@ -1010,79 +968,8 @@ async fn remove_clip(clip: Clip) {
 }
 
 // ---------------------------------------------------------------------------
-// the preview: kitty graphics through a tmux passthrough
+// the preview: kitty graphics through a tmux passthrough (listkit::image)
 // ---------------------------------------------------------------------------
-
-/// The placeholder cell, and the diacritics that number its row and
-/// column (the protocol's `rowcolumn-diacritics.txt`, in order; enough
-/// for the widest block the form draws).
-const PLACEHOLDER: char = '\u{10EEEE}';
-const DIACRITICS: [char; 80] = [
-    '\u{0305}', '\u{030D}', '\u{030E}', '\u{0310}', '\u{0312}', '\u{033D}', '\u{033E}', '\u{033F}',
-    '\u{0346}', '\u{034A}', '\u{034B}', '\u{034C}', '\u{0350}', '\u{0351}', '\u{0352}', '\u{0357}',
-    '\u{035B}', '\u{0363}', '\u{0364}', '\u{0365}', '\u{0366}', '\u{0367}', '\u{0368}', '\u{0369}',
-    '\u{036A}', '\u{036B}', '\u{036C}', '\u{036D}', '\u{036E}', '\u{036F}', '\u{0483}', '\u{0484}',
-    '\u{0485}', '\u{0486}', '\u{0487}', '\u{0592}', '\u{0593}', '\u{0594}', '\u{0595}', '\u{0597}',
-    '\u{0598}', '\u{0599}', '\u{059C}', '\u{059D}', '\u{059E}', '\u{059F}', '\u{05A0}', '\u{05A1}',
-    '\u{05A8}', '\u{05A9}', '\u{05AB}', '\u{05AC}', '\u{05AF}', '\u{05C4}', '\u{0610}', '\u{0611}',
-    '\u{0612}', '\u{0613}', '\u{0614}', '\u{0615}', '\u{0616}', '\u{0617}', '\u{0657}', '\u{0658}',
-    '\u{0659}', '\u{065A}', '\u{065B}', '\u{065D}', '\u{065E}', '\u{06D6}', '\u{06D7}', '\u{06D8}',
-    '\u{06D9}', '\u{06DA}', '\u{06DB}', '\u{06DC}', '\u{06DF}', '\u{06E0}', '\u{06E1}', '\u{06E2}',
-];
-
-/// One row of the placeholder block: the image id as the foreground
-/// colour, then a cell per column carrying its row and column.
-fn placeholder_row(id: u32, row: u32, cols: u32) -> String {
-    let mut s = format!("\x1b[38;2;{};{};{}m", (id >> 16) & 255, (id >> 8) & 255, id & 255);
-    let r = DIACRITICS[(row as usize).min(DIACRITICS.len() - 1)];
-    for col in 0..cols {
-        s.push(PLACEHOLDER);
-        s.push(r);
-        s.push(DIACRITICS[(col as usize).min(DIACRITICS.len() - 1)]);
-    }
-    s.push_str("\x1b[0m");
-    s
-}
-
-/// An escape sequence for the terminal, wrapped so tmux hands it on
-/// instead of reading it: `DCS tmux; <seq with every ESC doubled> ST`.
-fn passthrough(seq: &str) -> String {
-    format!("\x1bPtmux;{}\x1b\\", seq.replace('\x1b', "\x1b\x1b"))
-}
-
-/// The transmit by file: the terminal is on this machine and reads the
-/// PNG itself (`t=f`), so the image never passes through tmux; one
-/// sequence carries the path (base64) and the virtual placement of
-/// `cols`×`rows` for the placeholders to show.
-fn kitty_transmit_file(id: u32, path: &str, cols: u32, rows: u32) -> String {
-    let p = base64::engine::general_purpose::STANDARD.encode(path.as_bytes());
-    passthrough(&format!("\x1b_Ga=T,t=f,f=100,i={id},U=1,c={cols},r={rows},q=2;{p}\x1b\\"))
-}
-
-/// The transmit by data: the PNG, base64, in chunks of 4096, the first
-/// carrying the image's keys and the last `m=0`; then a virtual
-/// placement of `cols`×`rows` for the placeholders to show. For a
-/// terminal that cannot read our files.
-fn kitty_transmit(id: u32, png: &[u8], cols: u32, rows: u32) -> Vec<String> {
-    let b64 = base64::engine::general_purpose::STANDARD.encode(png);
-    let chunks: Vec<&[u8]> = b64.as_bytes().chunks(4096).collect();
-    let n = chunks.len();
-    let mut out = Vec::with_capacity(n + 1);
-    for (i, chunk) in chunks.iter().enumerate() {
-        let more = if i + 1 < n { 1 } else { 0 };
-        let ctl = if i == 0 { format!("a=t,f=100,i={id},q=2,m={more}") } else { format!("m={more}") };
-        let data = std::str::from_utf8(chunk).unwrap_or("");
-        out.push(passthrough(&format!("\x1b_G{ctl};{data}\x1b\\")));
-    }
-    out.push(passthrough(&format!("\x1b_Ga=p,U=1,i={id},c={cols},r={rows},q=2\x1b\\")));
-    out
-}
-
-/// Tell the terminal to forget the image: on close, so a form's worth
-/// of previews does not pile up in it.
-fn kitty_delete(id: u32) -> String {
-    passthrough(&format!("\x1b_Ga=d,d=I,i={id},q=2\x1b\\"))
-}
 
 /// A mode write takes at most this much at once (the host's cap, with
 /// room to spare); a transmit goes in as many writes as it needs.
@@ -1966,18 +1853,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn png_header() {
-        let mut b = b"\x89PNG\r\n\x1a\n".to_vec();
-        b.extend_from_slice(&13u32.to_be_bytes());
-        b.extend_from_slice(b"IHDR");
-        b.extend_from_slice(&2050u32.to_be_bytes());
-        b.extend_from_slice(&1426u32.to_be_bytes());
-        b.extend_from_slice(&[8, 6, 0, 0, 0]);
-        assert_eq!(png_size(&b), Some((2050, 1426)));
-        assert_eq!(png_size(b"not a png at all, nothing here"), None);
-    }
-
-    #[test]
     fn preview_shapes() {
         // A screenshot takes every row; the columns follow its shape.
         assert_eq!(preview_box(2050, 1426, 2.0), (40, PREVIEW_MAX_ROWS));
@@ -1990,42 +1865,6 @@ mod tests {
         assert_eq!(r, PREVIEW_MAX_ROWS);
         assert_eq!(c, 7);
         assert_eq!(preview_box(0, 0, 2.0), (1, 1));
-    }
-
-    #[test]
-    fn placeholder_cells_carry_id_row_and_column() {
-        let row = placeholder_row(0x0a0b0c, 1, 2);
-        assert!(row.starts_with("\x1b[38;2;10;11;12m"));
-        let cells: Vec<char> = row.trim_start_matches("\x1b[38;2;10;11;12m").trim_end_matches("\x1b[0m").chars().collect();
-        assert_eq!(cells, vec![PLACEHOLDER, '\u{030D}', '\u{0305}', PLACEHOLDER, '\u{030D}', '\u{030D}']);
-    }
-
-    #[test]
-    fn passthrough_doubles_escapes() {
-        assert_eq!(passthrough("\x1b_Gx\x1b\\"), "\x1bPtmux;\x1b\x1b_Gx\x1b\x1b\\\x1b\\");
-    }
-
-    #[test]
-    fn transmit_is_chunked_and_placed() {
-        let png = vec![7u8; 10_000];
-        let seqs = kitty_transmit(5, &png, 30, 10);
-        // 10000 bytes -> 13336 base64 chars -> 4 chunks, then the placement.
-        assert_eq!(seqs.len(), 5);
-        assert!(seqs[0].contains("a=t,f=100,i=5,q=2,m=1;"));
-        assert!(seqs[1].starts_with("\x1bPtmux;\x1b\x1b_Gm=1;"));
-        assert!(seqs[3].starts_with("\x1bPtmux;\x1b\x1b_Gm=0;"));
-        assert!(seqs[4].contains("a=p,U=1,i=5,c=30,r=10"));
-        assert!(kitty_delete(5).contains("a=d,d=I,i=5"));
-    }
-
-    #[test]
-    fn file_transmit_names_the_path() {
-        let seq = kitty_transmit_file(9, "/Users/z/.local/share/tmux/plugins/scp/clip-1.png", 40, 14);
-        assert!(seq.starts_with("\x1bPtmux;\x1b\x1b_Ga=T,t=f,f=100,i=9,U=1,c=40,r=14,q=2;"));
-        let b64 = base64::engine::general_purpose::STANDARD
-            .encode(b"/Users/z/.local/share/tmux/plugins/scp/clip-1.png");
-        assert!(seq.contains(&b64));
-        assert!(seq.ends_with("\x1b\x1b\\\x1b\\"));
     }
 
     #[test]

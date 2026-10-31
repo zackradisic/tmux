@@ -18,6 +18,9 @@
 //! - [`remotes`]: what the providers on linked servers last reported,
 //!   the bounded concurrent fetch, and the spinner that turns only while
 //!   a fetch is slow.
+//! - [`image`]: pictures in a mode through the kitty graphics protocol
+//!   (a transmit by file path, placeholder cells, the block that fits an
+//!   image), shared by the scp preview and the slack channel view.
 //! - [`keys`]: a rebindable key table with help text, so `?` and the
 //!   action menu are generated rather than written twice.
 //! - [`node`] and [`engine`]: the list itself. A consumer hands the
@@ -32,6 +35,7 @@
 //! itself, with its own capabilities.
 
 pub mod engine;
+pub mod image;
 pub mod keys;
 pub mod lines;
 pub mod node;

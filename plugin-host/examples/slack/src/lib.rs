@@ -39,6 +39,7 @@ mod emoji_table;
 mod feed;
 mod help;
 mod http;
+mod images;
 mod mrkdwn;
 mod sidebar;
 mod store;
@@ -107,6 +108,8 @@ pub struct State {
     pub names: Rc<NameMap>,
     pub side: Option<sidebar::Sidebar>,
     pub chat: Option<chat::Chat>,
+    /// The pictures fetched for the channel view.
+    pub images: images::Cache,
     pub synced_ms: u64,
     pub counts_ms: u64,
     pub syncing: bool,
@@ -247,6 +250,7 @@ impl Plugin for Slack {
             names: Rc::new(NameMap::default()),
             side: None,
             chat: None,
+            images: images::Cache::default(),
             synced_ms: 0,
             counts_ms: 0,
             syncing: false,
@@ -264,7 +268,9 @@ impl Plugin for Slack {
             names_queue: Vec::new(),
             names_inflight: 0,
         }));
+        images::attach(&st);
         ctx.spawn(boot(Rc::clone(&st)));
+        ctx.spawn(images::prune());
         Ok(Self { st })
     }
 
@@ -993,6 +999,7 @@ mod tests {
             names: Rc::new(NameMap::default()),
             side: None,
             chat: None,
+            images: images::Cache::default(),
             synced_ms: 0,
             counts_ms: 0,
             syncing: false,

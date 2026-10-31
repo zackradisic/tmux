@@ -32,4 +32,6 @@ requests = [
 ]
 
 [caps.net]
-hosts = ["slack.com", "*.slack.com"]
+# The web API and files.slack.com; Giphy and Slack's image proxy for the
+# pictures of attachments (a /giphy post, a link unfurl).
+hosts = ["slack.com", "*.slack.com", "giphy.com", "*.giphy.com", "slack-imgs.com", "*.slack-imgs.com", "*.slack-edge.com"]

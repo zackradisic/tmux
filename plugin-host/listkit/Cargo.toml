@@ -11,3 +11,5 @@ tmux-plugin-sdk = { path = "../sdk" }
 # Column widths for the cell model (wide and emoji glyphs); no CJK
 # ambiguity handling, the terminal does not have it either.
 unicode-width = { version = "0.2", default-features = false }
+# The kitty graphics transmit carries the PNG path (or the PNG) base64.
+base64 = "0.22"

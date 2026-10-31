@@ -934,6 +934,51 @@ What to know:
   was checked byte for byte on a scratch server (one `t=f` placement for
   the column, the form's placement deleted and placed again on Esc).
 
+### F3. Pictures in the Slack channel view (Oct 30 2026)
+
+- **The same seam as F1, shared now.** `listkit::image` holds what the
+  scp preview had (the passthrough, the `t=f` transmit, the placeholder
+  row with the protocol's full 297-entry diacritic table, `preview_fit`,
+  `png_size`); scp calls it unchanged. The slack plugin fetches a
+  message's image thumbnail through the host's `net` import with the
+  session's token and cookie (one redirect followed by hand; the host
+  follows none), writes it as it came, and has `sips` (macOS; `magick`
+  or `convert` elsewhere, nothing without them) make `img/<file id>.png`
+  of at most 1024 px under its data directory - a GIF's first frame, so
+  animation never reaches the terminal. The plugin reads back 24 bytes
+  (the IHDR) for the size; no pixel passes through wasm. The block is at
+  most 12 rows and 80 columns (the body's width when narrower), one
+  transmit per file and block size, placeholders redrawn as text on
+  every paint, so a scroll sends only text. `@slack-images off` leaves
+  the `📎` lines alone.
+- **A `/giphy` post is not a file.** It is an attachment whose `image`
+  block names a `media*.giphy.com/....webp` (sips reads WebP); a link
+  unfurl's picture is `image_url`, often through `slack-imgs.com`. These
+  are drawn under their `[image: …]` caption under ids of their own
+  (`a<ts>-<n>`), fetched without the session. The sidecar's `net`
+  allowlist (`slack.toml`) names those hosts now; a deployed sidecar
+  older than this build still refuses them and the caption stands
+  alone, with `slack: image a…: GET: …` in the plugin log. Pictures on
+  other hosts (an arbitrary site's og:image) stay captions by design.
+- **A blank block elsewhere.** iTerm2, Terminal.app and tmux's own
+  copy mode show the placeholder rows as empty space of the block's
+  size; the `📎 name` line above says what it is. Turn the option off
+  there. `y` copies the transcript without picture rows either way.
+- **A client that attaches later sees nothing in the block.** The
+  transmit went to the terminals showing the window at that moment;
+  a client attached after it never received the image and draws the
+  placeholders blank until something changes the block size (a resize
+  re-transmits). Closing the view, or `q`, deletes every placement
+  through the mode; a view the host closes from outside (its window
+  killed) cannot, and the terminal keeps those images until it exits.
+- **A picture is asked for once per process.** A fetch that fails (a
+  refused session, a converter missing, a thumbnail Slack no longer
+  serves) is logged (`slack: image F… (name): …`) and not retried until
+  the plugin reloads. The directory keeps the newest 200 pictures; older
+  ones and any half-written `.src` go at boot.
+- **The block is a shape guess**, as F1 says: cell aspect from the
+  window's report or 2.0, and the terminal letterboxes inside it.
+
 ## The palette
 
 ### K1. Rows come from three places; the key column is for learning

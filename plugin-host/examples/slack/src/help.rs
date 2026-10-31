@@ -72,7 +72,12 @@ message in it, one after the other, ready to hand to an agent. Y
 copies the message's Slack permalink instead.
 
 While composing, keys type; Enter sends, Escape drops the text, a paste
-goes in as is (newlines kept).";
+goes in as is (newlines kept).
+
+A shared picture (PNG, JPEG, a GIF's first frame), or a /giphy post's,
+is drawn under its clip or caption line in Ghostty or kitty;
+`set -g @slack-images off` leaves the line alone (other terminals show
+a blank block).";
 
 pub fn topic(verb: Option<&str>) -> &'static str {
     match verb {

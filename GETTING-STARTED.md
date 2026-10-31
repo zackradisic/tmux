@@ -528,7 +528,12 @@ messages, newest at the bottom. `Enter` opens the **channel view**: a
 transcript with day separators, the new-messages line, reactions and emoji
 drawn as glyphs (Slack's names, skin tones and your workspace's custom aliases
 included), bot cards with their fields, and every author by name, Slack
-Connect guests too. `Enter` on a message opens its thread (with or without
+Connect guests too. A shared picture (PNG, JPEG, a GIF's first frame), or a
+`/giphy` post's, is drawn under its `📎` or caption line in Ghostty or kitty
+through the kitty graphics protocol, fetched and converted once outside the
+plugin; `set -g @slack-images off` keeps the lines alone (iTerm2 would show
+blank blocks). `Enter` on a
+message opens its thread (with or without
 replies yet), `Escape` steps back: thread to channel, channel to sidebar; `q`
 closes outright. `i` composes, `r` replies in the message's thread, `e`
 reacts, `o` opens the message in the Slack app. `y` copies the message to the

@@ -286,7 +286,7 @@ fn preview_for(s: &State, side: &Sidebar, c: &Channel, width: usize) -> Preview 
                     }
                 }
                 for f in &m.files {
-                    lines.push(plain_cells(&format!("  📎 {f}"), ST_DIM));
+                    lines.push(plain_cells(&format!("  📎 {}", f.name), ST_DIM));
                 }
                 lines.push(Vec::new());
             }

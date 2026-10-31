@@ -28,7 +28,12 @@
 #     the "new messages" rule before the first unread message that is not
 #     ours; the Slack Connect author U3 (not in users.list) is named
 #     through users.info, once; a bot card with no text shows its
-#     fields; `i`, typed text, Enter posts to the fake and the view shows
+#     fields; the shared GIF's thumbnail is fetched once (with the
+#     session) and drawn under its clip line as kitty placeholder cells
+#     (U+10EEEE, the image id as the foreground colour), and the
+#     converted PNG sits in the plugin's data directory; a /giphy post's
+#     picture (an attachment image block) is drawn under its caption;
+#     `i`, typed text, Enter posts to the fake and the view shows
 #     it; Enter on that message (no replies yet) opens its thread, `i`
 #     then Enter posts there with its thread_ts and the reply shows;
 #     Escape goes back to the timeline, Escape again to the sidebar;
@@ -318,6 +323,40 @@ HEY=$(screen | grep -n 'look at this' | head -1 | cut -d: -f1)
 FINE=$(screen | grep -n 'fine' | head -1 | cut -d: -f1)
 [ "$NEW" -lt "$HEY" ] || fail "the rule ($NEW) is not before the hey message ($HEY)"
 [ "$FINE" -lt "$NEW" ] || fail "our own message ($FINE) counts as new (rule at $NEW)"
+# Pictures: the GIF's static thumbnail is fetched from the fake once, as
+# the session (bearer + cookie), converted to a PNG in the data
+# directory, and drawn under the clip line as 5 rows of placeholder
+# cells (400x50 at cell aspect 2 in a 156-cell body: 80 columns, the
+# widest block, 5 rows), their foreground the kitty image id (0x530000
+# is the first: 83;0;0). The /giphy post's picture (an attachment image
+# block, 400x50 too) is drawn under its caption the same way: 10
+# placeholder rows in all, two fetches, two ids.
+PH=$(printf '\364\216\273\256')
+screen_has '📎 Nervous K and P.gif' || fail "the file message shows no clip line"
+screen_has '│ \[image: meerkat GIF\]' || fail "the giphy post shows no caption"
+until_ok 80 sh -c "[ \"\$($TMUX capture-pane -M -p -t $FORM | grep -c '$PH')\" = 10 ]" || fail "placeholder rows: $(screen | grep -c "$PH"), not 10: $(tail -5 "$HOME/fake.log")"
+CLIP=$(screen | grep -n 'Nervous K and P' | head -1 | cut -d: -f1)
+screen | sed -n "$((CLIP + 1))p" | grep -q "$PH" || fail "no picture right under the clip line (line $CLIP)"
+screen | sed -n "$((CLIP + 5))p" | grep -q "$PH" || fail "the picture under the clip line is shorter than 5 rows"
+screen | sed -n "$((CLIP + 6))p" | grep -q "$PH" && fail "the picture under the clip line is taller than 5 rows"
+CAP=$(screen | grep -n 'meerkat GIF' | head -1 | cut -d: -f1)
+screen | sed -n "$((CAP + 1))p" | grep -q "$PH" || fail "no picture right under the giphy caption (line $CAP)"
+$TMUX capture-pane -M -p -e -t "$FORM" | grep "$PH" | grep -q "$(printf '\033')\[38;2;83;0;0m" || fail "no placeholder row carries the first image id as its colour"
+$TMUX capture-pane -M -p -e -t "$FORM" | grep "$PH" | grep -q "$(printf '\033')\[38;2;83;0;1m" || fail "no placeholder row carries the second image id as its colour"
+[ "$(ncalls _img)" = 2 ] || fail "the pictures were fetched $(ncalls _img) times, not 2"
+[ "$(ncalls _img path /_img/F1.png)" = 1 ] || fail "the thumbnail was not fetched once"
+[ "$(ncalls _img path /_img/A1.png)" = 1 ] || fail "the giphy picture was not fetched once"
+[ "$(ncalls _img auth bearer)" = 2 ] || fail "a picture was fetched without the session token"
+[ "$(ncalls _img cookie yes)" = 2 ] || fail "a picture was fetched without the session cookie"
+PNG=$(find "$HOME" -name F1.png | head -1)
+[ -n "$PNG" ] || fail "no converted F1.png under $HOME"
+find "$HOME" -name '*.src' | grep -q . && fail "a downloaded source was not removed"
+file "$PNG" | grep -q 'PNG image data, 400 x 50' || fail "F1.png is not the 400x50 picture: $(file "$PNG")"
+find "$HOME" -name 'a1700000028000100-0.png' | grep -q . || fail "the giphy picture was not converted under its own id"
+# Scrolling redraws the rows as text: no further fetch.
+keys k; keys k; keys j; keys j
+[ "$(ncalls _img)" = 2 ] || fail "scrolling fetched a picture again"
+[ "$(screen | grep -c "$PH")" = 10 ] || fail "the picture rows did not survive a scroll"
 # y copies the message under the cursor (the newest) as a transcript
 # line: author, stamp, text with the emoji as glyphs; v then k then y
 # copies the two newest, oldest first.

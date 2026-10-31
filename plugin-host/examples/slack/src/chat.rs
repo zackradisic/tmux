@@ -9,18 +9,30 @@
 //! its lines. `layout` takes plain inputs so the tests can run it
 //! without a mode.
 //!
+//! Pictures: a message's image files, and the pictures its attachments
+//! carry (a Giphy post, an unfurl), are fetched and converted by
+//! images.rs, laid out as rows under their `📎` or caption line and
+//! drawn as kitty graphics placeholders - `U+10EEEE` cells carrying the
+//! image id and the cell's row and column - over one `t=f` transmit per
+//! image and block size (listkit::image). Text to tmux, the picture to
+//! Ghostty or kitty, a blank block anywhere else; `@slack-images off`
+//! turns them off.
+//!
 //! Borrow discipline, as in sidebar.rs: decide under the `State`
 //! borrow, drop it, then do the async work or call into lib.rs.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
+use listkit::image::{kitty_delete, kitty_transmit_file, placeholder_row, preview_fit, MAX_BLOCK};
 use listkit::lines::{clamp_dim, default_size, SizeBox};
 use listkit::styled::{emit_cells, fit_cells, plain_cells, wrap_cells, Styled, ST_BOLD, ST_BRIGHT, ST_CYAN, ST_DIM, ST_GREEN, ST_INVERT, ST_ORANGE, ST_RED};
 use listkit::text::{clip, menu_item, menu_safe};
 use tmux_plugin_sdk::prelude::*;
 
-use crate::store::{Channel, Message};
-use crate::{api, emoji, mrkdwn, sidebar, store, timefmt, NameMap, Shared, State, NAME};
+use crate::store::{Channel, FileRef, Message};
+use crate::{api, emoji, images, mrkdwn, sidebar, store, timefmt, NameMap, Shared, State, NAME};
 
 /// Two posts by the same author this close together share one header.
 const GROUP_SECS: i64 = 5 * 60;
@@ -31,13 +43,63 @@ const PAGE: u32 = 100;
 /// The cache has to hold at least this many timeline messages before a
 /// fetch asks only for what came after it.
 const THIN_CACHE: usize = 20;
+/// A picture's block is at most this tall...
+const IMAGE_ROWS: u32 = 12;
+/// ...and this wide (the diacritics number no more cells than that).
+const IMAGE_COLS: u32 = 80;
+/// The first kitty image id this view hands out; the scp preview takes
+/// its ids from the clock, so a fixed range keeps clear of it.
+const IMAGE_ID_BASE: u32 = 0x53_0000;
 
 /// One display line: its cells (without the gutter) and the message it
-/// belongs to, if any (separators belong to none).
+/// belongs to, if any (separators belong to none). A picture's row has
+/// `image` set and is drawn as placeholders after its `cells` (the
+/// indent).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Line {
     pub cells: Vec<Styled>,
     pub msg: Option<usize>,
+    pub image: Option<ImageRow>,
+}
+
+/// Row `row` of the `cols`×`rows` block showing file `file`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImageRow {
+    pub file: String,
+    pub row: u32,
+    pub cols: u32,
+    pub rows: u32,
+}
+
+/// What `layout` knows about pictures: the converted ones by file id
+/// with their pixel size, and the cell shape (height over width) the
+/// blocks are fitted with.
+pub struct Pictures<'a> {
+    pub sizes: &'a HashMap<String, (u32, u32)>,
+    pub cell_aspect: f64,
+}
+
+/// A picture handed to the terminal: its kitty id and the block it was
+/// placed for. Another block size means another transmit.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Placed {
+    pub id: u32,
+    pub cols: u32,
+    pub rows: u32,
+}
+
+thread_local! {
+    static IMAGE_ID: std::cell::Cell<u32> = const { std::cell::Cell::new(IMAGE_ID_BASE) };
+}
+
+/// The next kitty image id: never 0, never reused in this process, and
+/// inside the 24 bits a placeholder's foreground colour carries.
+fn next_image_id() -> u32 {
+    IMAGE_ID.with(|g| {
+        let id = (g.get() & 0x00ff_ffff).max(1);
+        g.set(id + 1);
+        id
+    })
 }
 
 /// What Enter does with the typed text.
@@ -101,9 +163,54 @@ pub struct Chat {
     /// The cache was consulted (so an empty view says "no messages",
     /// not "loading").
     pub loaded: bool,
+    /// Pictures are drawn (`@slack-images`, on unless set off).
+    pub images_on: bool,
+    /// Cell height over cell width, for the pictures' blocks.
+    pub cell_aspect: f64,
+    /// The plugin's data directory, where the pictures are.
+    pub data_root: String,
+    /// The pictures the terminal holds for this view, by file id. A
+    /// cell, not a field the paint borrows mutably: `paint` reads the
+    /// state and this is the one thing it records.
+    pub placed: RefCell<HashMap<String, Placed>>,
 }
 
 impl Chat {
+    /// The image files of the messages near the viewport (a page above
+    /// and below) that `cache` has not seen: what to fetch now.
+    fn wanted_images(&self, cache: &images::Cache) -> Vec<FileRef> {
+        if !self.images_on {
+            return Vec::new();
+        }
+        let h = self.body_h();
+        let from = self.top.saturating_sub(h);
+        let to = self.top + 2 * h;
+        let mut out: Vec<FileRef> = Vec::new();
+        let mut seen: Option<usize> = None;
+        for l in self.lines.iter().take(to).skip(from) {
+            let Some(i) = l.msg else { continue };
+            if seen == Some(i) {
+                continue;
+            }
+            seen = Some(i);
+            for f in self.msgs[i].files.iter().chain(&self.msgs[i].pictures) {
+                if f.is_image() && !cache.ready.contains_key(&f.id) && !cache.asked.contains(&f.id) && !out.iter().any(|o| o.id == f.id) {
+                    out.push(f.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Tell the terminal to forget every picture placed for this view
+    /// (through the mode, so before it closes).
+    fn forget_images(&self) {
+        let seqs: String = self.placed.borrow_mut().drain().map(|(_, p)| kitty_delete(p.id)).collect();
+        if !seqs.is_empty() {
+            let _ = mode_write(self.mode, seqs.as_bytes());
+        }
+    }
+
     fn body_h(&self) -> usize {
         (self.height as usize).saturating_sub(self.chrome as usize).max(1)
     }
@@ -183,7 +290,8 @@ impl Chat {
 /// cells (the gutter is drawn by `paint`). `me` is the user's own id,
 /// `last_read` the channel's read mark when the view opened, `now_secs`
 /// the clock for the day labels and thread ages, `in_thread` whether
-/// the messages are a thread (no thread markers then).
+/// the messages are a thread (no thread markers then). `pics` is what
+/// is known about pictures; `None` draws none (the `📎` lines stay).
 #[allow(clippy::too_many_arguments)]
 pub fn layout(
     msgs: &[Message],
@@ -194,6 +302,7 @@ pub fn layout(
     names: &NameMap,
     now_secs: i64,
     in_thread: bool,
+    pics: Option<&Pictures>,
 ) -> Vec<Line> {
     let cw = width.saturating_sub(1).max(8);
     let body_w = width.saturating_sub(4).max(4);
@@ -204,7 +313,7 @@ pub fn layout(
         let pad = cw.saturating_sub(text.chars().count()) / 2;
         let mut cells: Vec<Styled> = plain_cells(&" ".repeat(pad), 0);
         cells.extend(plain_cells(&text, style));
-        out.push(Line { cells, msg: None });
+        out.push(Line { cells, msg: None, image: None });
     };
     let author = |m: &Message| m.user.clone().or_else(|| m.username.clone()).unwrap_or_default();
     // The read mark goes before the first message newer than it that is
@@ -243,19 +352,19 @@ pub fn layout(
             if m.edited {
                 cells.extend(plain_cells(" (edited)", ST_DIM));
             }
-            out.push(Line { cells, msg: Some(i) });
+            out.push(Line { cells, msg: Some(i), image: None });
         }
         let indent = || plain_cells("  ", 0);
         if m.deleted {
             let mut cells = indent();
             cells.extend(plain_cells("(deleted)", ST_DIM));
-            out.push(Line { cells, msg: Some(i) });
+            out.push(Line { cells, msg: Some(i), image: None });
         } else if !m.text.trim().is_empty() {
             let body = names.with(|n| mrkdwn::render(&m.text, body_w, 0, n));
             for mut l in body {
                 let mut cells = indent();
                 cells.append(&mut l);
-                out.push(Line { cells, msg: Some(i) });
+                out.push(Line { cells, msg: Some(i), image: None });
             }
         }
         for a in &m.attachments {
@@ -265,20 +374,35 @@ pub fn layout(
                     let mut cells = indent();
                     cells.extend(plain_cells("│ ", ST_DIM));
                     cells.append(&mut w);
-                    out.push(Line { cells, msg: Some(i) });
+                    out.push(Line { cells, msg: Some(i), image: None });
+                }
+            }
+        }
+        // An attachment's picture (a Giphy post, an unfurl): its caption
+        // is among the attachment lines, the block goes under them.
+        for p in &m.pictures {
+            if let Some((cols, rows)) = pics.and_then(|px| image_block(px, p, body_w)) {
+                for row in 0..rows {
+                    out.push(Line { cells: indent(), msg: Some(i), image: Some(ImageRow { file: p.id.clone(), row, cols, rows }) });
                 }
             }
         }
         for f in &m.files {
             let mut cells = indent();
-            cells.extend(plain_cells(&format!("📎 {f}"), ST_DIM));
-            out.push(Line { cells, msg: Some(i) });
+            cells.extend(plain_cells(&format!("📎 {}", f.name), ST_DIM));
+            out.push(Line { cells, msg: Some(i), image: None });
+            // The picture, once it is on disk: a block under the line.
+            if let Some((cols, rows)) = pics.and_then(|p| image_block(p, f, body_w)) {
+                for row in 0..rows {
+                    out.push(Line { cells: indent(), msg: Some(i), image: Some(ImageRow { file: f.id.clone(), row, cols, rows }) });
+                }
+            }
         }
         if !m.reactions.is_empty() {
             let text = m.reactions.iter().map(|(n, c)| format!(":{n}: {c}")).collect::<Vec<_>>().join(" · ");
             let mut cells = indent();
             emoji::push_text(&mut cells, &text, ST_DIM);
-            out.push(Line { cells, msg: Some(i) });
+            out.push(Line { cells, msg: Some(i), image: None });
         }
         if !in_thread && m.reply_count > 0 {
             let when = m.latest_reply.as_deref().unwrap_or(&m.ts);
@@ -290,11 +414,23 @@ pub fn layout(
             );
             let mut cells = indent();
             cells.extend(plain_cells(&text, ST_CYAN));
-            out.push(Line { cells, msg: Some(i) });
+            out.push(Line { cells, msg: Some(i), image: None });
         }
         prev = Some(m);
     }
     out
+}
+
+/// The block for file `f`'s picture in a body `body_w` cells wide, when
+/// the picture is there: at most [`IMAGE_ROWS`] tall and [`IMAGE_COLS`]
+/// wide, the image's shape within that.
+fn image_block(pics: &Pictures, f: &FileRef, body_w: usize) -> Option<(u32, u32)> {
+    if !f.is_image() {
+        return None;
+    }
+    let &(w, h) = pics.sizes.get(&f.id)?;
+    let max_cols = (body_w as u32).min(IMAGE_COLS).min(MAX_BLOCK);
+    Some(preview_fit(w, h, pics.cell_aspect, max_cols, IMAGE_ROWS))
 }
 
 /// The first and last display line of message `i`.
@@ -338,7 +474,7 @@ pub fn transcript(msgs: &[Message], idxs: &[usize], tz: i64, names: &NameMap) ->
             }
         }
         for f in &m.files {
-            lines.push(format!("📎 {f}"));
+            lines.push(format!("📎 {}", f.name));
         }
         let head = format!("{who} ({}):", timefmt::stamp(&m.ts, tz));
         let mut it = lines.into_iter();
@@ -359,12 +495,29 @@ fn relayout(s: &mut State) {
     let tz = s.tz();
     let me = s.ident.as_ref().map(|i| i.user_id.clone()).unwrap_or_default();
     let now = (now_ms() / 1000) as i64;
-    let Some(c) = s.chat.as_mut() else { return };
-    c.lines = layout(&c.msgs, c.width as usize, tz, &me, c.last_read.as_deref(), &names, now, c.thread.is_some());
+    let State { chat, images, .. } = s;
+    let Some(c) = chat.as_mut() else { return };
+    // A reader scrolled up keeps the message under the top line where it
+    // is, however many picture rows arrive above it.
+    let anchor = (!c.follow)
+        .then(|| c.lines.iter().skip(c.top).find_map(|l| l.msg))
+        .flatten()
+        .and_then(|i| Some((c.msgs.get(i)?.ts.clone(), c.top as isize - lines_of(&c.lines, i)?.0 as isize)));
+    let pics = Pictures { sizes: &images.ready, cell_aspect: c.cell_aspect };
+    c.lines = layout(&c.msgs, c.width as usize, tz, &me, c.last_read.as_deref(), &names, now, c.thread.is_some(), c.images_on.then_some(&pics));
     if c.follow {
         c.top = c.max_top();
     } else {
+        if let Some((ts, off)) = anchor {
+            if let Some(first) = c.msgs.iter().position(|m| m.ts == ts).and_then(|i| lines_of(&c.lines, i)).map(|(f, _)| f) {
+                c.top = (first as isize + off).max(0) as usize;
+            }
+        }
         c.top = c.top.min(c.max_top());
+    }
+    let wanted = c.wanted_images(images);
+    if !wanted.is_empty() {
+        images::request(s, wanted);
     }
 }
 
@@ -470,9 +623,41 @@ pub(crate) fn paint_body(c: &Chat, out: &mut String, x0: usize, y0: usize) {
             (' ', 0)
         };
         let mut cells: Vec<Styled> = vec![gutter];
+        if let Some(img) = &line.image {
+            // The indent as text, then the placeholders: the terminal
+            // draws row `img.row` of the picture over them.
+            cells.extend(fit_cells(&line.cells, w.saturating_sub(1)));
+            let cols = img.cols.min(w.saturating_sub(cells.len() + 1) as u32);
+            let id = place_image(c, img, out);
+            out.push_str(&format!("\x1b[{row};{}H{}{}", x0 + 1, emit_cells(&cells, false), placeholder_row(id, img.row, cols)));
+            let used = cells.len() + cols as usize;
+            if used < w {
+                out.push_str(&" ".repeat(w - used));
+            }
+            continue;
+        }
         cells.extend(fit_cells(&line.cells, w.saturating_sub(1)));
         out.push_str(&format!("\x1b[{row};{}H{}", x0 + 1, emit_cells(&cells, false)));
     }
+}
+
+/// The kitty id showing `img`'s file at its block size: the one already
+/// placed, else a transmit (by path: the terminal reads the PNG itself)
+/// written into `out` ahead of the row, the old placement of another
+/// size deleted first. Scrolling, then, re-sends only text.
+fn place_image(c: &Chat, img: &ImageRow, out: &mut String) -> u32 {
+    let mut placed = c.placed.borrow_mut();
+    if let Some(p) = placed.get(&img.file) {
+        if p.cols == img.cols && p.rows == img.rows {
+            return p.id;
+        }
+        out.push_str(&kitty_delete(p.id));
+    }
+    let id = next_image_id();
+    let path = format!("{}/{}", c.data_root, images::png_name(&img.file));
+    out.push_str(&kitty_transmit_file(id, &path, img.cols, img.rows));
+    placed.insert(img.file.clone(), Placed { id, cols: img.cols, rows: img.rows });
+    id
 }
 
 fn relayout_paint(s: &mut State) {
@@ -490,6 +675,16 @@ fn size_box() -> SizeBox {
 
 fn opt_u32(name: &str) -> Option<u32> {
     get_option(name).ok().and_then(|v| v.trim().parse::<u32>().ok()).filter(|v| *v > 0)
+}
+
+/// An on/off option: `off`, `0`, `no` or `false` turn it off, anything
+/// else (unset included) is `default`.
+fn opt_flag(name: &str, default: bool) -> bool {
+    match get_option(name).ok().map(|v| v.trim().to_ascii_lowercase()) {
+        Some(v) if matches!(v.as_str(), "off" | "0" | "no" | "false") => false,
+        Some(v) if matches!(v.as_str(), "on" | "1" | "yes" | "true") => true,
+        _ => default,
+    }
 }
 
 thread_local! {
@@ -534,6 +729,9 @@ pub fn open(st: &Shared, ch: Channel, thread: Option<String>, client: Option<u64
     };
     let gen = next_gen();
     let compose = compose.then(|| Compose { kind: ComposeKind::Message(thread.clone()), text: String::new() });
+    let images_on = opt_flag("@slack-images", true);
+    let cell_aspect = listkit::image::cell_aspect(window);
+    let data_root = fs_root().unwrap_or_default();
     {
         let mut s = st.borrow_mut();
         // The freshest channel row we have: the badge may have moved
@@ -566,6 +764,10 @@ pub fn open(st: &Shared, ch: Channel, thread: Option<String>, client: Option<u64
             fetching: false,
             marked_ms: 0,
             loaded: false,
+            images_on,
+            cell_aspect,
+            data_root,
+            placed: RefCell::new(HashMap::new()),
         });
         paint(&s);
     }
@@ -577,8 +779,19 @@ pub fn close(st: &Shared) {
         if let Some(t) = c.poll {
             cancel(t);
         }
+        c.forget_images();
         let _ = mode_close(c.mode);
     }
+}
+
+/// A picture arrived on disk (images.rs): lay out again, so its rows
+/// appear under its `📎` line, and draw them.
+pub fn on_image(st: &Shared) {
+    let mut s = st.borrow_mut();
+    if s.chat.is_none() {
+        return;
+    }
+    relayout_paint(&mut s);
 }
 
 /// Repaint if open (something the view shows changed).
@@ -1571,7 +1784,7 @@ mod tests {
             msg(NOON + 60 + 400, "U1", "three"), // six minutes on: a header again
             msg(NOON + 500, "U2", "four"),       // another author: a header
         ];
-        let lines = layout(&msgs, 60, 0, "U1", None, &names(), NOON + 3600, false);
+        let lines = layout(&msgs, 60, 0, "U1", None, &names(), NOON + 3600, false, None);
         let t = texts(&lines);
         assert_eq!(t[0].trim(), "── Yesterday ──");
         assert_eq!(t[1], "zack  12:00");
@@ -1599,7 +1812,7 @@ mod tests {
         // separator breaks the group.
         let midnight = (NOON / DAY + 1) * DAY;
         let msgs = vec![msg(midnight - 60, "U1", "a"), msg(midnight + 60, "U1", "b")];
-        let lines = layout(&msgs, 60, 0, "U1", None, &names(), midnight + 3600, false);
+        let lines = layout(&msgs, 60, 0, "U1", None, &names(), midnight + 3600, false, None);
         let t: Vec<String> = lines.iter().map(|l| cells_text(&l.cells).trim().to_string()).collect();
         assert_eq!(t, vec!["── Yesterday ──", "zack  23:59", "a", "── Today ──", "zack  00:01", "b"]);
     }
@@ -1607,25 +1820,25 @@ mod tests {
     #[test]
     fn new_messages_line() {
         let msgs = vec![msg(NOON, "U1", "old"), msg(NOON + 10, "U2", "new"), msg(NOON + 20, "U2", "newer")];
-        let lines = layout(&msgs, 60, 0, "U1", Some("1698667205.000000"), &names(), NOON + 100, false);
+        let lines = layout(&msgs, 60, 0, "U1", Some("1698667205.000000"), &names(), NOON + 100, false, None);
         let t = texts(&lines);
         assert_eq!(t[3].trim(), "── new messages ──");
         assert!(lines[3].cells.iter().any(|c| c.1 & ST_RED != 0));
         assert_eq!(t.iter().filter(|l| l.contains("new messages")).count(), 1, "drawn once");
         // Read before everything: our own first message is not news, so
         // the line still sits between it and the others'.
-        let lines = layout(&msgs, 60, 0, "U1", Some("1698667100.000000"), &names(), NOON + 100, false);
+        let lines = layout(&msgs, 60, 0, "U1", Some("1698667100.000000"), &names(), NOON + 100, false, None);
         assert_eq!(texts(&lines)[3].trim(), "── new messages ──");
         // Nothing older shown at all: no line, nothing to be new against.
         let others = vec![msg(NOON + 10, "U2", "new"), msg(NOON + 20, "U2", "newer")];
-        let lines = layout(&others, 60, 0, "U1", Some("1698667100.000000"), &names(), NOON + 100, false);
+        let lines = layout(&others, 60, 0, "U1", Some("1698667100.000000"), &names(), NOON + 100, false, None);
         assert!(!texts(&lines).iter().any(|l| l.contains("new messages")));
         // Everything read: no line either.
-        let lines = layout(&msgs, 60, 0, "U1", Some("1698667220.000100"), &names(), NOON + 100, false);
+        let lines = layout(&msgs, 60, 0, "U1", Some("1698667220.000100"), &names(), NOON + 100, false, None);
         assert!(!texts(&lines).iter().any(|l| l.contains("new messages")));
         // Only our own post is newer than the mark: nothing is new.
         let mine = vec![msg(NOON, "U2", "theirs"), msg(NOON + 10, "U1", "ours")];
-        let lines = layout(&mine, 60, 0, "U1", Some("1698667205.000000"), &names(), NOON + 100, false);
+        let lines = layout(&mine, 60, 0, "U1", Some("1698667205.000000"), &names(), NOON + 100, false, None);
         assert!(!texts(&lines).iter().any(|l| l.contains("new messages")));
     }
 
@@ -1636,11 +1849,11 @@ mod tests {
         long.reply_count = 3;
         long.latest_reply = Some(format!("{}.000000", NOON + 1800));
         let mut second = msg(NOON + 1000, "U2", "hi");
-        second.files = vec!["notes.txt".into()];
+        second.files = vec![FileRef::named("notes.txt")];
         second.attachments = vec!["Card title\ncard text".into()];
         second.edited = true;
         let msgs = vec![long, second];
-        let lines = layout(&msgs, 24, 0, "U1", None, &names(), NOON + 3600, false);
+        let lines = layout(&msgs, 24, 0, "U1", None, &names(), NOON + 3600, false, None);
         let t = texts(&lines);
         // Today, header, wrapped body (width 20 -> several lines), reactions, thread marker.
         assert_eq!(lines[0].msg, None);
@@ -1658,7 +1871,7 @@ mod tests {
         assert_eq!(t[l1], "  📎 notes.txt");
         assert_eq!(l1, lines.len() - 1);
         // In a thread the root shows no marker.
-        let thread = layout(&msgs, 24, 0, "U1", None, &names(), NOON + 3600, true);
+        let thread = layout(&msgs, 24, 0, "U1", None, &names(), NOON + 3600, true, None);
         assert!(!texts(&thread).iter().any(|l| l.contains("replies")));
     }
 
@@ -1721,9 +1934,104 @@ mod tests {
             fetching: false,
             marked_ms: 0,
             loaded: true,
+            images_on: true,
+            cell_aspect: 2.0,
+            data_root: "/d".into(),
+            placed: RefCell::new(HashMap::new()),
         };
         c.set_cursor_idx(1);
         c
+    }
+
+    #[test]
+    fn picture_rows_follow_the_clip_line() {
+        let mut m = msg(NOON, "U2", "look");
+        m.files.push(FileRef {
+            id: "F1".into(),
+            name: "wide.png".into(),
+            mimetype: "image/png".into(),
+            size: Some((800, 100)),
+            thumb: Some("https://files.slack.com/t/F1/thumb_480.png".into()),
+            url: None,
+        });
+        m.files.push(FileRef::named("notes.txt"));
+        let msgs = vec![m, msg(NOON + 10, "U1", "ok")];
+        // Nothing known about the picture: the clip line alone.
+        let plain = layout(&msgs, 80, 0, "U1", None, &names(), NOON + 100, false, None);
+        assert_eq!(texts(&plain)[3], "  📎 wide.png");
+        assert!(plain.iter().all(|l| l.image.is_none()));
+        // On disk at 800x100: a block of 5 rows (76 cells wide at aspect
+        // 2, which the 76-cell body allows) under the line, each row
+        // tagged with the file, before the next file's line.
+        let mut sizes = HashMap::new();
+        sizes.insert("F1".to_string(), (800u32, 100u32));
+        let pics = Pictures { sizes: &sizes, cell_aspect: 2.0 };
+        let lines = layout(&msgs, 80, 0, "U1", None, &names(), NOON + 100, false, Some(&pics));
+        let t = texts(&lines);
+        assert_eq!(t[3], "  📎 wide.png");
+        let rows: Vec<&ImageRow> = lines.iter().filter_map(|l| l.image.as_ref()).collect();
+        assert_eq!(rows.len(), 5, "{t:?}");
+        assert_eq!(rows[0], &ImageRow { file: "F1".into(), row: 0, cols: 76, rows: 5 });
+        assert_eq!(rows[4].row, 4);
+        assert_eq!(lines[4].image.as_ref().map(|r| r.row), Some(0));
+        assert_eq!(lines[4].msg, Some(0), "a picture row belongs to its message");
+        assert_eq!(t[9], "  📎 notes.txt");
+        assert_eq!(lines.len(), plain.len() + 5);
+        // A narrow view clamps the block to its body.
+        let narrow = layout(&msgs, 40, 0, "U1", None, &names(), NOON + 100, false, Some(&pics));
+        let r = narrow.iter().find_map(|l| l.image.as_ref()).unwrap();
+        assert_eq!((r.cols, r.rows), (36, 2));
+        // A tall one takes every row and few columns.
+        sizes.insert("F1".to_string(), (100, 800));
+        let pics = Pictures { sizes: &sizes, cell_aspect: 2.0 };
+        let tall = layout(&msgs, 80, 0, "U1", None, &names(), NOON + 100, false, Some(&pics));
+        let r = tall.iter().find_map(|l| l.image.as_ref()).unwrap();
+        assert_eq!((r.cols, r.rows), (3, 12));
+        // The transcript never carries picture rows.
+        assert_eq!(transcript(&msgs, &[0], 0, &names()), "tejas (2023-10-30 12:00): look\n  📎 wide.png\n  📎 notes.txt\n");
+    }
+
+    #[test]
+    fn pictures_are_placed_once_per_block_size() {
+        let mut c = chat();
+        let mut m = msg(NOON + 5, "U2", "");
+        m.files.push(FileRef { id: "F1".into(), name: "a.png".into(), mimetype: "image/png".into(), size: None, thumb: Some("u".into()), url: None });
+        c.msgs.insert(1, m);
+        let mut sizes = HashMap::new();
+        sizes.insert("F1".to_string(), (800u32, 100u32));
+        let pics = Pictures { sizes: &sizes, cell_aspect: 2.0 };
+        c.lines = layout(&c.msgs, c.width as usize, 0, "U1", None, &names(), NOON + 100, false, Some(&pics));
+        let mut out = String::new();
+        paint_body(&c, &mut out, 0, 2);
+        // One transmit by path, then placeholder rows carrying id 0x530000.
+        assert_eq!(out.matches("a=T,t=f,f=100,i=").count(), 1, "{out:?}");
+        assert!(out.contains("\x1bPtmux;\x1b\x1b_Ga=T,t=f,f=100,i="), "{out:?}");
+        let ph = "\u{10EEEE}";
+        assert!(out.matches(ph).count() >= 5 * 70, "{}", out.matches(ph).count());
+        let id = c.placed.borrow().get("F1").map(|p| p.id).unwrap();
+        assert!(id >= IMAGE_ID_BASE);
+        assert!(out.contains(&format!("\x1b[38;2;{};{};{}m", (id >> 16) & 255, (id >> 8) & 255, id & 255)));
+        // The next paint sends text only.
+        let mut again = String::new();
+        paint_body(&c, &mut again, 0, 2);
+        assert!(!again.contains("_Ga=T"), "{again:?}");
+        assert!(again.contains(ph));
+        // A narrower view: the old placement is deleted, a new one sent.
+        c.width = 40;
+        c.lines = layout(&c.msgs, 40, 0, "U1", None, &names(), NOON + 100, false, Some(&pics));
+        let mut resized = String::new();
+        paint_body(&c, &mut resized, 0, 2);
+        assert!(resized.contains(&format!("a=d,d=I,i={id}")), "{resized:?}");
+        assert_eq!(resized.matches("a=T,t=f").count(), 1);
+        assert_ne!(c.placed.borrow().get("F1").map(|p| p.id), Some(id));
+        // Nothing wanted from the cache once the picture is known.
+        let mut cache = images::Cache::default();
+        assert_eq!(c.wanted_images(&cache).len(), 1);
+        cache.asked.insert("F1".into());
+        assert!(c.wanted_images(&cache).is_empty());
+        c.images_on = false;
+        cache.asked.clear();
+        assert!(c.wanted_images(&cache).is_empty(), "off: nothing is fetched");
     }
 
     fn in_thread(from_timeline: bool) -> Chat {
@@ -1755,7 +2063,7 @@ mod tests {
     #[test]
     fn transcript_lines() {
         let mut m = msg(NOON, "U2", "hey <@U1> *look*\n```\nlet x = 1;\n```");
-        m.files.push("shot.png".into());
+        m.files.push(FileRef::named("shot.png"));
         let msgs = vec![m, msg(NOON + 60, "U1", "ok")];
         let t = transcript(&msgs, &[0, 1], 0, &names());
         assert_eq!(t, "tejas (2023-10-30 12:00): hey @zack look\n  let x = 1;\n  📎 shot.png\nzack (2023-10-30 12:01): ok\n");

@@ -5,7 +5,7 @@
 use serde_json::Value;
 
 use crate::http;
-use crate::store::{Channel, Count, Identity, Kind, Message, Section, User};
+use crate::store::{Channel, Count, FileRef, Identity, Kind, Message, Section, User};
 
 fn s(v: &Value, k: &str) -> Option<String> {
     v.get(k).and_then(Value::as_str).map(str::to_string)
@@ -396,15 +396,8 @@ pub fn message_from(channel: &str, m: &Value) -> Option<Message> {
         .and_then(Value::as_array)
         .map(|a| a.iter().filter_map(|r| Some((s(r, "name")?, i(r, "count")))).collect())
         .unwrap_or_default();
-    let files = m
-        .get("files")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(|f| s(f, "title").filter(|t| !t.is_empty()).or_else(|| s(f, "name")))
-                .collect()
-        })
-        .unwrap_or_default();
+    let files = m.get("files").and_then(Value::as_array).map(|a| a.iter().filter_map(file_from).collect()).unwrap_or_default();
+    let pictures = pictures_from(m, &ts);
     let attachments: Vec<String> = m
         .get("attachments")
         .and_then(Value::as_array)
@@ -429,9 +422,89 @@ pub fn message_from(channel: &str, m: &Value) -> Option<Message> {
         latest_reply: s(m, "latest_reply"),
         reactions,
         files,
+        pictures,
         edited: m.get("edited").is_some(),
         attachments,
         deleted: false,
+    })
+}
+
+/// The pictures a message carries outside its files: `image` blocks in
+/// its attachments (a Giphy post, a link unfurl's picture) or in its own
+/// blocks, and a legacy attachment's `image_url`. Each gets an id of its
+/// own (`a<ts>-<n>`) for the cache. The text they stand beside
+/// (`[image: alt]`) is in `attachments` / `text` already.
+fn pictures_from(m: &Value, ts: &str) -> Vec<FileRef> {
+    let mut out: Vec<FileRef> = Vec::new();
+    let stamp = ts.replace('.', "");
+    for at in m.get("attachments").and_then(Value::as_array).into_iter().flatten() {
+        if let Some(blocks) = at.get("blocks") {
+            picture_blocks(&mut out, &stamp, blocks);
+        } else {
+            let name = s(at, "title").or_else(|| s(at, "fallback"));
+            push_picture(&mut out, &stamp, s(at, "image_url"), name, at.get("image_width").and_then(Value::as_u64), at.get("image_height").and_then(Value::as_u64));
+        }
+    }
+    if let Some(blocks) = m.get("blocks") {
+        picture_blocks(&mut out, &stamp, blocks);
+    }
+    out
+}
+
+/// The `image` blocks of a Block Kit array, as pictures.
+fn picture_blocks(out: &mut Vec<FileRef>, stamp: &str, blocks: &Value) {
+    for blk in blocks.as_array().into_iter().flatten() {
+        if s(blk, "type").as_deref() == Some("image") {
+            let name = s(blk, "alt_text").or_else(|| blk.get("title").and_then(|t| s(t, "text")));
+            push_picture(out, stamp, s(blk, "image_url"), name, blk.get("image_width").and_then(Value::as_u64), blk.get("image_height").and_then(Value::as_u64));
+        }
+    }
+}
+
+/// One picture by URL (http(s), not an SVG), numbered after the ones
+/// before it.
+fn push_picture(out: &mut Vec<FileRef>, stamp: &str, url: Option<String>, name: Option<String>, w: Option<u64>, h: Option<u64>) {
+    let Some(url) = url.filter(|u| u.starts_with("http")) else { return };
+    let path = url.split('?').next().unwrap_or("").to_ascii_lowercase();
+    if path.ends_with(".svg") {
+        return;
+    }
+    out.push(FileRef {
+        id: format!("a{stamp}-{}", out.len()),
+        name: name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "image".into()),
+        mimetype: "image/*".into(),
+        size: match (w, h) {
+            (Some(w), Some(h)) if w > 0 && h > 0 => Some((w as u32, h as u32)),
+            _ => None,
+        },
+        thumb: None,
+        url: Some(url),
+    });
+}
+
+/// The thumbnails Slack renders for an image, best first for a block up
+/// to 80 cells wide: 720 px fits it at a typical cell width, 480 and 360
+/// are what most files have, the larger ones are rare and heavy. A GIF's
+/// thumbnails are its first frame; `deanimate_gif`, when present, is
+/// that frame at full size.
+const THUMBS: [&str; 9] = ["deanimate_gif", "deanimate", "thumb_720", "thumb_480", "thumb_360", "thumb_800", "thumb_960", "thumb_1024", "thumb_160"];
+
+/// One file object as the views keep it. A file with neither title nor
+/// name is dropped (a deleted file's tombstone).
+fn file_from(f: &Value) -> Option<FileRef> {
+    let name = s(f, "title").filter(|t| !t.is_empty()).or_else(|| s(f, "name"))?;
+    let w = f.get("original_w").and_then(Value::as_u64);
+    let h = f.get("original_h").and_then(Value::as_u64);
+    Some(FileRef {
+        id: s(f, "id").unwrap_or_default(),
+        name,
+        mimetype: s(f, "mimetype").unwrap_or_default(),
+        size: match (w, h) {
+            (Some(w), Some(h)) if w > 0 && h > 0 => Some((w as u32, h as u32)),
+            _ => None,
+        },
+        thumb: THUMBS.iter().find_map(|k| s(f, k).filter(|u| !u.is_empty())),
+        url: s(f, "url_private"),
     })
 }
 
@@ -586,10 +659,66 @@ mod tests {
         assert_eq!(m.user.as_deref(), Some("U1"));
         assert_eq!(m.reply_count, 2);
         assert_eq!(m.reactions, vec![("+1".to_string(), 3)]);
-        assert_eq!(m.files, vec!["a.png".to_string()]);
+        assert_eq!(m.files, vec![FileRef::named("a.png")]);
         assert!(m.edited);
         assert_eq!(m.attachments, vec!["A link\nits text".to_string()]);
         assert!(!m.is_reply());
+    }
+
+    #[test]
+    fn keeps_what_an_image_needs() {
+        let v: Value = serde_json::from_str(
+            r#"{"type":"message","user":"U1","text":"","ts":"1.1","files":[
+                {"id":"F1","name":"Nervous K and P.gif","title":"","mimetype":"image/gif","original_w":480,"original_h":270,
+                 "thumb_360":"https://files.slack.com/t/F1/360.png","thumb_480":"https://files.slack.com/t/F1/480.png",
+                 "deanimate_gif":"https://files.slack.com/t/F1/deanimate.gif","url_private":"https://files.slack.com/t/F1/x.gif"},
+                {"id":"F2","name":"notes.txt","mimetype":"text/plain","url_private":"https://files.slack.com/t/F2/notes.txt"},
+                {"id":"F3","mode":"tombstone"}]}"#,
+        )
+        .unwrap();
+        let m = message_from("C1", &v).unwrap();
+        assert_eq!(m.files.len(), 2, "the tombstone is dropped");
+        let g = &m.files[0];
+        assert_eq!(g.name, "Nervous K and P.gif");
+        assert!(g.is_image());
+        assert_eq!(g.size, Some((480, 270)));
+        assert_eq!(g.fetch_url(), Some("https://files.slack.com/t/F1/deanimate.gif"), "the static frame first");
+        assert!(!m.files[1].is_image());
+        // An old cached row names its files as strings; a new one is full.
+        let old: Message = serde_json::from_str(r#"{"channel":"C1","ts":"1.1","files":["bribe.gif"]}"#).unwrap();
+        assert_eq!(old.files, vec![FileRef::named("bribe.gif")]);
+        assert!(!old.files[0].is_image());
+        let back: Message = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back.files, m.files);
+    }
+
+    #[test]
+    fn pictures_in_attachments_and_blocks() {
+        // A Giphy post (an attachment with an image block), a legacy
+        // unfurl with image_url, an SVG (skipped), a bot's own image block.
+        let v: Value = serde_json::from_str(
+            r#"{"type":"message","user":"U1","text":"","ts":"1793331107.403129","attachments":[
+                {"id":1,"fallback":"shared a GIF","blocks":[{"type":"image","image_url":"https://media3.giphy.com/media/x/giphy.webp?cid=1","alt_text":"nervous k&p GIF by myLAB Box","title":{"type":"plain_text","text":"GIF"},"image_width":299,"image_height":225,"is_animated":true}]},
+                {"id":2,"title":"A page","image_url":"https://slack-imgs.com/?url=https%3A%2F%2Fx%2Fog.png","image_width":1200,"image_height":630},
+                {"id":3,"title":"Logo","image_url":"https://x/logo.svg"}],
+              "blocks":[{"type":"image","image_url":"https://x/chart.png","alt_text":"chart"}]}"#,
+        )
+        .unwrap();
+        let m = message_from("C1", &v).unwrap();
+        assert_eq!(m.pictures.len(), 3, "{:?}", m.pictures);
+        assert_eq!(m.pictures[0].id, "a1793331107403129-0");
+        assert_eq!(m.pictures[0].name, "nervous k&p GIF by myLAB Box");
+        assert_eq!(m.pictures[0].size, Some((299, 225)));
+        assert_eq!(m.pictures[0].fetch_url(), Some("https://media3.giphy.com/media/x/giphy.webp?cid=1"));
+        assert!(m.pictures[0].is_image());
+        assert_eq!(m.pictures[1].id, "a1793331107403129-1");
+        assert_eq!(m.pictures[1].name, "A page");
+        assert_eq!(m.pictures[2].name, "chart");
+        assert!(m.files.is_empty());
+        // The text beside them is in the attachments as before.
+        assert_eq!(m.attachments[0], "[image: nervous k&p GIF by myLAB Box]");
+        let old: Message = serde_json::from_str(r#"{"channel":"C1","ts":"1.1"}"#).unwrap();
+        assert!(old.pictures.is_empty());
     }
 
     #[test]

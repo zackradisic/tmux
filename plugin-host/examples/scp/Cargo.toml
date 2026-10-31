@@ -9,6 +9,7 @@ crate-type = ["cdylib"]
 [dependencies]
 tmux-plugin-sdk = { path = "../../sdk" }
 formkit = { path = "../../formkit" }
+# The clipboard preview: kitty graphics through the passthrough.
+listkit = { path = "../../listkit" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-base64 = "0.22"

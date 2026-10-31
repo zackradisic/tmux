@@ -15,6 +15,8 @@ Every request is logged to stderr as `METHOD field=value ...`.
   GET  /_calls         JSON list of [method, fields] seen so far
   GET  /_posted        JSON list of the messages chat.postMessage took
   GET  /_unread?channel=C1
+  GET  /_img/<name>     a small real PNG (400x50), logged and counted as
+                        a call of method "_img" with the auth it carried
                        give the channel its initial unread state back
 
 Standard library only.
@@ -73,6 +75,21 @@ HISTORY = {
          "attachments": [{"fallback": "[no preview available]", "id": 1, "mrkdwn_in": ["fields"],
                           "fields": [{"title": "Status", "value": "deploy green", "short": True}]}]},
         {"type": "message", "user": "U3", "text": "hello from gregor", "ts": "1700000050.000100"},
+        # A shared GIF: the thumbnail URLs point back at this fake ({BASE}
+        # is filled in when the page is served). The plugin fetches the
+        # static thumb once and draws it under the clip line.
+        {"type": "message", "user": "U2", "text": "", "ts": "1700000030.000100",
+         "files": [{"id": "F1", "name": "Nervous K and P.gif", "title": "", "mimetype": "image/gif",
+                    "filetype": "gif", "original_w": 400, "original_h": 50,
+                    "thumb_360": "{BASE}/_img/F1.png", "thumb_480": "{BASE}/_img/F1.png",
+                    "url_private": "{BASE}/_img/F1.gif"}]},
+        # A /giphy post: no file, an attachment whose image block names
+        # the picture. Drawn under its "[image: ...]" caption.
+        {"type": "message", "user": "U2", "text": "", "ts": "1700000028.000100",
+         "attachments": [{"id": 1, "fallback": "shared a GIF",
+                          "blocks": [{"type": "image", "image_url": "{BASE}/_img/A1.png", "alt_text": "meerkat GIF",
+                                      "title": {"type": "plain_text", "text": "GIF"}, "image_width": 400, "image_height": 50,
+                                      "is_animated": True}]}]},
         {"type": "message", "user": "U9", "text": "ghost", "ts": "1700000025.000100"},
     ],
     "C2": [
@@ -94,6 +111,28 @@ COUNTS = {
 INITIAL_COUNTS = {k: dict(v) for k, v in COUNTS.items()}
 
 TS_SEQ = [0]
+# This fake's own origin, for the file URLs in HISTORY.
+BASE = [""]
+
+
+def with_base(msgs):
+    """Messages with {BASE} in their file URLs filled in."""
+    return json.loads(json.dumps(msgs).replace("{BASE}", BASE[0]))
+
+
+def tiny_png(width, height):
+    """A real PNG, width x height, one flat colour, from the standard library."""
+    import struct, zlib
+
+    def chunk(kind, data):
+        c = struct.pack(">I", len(data)) + kind + data
+        return c + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+
+    row = b"\x00" + b"\x30\x90\xc0" * width
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(row * height))
+            + chunk(b"IEND", b""))
 
 
 def fresh_ts():
@@ -170,14 +209,14 @@ def handle(method, f):
             limit = int(f.get("limit", "100"))
         except ValueError:
             limit = 100
-        return ok(messages=msgs[:limit], has_more=len(msgs) > limit)
+        return ok(messages=with_base(msgs[:limit]), has_more=len(msgs) > limit)
     if method == "conversations.replies":
         cid, ts = f.get("channel", ""), f.get("ts", "")
         root = [m for m in HISTORY.get(cid, []) if m["ts"] == ts]
         if not root:
             return err("thread_not_found")
         replies = sorted((m for m in REPLIES if m["channel"] == cid and m["thread_ts"] == ts), key=lambda m: m["ts"])
-        return ok(messages=root + [{k: v for k, v in m.items() if k != "channel"} for m in replies], has_more=False)
+        return ok(messages=with_base(root + [{k: v for k, v in m.items() if k != "channel"} for m in replies]), has_more=False)
     if method == "conversations.mark":
         cid, ts = f.get("channel", ""), f.get("ts", "")
         if cid not in COUNTS:
@@ -247,6 +286,17 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_html('<html><body><script>var boot={"api_token":"xoxc-fake","team_id":"T1"};</script></body></html>')
             elif path == "/_calls":
                 self.send_json(CALLS)
+            elif path.startswith("/_img/"):
+                auth = "bearer" if self.headers.get("Authorization", "").startswith("Bearer xox") else "none"
+                cookie = "yes" if self.headers.get("Cookie", "").startswith("d=") else "no"
+                CALLS.append(["_img", {"path": path, "auth": auth, "cookie": cookie}])
+                sys.stderr.write("GET %s auth=%s cookie=%s\n" % (path, auth, cookie)); sys.stderr.flush()
+                body = tiny_png(400, 50)
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
             elif path == "/_posted":
                 self.send_json(POSTED)
             elif path == "/_marks":
@@ -289,6 +339,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 0
     srv = HTTPServer(("127.0.0.1", port), Handler)
+    BASE[0] = "http://127.0.0.1:%d" % srv.server_address[1]
     sys.stdout.write("%d\n" % srv.server_address[1])
     sys.stdout.flush()
     try:
