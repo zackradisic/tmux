@@ -557,21 +557,59 @@ screen_has 'agent started in main' || fail "the view does not report the agent: 
 screen_has 'selecting' && fail "the selection survived n"
 $TMUX kill-window -t main:general
 keys j
-# Compose: i, the text, Enter.
+# Compose: i opens the box in insert mode; Enter sends and the box stays
+# open, empty, for the next message.
 keys i
+screen_has '› ' || fail "i did not open the compose box"
+screen_has -- '-- INSERT --' || fail "the box does not say insert mode: $(screen | tail -3)"
+screen_has 'C-j newline' || fail "the foot does not carry the compose hint: $(screen | tail -1)"
 $TMUX send-keys -t "$FORM" -l 'hello there'; sleep 0.4
 screen_has 'hello there' || fail "the typed text is not in the compose box"
 keys Enter
 until_ok 40 posted C1 'hello there' || fail "the post did not reach the fake: $(fetch "$BASE/_posted")"
 until_ok 40 screen_has 'hello there' || fail "the posted message is not shown"
 screen | grep -q 'posting' && fail "the posting status stayed"
-ROOT=$(posted_ts C1 'hello there')
-# Enter opens the thread of the message under the cursor - the one we
-# just posted, which has no replies - and does not compose.
+screen_has '› ' || fail "Enter closed the compose box"
+screen_has -- '-- INSERT --' || fail "the box left insert mode after Enter: $(screen | tail -3)"
+# The next message needs no i; C-j puts a newline inside it, and the
+# box grows a row for it.
+$TMUX send-keys -t "$FORM" -l 'line one'; keys C-j
+$TMUX send-keys -t "$FORM" -l 'line two'; sleep 0.4
+screen_has '› line one' || fail "the first line of the draft is not shown: $(screen | tail -4)"
+screen_has '  line two' || fail "C-j did not start a second line: $(screen | tail -4)"
+keys Enter
+TWO=$(printf 'line one\nline two')
+until_ok 40 posted C1 "$TWO" || fail "the two-line post did not keep its newline: $(fetch "$BASE/_posted")"
+until_ok 40 screen_has 'line two' || fail "the two-line post is not shown"
+# Escape: normal mode, where vim keys edit the draft; Escape again closes.
+$TMUX send-keys -t "$FORM" -l 'draft words'; sleep 0.4
+keys Escape
+screen_has -- '-- NORMAL --' || fail "Escape did not switch the box to normal mode: $(screen | tail -3)"
+screen_has '› draft words' || fail "Escape dropped the draft"
+keys b
+keys d
+keys w
+screen_lacks 'draft words' || fail "dw did not delete the word: $(screen | tail -3)"
+screen_has '› draft' || fail "dw took too much: $(screen | tail -3)"
+keys 0
+keys x
+screen_has '› raft' || fail "0 x did not delete the first character: $(screen | tail -3)"
+keys d
+keys d
+screen_lacks 'raft' || fail "dd did not empty the draft: $(screen | tail -3)"
+screen_has '› ' || fail "dd closed the box"
+keys Escape
+screen | grep -q '› ' && fail "the second Escape did not close the box"
+screen | grep -q -- '-- NORMAL --' && fail "the mode tag outlived the box"
+mode_open || fail "Escape while composing left the view"
+screen_has 'Space menu' || fail "the foot did not go back to the hints: $(screen | tail -1)"
+ROOT=$(posted_ts C1 "$TWO")
+# Enter opens the thread of the message under the cursor - the two-line
+# post, the newest, which has no replies - and does not compose.
 keys Enter
 until_ok 40 screen_has '· thread' || fail "Enter did not open the thread"
 until_ok 40 screen_lacks 'morning' || fail "the thread still shows the timeline"
-screen_has 'hello there' || fail "the thread lacks its root"
+screen_has 'line two' || fail "the thread lacks its root"
 screen | grep -q '› ' && fail "Enter opened the compose box"
 # i then Enter is "reply in this thread": the post carries the root's ts.
 keys i
@@ -580,6 +618,12 @@ screen_has 'reply › in the thread' || fail "the thread compose box is not a re
 keys Enter
 until_ok 40 posted C1 'in the thread' "$ROOT" || fail "the reply did not carry thread_ts=$ROOT: $(fetch "$BASE/_posted")"
 until_ok 40 screen_has 'in the thread' || fail "the reply is not shown in the thread"
+# The reply box stays open too: Escape to normal mode, Escape closes it.
+screen_has 'reply › ' || fail "Enter closed the reply box"
+keys Escape
+screen_has -- '-- NORMAL --' || fail "Escape did not switch the reply box to normal mode"
+keys Escape
+screen | grep -q 'reply › ' && fail "the second Escape did not close the reply box"
 # Escape: back to the timeline, then back to the sidebar.
 keys Escape
 until_ok 40 screen_has 'morning' || fail "Escape did not return to the timeline"
@@ -657,13 +701,18 @@ seen | grep 'load older' | grep -q '(L)' && fail "load older offered a key insid
 $OUTER send-keys -t "$VIEW" Escape
 until_ok 40 seen_lacks 'back to channel' || fail "Escape did not take the thread menu down"
 until_ok 40 screen_has 'morning' || fail "Escape chosen in the menu did not return to the timeline"
-# While composing, Space types a space and Escape drops the text.
+# While composing, Space types a space; Escape keeps the draft and goes
+# to normal mode, where q is a vim key and not "close"; Escape closes.
 keys i
 keys Space
 $TMUX send-keys -t "$FORM" -l 'x'; sleep 0.4
 screen_has '›  x' || fail "Space while composing did not type a space: $(screen | tail -2)"
 keys Escape
-screen | grep -q '›  x' && fail "Escape did not drop the composed text"
+screen_has '›  x' || fail "Escape dropped the draft instead of switching modes"
+keys q
+mode_open || fail "q in the box's normal mode closed the view"
+keys Escape
+screen | grep -q '›  x' && fail "the second Escape did not close the box"
 mode_open || fail "Escape while composing left the view"
 keys q
 until_ok 40 mode_closed || fail "q did not close the channel view (menu)"

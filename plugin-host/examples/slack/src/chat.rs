@@ -1,7 +1,10 @@
 //! The channel view: one conversation in a float - a channel or DM
 //! timeline, or a single thread - read from the cache first, then kept
-//! current by a poll while it is open, with a one-line compose box at
-//! the bottom.
+//! current by a poll while it is open, with a compose box above the
+//! foot: a vimkit editor that opens in insert mode, posts on Enter and
+//! stays open for the next message, and takes vim's normal-mode keys
+//! after Escape (Escape again closes it). It grows with the draft from
+//! one row to [`COMPOSE_MAX_ROWS`] and takes those rows off the body.
 //!
 //! Messages are multi-line, so the view lays them out itself into
 //! display lines (`layout`) and scrolls over lines, not messages; the
@@ -27,7 +30,7 @@ use std::rc::Rc;
 
 use listkit::image::{kitty_delete, kitty_transmit_file, placeholder_row, preview_fit, MAX_BLOCK};
 use listkit::lines::{clamp_dim, default_size, SizeBox};
-use listkit::styled::{emit_cells, fit_cells, plain_cells, wrap_cells, Styled, ST_BOLD, ST_BRIGHT, ST_CYAN, ST_DIM, ST_GREEN, ST_INVERT, ST_ORANGE, ST_RED};
+use listkit::styled::{emit_cells, fit_cells, plain_cells, wrap_cells, Styled, ST_BOLD, ST_BRIGHT, ST_CYAN, ST_DIM, ST_GREEN, ST_ORANGE, ST_RED};
 use listkit::text::{clip, menu_item, menu_safe};
 use tmux_plugin_sdk::prelude::*;
 
@@ -116,8 +119,41 @@ pub enum ComposeKind {
 
 pub struct Compose {
     pub kind: ComposeKind,
-    pub text: String,
+    /// The draft: a vim-flavoured editor, in insert mode when the box
+    /// opens.
+    pub editor: vimkit::Editor,
 }
+
+impl Compose {
+    /// An empty box in insert mode.
+    pub fn new(kind: ComposeKind) -> Self {
+        Self::with_text(kind, "")
+    }
+
+    /// A box holding `text` (a paste, a post that failed), the cursor
+    /// after it, in insert mode.
+    pub fn with_text(kind: ComposeKind, text: &str) -> Self {
+        let mut editor = vimkit::Editor::new();
+        editor.insert();
+        editor.set_text(text);
+        Compose { kind, editor }
+    }
+
+    pub fn text(&self) -> String {
+        self.editor.text()
+    }
+
+    fn prompt(&self) -> &'static str {
+        match &self.kind {
+            ComposeKind::Message(Some(_)) => "reply › ",
+            ComposeKind::Message(None) => "› ",
+            ComposeKind::Reaction(_) => "react :",
+        }
+    }
+}
+
+/// The most rows the compose box grows to before its text scrolls.
+pub(crate) const COMPOSE_MAX_ROWS: usize = 6;
 
 pub struct Chat {
     pub mode: ModeId,
@@ -134,7 +170,8 @@ pub struct Chat {
     pub height: u32,
     /// Rows the frame takes out of `height`: the title, its rule, the
     /// foot's rule and the foot in the float (4); none when the body is
-    /// drawn into another view's column.
+    /// drawn into another view's column. The compose box's rows come
+    /// on top of these (`box_rows`).
     pub chrome: u32,
     /// The 0-based screen row of the body's first line (2 under the
     /// float's title and rule).
@@ -215,7 +252,23 @@ impl Chat {
     }
 
     pub(crate) fn body_h(&self) -> usize {
-        (self.height as usize).saturating_sub(self.chrome as usize).max(1)
+        (self.height as usize).saturating_sub(self.chrome as usize + self.box_rows()).max(1)
+    }
+
+    /// Rows the compose box takes out of the body: as many as its draft
+    /// needs, 1 to [`COMPOSE_MAX_ROWS`]; none embedded, where the owner
+    /// draws it on its own foot row.
+    pub(crate) fn box_rows(&self) -> usize {
+        if self.chrome == 0 {
+            return 0;
+        }
+        self.compose.as_ref().map_or(0, |cp| compose_height(cp, (self.width as usize).saturating_sub(2)))
+    }
+
+    /// The box grew, shrank, opened or closed: keep the bottom of the
+    /// conversation in view when following it, and the top in range.
+    pub(crate) fn fit_box(&mut self) {
+        self.top = if self.follow { self.max_top() } else { self.top.min(self.max_top()) };
     }
 
     /// The messages a copy acts on: from the anchor to the cursor while
@@ -544,23 +597,63 @@ fn rule(width: usize) -> String {
     "─".repeat(width)
 }
 
-/// The compose box: `› text` with a reverse-video cursor cell; the tail
-/// of a long text, so the cursor stays on screen.
-pub(crate) fn compose_cells(c: &Compose, width: usize) -> Vec<Styled> {
-    let prompt = match &c.kind {
-        ComposeKind::Message(Some(_)) => "reply › ",
-        ComposeKind::Message(None) => "› ",
-        ComposeKind::Reaction(_) => "react :",
-    };
-    let mut cells = plain_cells(prompt, ST_DIM);
-    let avail = width.saturating_sub(cells.len() + 1);
-    let shown: Vec<char> = c.text.chars().map(|ch| if ch == '\n' { '↵' } else { ch }).collect();
-    let skip = shown.len().saturating_sub(avail);
-    for ch in &shown[skip..] {
-        cells.push((*ch, 0));
+/// The foot's hint while the box is open.
+pub(crate) fn compose_hints(kind: &ComposeKind) -> &'static str {
+    match kind {
+        ComposeKind::Reaction(_) => "Enter react · Esc normal/close",
+        ComposeKind::Message(_) => "Enter send · C-j newline · Esc normal/close",
     }
-    cells.push((' ', ST_INVERT));
-    cells
+}
+
+/// The mode tag beside the box: the editor's (`-- INSERT --`, a pending
+/// `3d`, `/pattern`), or `-- NORMAL --` where vim would show nothing.
+pub(crate) fn mode_tag(ed: &vimkit::Editor) -> String {
+    let s = ed.status();
+    if s.is_empty() {
+        "-- NORMAL --".to_string()
+    } else {
+        s
+    }
+}
+
+/// How many rows the box wants at `width`: what its draft takes under
+/// the prompt, 1 to [`COMPOSE_MAX_ROWS`].
+pub(crate) fn compose_height(c: &Compose, width: usize) -> usize {
+    let text_w = width.saturating_sub(c.prompt().chars().count()).max(1);
+    c.editor.rows_needed(text_w).clamp(1, COMPOSE_MAX_ROWS)
+}
+
+/// The compose box as `rows` rows `width` wide: the prompt on the
+/// first, the draft soft-wrapped under it with the cursor as a
+/// reverse-video cell (scrolled to keep it on screen), and the mode tag
+/// dim at the right end of the last row when the text leaves it room
+/// (`true`); else the tag is left for the owner's foot (`false`).
+pub(crate) fn compose_rows(c: &Compose, width: usize, rows: usize) -> (Vec<Vec<Styled>>, bool) {
+    let prompt = c.prompt();
+    let plen = prompt.chars().count();
+    let text_w = width.saturating_sub(plen).max(1);
+    let mut out: Vec<Vec<Styled>> = Vec::with_capacity(rows);
+    for (i, row) in c.editor.render(text_w, rows).into_iter().enumerate() {
+        let mut cells = if i == 0 { plain_cells(prompt, ST_DIM) } else { plain_cells(&" ".repeat(plen), 0) };
+        cells.extend(row);
+        out.push(cells);
+    }
+    let tag = mode_tag(&c.editor);
+    let tlen = tag.chars().count();
+    let mut placed = false;
+    if let Some(last) = out.last_mut() {
+        if last.len() + 2 + tlen <= width {
+            last.resize(width - tlen, (' ', 0));
+            last.extend(plain_cells(&tag, ST_DIM));
+            placed = true;
+        }
+    }
+    (out, placed)
+}
+
+/// The box as one row (the sidebar's foot): the draft's cursor row.
+pub(crate) fn compose_cells(c: &Compose, width: usize) -> Vec<Styled> {
+    compose_rows(c, width, 1).0.pop().unwrap_or_default()
 }
 
 /// Draw the whole screen.
@@ -589,14 +682,34 @@ fn paint(s: &State) {
         }
     }
     paint_body(c, &mut out, 0, c.body_y as usize);
-    // The foot: a rule, then the compose box, a status, or the hints.
+    // The compose box, just above the foot's rule; its mode tag goes to
+    // the foot when the last row is too full for it.
+    let mut tag_in_foot: Option<String> = None;
+    if let Some(cp) = &c.compose {
+        let rows = c.box_rows();
+        let (cells, placed) = compose_rows(cp, w.saturating_sub(2), rows);
+        if !placed {
+            tag_in_foot = Some(mode_tag(&cp.editor));
+        }
+        let y0 = h.saturating_sub(1 + rows);
+        for (k, row) in cells.iter().enumerate() {
+            out.push_str(&format!("\x1b[{};2H{}", y0 + k, emit_cells(row, false)));
+        }
+    }
+    // The foot: a rule, then a status, the compose hint, or the hints.
     if h >= 2 {
         out.push_str(&format!("\x1b[{};1H\x1b[2m{}\x1b[0m", h - 1, rule(w)));
     }
-    let foot: Vec<Styled> = if let Some(cp) = &c.compose {
-        compose_cells(cp, w.saturating_sub(1))
-    } else if let Some(st) = &c.status {
+    let foot: Vec<Styled> = if let Some(st) = &c.status {
         plain_cells(&clip(st, w.saturating_sub(2)), ST_CYAN)
+    } else if let Some(cp) = &c.compose {
+        let mut f: Vec<Styled> = Vec::new();
+        if let Some(tag) = tag_in_foot {
+            f.extend(plain_cells(&tag, ST_DIM));
+            f.extend(plain_cells("  ", 0));
+        }
+        f.extend(plain_cells(compose_hints(&cp.kind), ST_DIM));
+        fit_cells(&f, w.saturating_sub(2))
     } else {
         plain_cells(&clip(hints(), w.saturating_sub(2)), ST_DIM)
     };
@@ -739,7 +852,7 @@ pub fn open(st: &Shared, ch: Channel, thread: Option<String>, client: Option<u64
         }
     };
     let gen = next_gen();
-    let compose = compose.then(|| Compose { kind: ComposeKind::Message(thread.clone()), text: String::new() });
+    let compose = compose.then(|| Compose::new(ComposeKind::Message(thread.clone())));
     let images_on = opt_flag("@slack-images", true);
     let cell_aspect = listkit::image::cell_aspect(window);
     let data_root = fs_root().unwrap_or_default();
@@ -1089,7 +1202,10 @@ async fn fetch(st: &Shared, gen: u64) {
             if let Some(more) = more {
                 c.has_more = more;
             }
-            if c.follow {
+            // Following the bottom moves the cursor onto what arrived;
+            // a poll that brought nothing leaves it where the reader
+            // put it (as the feed path does).
+            if c.follow && added > 0 {
                 let last = c.msgs.len().saturating_sub(1);
                 c.set_cursor_idx(last);
             } else if added > 0 {
@@ -1244,6 +1360,8 @@ pub(crate) enum After {
     Permalink(String),
     /// Copy these messages as text.
     Copy(Vec<usize>),
+    /// Copy this text (a yank in the compose box).
+    Clip(String),
     /// Start an agent with these messages as its first prompt (the
     /// hand-off form, handoff.rs).
     Agent(Vec<usize>),
@@ -1298,12 +1416,13 @@ pub fn on_mode_event(st: &Shared, name: &str, event: &Event) {
             let mut s = st.borrow_mut();
             let Some(c) = s.chat.as_mut() else { return };
             match c.compose.as_mut() {
-                Some(cp) => cp.text.push_str(&text),
+                Some(cp) => cp.editor.paste(&text),
                 // A paste outside the box starts composing with it.
                 None => {
-                    c.compose = Some(Compose { kind: ComposeKind::Message(c.thread.clone()), text });
+                    c.compose = Some(Compose::with_text(ComposeKind::Message(c.thread.clone()), &text));
                 }
             }
+            c.fit_box();
             paint(&s);
         }
         "mode-resize" => {
@@ -1332,24 +1451,33 @@ pub fn on_mode_event(st: &Shared, name: &str, event: &Event) {
     }
 }
 
-/// A key while composing: typing, editing, send or cancel.
+/// A key while composing: the editor's, then what its event asks for.
+/// Enter posts the draft and keeps the box open - empty, in insert
+/// mode - for the next message; Escape in normal mode closes it; a
+/// yank goes to the clipboard. A reaction box closes on Enter.
 fn compose_key(c: &mut Chat, key: &str) -> After {
+    // A status answers the last action; the next key dismisses it,
+    // except the one that says a post is still on its way.
+    if c.status.as_deref() != Some("posting…") {
+        c.status = None;
+    }
     let Some(cp) = c.compose.as_mut() else { return After::None };
-    match key {
-        "Enter" => {
-            let text = std::mem::take(&mut cp.text);
-            let kind = cp.kind.clone();
-            c.compose = None;
-            match kind {
+    let after = match cp.editor.key(key) {
+        vimkit::Event::Submit => {
+            let text = cp.text();
+            match cp.kind.clone() {
                 ComposeKind::Message(thread) => {
                     if text.trim().is_empty() {
                         After::None
                     } else {
+                        cp.editor.clear();
+                        cp.editor.insert();
                         c.status = Some("posting…".into());
                         After::Post(text, thread)
                     }
                 }
                 ComposeKind::Reaction(ts) => {
+                    c.compose = None;
                     let name = text.trim().trim_matches(':').to_string();
                     if name.is_empty() {
                         After::None
@@ -1360,44 +1488,15 @@ fn compose_key(c: &mut Chat, key: &str) -> After {
                 }
             }
         }
-        "Escape" => {
+        vimkit::Event::Leave => {
             c.compose = None;
             After::None
         }
-        "BSpace" | "C-h" => {
-            cp.text.pop();
-            After::None
-        }
-        "C-u" => {
-            cp.text.clear();
-            After::None
-        }
-        "C-w" => {
-            let trimmed = cp.text.trim_end().len();
-            cp.text.truncate(trimmed);
-            while cp.text.chars().last().is_some_and(|ch| !ch.is_whitespace()) {
-                cp.text.pop();
-            }
-            After::None
-        }
-        "Space" => {
-            cp.text.push(' ');
-            After::None
-        }
-        "Tab" => {
-            cp.text.push('\t');
-            After::None
-        }
-        _ => {
-            let mut it = key.chars();
-            if let (Some(ch), None) = (it.next(), it.next()) {
-                if !ch.is_control() {
-                    cp.text.push(ch);
-                }
-            }
-            After::None
-        }
-    }
+        vimkit::Event::Yank(text) => After::Clip(text),
+        vimkit::Event::Redraw | vimkit::Event::None => After::None,
+    };
+    c.fit_box();
+    after
 }
 
 /// The keymap. Enter opens the thread of the message under the cursor
@@ -1468,14 +1567,16 @@ pub(crate) fn handle_key(c: &mut Chat, key: &str, mouse: Option<(u32, u32)>) -> 
             After::None
         }
         "i" => {
-            c.compose = Some(Compose { kind: ComposeKind::Message(c.thread.clone()), text: String::new() });
+            c.compose = Some(Compose::new(ComposeKind::Message(c.thread.clone())));
+            c.fit_box();
             After::None
         }
         "r" => {
             let Some(i) = c.cursor_idx() else { return After::None };
             let m = &c.msgs[i];
             let root = m.thread_ts.clone().unwrap_or_else(|| m.ts.clone());
-            c.compose = Some(Compose { kind: ComposeKind::Message(Some(root)), text: String::new() });
+            c.compose = Some(Compose::new(ComposeKind::Message(Some(root))));
+            c.fit_box();
             After::None
         }
         // Enter opens the thread of any message, with or without replies
@@ -1493,7 +1594,8 @@ pub(crate) fn handle_key(c: &mut Chat, key: &str, mouse: Option<(u32, u32)>) -> 
         "e" => {
             let Some(i) = c.cursor_idx() else { return After::None };
             let ts = c.msgs[i].ts.clone();
-            c.compose = Some(Compose { kind: ComposeKind::Reaction(ts), text: String::new() });
+            c.compose = Some(Compose::new(ComposeKind::Reaction(ts)));
+            c.fit_box();
             After::None
         }
         "o" => {
@@ -1712,8 +1814,16 @@ fn run(st: &Shared, after: After) {
                         let mut s = st2.borrow_mut();
                         if let Some(c) = s.chat.as_mut().filter(|c| c.channel.id == channel) {
                             c.status = Some(format!("post failed: {e}"));
-                            // Give the text back rather than lose it.
-                            c.compose = Some(Compose { kind: ComposeKind::Message(thread.clone()), text: text.clone() });
+                            // Give the text back rather than lose it: into
+                            // the open box, ahead of what was typed since.
+                            match c.compose.as_mut() {
+                                Some(cp) if cp.kind == ComposeKind::Message(thread.clone()) => {
+                                    let draft = cp.text();
+                                    cp.editor.set_text(&if draft.is_empty() { text.clone() } else { format!("{text}\n{draft}") });
+                                }
+                                _ => c.compose = Some(Compose::with_text(ComposeKind::Message(thread.clone()), &text)),
+                            }
+                            c.fit_box();
                         }
                         paint(&s);
                     }
@@ -1799,6 +1909,25 @@ fn run(st: &Shared, after: After) {
                 }
             });
         }
+        After::Clip(text) => {
+            let (client, gen) = {
+                let s = st.borrow();
+                let Some(c) = s.chat.as_ref() else { return };
+                (c.client, c.gen)
+            };
+            let st2 = Rc::clone(st);
+            spawn(async move {
+                let status = match copy_text(&text, client).await {
+                    Ok(()) => "yanked to the clipboard".to_string(),
+                    Err(e) => format!("copy: {e}"),
+                };
+                let mut s = st2.borrow_mut();
+                if let Some(c) = s.chat.as_mut().filter(|c| c.gen == gen) {
+                    c.status = Some(status);
+                    paint(&s);
+                }
+            });
+        }
         After::Agent(idxs) => {
             // The transcript `y` would have copied, with where it came
             // from; the form takes it from here (handoff.rs). The view
@@ -1855,7 +1984,20 @@ fn run(st: &Shared, after: After) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use listkit::styled::cells_text;
+    use listkit::styled::{cells_text, ST_INVERT};
+    use vimkit::Mode;
+
+    fn keys(c: &mut Chat, keys: &[&str]) -> Vec<After> {
+        keys.iter().map(|k| handle_key(c, k, None)).collect()
+    }
+
+    fn draft(c: &Chat) -> Option<String> {
+        c.compose.as_ref().map(|cp| cp.text())
+    }
+
+    fn compose_mode(c: &Chat) -> Option<Mode> {
+        c.compose.as_ref().map(|cp| cp.editor.mode())
+    }
 
     const DAY: i64 = 86_400;
     /// 2023-10-30 12:00 UTC, a Monday.
@@ -2219,18 +2361,110 @@ mod tests {
     fn space_is_the_menu_outside_the_compose_box() {
         let mut c = chat();
         assert_eq!(handle_key(&mut c, "Space", None), After::Menu);
-        // Composing: Space types, Enter sends, Escape drops the text.
+        // Composing: Space types, Enter sends and the box stays open.
         handle_key(&mut c, "i", None);
+        assert_eq!(compose_mode(&c), Some(Mode::Insert));
         handle_key(&mut c, "h", None);
         assert_eq!(handle_key(&mut c, "Space", None), After::None);
         handle_key(&mut c, "i", None);
-        assert_eq!(c.compose.as_ref().map(|cp| cp.text.as_str()), Some("h i"));
+        assert_eq!(draft(&c).as_deref(), Some("h i"));
         assert_eq!(handle_key(&mut c, "Enter", None), After::Post("h i".into(), None));
-        assert!(c.compose.is_none());
-        handle_key(&mut c, "i", None);
+        assert_eq!(draft(&c).as_deref(), Some(""), "the box stays open, empty");
+        assert_eq!(compose_mode(&c), Some(Mode::Insert));
+        assert_eq!(c.status.as_deref(), Some("posting…"));
+        // Escape: normal mode, the draft kept; Escape again closes.
         handle_key(&mut c, "x", None);
         assert_eq!(handle_key(&mut c, "Escape", None), After::None);
-        assert!(c.compose.is_none(), "Escape drops the text");
+        assert_eq!(compose_mode(&c), Some(Mode::Normal));
+        assert_eq!(draft(&c).as_deref(), Some("x"));
+        assert_eq!(handle_key(&mut c, "Escape", None), After::None);
+        assert!(c.compose.is_none(), "the second Escape closes the box");
+        assert_eq!(handle_key(&mut c, "Space", None), After::Menu);
+    }
+
+    #[test]
+    fn compose_box_takes_vim_keys_after_escape() {
+        let mut c = chat();
+        handle_key(&mut c, "i", None);
+        for k in "hello big world".chars() {
+            handle_key(&mut c, &if k == ' ' { "Space".to_string() } else { k.to_string() }, None);
+        }
+        keys(&mut c, &["Escape", "b", "d", "w"]);
+        assert_eq!(draft(&c).as_deref(), Some("hello big "));
+        keys(&mut c, &["0", "x"]);
+        assert_eq!(draft(&c).as_deref(), Some("ello big "));
+        assert_eq!(handle_key(&mut c, "u", None), After::None);
+        assert_eq!(draft(&c).as_deref(), Some("hello big "));
+        // yy yanks to the clipboard; a yank is not a send.
+        assert_eq!(keys(&mut c, &["y", "y"])[1], After::Clip("hello big \n".into()));
+        assert!(c.compose.is_some());
+        // dd empties the draft; Enter on an empty draft posts nothing.
+        keys(&mut c, &["d", "d"]);
+        assert_eq!(draft(&c).as_deref(), Some(""));
+        assert_eq!(handle_key(&mut c, "Enter", None), After::None);
+        assert!(c.compose.is_some());
+        // Enter in normal mode sends too, and the box goes back to insert.
+        keys(&mut c, &["i", "o", "k", "Escape"]);
+        assert_eq!(compose_mode(&c), Some(Mode::Normal));
+        assert_eq!(handle_key(&mut c, "Enter", None), After::Post("ok".into(), None));
+        assert_eq!(compose_mode(&c), Some(Mode::Insert));
+        assert_eq!(draft(&c).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn compose_newlines_from_c_j_and_o() {
+        let mut c = chat();
+        keys(&mut c, &["i", "a", "C-j", "b"]);
+        assert_eq!(draft(&c).as_deref(), Some("a\nb"));
+        keys(&mut c, &["Escape", "o", "c", "Escape", "O", "x", "Escape"]);
+        assert_eq!(draft(&c).as_deref(), Some("a\nb\nx\nc"));
+        assert_eq!(handle_key(&mut c, "Enter", None), After::Post("a\nb\nx\nc".into(), None));
+    }
+
+    #[test]
+    fn compose_box_grows_and_shrinks_the_body() {
+        let mut c = chat();
+        assert_eq!(c.box_rows(), 0);
+        assert_eq!(c.body_h(), 16);
+        handle_key(&mut c, "i", None);
+        assert_eq!(c.box_rows(), 1);
+        assert_eq!(c.body_h(), 15, "the box takes a row off the body");
+        for _ in 0..3 {
+            keys(&mut c, &["x", "C-j"]);
+        }
+        assert_eq!(c.box_rows(), 4);
+        for _ in 0..10 {
+            keys(&mut c, &["x", "C-j"]);
+        }
+        assert_eq!(c.box_rows(), COMPOSE_MAX_ROWS, "then it scrolls");
+        assert_eq!(c.body_h(), 16 - COMPOSE_MAX_ROWS);
+        // A long line wraps into rows too.
+        let mut c = chat();
+        c.compose = Some(Compose::with_text(ComposeKind::Message(None), &"x".repeat(200)));
+        assert_eq!(c.box_rows(), 3, "200 cells under a 2-cell prompt at width 78");
+        // Embedded in the sidebar the box lives on the foot row.
+        c.chrome = 0;
+        assert_eq!(c.box_rows(), 0);
+        // Closing gives the rows back.
+        c.chrome = 4;
+        c.compose = None;
+        assert_eq!(c.body_h(), 16);
+    }
+
+    #[test]
+    fn compose_paste_and_failed_post() {
+        let mut c = chat();
+        handle_key(&mut c, "i", None);
+        c.compose.as_mut().unwrap().editor.paste("one\ntwo");
+        assert_eq!(draft(&c).as_deref(), Some("one\ntwo"));
+        assert_eq!(compose_mode(&c), Some(Mode::Insert));
+        // A failed post's text comes back ahead of the new draft.
+        let cp = c.compose.as_mut().unwrap();
+        let text = "lost";
+        let d = cp.text();
+        cp.editor.set_text(&format!("{text}\n{d}"));
+        assert_eq!(draft(&c).as_deref(), Some("lost\none\ntwo"));
+        assert_eq!(c.compose.as_ref().unwrap().editor.cursor(), (2, 3));
     }
 
     #[test]
@@ -2265,14 +2499,36 @@ mod tests {
     }
 
     #[test]
-    fn compose_box_shows_tail_with_cursor() {
-        let cp = Compose { kind: ComposeKind::Message(None), text: "hello\nworld".into() };
-        let cells = compose_cells(&cp, 40);
-        assert_eq!(cells_text(&cells), "› hello↵world ");
-        assert!(cells.last().unwrap().1 & ST_INVERT != 0);
-        let cp = Compose { kind: ComposeKind::Reaction("1.2".into()), text: "abcdefghijklmnop".into() };
+    fn compose_rows_prompt_wrap_and_tag() {
+        let cp = Compose::with_text(ComposeKind::Message(None), "hello\nworld");
+        let (rows, placed) = compose_rows(&cp, 40, 2);
+        assert!(placed);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(cells_text(&rows[0]), "› hello");
+        assert_eq!(rows[0][0].1, ST_DIM, "the prompt is dim");
+        assert_eq!(cells_text(&rows[1]), "  world                     -- INSERT --");
+        assert_eq!(rows[1].len(), 40);
+        assert_eq!(rows[1][7].1, ST_INVERT, "the cursor after the text");
+        assert_eq!(rows[1][39].1, ST_DIM, "the tag is dim");
+        // A full last row leaves the tag to the foot.
+        let cp = Compose::with_text(ComposeKind::Message(None), &"x".repeat(37));
+        let (rows, placed) = compose_rows(&cp, 40, 1);
+        assert!(!placed);
+        assert_eq!(rows[0].len(), 40, "prompt, 37 cells, the cursor");
+        // Normal mode shows its own tag; a pending command replaces it.
+        let mut cp = Compose::with_text(ComposeKind::Message(Some("1.2".into())), "abc");
+        cp.editor.key("Escape");
+        assert_eq!(mode_tag(&cp.editor), "-- NORMAL --");
+        let (rows, _) = compose_rows(&cp, 40, 1);
+        assert!(cells_text(&rows[0]).starts_with("reply › abc"), "{}", cells_text(&rows[0]));
+        assert!(cells_text(&rows[0]).ends_with("-- NORMAL --"));
+        cp.editor.key("d");
+        assert_eq!(mode_tag(&cp.editor), "d");
+        // The one-row form shows the cursor's row of a long draft.
+        let cp = Compose::with_text(ComposeKind::Reaction("1.2".into()), "abcdefghijklmnop");
         let cells = compose_cells(&cp, 12);
-        assert_eq!(cells.len(), 12);
-        assert!(cells_text(&cells).ends_with("nop "));
+        assert_eq!(cells_text(&cells), "react :p ");
+        assert_eq!(cells.last().unwrap().1, ST_INVERT);
+        assert_eq!(compose_height(&cp, 12), 4);
     }
 }

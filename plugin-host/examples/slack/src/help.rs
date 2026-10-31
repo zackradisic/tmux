@@ -60,7 +60,7 @@ pub const OPEN: &str = "\
 open: the channel view.
 
   j/k  move over messages      Enter / t  open the message's thread
-  J/K  page                    i          compose (Enter sends)
+  J/K  page                    i          compose (Enter sends, box stays)
   g/G  top / bottom            r          reply in the message's thread
   L    load older              e          react (type :name: then Enter)
   o    open in the Slack app   y          copy the message (or selection)
@@ -93,8 +93,17 @@ Tab toggles). C-e opens the file in $EDITOR in a popup; Enter starts
 the agent through the agents plugin, in the background, and says where
 it landed.
 
-While composing, keys type; Enter sends, Escape drops the text, a paste
-goes in as is (newlines kept).
+The compose box (i; r for the message's thread) opens in insert mode:
+keys type, Enter sends and the box stays open, empty, for the next
+message; C-j puts a newline inside a message (tmux sees Shift-Enter as
+Enter). Escape switches the box to normal mode, where vim's keys edit
+the draft - h j k l, w b e, 0 ^ $, x dd dw cw D C, yy p P, o O a A I,
+r J u, v / V / C-v selections with y d c (C-v then I or A inserts on
+every line), / search with n and N - and Enter still sends; Escape in
+normal mode closes the box. The box grows with the draft, up to six
+rows, and its right edge says -- INSERT -- or -- NORMAL --. A paste
+goes in as is, newlines kept. e (a reaction) is a one-shot box: Enter
+reacts and closes it.
 
 A shared picture (PNG, JPEG, a GIF's first frame), or a /giphy post's,
 is drawn under its clip or caption line in Ghostty or kitty;
