@@ -120,6 +120,10 @@ fail() {
 	fi
 	echo "--- fake log (tail):" >&2
 	tail -20 "$HOME/fake.log" >&2 2>/dev/null
+	echo "--- server: $($TMUX list-panes -a -F '#{pane_id} #{pane_mode} #{window_name}' 2>&1 | tr '\n' ';')" >&2
+	echo "--- plugin log (tail):" >&2
+	$TMUX plugin-log slack 2>&1 | tail -25 >&2
+	$TMUX show-messages 2>/dev/null | tail -8 >&2
 	cleanup
 	exit 1
 }
@@ -411,6 +415,9 @@ keys '?'
 screen_has 'n agent' || fail "the footer does not offer n: $(screen | tail -1)"
 printf '#!/bin/sh\nprintf "edited in the popup\\n" >>"$1"\n' >"$HOME/ed.sh"; chmod +x "$HOME/ed.sh"
 $TMUX set-environment -g EDITOR "$HOME/ed.sh"
+# From the newest message: the selection is the two newest, whatever the
+# copy checks above left the cursor on.
+keys G
 keys v
 screen_has 'n agent' || fail "the selecting status does not offer n: $(screen | tail -1)"
 keys k
