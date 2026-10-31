@@ -15,7 +15,7 @@
 use std::rc::Rc;
 
 use listkit::lines::{clamp_dim, default_size, SizeBox};
-use listkit::styled::{emit_cells, fit_cells, plain_cells, wrap_cells, Styled, ST_BOLD, ST_BRIGHT, ST_CYAN, ST_DIM, ST_GREEN, ST_INVERT, ST_RED};
+use listkit::styled::{emit_cells, fit_cells, plain_cells, wrap_cells, Styled, ST_BOLD, ST_BRIGHT, ST_CYAN, ST_DIM, ST_GREEN, ST_INVERT, ST_ORANGE, ST_RED};
 use listkit::text::{clip, menu_item, menu_safe};
 use tmux_plugin_sdk::prelude::*;
 
@@ -67,12 +67,22 @@ pub struct Chat {
     pub pane: Option<u32>,
     pub width: u32,
     pub height: u32,
+    /// Rows the frame takes out of `height`: the title, its rule, the
+    /// foot's rule and the foot in the float (4); none when the body is
+    /// drawn into another view's column.
+    pub chrome: u32,
+    /// The 0-based screen row of the body's first line (2 under the
+    /// float's title and rule).
+    pub body_y: u32,
     pub msgs: Vec<Message>,
     pub lines: Vec<Line>,
     /// The first display line on screen.
     pub top: usize,
     /// The cursor message, by ts: stable across a relayout or a prepend.
     pub cursor: Option<String>,
+    /// The other end of a selection (`v`), by ts: the messages from it
+    /// to the cursor are what `y` copies.
+    pub anchor: Option<String>,
     /// Stick to the bottom as messages arrive.
     pub follow: bool,
     /// Slack has older history than what is shown (`L` fetches it).
@@ -95,7 +105,25 @@ pub struct Chat {
 
 impl Chat {
     fn body_h(&self) -> usize {
-        (self.height as usize).saturating_sub(4).max(1)
+        (self.height as usize).saturating_sub(self.chrome as usize).max(1)
+    }
+
+    /// The messages a copy acts on: from the anchor to the cursor while
+    /// a selection is open, else the cursor message alone.
+    fn selection(&self) -> Vec<usize> {
+        let Some(cur) = self.cursor_idx() else { return Vec::new() };
+        let anchor = self.anchor.as_deref().and_then(|a| self.msgs.iter().position(|m| m.ts == a));
+        match anchor {
+            Some(a) => (a.min(cur)..=a.max(cur)).collect(),
+            None => vec![cur],
+        }
+    }
+
+    /// Message `i` is inside the open selection.
+    fn in_selection(&self, i: usize) -> bool {
+        let (Some(cur), Some(a)) = (self.cursor_idx(), self.anchor.as_deref()) else { return false };
+        let Some(a) = self.msgs.iter().position(|m| m.ts == a) else { return false };
+        (a.min(cur)..=a.max(cur)).contains(&i)
     }
 
     fn max_top(&self) -> usize {
@@ -276,6 +304,55 @@ pub fn lines_of(lines: &[Line], i: usize) -> Option<(usize, usize)> {
     Some((first, last))
 }
 
+/// Messages `idxs` as text for the clipboard, one per line with its
+/// author and stamp, continuation lines indented:
+///
+/// ```text
+/// Tejas (2026-10-30 14:02): first line
+///   second line
+///   📎 screenshot.png
+/// zack (2026-10-30 14:05): reply
+/// ```
+pub fn transcript(msgs: &[Message], idxs: &[usize], tz: i64, names: &NameMap) -> String {
+    let mut out = String::new();
+    for &i in idxs {
+        let Some(m) = msgs.get(i) else { continue };
+        let who = m
+            .user
+            .as_deref()
+            .map(|u| names.users.get(u).cloned().unwrap_or_else(|| u.to_string()))
+            .or_else(|| m.username.clone())
+            .unwrap_or_else(|| "?".into());
+        let mut lines: Vec<String> = Vec::new();
+        if m.deleted {
+            lines.push("(deleted)".into());
+        } else if !m.text.trim().is_empty() {
+            lines.extend(names.with(|n| mrkdwn::plain_lines(&m.text, n)));
+        }
+        for a in &m.attachments {
+            for raw in a.lines() {
+                let t = names.with(|n| mrkdwn::plain(raw, n));
+                if !t.is_empty() {
+                    lines.push(format!("│ {t}"));
+                }
+            }
+        }
+        for f in &m.files {
+            lines.push(format!("📎 {f}"));
+        }
+        let head = format!("{who} ({}):", timefmt::stamp(&m.ts, tz));
+        let mut it = lines.into_iter();
+        match it.next() {
+            Some(first) => out.push_str(&format!("{head} {first}\n")),
+            None => out.push_str(&format!("{head}\n")),
+        }
+        for l in it {
+            out.push_str(&format!("  {l}\n"));
+        }
+    }
+    out
+}
+
 /// Lay the open conversation out again from the current state.
 fn relayout(s: &mut State) {
     let names = Rc::clone(&s.names);
@@ -296,7 +373,7 @@ fn relayout(s: &mut State) {
 // ---------------------------------------------------------------------------
 
 fn hints() -> &'static str {
-    "j/k move · Enter thread · i compose · r reply · e react · y link · m read · L older · Space menu · Esc back · ? help · q close"
+    "j/k move · Enter thread · i compose · r reply · e react · y copy · v select · m read · L older · Space menu · Esc back · ? help · q close"
 }
 
 fn rule(width: usize) -> String {
@@ -347,26 +424,7 @@ fn paint(s: &State) {
             out.push_str(&format!("\x1b[2;{}H\x1b[2m{hint}\x1b[0m", w - n));
         }
     }
-    // The body.
-    let body_h = c.body_h();
-    let cursor = c.cursor_idx();
-    if c.lines.is_empty() {
-        let text = if !c.loaded {
-            "loading…"
-        } else if c.thread.is_some() {
-            "(no replies)"
-        } else {
-            "(no messages)"
-        };
-        out.push_str(&format!("\x1b[3;3H\x1b[2m{text}\x1b[0m"));
-    }
-    for (k, line) in c.lines.iter().skip(c.top).take(body_h).enumerate() {
-        let row = 3 + k;
-        let on_cursor = cursor.is_some() && line.msg == cursor;
-        let mut cells: Vec<Styled> = vec![if on_cursor { ('▎', ST_CYAN | ST_BRIGHT) } else { (' ', 0) }];
-        cells.extend(fit_cells(&line.cells, w.saturating_sub(1)));
-        out.push_str(&format!("\x1b[{row};1H{}", emit_cells(&cells, false)));
-    }
+    paint_body(c, &mut out, 0, c.body_y as usize);
     // The foot: a rule, then the compose box, a status, or the hints.
     if h >= 2 {
         out.push_str(&format!("\x1b[{};1H\x1b[2m{}\x1b[0m", h - 1, rule(w)));
@@ -380,6 +438,41 @@ fn paint(s: &State) {
     };
     out.push_str(&format!("\x1b[{h};2H{}", emit_cells(&foot, false)));
     let _ = mode_write(c.mode, out.as_bytes());
+}
+
+/// Draw the body - the message lines from `top`, each behind its gutter
+/// cell - with its top-left at 0-based column `x0`, row `y0`, `width`
+/// cells wide and `body_h` rows tall. The frame around it is the
+/// caller's (the float's title and foot, or another view's column).
+pub(crate) fn paint_body(c: &Chat, out: &mut String, x0: usize, y0: usize) {
+    let w = c.width as usize;
+    let body_h = c.body_h();
+    let cursor = c.cursor_idx();
+    if c.lines.is_empty() {
+        let text = if !c.loaded {
+            "loading…"
+        } else if c.thread.is_some() {
+            "(no replies)"
+        } else {
+            "(no messages)"
+        };
+        out.push_str(&format!("\x1b[{};{}H\x1b[2m{text}\x1b[0m", y0 + 1, x0 + 3));
+    }
+    for (k, line) in c.lines.iter().skip(c.top).take(body_h).enumerate() {
+        let row = y0 + 1 + k;
+        let on_cursor = cursor.is_some() && line.msg == cursor;
+        let selected = line.msg.is_some_and(|i| c.in_selection(i));
+        let gutter = if on_cursor {
+            ('▎', ST_CYAN | ST_BRIGHT)
+        } else if selected {
+            ('▎', ST_ORANGE)
+        } else {
+            (' ', 0)
+        };
+        let mut cells: Vec<Styled> = vec![gutter];
+        cells.extend(fit_cells(&line.cells, w.saturating_sub(1)));
+        out.push_str(&format!("\x1b[{row};{}H{}", x0 + 1, emit_cells(&cells, false)));
+    }
 }
 
 fn relayout_paint(s: &mut State) {
@@ -456,10 +549,13 @@ pub fn open(st: &Shared, ch: Channel, thread: Option<String>, client: Option<u64
             pane,
             width,
             height,
+            chrome: 4,
+            body_y: 2,
             msgs: Vec::new(),
             lines: Vec::new(),
             top: 0,
             cursor: None,
+            anchor: None,
             follow: true,
             has_more: false,
             last_read,
@@ -878,6 +974,8 @@ enum After {
     React(String, String),
     OpenApp(String),
     Permalink(String),
+    /// Copy these messages as text.
+    Copy(Vec<usize>),
     Mark,
     Refetch,
     Older,
@@ -1131,7 +1229,27 @@ fn handle_key(c: &mut Chat, key: &str, mouse: Option<(u32, u32)>) -> After {
             let ts = c.cursor_idx().map(|i| c.msgs[i].ts.clone()).unwrap_or_default();
             After::OpenApp(ts)
         }
+        // v opens a selection at the cursor; j/k extend it, y copies it
+        // (or the cursor message alone), Y the cursor message's link.
+        "v" => {
+            if c.anchor.take().is_some() {
+                c.status = Some("selection cleared".into());
+            } else if let Some(i) = c.cursor_idx() {
+                c.anchor = Some(c.msgs[i].ts.clone());
+                c.status = Some("selecting · j/k extend · y copy · v cancel".into());
+            }
+            After::None
+        }
         "y" => {
+            let sel = c.selection();
+            if sel.is_empty() {
+                return After::None;
+            }
+            c.anchor = None;
+            c.status = Some("copying…".into());
+            After::Copy(sel)
+        }
+        "Y" => {
             let Some(i) = c.cursor_idx() else { return After::None };
             c.status = Some("fetching the permalink…".into());
             After::Permalink(c.msgs[i].ts.clone())
@@ -1149,7 +1267,10 @@ fn handle_key(c: &mut Chat, key: &str, mouse: Option<(u32, u32)>) -> After {
         // Escape steps back one level: a thread (however it was opened)
         // to its channel's timeline, the timeline to the sidebar.
         "Escape" => {
-            if c.thread.is_some() {
+            if c.anchor.take().is_some() {
+                c.status = Some("selection cleared".into());
+                After::None
+            } else if c.thread.is_some() {
                 After::Back
             } else {
                 After::Sidebar
@@ -1172,10 +1293,10 @@ fn handle_key(c: &mut Chat, key: &str, mouse: Option<(u32, u32)>) -> After {
             }
             "MouseDown1Pane" | "DoubleClick1Pane" => {
                 if let Some((_, y)) = mouse {
-                    // Rows are 1-based on screen, the mouse 0-based: the
-                    // body starts at y == 2.
-                    if y >= 2 && (y as usize) < 2 + c.body_h() {
-                        let line = c.top + (y as usize - 2);
+                    // The mouse row is 0-based, like `body_y`.
+                    let y0 = c.body_y as usize;
+                    if (y as usize) >= y0 && (y as usize) < y0 + c.body_h() {
+                        let line = c.top + (y as usize - y0);
                         if let Some(i) = c.lines.get(line).and_then(|l| l.msg) {
                             c.set_cursor_idx(i);
                         }
@@ -1200,7 +1321,9 @@ fn menu_items(c: &Chat) -> String {
     items.push_str(&menu_item(NAME, "compose", "i", true));
     items.push_str(&menu_item(NAME, "reply in thread", "r", on_msg));
     items.push_str(&menu_item(NAME, "react", "e", on_msg));
-    items.push_str(&menu_item(NAME, "copy permalink", "y", on_msg));
+    items.push_str(&menu_item(NAME, if c.anchor.is_some() { "copy the selection" } else { "copy message" }, "y", on_msg));
+    items.push_str(&menu_item(NAME, "copy permalink", "Y", on_msg));
+    items.push_str(&menu_item(NAME, if c.anchor.is_some() { "cancel selection" } else { "select from here" }, "v", on_msg));
     items.push_str(&menu_item(NAME, "open in Slack app", "o", true));
     items.push_str(" ''");
     items.push_str(&menu_item(NAME, "mark read", "m", true));
@@ -1243,6 +1366,26 @@ async fn open_menu(st: Shared) {
 
 /// The session, channel and generation of the open view, for an API
 /// call made on its behalf.
+/// Put `text` on the clipboard of the client that pressed the key: a
+/// tmux paste buffer and, over OSC 52, the terminal's own clipboard
+/// (`load-buffer -w`). The text goes through a file under the plugin's
+/// data directory, since a tmux command line cannot carry newlines.
+pub(crate) async fn copy_text(text: &str, client: Option<u64>) -> Result<(), String> {
+    let root = fs_root().map_err(|e| e.message.clone())?;
+    fs_write("copy.txt", text.as_bytes().to_vec(), false).await.map_err(|e| e.message.clone())?;
+    let path = crate::http::sq(&format!("{root}/copy.txt"));
+    let name = client
+        .and_then(|cid| list_clients().ok()?.into_iter().find(|c| u64::from(c.id) == cid))
+        .map(|c| c.name)
+        .filter(|n| n.chars().all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c)));
+    if let Some(n) = name {
+        if run_command(&format!("load-buffer -w -t '{n}' {path}")).await.is_ok() {
+            return Ok(());
+        }
+    }
+    run_command(&format!("load-buffer -w {path}")).await.map(|_| ()).map_err(|e| e.message.clone())
+}
+
 fn view_ctx(st: &Shared) -> Option<(crate::store::Identity, String, u64)> {
     let s = st.borrow();
     let id = s.ident.clone()?;
@@ -1338,6 +1481,26 @@ fn run(st: &Shared, after: After) {
                 if let Ok(url) = &r {
                     let _ = run_command(&format!("set-buffer -- '{}'", url.replace('\'', ""))).await;
                 }
+                let mut s = st2.borrow_mut();
+                if let Some(c) = s.chat.as_mut().filter(|c| c.gen == gen) {
+                    c.status = Some(status);
+                    paint(&s);
+                }
+            });
+        }
+        After::Copy(idxs) => {
+            let (text, client, gen) = {
+                let s = st.borrow();
+                let Some(c) = s.chat.as_ref() else { return };
+                (transcript(&c.msgs, &idxs, s.tz(), &s.names), c.client, c.gen)
+            };
+            let n = idxs.len();
+            let st2 = Rc::clone(st);
+            spawn(async move {
+                let status = match copy_text(&text, client).await {
+                    Ok(()) => format!("copied {n} message{}", if n == 1 { "" } else { "s" }),
+                    Err(e) => format!("copy: {e}"),
+                };
                 let mut s = st2.borrow_mut();
                 if let Some(c) = s.chat.as_mut().filter(|c| c.gen == gen) {
                     c.status = Some(status);
@@ -1541,10 +1704,13 @@ mod tests {
             pane: None,
             width: 80,
             height: 20,
+            chrome: 4,
+            body_y: 2,
             msgs,
             lines: Vec::new(),
             top: 0,
             cursor: None,
+            anchor: None,
             follow: true,
             has_more: false,
             last_read: None,
@@ -1565,6 +1731,34 @@ mod tests {
         c.thread = Some(c.msgs[0].ts.clone());
         c.from_timeline = from_timeline;
         c
+    }
+
+    #[test]
+    fn y_copies_the_cursor_or_the_selection() {
+        let mut c = chat();
+        assert_eq!(handle_key(&mut c, "y", None), After::Copy(vec![1]));
+        assert_eq!(handle_key(&mut c, "v", None), After::None);
+        assert!(c.anchor.is_some() && c.in_selection(1) && !c.in_selection(0));
+        handle_key(&mut c, "k", None);
+        assert!(c.in_selection(0) && c.in_selection(1));
+        assert_eq!(handle_key(&mut c, "y", None), After::Copy(vec![0, 1]));
+        assert!(c.anchor.is_none(), "y closes the selection");
+        let ts = c.msgs[0].ts.clone();
+        assert_eq!(handle_key(&mut c, "Y", None), After::Permalink(ts));
+        // Escape clears a selection before it steps back.
+        handle_key(&mut c, "v", None);
+        assert_eq!(handle_key(&mut c, "Escape", None), After::None);
+        assert!(c.anchor.is_none());
+        assert_eq!(handle_key(&mut c, "Escape", None), After::Sidebar);
+    }
+
+    #[test]
+    fn transcript_lines() {
+        let mut m = msg(NOON, "U2", "hey <@U1> *look*\n```\nlet x = 1;\n```");
+        m.files.push("shot.png".into());
+        let msgs = vec![m, msg(NOON + 60, "U1", "ok")];
+        let t = transcript(&msgs, &[0, 1], 0, &names());
+        assert_eq!(t, "tejas (2023-10-30 12:00): hey @zack look\n  let x = 1;\n  📎 shot.png\nzack (2023-10-30 12:01): ok\n");
     }
 
     #[test]

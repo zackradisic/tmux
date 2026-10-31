@@ -52,16 +52,24 @@ open: the channel view.
   J/K  page                    i          compose (Enter sends)
   g/G  top / bottom            r          reply in the message's thread
   L    load older              e          react (type :name: then Enter)
-  o    open in the Slack app   y          copy the permalink (tmux buffer)
-  m    mark read               Space      the action menu (every key)
-  R    refetch                 Escape     back: thread, channel, sidebar
-  b    back to the sidebar     q          close
+  o    open in the Slack app   y          copy the message (or selection)
+  m    mark read               Y          copy the permalink
+  R    refetch                 v          select from here (j/k extend)
+  b    back to the sidebar     Space      the action menu (every key)
+  q    close                   Escape     back: thread, channel, sidebar
 
 Enter opens the thread of any message, with or without replies, so
 Enter then i is \"reply in this thread\". Escape steps back one level:
 from a thread to its channel (however the thread was opened), from
 the channel to the sidebar; q closes the view outright. Space lists
 every action as a menu; what does not apply is dimmed.
+
+y copies the message under the cursor to the clipboard (a tmux paste
+buffer, and the terminal's clipboard over OSC 52) as
+`Name (2026-10-30 14:02): text`, continuation lines indented. v opens
+a selection at the cursor and j/k extend it; y then copies every
+message in it, one after the other, ready to hand to an agent. Y
+copies the message's Slack permalink instead.
 
 While composing, keys type; Enter sends, Escape drops the text, a paste
 goes in as is (newlines kept).";

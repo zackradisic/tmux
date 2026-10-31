@@ -531,10 +531,14 @@ included), bot cards with their fields, and every author by name, Slack
 Connect guests too. `Enter` on a message opens its thread (with or without
 replies yet), `Escape` steps back: thread to channel, channel to sidebar; `q`
 closes outright. `i` composes, `r` replies in the message's thread, `e`
-reacts, `o` opens the message in the Slack app, `y` copies its permalink.
-`Space` opens an action menu in either view, the same items as the keys. `v`
-cycles sections / unread / all; `/` searches with `#channel`, `@user` and
-`!unread` tokens.
+reacts, `o` opens the message in the Slack app. `y` copies the message to the
+clipboard as `Name (2026-10-30 14:02): text`, ready to paste into an agent;
+`v` starts a selection that `j`/`k` extend, so `y` copies a whole exchange;
+`Y` copies the permalink. `Space` opens an action menu in either view, the
+same items as the keys. In the sidebar `m` marks a channel read and the
+cursor stays where it is while the row drops down the list; `v` cycles
+sections / unread / all; `/` searches with `#channel`, `@user` and `!unread`
+tokens.
 
 Updates are live: the plugin holds Slack's own RTM websocket through the
 host's `net` capability. A message shows the moment it is posted, a channel

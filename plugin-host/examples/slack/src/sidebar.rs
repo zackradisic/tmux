@@ -55,6 +55,11 @@ pub struct Sidebar {
     /// Recent messages per channel, for the preview column.
     pub previews: HashMap<String, Vec<Message>>,
     pub fetching: HashSet<String>,
+    /// The cursor's position and the channels just marked read: as those
+    /// rows move down the list the cursor stays put, on the row that
+    /// takes their place, rather than following them. Dropped once they
+    /// are all read, or when the user moves.
+    pub hold: Option<(usize, Vec<String>)>,
 }
 
 pub fn keys() -> KeyTable {
@@ -121,7 +126,7 @@ pub fn open(st: &Shared, client: Option<u64>, pane: Option<u32>) {
     let view = View::parse(&get_option("@slack-view").unwrap_or_default());
     {
         let mut s = st.borrow_mut();
-        s.side = Some(Sidebar { engine, client, pane, view, previews: HashMap::new(), fetching: HashSet::new() });
+        s.side = Some(Sidebar { engine, client, pane, view, previews: HashMap::new(), fetching: HashSet::new(), hold: None });
         rebuild(&mut s);
         if let Some(side) = s.side.as_mut() {
             render(side);
@@ -468,10 +473,22 @@ pub fn rebuild(s: &mut State) {
         },
     };
     let view = s.side.as_ref().map(|p| p.view).unwrap_or(View::Sections);
+    let held = s.side.as_ref().and_then(|p| p.hold.clone());
+    let held_done = held.as_ref().is_some_and(|(_, ids)| ids.iter().all(|id| s.channel(id).is_none_or(|c| !c.has_unreads)));
     if let Some(side) = s.side.as_mut() {
         side.engine.header_tag = format!("{tag} · by {}", view.label());
         side.engine.empty_text = empty;
         side.engine.set_nodes(nodes);
+        if let Some((pos, ids)) = held {
+            // set_nodes followed the marked row by key; put the cursor
+            // back where it was.
+            if side.engine.selected_key().is_some_and(|k| ids.contains(&k)) {
+                side.engine.select_pos(pos);
+            }
+            if held_done {
+                side.hold = None;
+            }
+        }
     }
 }
 
@@ -599,6 +616,7 @@ pub fn on_mode_event(st: &Shared, name: &str, event: &Event) {
             let outcome = {
                 let mut s = st.borrow_mut();
                 let Some(side) = s.side.as_mut() else { return };
+                side.hold = None;
                 side.engine.handle_key(&key, mouse)
             };
             execute(st, outcome);
@@ -608,6 +626,7 @@ pub fn on_mode_event(st: &Shared, name: &str, event: &Event) {
             let outcome = {
                 let mut s = st.borrow_mut();
                 let Some(side) = s.side.as_mut() else { return };
+                side.hold = None;
                 side.engine.handle_nav(&dir)
             };
             execute(st, outcome);
@@ -684,10 +703,12 @@ fn execute(st: &Shared, outcome: Outcome) {
                     },
                     "open_app" => After::OpenApp(chans),
                     "mark" => {
+                        let ids: Vec<String> = chans.into_iter().map(|c| c.id).collect();
                         if let Some(side) = s.side.as_mut() {
                             side.engine.clear_marks();
+                            side.hold = Some((side.engine.sel(), ids.clone()));
                         }
-                        After::Mark(chans.into_iter().map(|c| c.id).collect())
+                        After::Mark(ids)
                     }
                     "view" => {
                         let v = s.side.as_ref().map(|p| p.view).unwrap_or(View::Sections).next();

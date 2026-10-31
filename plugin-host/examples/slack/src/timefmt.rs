@@ -61,6 +61,13 @@ pub fn clock(ts: &str, tz_offset: i64) -> String {
     hhmm(h, m)
 }
 
+/// "2026-10-30 14:02" of a ts: the stamp on a copied message.
+pub fn stamp(ts: &str, tz_offset: i64) -> String {
+    let (days, h, m) = local(secs(ts), tz_offset);
+    let (y, mo, d) = civil(days);
+    format!("{y:04}-{mo:02}-{d:02} {}", hhmm(h, m))
+}
+
 /// "3m", "2h", "5d" since the ts.
 pub fn age(ts: &str, now_ms: u64) -> String {
     let now = (now_ms / 1000) as i64;
@@ -89,5 +96,6 @@ mod tests {
         assert_eq!(day_label(19_660, 19_665), "Mon Oct 30");
         assert_eq!(day_label(19_660, 20_100), "Oct 30 2023");
         assert_eq!(clock("1698666000.000100", 0), "11:40");
+        assert_eq!(stamp("1698666000.000100", -7 * 3600), "2023-10-30 04:40");
     }
 }

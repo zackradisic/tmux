@@ -5,7 +5,7 @@
 # every web API call lands on the fake and the identity comes from
 # `auth.test` alone. Check:
 #
-#   boot: `status` names the user and team and counts the 3 channels;
+#   boot: `status` names the user and team and counts the 4 channels;
 #   `unread` lists the channel with a mention and the DM, not the read
 #     private channel; the @slack_unread/@slack_mentions/@slack_dms
 #     options carry the badges;
@@ -151,6 +151,9 @@ seen_has() { seen | grep -q -- "$1"; }
 seen_lacks() { ! seen_has "$1"; }
 VIEW=
 marks_grew() { [ "$(ncalls conversations.mark channel C1)" -gt "$1" ]; }
+# The row under the cursor (reverse video), its attributes stripped.
+cursor_row() { $TMUX capture-pane -M -p -e -t "$FORM" | grep -E "$(printf '\033')\[([0-9]+;)*7m" | head -1 | sed "s/$(printf '\033')\[[0-9;]*m//g"; }
+buffer_has() { $TMUX show-buffer 2>/dev/null | grep -q -- "$1"; }
 FORM=
 VIEW=
 
@@ -197,7 +200,7 @@ $TMUX load-plugin -s server -o workspace=test -o "api_base=$BASE" -o token=xoxc-
 # --- boot: identity and the first sync --------------------------------------
 until_ok 80 status_ready || fail "status never named the user: $(slack status)"
 ST=$(slack status)
-echo "$ST" | grep -q '3 channels' || fail "status does not count 3 channels: $ST"
+echo "$ST" | grep -q "4 channels" || fail "status does not count 4 channels: $ST"
 echo "$ST" | grep -q 'test.slack.com' || fail "status does not name the workspace: $ST"
 [ "$(ncalls auth.test)" -ge 1 ] || fail "auth.test was not called"
 [ "$(ncalls users.conversations)" -ge 1 ] || fail "users.conversations was not called"
@@ -267,9 +270,29 @@ until_ok 20 screen_has 'by unread' || fail "menu-key v did not switch to the unr
 screen_lacks 'secret' || fail "the unread view lists the read channel"
 screen_has '#general' || fail "the unread view lacks #general"
 screen_has '@Tejas' || fail "the unread view lacks @Tejas"
+# Back to sections. m on #general (the first row of Work): the row loses
+# its badge and, read now, sorts below #random, which spoke later. The
+# cursor does not follow it down: it stays on the first row, #random.
+$TMUX plugin-command slack 'menu-key v'; sleep 0.3
+$TMUX plugin-command slack 'menu-key v'
+until_ok 20 screen_has 'by sections' || fail "menu-key v twice did not return to sections"
+keys g; keys g
+BEFORE_M=$(ncalls conversations.mark channel C1)
+keys m
+until_ok 40 marks_grew "$BEFORE_M" || fail "m did not mark #general read"
+until_ok 40 sh -c "$TMUX capture-pane -M -p -t $FORM | grep -q '· #general'" || fail "#general kept its badge: $(screen | grep general)"
+RANDOM_AT=$(screen | grep -n '#random' | head -1 | cut -d: -f1)
+GENERAL_AT=$(screen | grep -n '#general' | head -1 | cut -d: -f1)
+[ "$RANDOM_AT" -lt "$GENERAL_AT" ] || fail "#general ($GENERAL_AT) did not drop below #random ($RANDOM_AT)"
+cursor_row | grep -q '#random' || fail "the cursor followed the marked row: $(cursor_row)"
 keys q
 until_ok 40 mode_closed || fail "q did not close the sidebar"
 FORM=
+# Undo for the channel-view checks below (the new-messages rule): the
+# fake gives #general its unread back, a refresh picks it up.
+fetch "$BASE/_unread?channel=C1" >/dev/null
+slack refresh
+until_ok 40 sh -c "$TMUX plugin-command slack unread | grep -q general" || fail "#general did not get its unread back: $(slack unread)"
 
 # --- the channel view ---------------------------------------------------------
 $TMUX plugin-command -t "$PANE" slack 'open #general' || fail "plugin-command open"
@@ -295,6 +318,20 @@ HEY=$(screen | grep -n 'look at this' | head -1 | cut -d: -f1)
 FINE=$(screen | grep -n 'fine' | head -1 | cut -d: -f1)
 [ "$NEW" -lt "$HEY" ] || fail "the rule ($NEW) is not before the hey message ($HEY)"
 [ "$FINE" -lt "$NEW" ] || fail "our own message ($FINE) counts as new (rule at $NEW)"
+# y copies the message under the cursor (the newest) as a transcript
+# line: author, stamp, text with the emoji as glyphs; v then k then y
+# copies the two newest, oldest first.
+keys y
+until_ok 40 buffer_has 'Tejas (2023-11-1[45] [0-9:]*): shipped 🙌 🎉 :morph:' || fail "y did not copy the message: $($TMUX show-buffer)"
+keys v
+screen_has 'selecting' || fail "v did not open a selection"
+keys k
+keys y
+until_ok 40 buffer_has 'look at this' || fail "y did not copy the selection: $($TMUX show-buffer)"
+[ "$($TMUX show-buffer | grep -c '^Tejas (')" = 2 ] || fail "the selection copy is not two messages: $($TMUX show-buffer)"
+[ "$($TMUX show-buffer | head -1 | grep -c 'look at this')" = 1 ] || fail "the selection is not oldest first: $($TMUX show-buffer)"
+screen_has 'copied 2 messages' || fail "no copied status: $(screen | tail -2)"
+keys j
 # Compose: i, the text, Enter.
 keys i
 $TMUX send-keys -t "$FORM" -l 'hello there'; sleep 0.4

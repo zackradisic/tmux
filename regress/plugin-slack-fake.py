@@ -14,6 +14,8 @@ Every request is logged to stderr as `METHOD field=value ...`.
   GET  /               the workspace page, with `"api_token":"xoxc-fake"`
   GET  /_calls         JSON list of [method, fields] seen so far
   GET  /_posted        JSON list of the messages chat.postMessage took
+  GET  /_unread?channel=C1
+                       give the channel its initial unread state back
 
 Standard library only.
 """
@@ -46,6 +48,10 @@ STRANGER = {"id": "U3", "team_id": "T2", "name": "gregor", "real_name": None, "t
 CHANNELS = [
     {"id": "C1", "name": "general", "is_channel": True, "is_private": False,
      "is_member": True, "topic": {"value": "the town square"}, "purpose": {"value": ""}},
+    # Read, but spoke more recently than #general: once #general is read
+    # too, it sorts below this one.
+    {"id": "C2", "name": "random", "is_channel": True, "is_private": False,
+     "is_member": True, "topic": {"value": ""}, "purpose": {"value": ""}},
     {"id": "G1", "name": "secret", "is_channel": False, "is_group": True, "is_private": True,
      "is_member": True, "topic": {"value": ""}, "purpose": {"value": ""}},
     {"id": "D1", "is_im": True, "user": "U2", "is_member": True, "is_open": True},
@@ -69,6 +75,9 @@ HISTORY = {
         {"type": "message", "user": "U3", "text": "hello from gregor", "ts": "1700000050.000100"},
         {"type": "message", "user": "U9", "text": "ghost", "ts": "1700000025.000100"},
     ],
+    "C2": [
+        {"type": "message", "user": "U1", "text": "random chatter", "ts": "1700000500.000100"},
+    ],
     "G1": [],
     "D1": [],
 }
@@ -77,9 +86,12 @@ HISTORY = {
 COUNTS = {
     # Read up to "morning": the "fine" after it is ours, the "hey" is news.
     "C1": {"has_unreads": True, "mention_count": 1, "latest": "1700000400.000100", "last_read": "1700000100.000100"},
+    "C2": {"has_unreads": False, "mention_count": 0, "latest": "1700000500.000100", "last_read": "1700000500.000100"},
     "G1": {"has_unreads": False, "mention_count": 0, "latest": "1699990000.000100", "last_read": "1699990000.000100"},
     "D1": {"has_unreads": True, "mention_count": 0, "latest": "1700000050.000100", "last_read": "1700000000.000000"},
 }
+
+INITIAL_COUNTS = {k: dict(v) for k, v in COUNTS.items()}
 
 TS_SEQ = [0]
 
@@ -118,7 +130,7 @@ def handle(method, f):
     if method == "users.channelSections.list":
         return ok(channel_sections=[
             {"channel_section_id": "S1", "name": "Work", "type": "standard", "emoji": "",
-             "channel_ids_page": {"channel_ids": ["C1"]}},
+             "channel_ids_page": {"channel_ids": ["C1", "C2"]}},
             {"channel_section_id": "S2", "name": "Channels", "type": "channels", "emoji": "",
              "channel_ids_page": {"channel_ids": []}},
             {"channel_section_id": "S3", "name": "Direct messages", "type": "direct_messages", "emoji": "",
@@ -141,7 +153,7 @@ def handle(method, f):
         return ok(emoji={"morph": "https://emoji.slack-edge.com/T1/morph/abc.png",
                          "party": "alias:tada", "yay": "alias:party"})
     if method == "client.counts":
-        return ok(channels=[count_row("C1"), count_row("G1")], mpims=[], ims=[count_row("D1")],
+        return ok(channels=[count_row("C1"), count_row("C2"), count_row("G1")], mpims=[], ims=[count_row("D1")],
                   threads={"has_unreads": False, "mention_count": 0})
     if method == "conversations.history":
         cid = f.get("channel", "")
@@ -239,6 +251,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(POSTED)
             elif path == "/_marks":
                 self.send_json(MARKS)
+            elif path == "/_unread":
+                q = self.path.split("?", 1)[1] if "?" in self.path else ""
+                cid = dict(p.split("=", 1) for p in q.split("&") if "=" in p).get("channel", "")
+                if cid in INITIAL_COUNTS:
+                    COUNTS[cid] = dict(INITIAL_COUNTS[cid])
+                self.send_json(ok())
             else:
                 self.send_json(err("unknown_path"), 404)
 

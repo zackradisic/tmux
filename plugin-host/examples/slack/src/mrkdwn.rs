@@ -197,6 +197,34 @@ pub fn render(text: &str, width: usize, base: u16, names: &Names) -> Vec<Vec<Sty
     out
 }
 
+/// The text without markup, names resolved, one String per source
+/// line: a message as it reads when copied. Fenced code keeps its lines
+/// (the fence markers go), a quote keeps a `> ` prefix, entities are
+/// undone.
+pub fn plain_lines(text: &str, names: &Names) -> Vec<String> {
+    let mut out = Vec::new();
+    for (k, seg) in text.split("```").enumerate() {
+        let seg = if k > 0 { seg.strip_prefix('\n').unwrap_or(seg) } else { seg };
+        let seg = seg.strip_suffix('\n').unwrap_or(seg);
+        if seg.is_empty() {
+            continue;
+        }
+        for line in seg.split('\n') {
+            if k % 2 == 1 {
+                out.push(unescape(line).trim_end().to_string());
+                continue;
+            }
+            let (quoted, body) = match line.strip_prefix("&gt;").or_else(|| line.strip_prefix('>')) {
+                Some(rest) => (true, rest.trim_start()),
+                None => (false, line),
+            };
+            let text = cells_text(&inline(body, 0, names));
+            out.push(if quoted { format!("> {}", text.trim_end()) } else { text.trim_end().to_string() });
+        }
+    }
+    out
+}
+
 /// The text without markup, one line, names resolved: for a
 /// notification body or a preview row.
 pub fn plain(text: &str, names: &Names) -> String {
@@ -246,6 +274,10 @@ mod tests {
         assert_eq!(texts[1].trim(), "let x = 1;");
         assert!(texts[2].starts_with("▎ quoted"));
         assert_eq!(plain("hi <@U1>\n*there*", &names()), "hi @zack there");
+        assert_eq!(
+            plain_lines("hi <@U1>\n&gt; *there*\n```\nlet x = 1 &amp;&amp; 2;\n```tail", &names()),
+            vec!["hi @zack", "> there", "let x = 1 && 2;", "tail"]
+        );
     }
 
     #[test]

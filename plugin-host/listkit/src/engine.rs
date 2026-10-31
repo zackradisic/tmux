@@ -443,6 +443,16 @@ impl Engine {
         true
     }
 
+    /// Put the cursor at a visible position (clamped, never on a header):
+    /// for a caller that wants the cursor to stay where it is while the
+    /// row under it moves away, so it lands on the row that takes its
+    /// place rather than following.
+    pub fn select_pos(&mut self, pos: usize) {
+        self.sel = pos;
+        self.clamp_sel();
+        self.scroll_to_selection();
+    }
+
     /// Put the cursor on the node with this key, expanding its ancestors
     /// so it is visible.
     pub fn reveal_key(&mut self, key: &str) -> bool {
