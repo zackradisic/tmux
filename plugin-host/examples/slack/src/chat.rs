@@ -181,7 +181,7 @@ pub struct Chat {
 impl Chat {
     /// The image files of the messages near the viewport (a page above
     /// and below) that `cache` has not seen: what to fetch now.
-    fn wanted_images(&self, cache: &images::Cache) -> Vec<FileRef> {
+    pub(crate) fn wanted_images(&self, cache: &images::Cache) -> Vec<FileRef> {
         if !self.images_on {
             return Vec::new();
         }
@@ -207,7 +207,7 @@ impl Chat {
 
     /// Tell the terminal to forget every picture placed for this view
     /// (through the mode, so before it closes).
-    fn forget_images(&self) {
+    pub(crate) fn forget_images(&self) {
         let seqs: String = self.placed.borrow_mut().drain().map(|(_, p)| kitty_delete(p.id)).collect();
         if !seqs.is_empty() {
             let _ = mode_write(self.mode, seqs.as_bytes());
@@ -690,7 +690,7 @@ fn opt_u32(name: &str) -> Option<u32> {
 
 /// An on/off option: `off`, `0`, `no` or `false` turn it off, anything
 /// else (unset included) is `default`.
-fn opt_flag(name: &str, default: bool) -> bool {
+pub(crate) fn opt_flag(name: &str, default: bool) -> bool {
     match get_option(name).ok().map(|v| v.trim().to_ascii_lowercase()) {
         Some(v) if matches!(v.as_str(), "off" | "0" | "no" | "false") => false,
         Some(v) if matches!(v.as_str(), "on" | "1" | "yes" | "true") => true,
@@ -803,6 +803,14 @@ pub fn on_image(st: &Shared) {
         return;
     }
     relayout_paint(&mut s);
+}
+
+/// What a view needs to show pictures: whether they are on, the cell
+/// aspect of the window it draws into, and where the files are.
+pub(crate) fn picture_setup(client: Option<u64>, pane: Option<u32>) -> (bool, f64, String) {
+    let on = opt_flag("@slack-images", true);
+    let aspect = listkit::window_for(client, pane).map(listkit::image::cell_aspect).unwrap_or(DEFAULT_CELL_ASPECT);
+    (on, aspect, fs_root().unwrap_or_default())
 }
 
 /// A timeline view drawn inside another view's column (the sidebar's
@@ -1089,7 +1097,10 @@ async fn fetch(st: &Shared, gen: u64) {
             if let Some(more) = more {
                 c.has_more = more;
             }
-            if c.follow {
+            // Following the bottom, the cursor goes to what just arrived;
+            // a poll that brought nothing leaves it where the user put it
+            // (a selection in progress, say).
+            if c.follow && added > 0 {
                 let last = c.msgs.len().saturating_sub(1);
                 c.set_cursor_idx(last);
             } else if added > 0 {

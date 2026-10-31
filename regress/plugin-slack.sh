@@ -294,6 +294,15 @@ screen | grep -q '● @Tejas' || fail "the unread DM lacks its dot before the na
 screen | grep -q '· \*secret' || fail "the read private channel lacks its dim dot"
 screen_has '●1' && fail "the old right-hand badge is still drawn"
 screen_has 'by sections' || fail "the sidebar is not tagged by sections"
+# The Unread section comes first: every unread row, the DM before the
+# channel; #general is there and in Work. The cursor opens on the DM.
+screen | grep -q '▪ Unread  2' || fail "no Unread section of 2 rows: $(screen | grep Unread)"
+TEJ=$(screen | grep -n '● @Tejas' | head -1 | cut -d: -f1)
+GEN=$(screen | grep -n '! #general' | head -1 | cut -d: -f1)
+[ "$TEJ" -lt "$GEN" ] || fail "the DM ($TEJ) is not before the channel ($GEN) in Unread"
+[ "$(screen | grep -c '#general')" = 2 ] || fail "#general is not in Unread and in Work: $(screen | grep -c '#general')"
+until_ok 60 screen_has 'are you around' || fail "the DM preview never loaded"
+keys j
 # The preview of the selected channel names the stranger, lazily.
 until_ok 60 screen_has 'hello from gregor' || fail "the preview never showed the history"
 until_ok 60 screen_has 'gregor  ' || fail "the preview did not name U3"
@@ -327,7 +336,8 @@ screen_has '@Tejas' || fail "the unread view lacks @Tejas"
 $TMUX plugin-command slack 'menu-key v'; sleep 0.3
 $TMUX plugin-command slack 'menu-key v'
 until_ok 20 screen_has 'by sections' || fail "menu-key v twice did not return to sections"
-keys g; keys g
+keys g; keys g; keys j
+cursor_row | grep -q '#general' || fail "gg j is not on #general in Unread: $(cursor_row)"
 BEFORE_M=$(ncalls conversations.mark channel C1)
 keys m
 until_ok 40 marks_grew "$BEFORE_M" || fail "m did not mark #general read"
@@ -397,7 +407,7 @@ until_ok 40 screen_has 'Work' || fail "the reopened sidebar shows no Work sectio
 sep_lit && fail "the reopened sidebar has the keyboard on the preview"
 screen_has 'l preview' || fail "the footer does not offer l: $(screen | tail -1)"
 # l then Escape: the keyboard comes back to the list, where j moves the cursor.
-until_ok 40 screen_has 'random chatter' || fail "the preview of the first row never loaded"
+until_ok 40 screen_has 'are you around' || fail "the preview of the first row (the unread DM) never loaded"
 keys l
 until_ok 20 sep_lit || fail "l did not light the separator the second time"
 keys Escape

@@ -42,7 +42,7 @@ const TIMEOUT_MS: u64 = 30_000;
 
 /// What the view knows about pictures: the ones on disk by file id, and
 /// the ones already asked for (in flight or failed).
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Cache {
     /// File id -> pixel size of `img/<id>.png`.
     pub ready: HashMap<String, (u32, u32)>,
@@ -94,6 +94,7 @@ pub fn request(s: &mut State, files: Vec<FileRef>) {
                 }
             }
             chat::on_image(&st);
+            crate::sidebar::on_image(&st);
         });
     }
 }

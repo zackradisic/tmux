@@ -522,7 +522,9 @@ client uses, so there is no bot, no app and nothing to configure beyond the
 workspace name. Everything the desktop client can do, the plugin can.
 
 The **sidebar** (`prefix + C-s`) is a picker over your conversations, grouped
-as your own Slack sidebar is (its sections, then channels, then DMs). Rows look
+as your own Slack sidebar is (its sections, then channels, then DMs), under an
+**Unread** section that gathers every channel and DM with something new, DMs
+first (the rows stay in their own sections too). Rows look
 like the agents picker's: the badge comes first (`!` on a red block and the
 count when you were mentioned, a cyan `●` while unread, a dim `·` once read),
 an unread name is bold, a read or muted one dim, and the right column says how

@@ -38,7 +38,9 @@ pick: the sidebar, as a floating picker.
   l / Right   read the preview                 ! unread|mention|dm|muted)
   ?           every key (R: refresh)
 
-Each row starts with its badge: a red `!` block when you were mentioned
+An Unread section sits above your own sections: every channel and DM
+with something new, DMs first, in the order of the badges; the rows
+stay in their own sections too. Each row starts with its badge: a red `!` block when you were mentioned
 (the name red, the count after it as @3), a cyan dot while it has
 unread messages (the name bold), a dim dot when read or muted. The
 right column is how long ago the channel last spoke. The preview is

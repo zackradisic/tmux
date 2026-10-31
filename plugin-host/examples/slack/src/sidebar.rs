@@ -177,6 +177,9 @@ pub fn open(st: &Shared, client: Option<u64>, pane: Option<u32>) {
 
 pub fn close(st: &Shared) {
     if let Some(old) = st.borrow_mut().side.take() {
+        if let Some(c) = old.preview.as_ref() {
+            c.forget_images();
+        }
         let _ = mode_close(old.engine.mode);
     }
 }
@@ -268,8 +271,9 @@ fn sync_preview(s: &mut State) {
     let tz = s.tz();
     let me = s.ident.as_ref().map(|i| i.user_id.clone()).unwrap_or_default();
     let now = (now_ms() / 1000) as i64;
+    let cache = s.images.clone();
     let Some(side) = s.side.as_ref() else { return };
-    let key = side.engine.selected_key().filter(|k| !k.starts_with("sec:"));
+    let key = side.engine.selected_key().filter(|k| !k.starts_with("sec:")).map(|k| chan_key(&k).to_string());
     let channel = key.as_deref().and_then(|k| s.channel(k).cloned());
     let Some(side) = s.side.as_mut() else { return };
     let (_, pw, body_y, body_h) = preview_geometry(side.engine.width as usize, side.engine.height as usize, side.engine.list_w());
@@ -302,18 +306,55 @@ fn sync_preview(s: &mut State) {
         }
         None => {
             side.preview_focus = false;
-            side.preview.insert(chat::embedded(side.engine.mode, channel, side.client, side.pane, msgs.clone(), pw as u32, body_h as u32, body_y as u32))
+            // Another channel: the terminal forgets the old one's pictures.
+            if let Some(old) = side.preview.take() {
+                old.forget_images();
+            }
+            let mut c = chat::embedded(side.engine.mode, channel, side.client, side.pane, msgs.clone(), pw as u32, body_h as u32, body_y as u32);
+            let (on, aspect, root) = chat::picture_setup(side.client, side.pane);
+            c.images_on = on;
+            c.cell_aspect = aspect;
+            c.data_root = root;
+            side.preview.insert(c)
         }
     };
-    chat::layout_chat(c, &names, tz, &me, now, None);
+    // Pictures as in the float: laid out from the cache, placed by
+    // paint_body through the sidebar's mode, the missing ones fetched.
+    let pics = chat::Pictures { sizes: &cache.ready, cell_aspect: c.cell_aspect };
+    let on = c.images_on;
+    chat::layout_chat(c, &names, tz, &me, now, on.then_some(&pics));
     if !c.follow {
         c.reveal_cursor();
     }
+    let wanted = c.wanted_images(&cache);
+    if !wanted.is_empty() {
+        crate::images::request(s, wanted);
+    }
+}
+
+/// A picture arrived on disk (images.rs): the embedded preview lays out
+/// again so its rows appear, and the column is redrawn.
+pub fn on_image(st: &Shared) {
+    let mut s = st.borrow_mut();
+    if s.side.as_ref().is_none_or(|p| p.preview.is_none()) {
+        return;
+    }
+    sync_preview(&mut s);
+    render(&mut s);
 }
 
 // ---------------------------------------------------------------------------
 // nodes
 // ---------------------------------------------------------------------------
+
+/// The key prefix of a row in the Unread section, which repeats a
+/// channel that has a row in its own section too.
+const UNREAD_PREFIX: &str = "u:";
+
+/// The channel id behind a row key, whichever section the row is in.
+fn chan_key(key: &str) -> &str {
+    key.strip_prefix(UNREAD_PREFIX).unwrap_or(key)
+}
 
 /// Is the channel one the sidebar shows at all?
 fn shown(c: &Channel) -> bool {
@@ -471,6 +512,25 @@ fn build_nodes(s: &State) -> Vec<Node> {
             group(&mut nodes, "sec:dms", "Direct messages", &dm);
         }
         View::Sections => {
+            // Everything with something new first, DMs before channels,
+            // each in rank order. The rows stay in their own sections
+            // below as well, so these carry a key prefix of their own.
+            let fresh = |c: &&Channel| (c.has_unreads || c.mentions > 0) && !c.is_muted;
+            let unread: Vec<&Channel> = chans
+                .iter()
+                .copied()
+                .filter(|c| c.kind.is_dm() && fresh(c))
+                .chain(chans.iter().copied().filter(|c| !c.kind.is_dm() && fresh(c)))
+                .collect();
+            if !unread.is_empty() {
+                nodes.push(group_node("sec:unread", "Unread", unread.len(), 0));
+                for c in &unread {
+                    let mut n = channel_node(s, side, c, 1, now);
+                    n.key = format!("{UNREAD_PREFIX}{}", c.id);
+                    nodes.push(n);
+                }
+            }
+            let base = nodes.len();
             let mut placed: HashSet<&str> = HashSet::new();
             let mut channels_name = "Channels".to_string();
             let mut dms_name = "Direct messages".to_string();
@@ -524,8 +584,8 @@ fn build_nodes(s: &State) -> Vec<Node> {
                 for c in &starred {
                     placed.insert(c.id.as_str());
                 }
-                nodes.insert(0, group_node("sec:starred", "Starred", starred.len(), starred.iter().filter(|c| c.has_unreads).count()));
-                let mut i = 1;
+                nodes.insert(base, group_node("sec:starred", "Starred", starred.len(), starred.iter().filter(|c| c.has_unreads).count()));
+                let mut i = base + 1;
                 for c in &starred {
                     nodes.insert(i, channel_node(s, side, c, 1, now));
                     i += 1;
@@ -580,7 +640,7 @@ pub fn rebuild(s: &mut State) {
         if let Some((pos, ids)) = held {
             // set_nodes followed the marked row by key; put the cursor
             // back where it was.
-            if side.engine.selected_key().is_some_and(|k| ids.contains(&k)) {
+            if side.engine.selected_key().is_some_and(|k| ids.iter().any(|id| id == chan_key(&k))) {
                 side.engine.select_pos(pos);
             }
             if held_done {
@@ -598,6 +658,7 @@ fn ensure_preview(st: &Shared) {
         let Some(ident) = s.ident.clone() else { return };
         let Some(side) = s.side.as_mut() else { return };
         let Some(key) = side.engine.selected_key() else { return };
+        let key = chan_key(&key).to_string();
         if key.starts_with("sec:") || side.previews.contains_key(&key) || side.fetching.contains(&key) {
             return;
         }
@@ -667,7 +728,7 @@ fn open_menu(st: &Shared) {
         let s = st.borrow();
         let Some(side) = s.side.as_ref() else { return };
         let k = |action: &str| side.engine.keys.key_of(action).to_string();
-        let sel = side.engine.selected_key().and_then(|key| s.channel(&key).cloned());
+        let sel = side.engine.selected_key().and_then(|key| s.channel(chan_key(&key)).cloned());
         let row = sel.is_some();
         let unread = sel.as_ref().is_some_and(|c| c.has_unreads || c.mentions > 0);
         let title = match &sel {
@@ -1163,12 +1224,12 @@ fn execute(st: &Shared, outcome: Outcome) {
                 let _ = set_option("@slack-height", &h.to_string());
                 After::None
             }
-            Outcome::Activate(key) => match s.channel(&key).cloned() {
+            Outcome::Activate(key) => match s.channel(chan_key(&key)).cloned() {
                 Some(c) => After::OpenChat(c, false),
                 None => return,
             },
             Outcome::Action(action, targets) => {
-                let chans: Vec<Channel> = targets.iter().filter_map(|k| s.channel(k).cloned()).collect();
+                let chans: Vec<Channel> = targets.iter().filter_map(|k| s.channel(chan_key(k)).cloned()).collect();
                 match action {
                     "compose" => match chans.into_iter().next() {
                         Some(c) => After::OpenChat(c, true),

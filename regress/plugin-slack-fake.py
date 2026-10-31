@@ -96,7 +96,9 @@ HISTORY = {
         {"type": "message", "user": "U1", "text": "random chatter", "ts": "1700000500.000100"},
     ],
     "G1": [],
-    "D1": [],
+    "D1": [
+        {"type": "message", "user": "U2", "text": "are you around?", "ts": "1700000050.000100"},
+    ],
 }
 
 # What client.counts says; conversations.mark and chat.postMessage move it.
