@@ -61,11 +61,65 @@ fn token(inner: &str, base: u16, names: &Names) -> Vec<Styled> {
         };
         push_text(&mut out, &text, base | ST_BOLD);
     } else {
-        // A link: its label, else the url itself.
-        let text = label.filter(|l| !l.is_empty()).unwrap_or(head);
-        push_text(&mut out, text, base | ST_UNDER);
+        // A link. The terminal's own link detection (Ghostty, iTerm2) is
+        // what makes it clickable, and it only sees what is drawn: a
+        // label that is the url shortened ("very.long/url/pa…", or the
+        // url without its scheme) gives way to the whole url; a label
+        // that is real text keeps it and the url follows, dim, in angle
+        // brackets, so the full url is on screen either way.
+        let url = unescape(head);
+        match label.map(unescape).filter(|l| !l.is_empty() && !label_abbreviates(l, &url)) {
+            None => push_url(&mut out, &url, base | ST_UNDER),
+            Some(l) => {
+                push_text(&mut out, &l, base | ST_UNDER);
+                out.push((' ', base));
+                out.push(('<', base | ST_DIM));
+                push_url(&mut out, &url, base | ST_DIM | ST_UNDER);
+                out.push(('>', base | ST_DIM));
+            }
+        }
     }
     out
+}
+
+/// A url's cells: literal (no shortcode in `/a:b:c/` becomes a glyph),
+/// one style.
+fn push_url(out: &mut Vec<Styled>, url: &str, style: u16) {
+    out.extend(url.chars().filter(|c| !c.is_control()).map(|c| (c, style)));
+}
+
+/// The url without its scheme (`https://x.y/z` -> `x.y/z`, `mailto:a@b`
+/// -> `a@b`) and without a trailing slash.
+fn bare(url: &str) -> &str {
+    let rest = match url.find("://") {
+        Some(i) if url[..i].chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c)) => &url[i + 3..],
+        _ => url.strip_prefix("mailto:").unwrap_or(url),
+    };
+    rest.trim_end_matches('/')
+}
+
+/// Whether a link's label is the url itself, shortened the way Slack
+/// shortens one: the url or the url without its scheme, possibly cut
+/// with an ellipsis. Real text ("the docs", "read more...") is not.
+pub fn label_abbreviates(label: &str, url: &str) -> bool {
+    let label = label.trim();
+    let whole = label.trim_end_matches('/');
+    if whole == url.trim_end_matches('/') || whole == bare(url) {
+        return true;
+    }
+    // "x.y/some/pa…" or "x.y/some/pa...": the text before the cut is a
+    // prefix of the url (with or without the scheme); an empty prefix is
+    // nothing but a cut and still the url's.
+    let head = match (label.find('…'), label.find("...")) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    let Some(cut) = head else { return false };
+    let prefix = label[..cut].trim_end();
+    // The tail after a middle cut ("x.y/aaa…/zzz") must end the url.
+    let tail = label[cut..].trim_start_matches(['…', '.']).trim();
+    let tail_ok = tail.is_empty() || url.ends_with(tail);
+    tail_ok && (url.starts_with(prefix) || bare(url).starts_with(prefix))
 }
 
 fn boundary_before(chars: &[char], i: usize) -> bool {
@@ -248,9 +302,53 @@ mod tests {
     #[test]
     fn tokens_resolve() {
         let c = inline("hey <@U1> see <#C1|general> and <#C2> at <https://x.y/z|the link> <!here>", 0, &names());
-        assert_eq!(cells_text(&c), "hey @zack see #general and #C2 at the link @here");
+        assert_eq!(cells_text(&c), "hey @zack see #general and #C2 at the link <https://x.y/z> @here");
         assert!(c.iter().any(|x| x.1 & ST_UNDER != 0));
         assert!(c[4].1 & ST_BOLD != 0 && c[4].1 & ST_CYAN != 0);
+    }
+
+    #[test]
+    fn links_show_the_full_url() {
+        // Slack's shortened label (the url without its scheme, cut with an
+        // ellipsis) gives way to the whole url, underlined.
+        let long = "https://very.long.example/url/path/to/a/document";
+        let c = inline(&format!("see <{long}|very.long.example/url/pa…> now"), 0, &names());
+        assert_eq!(cells_text(&c), format!("see {long} now"));
+        let under: String = c.iter().filter(|x| x.1 & ST_UNDER != 0).map(|x| x.0).collect();
+        assert_eq!(under, long);
+        // The three-dot spelling, a label that is the url minus the
+        // scheme, and a label that is the url itself: all the url once.
+        let c = inline(&format!("<{long}|very.long.example/url/pa...>"), 0, &names());
+        assert_eq!(cells_text(&c), long);
+        assert_eq!(cells_text(&inline("<https://x.y/z/|x.y/z>", 0, &names())), "https://x.y/z/");
+        assert_eq!(cells_text(&inline("<https://x.y/z|https://x.y/z>", 0, &names())), "https://x.y/z");
+        // A real label keeps its text and the url follows in brackets,
+        // dim, one word for the wrapper.
+        let c = inline("<https://x.y/z|the docs>", 0, &names());
+        assert_eq!(cells_text(&c), "the docs <https://x.y/z>");
+        assert!(c[0].1 & ST_UNDER != 0 && c[0].1 & ST_DIM == 0);
+        let dim: String = c.iter().filter(|x| x.1 & ST_DIM != 0).map(|x| x.0).collect();
+        assert_eq!(dim, "<https://x.y/z>");
+        // "read more..." is text, not a cut url.
+        assert_eq!(cells_text(&inline("<https://x.y/z|read more...>", 0, &names())), "read more... <https://x.y/z>");
+        // A bare url is itself; entities in it are undone; no shortcode
+        // in a url path becomes a glyph.
+        assert_eq!(cells_text(&inline("<https://x.y/?a=1&amp;b=2>", 0, &names())), "https://x.y/?a=1&b=2");
+        assert_eq!(cells_text(&inline("<https://x.y/a:+1:b|the docs>", 0, &names())), "the docs <https://x.y/a:+1:b>");
+        // The copy transcript carries the same.
+        assert_eq!(plain("go <https://x.y/z|x.y/z> or <https://x.y/w|here>", &names()), "go https://x.y/z or here <https://x.y/w>");
+        assert_eq!(plain_lines("<https://x.y/z|x.y/…>", &names()), vec!["https://x.y/z"]);
+        // The wrapper keeps a url whole when it fits on the next line and
+        // only cuts one wider than the view.
+        let lines = render("read <https://x.y/some/long/path|x.y/some/long/pa…> now", 20, 0, &names());
+        let texts: Vec<String> = lines.iter().map(|l| cells_text(l)).collect();
+        assert_eq!(texts, vec!["read", "https://x.y/some/lon", "g/path now"]);
+        let lines = render("read <https://x.y/path|x.y/path> now", 20, 0, &names());
+        let texts: Vec<String> = lines.iter().map(|l| cells_text(l)).collect();
+        assert_eq!(texts, vec!["read", "https://x.y/path now"]);
+        assert!(label_abbreviates("x.y/aaa…/zzz", "https://x.y/aaa/bbb/zzz"));
+        assert!(!label_abbreviates("x.y/aaa…/qqq", "https://x.y/aaa/bbb/zzz"));
+        assert!(label_abbreviates("…", "https://x.y"));
     }
 
     #[test]

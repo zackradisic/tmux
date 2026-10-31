@@ -557,11 +557,21 @@ cursor stays where it is while the row drops down the list; `v` cycles
 sections / unread / all; `/` searches with `#channel`, `@user` and `!unread`
 tokens.
 
+Links are drawn whole: a link Slack delivers with a shortened label
+(`example.com/some/long/pa…`) shows its full URL, and a link behind text
+shows the text with the URL after it in angle brackets (`the docs
+<https://…>`), so the terminal's own link detection (Ghostty, iTerm2) always
+has a complete URL to open; `y` copies the same.
+
 Updates are live: the plugin holds Slack's own RTM websocket through the
 host's `net` capability. A message shows the moment it is posted, a channel
 you read on your phone loses its badge here, and the notification Slack would
-have shown lands in the toast feed. The badges also reach the status line as
-`#{@slack_unread}`, `#{@slack_mentions}` and `#{@slack_dms}`.
+have shown lands in the toast feed. A direct message (one to one or a group)
+from someone else is toasted the moment it arrives, titled with the sender,
+whether or not Slack sends a notification for it (a conversation you have on
+screen, or muted, stays quiet), and `#{@slack_dms}` moves at once. The badges
+also reach the status line as `#{@slack_unread}`, `#{@slack_mentions}` and
+`#{@slack_dms}`.
 
 ```sh
 tmux2 plugin-command slack help                       # every verb
