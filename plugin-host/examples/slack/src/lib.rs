@@ -15,6 +15,12 @@
 //! Status line: `#{@slack_unread}` channels with unread messages,
 //! `#{@slack_mentions}` mentions, `#{@slack_dms}` unread DMs.
 //!
+//! `n` in the channel view hands the message or the selection to a new
+//! agent (handoff.rs): the transcript goes to a file under the data
+//! directory and the new-agent form (`formkit`) opens over the view;
+//! Enter asks the agents plugin's `new` service to start it with the
+//! file as its first prompt.
+//!
 //! For tests and for a workspace reached another way: `-o api_base=URL`
 //! sends every call to `URL/api/<method>` instead of
 //! `https://<workspace>.slack.com`, and `-o token=xoxc-… -o cookie=xoxd-…`
@@ -37,6 +43,7 @@ mod chat;
 mod emoji;
 mod emoji_table;
 mod feed;
+mod handoff;
 mod help;
 mod http;
 mod images;
@@ -301,6 +308,8 @@ impl Plugin for Slack {
                     sidebar::on_mode_event(&self.st, name.as_str(), &event);
                 } else if is_chat {
                     chat::on_mode_event(&self.st, name.as_str(), &event);
+                } else if handoff::owns(mode) {
+                    handoff::on_mode_event(name.as_str(), &event);
                 }
             }
             _ => {}
@@ -308,6 +317,7 @@ impl Plugin for Slack {
     }
 
     fn on_unload(&mut self, _ctx: &Ctx) {
+        handoff::close();
         sidebar::close(&self.st);
         chat::close(&self.st);
         feed::close(&self.st);
@@ -761,6 +771,7 @@ fn on_command(st: &Shared, event: &Event) {
             });
         }
         "close" => {
+            handoff::close();
             sidebar::close(st);
             chat::close(st);
         }

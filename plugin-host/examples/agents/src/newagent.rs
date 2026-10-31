@@ -399,6 +399,24 @@ pub fn resume_command(harness: &str, command: &str, resume: &str) -> String {
     }
 }
 
+/// The command line with the agent's first prompt, when there is one:
+/// `claude 'text'` / `codex 'text'` (a positional argument), `opencode
+/// --prompt 'text'`. A file is read by the shell the window runs,
+/// `"$(cat '<path>')"`, so quotes and newlines in the prompt never meet
+/// a tmux command line; the file wins when both are given. An empty
+/// prompt is no prompt.
+pub fn prompt_command(harness: &str, command: &str, prompt: Option<&str>, file: Option<&str>) -> String {
+    let arg = match (file.filter(|f| !f.trim().is_empty()), prompt.filter(|p| !p.is_empty())) {
+        (Some(f), _) => format!("\"$(cat {})\"", quote(f.trim())),
+        (None, Some(p)) => quote(p),
+        (None, None) => return command.to_string(),
+    };
+    match harness {
+        "opencode" => format!("{command} --prompt {arg}"),
+        _ => format!("{command} {arg}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,7 +443,25 @@ mod tests {
         assert_eq!(w("  new   "), vec!["new"]);
         assert!(is_direct(&w("new --project x")));
         assert!(is_direct(&w("new --resume=abc")));
+        assert!(is_direct(&w("new --prompt-file /tmp/p.md")));
         assert!(!is_direct(&w("new @boat --client c0 --profile /tmp/p")));
+    }
+
+    #[test]
+    fn prompt_per_harness_and_from_a_file() {
+        assert_eq!(prompt_command("claude", "claude", Some("fix it"), None), "claude 'fix it'");
+        assert_eq!(prompt_command("codex", "codex --yolo", Some("it's"), None), "codex --yolo 'it'\\''s'");
+        assert_eq!(prompt_command("opencode", "opencode", Some("go"), None), "opencode --prompt 'go'");
+        assert_eq!(
+            prompt_command("claude", "claude", None, Some("/tmp/p.md")),
+            "claude \"$(cat '/tmp/p.md')\""
+        );
+        assert_eq!(
+            prompt_command("opencode", "opencode", Some("ignored"), Some("/tmp/p.md")),
+            "opencode --prompt \"$(cat '/tmp/p.md')\""
+        );
+        assert_eq!(prompt_command("claude", "claude", Some(""), None), "claude");
+        assert_eq!(prompt_command("claude", "claude", None, Some(" ")), "claude");
     }
 
     #[test]
@@ -928,6 +964,8 @@ async fn submit() {
         remote_host,
         focus: true,
         split: None,
+        prompt: None,
+        prompt_file: None,
     })
     .await;
     let landed = match landed {
@@ -986,6 +1024,14 @@ pub struct Launch {
     pub focus: bool,
     /// Split this pane instead of opening a window.
     pub split: Option<u32>,
+    /// The agent's first prompt, typed for it: a positional argument
+    /// for claude and codex, `--prompt` for opencode.
+    pub prompt: Option<String>,
+    /// The first prompt read from this file instead, as `"$(cat
+    /// '<path>')"` on the command line: the shell the window runs reads
+    /// it, so a prompt with quotes or newlines rides in a file untouched.
+    /// Wins over `prompt` when both are given.
+    pub prompt_file: Option<String>,
 }
 
 /// Where the agent landed.
@@ -1021,6 +1067,7 @@ pub async fn launch(l: Launch) -> Result<Landed, String> {
             }
         }
     };
+    let command = prompt_command(&l.harness, &command, l.prompt.as_deref(), l.prompt_file.as_deref());
     let detach = if l.focus { "" } else { "-d " };
     // The ids there before, so the new window (or pane) can be told
     // from the old ones after: made with `-d` it is nobody's current
@@ -1138,6 +1185,8 @@ const DIRECT_FLAGS: &[&str] = &[
     "--window",
     "-w",
     "--focus",
+    "--prompt",
+    "--prompt-file",
 ];
 
 pub fn is_direct(words: &[String]) -> bool {
@@ -1224,6 +1273,8 @@ fn value<'a>(
 ///   --split            a pane beside the caller instead of a window
 ///   --window <w>       with --split: in that window (index, name, @id)
 ///   --focus            switch to it (default: made in the background)
+///   --prompt <text>    its first prompt
+///   --prompt-file <p>  its first prompt, read from that file
 ///   --profile <dir>    CLAUDE_CONFIG_DIR for it
 ///   @host              on that linked server
 pub async fn direct(
@@ -1243,6 +1294,8 @@ pub async fn direct(
     let mut window: Option<String> = None;
     let mut focus = false;
     let mut profile: Option<String> = None;
+    let mut prompt: Option<String> = None;
+    let mut prompt_file: Option<String> = None;
     let mut remote: Option<String> = None;
     let mut it = words.iter();
     while let Some(w) = it.next() {
@@ -1266,6 +1319,8 @@ pub async fn direct(
             }
             "--focus" => focus = true,
             "--profile" => profile = Some(value(flag, inline, &mut it)?),
+            "--prompt" => prompt = Some(value(flag, inline, &mut it)?),
+            "--prompt-file" => prompt_file = Some(value(flag, inline, &mut it)?),
             // The form's: a client to open on. Nothing opens here.
             "--client" => {
                 value(flag, inline, &mut it)?;
@@ -1379,6 +1434,8 @@ pub async fn direct(
         remote_host: remote,
         focus,
         split,
+        prompt,
+        prompt_file,
     })
     .await
 }

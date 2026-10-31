@@ -526,7 +526,7 @@ fn relayout(s: &mut State) {
 // ---------------------------------------------------------------------------
 
 fn hints() -> &'static str {
-    "j/k move · Enter thread · i compose · r reply · e react · y copy · v select · m read · L older · Space menu · Esc back · ? help · q close"
+    "j/k move · Enter thread · i compose · r reply · e react · y copy · v select · n agent · m read · L older · Space menu · Esc back · ? help · q close"
 }
 
 fn rule(width: usize) -> String {
@@ -1189,6 +1189,9 @@ enum After {
     Permalink(String),
     /// Copy these messages as text.
     Copy(Vec<usize>),
+    /// Start an agent with these messages as its first prompt (the
+    /// hand-off form, handoff.rs).
+    Agent(Vec<usize>),
     Mark,
     Refetch,
     Older,
@@ -1449,7 +1452,7 @@ fn handle_key(c: &mut Chat, key: &str, mouse: Option<(u32, u32)>) -> After {
                 c.status = Some("selection cleared".into());
             } else if let Some(i) = c.cursor_idx() {
                 c.anchor = Some(c.msgs[i].ts.clone());
-                c.status = Some("selecting · j/k extend · y copy · v cancel".into());
+                c.status = Some("selecting · j/k extend · y copy · n agent · v cancel".into());
             }
             After::None
         }
@@ -1461,6 +1464,16 @@ fn handle_key(c: &mut Chat, key: &str, mouse: Option<(u32, u32)>) -> After {
             c.anchor = None;
             c.status = Some("copying…".into());
             After::Copy(sel)
+        }
+        // n hands the same messages to a new agent as its first prompt.
+        "n" => {
+            let sel = c.selection();
+            if sel.is_empty() {
+                return After::None;
+            }
+            c.anchor = None;
+            c.status = Some("new agent…".into());
+            After::Agent(sel)
         }
         "Y" => {
             let Some(i) = c.cursor_idx() else { return After::None };
@@ -1537,6 +1550,7 @@ fn menu_items(c: &Chat) -> String {
     items.push_str(&menu_item(NAME, if c.anchor.is_some() { "copy the selection" } else { "copy message" }, "y", on_msg));
     items.push_str(&menu_item(NAME, "copy permalink", "Y", on_msg));
     items.push_str(&menu_item(NAME, if c.anchor.is_some() { "cancel selection" } else { "select from here" }, "v", on_msg));
+    items.push_str(&menu_item(NAME, if c.anchor.is_some() { "new agent from the selection" } else { "new agent from message" }, "n", on_msg));
     items.push_str(&menu_item(NAME, "open in Slack app", "o", true));
     items.push_str(" ''");
     items.push_str(&menu_item(NAME, "mark read", "m", true));
@@ -1597,6 +1611,15 @@ pub(crate) async fn copy_text(text: &str, client: Option<u64>) -> Result<(), Str
         }
     }
     run_command(&format!("load-buffer -w {path}")).await.map(|_| ()).map_err(|e| e.message.clone())
+}
+
+/// A line for the view's status (another module reporting back, the
+/// hand-off form mostly), drawn at once if the view is open.
+pub fn note(st: &Shared, text: String) {
+    let mut s = st.borrow_mut();
+    let Some(c) = s.chat.as_mut() else { return };
+    c.status = Some(text);
+    paint(&s);
 }
 
 fn view_ctx(st: &Shared) -> Option<(crate::store::Identity, String, u64)> {
@@ -1720,6 +1743,29 @@ fn run(st: &Shared, after: After) {
                     paint(&s);
                 }
             });
+        }
+        After::Agent(idxs) => {
+            // The transcript `y` would have copied, with where it came
+            // from; the form takes it from here (handoff.rs). The view
+            // stays open underneath: the form is a float of its own.
+            let req = {
+                let s = st.borrow();
+                let Some(c) = s.chat.as_ref() else { return };
+                let first_ts = idxs.iter().filter_map(|&i| c.msgs.get(i)).map(|m| m.ts.clone()).min().unwrap_or_default();
+                crate::handoff::Request {
+                    st: Rc::clone(st),
+                    label: s.channel_label(&c.channel),
+                    channel: s.channel_label(&c.channel).trim_start_matches(['#', '@']).to_string(),
+                    thread: c.thread.is_some(),
+                    first_ts,
+                    transcript: transcript(&c.msgs, &idxs, s.tz(), &s.names),
+                    count: idxs.len(),
+                    client: c.client,
+                    pane: c.pane,
+                    tz: s.tz(),
+                }
+            };
+            spawn(crate::handoff::open(req));
         }
         After::Mark => {
             let channel = {
@@ -2053,6 +2099,15 @@ mod tests {
         assert!(c.anchor.is_none(), "y closes the selection");
         let ts = c.msgs[0].ts.clone();
         assert_eq!(handle_key(&mut c, "Y", None), After::Permalink(ts));
+        // n hands the cursor message, or the selection, to a new agent
+        // and closes the selection like y does.
+        assert_eq!(handle_key(&mut c, "n", None), After::Agent(vec![0]));
+        handle_key(&mut c, "v", None);
+        assert!(c.status.as_deref().is_some_and(|s| s.contains("n agent")), "{:?}", c.status);
+        handle_key(&mut c, "j", None);
+        assert_eq!(handle_key(&mut c, "n", None), After::Agent(vec![0, 1]));
+        assert!(c.anchor.is_none(), "n closes the selection");
+        assert_eq!(c.status.as_deref(), Some("new agent…"));
         // Escape clears a selection before it steps back.
         handle_key(&mut c, "v", None);
         assert_eq!(handle_key(&mut c, "Escape", None), After::None);
@@ -2131,6 +2186,10 @@ mod tests {
         assert!(items.contains(" 'back to sidebar' 'Escape' "), "{items}");
         assert!(items.contains(" 'load older' 'L' "), "{items}");
         assert!(items.contains(" 'close' 'q' "), "{items}");
+        assert!(items.contains(" 'new agent from message' 'n' \"plugin-command slack 'menu-key n'\""), "{items}");
+        let mut sel = chat();
+        sel.anchor = Some(sel.msgs[0].ts.clone());
+        assert!(menu_items(&sel).contains(" 'new agent from the selection' 'n' "), "{}", menu_items(&sel));
         assert!(!items.contains("'-"), "everything applies on a message in a timeline: {items}");
         // In a thread: no thread to open, nothing older to load, back
         // goes to the channel.
@@ -2144,7 +2203,7 @@ mod tests {
         c.msgs.clear();
         c.cursor = None;
         let items = menu_items(&c);
-        for label in ["open thread", "reply in thread", "react", "copy permalink"] {
+        for label in ["open thread", "reply in thread", "react", "copy permalink", "new agent from message"] {
             assert!(items.contains(&format!(" '-{label}' ")), "{label}: {items}");
         }
         assert!(items.contains(" 'compose' 'i' "), "{items}");

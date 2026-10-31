@@ -463,7 +463,10 @@ tmux2 plugin-command -t "$TMUX_PANE" agents "new --command claude --name reviewe
 
 `--resume <id>` (`--fork` for a copy), `--command`, `--folder`, `--session`
 (`--new-session` for one of its own), `--name`, `--project`, `--split`
-(`--window <w>` to pick the window), `--focus`; the caller pane's folder,
+(`--window <w>` to pick the window), `--focus`, `--prompt <text>` (its first
+prompt, as the harness's argument) or `--prompt-file <path>` (the same read
+from a file, as `"$(cat '<path>')"`, for a long prompt or one with quotes
+and newlines); the caller pane's folder,
 session and `@project` are the defaults. The window is made in the
 background and the result is left in the caller pane's `@agents_new`
 option (`%pane @window session`, or `error: …`). `tmux2 plugin-command
@@ -539,7 +542,14 @@ closes outright. `i` composes, `r` replies in the message's thread, `e`
 reacts, `o` opens the message in the Slack app. `y` copies the message to the
 clipboard as `Name (2026-10-30 14:02): text`, ready to paste into an agent;
 `v` starts a selection that `j`/`k` extend, so `y` copies a whole exchange;
-`Y` copies the permalink. `Space` opens an action menu in either view, the
+`Y` copies the permalink. `n` hands the message or the selection to a new
+agent: the transcript is written to a prompt file under a `From Slack
+#channel on <date>:` header and the new-agent form opens over the view (an
+instruction to put above it, folder, session, name, command, project; `C-e`
+edits the file in `$EDITOR`, `Tab` on the prompt field swaps it for the
+paste buffer). `Enter` starts the agent through the agents plugin, in the
+background, with the file as its first prompt (`agents new --prompt-file`),
+and says where it landed. `Space` opens an action menu in either view, the
 same items as the keys. In the sidebar `m` marks a channel read and the
 cursor stays where it is while the row drops down the list; `v` cycles
 sections / unread / all; `/` searches with `#channel`, `@user` and `!unread`

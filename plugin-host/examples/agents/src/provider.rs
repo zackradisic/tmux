@@ -1242,7 +1242,7 @@ pub fn reply_mode(reply: &SearchReply) -> SearchMode {
 /// Register the methods a view calls. Needs `service-serve`; without it
 /// the plugin still works alone on its server.
 pub fn register_services() {
-    for m in ["list", "capture", "search", "turns", "stats", "act", "palette"] {
+    for m in ["list", "capture", "search", "turns", "stats", "act", "palette", "new"] {
         if let Err(e) = service::register(m) {
             log(&format!("agents: register {m}: {}", e.message));
             return;
@@ -1275,9 +1275,59 @@ pub async fn broadcast_changed() {
     let _ = service::emit_json(TOPIC, &snap);
 }
 
+/// Another plugin's `new`: the verb's words (after `new`) as they would
+/// be typed, no shell in between, and the caller's pane for the
+/// defaults (`-t $TMUX_PANE`).
+#[derive(Debug, Default, Deserialize)]
+pub struct NewReq {
+    #[serde(default)]
+    pub words: Vec<String>,
+    #[serde(default)]
+    pub pane: Option<u32>,
+}
+
+/// Where `new` landed: what `@agents_new` would have said, as fields.
+#[derive(Debug, Serialize)]
+pub struct NewReply {
+    pub pane: Option<String>,
+    pub window: Option<String>,
+    pub session: String,
+    pub command: String,
+}
+
 /// Answer one service request from a view.
 pub async fn handle(req: ServiceRequest, cfg: Rc<Config>) {
     match req.method.as_str() {
+        // A plugin on this server starts an agent (the slack view's `n`)
+        // without going through a tmux command line and the caller
+        // pane's option. Local only: a linked server's plugin has an
+        // agents plugin of its own to ask, and its words would name
+        // folders and sessions over here.
+        "new" => {
+            if req.server != store::LOCAL {
+                let _ = req.fail("new: local callers only");
+                return;
+            }
+            let Ok(q) = req.json::<NewReq>() else {
+                let _ = req.fail("new: bad request");
+                return;
+            };
+            let caller = crate::newagent::Caller { pane: q.pane };
+            match crate::newagent::direct(&q.words, caller, cfg.launchers.clone()).await {
+                Ok(l) => {
+                    let _ = display_message(&format!("agent started: {} in {}", l.command, l.target));
+                    let _ = req.reply_json(&NewReply {
+                        pane: l.pane.map(|p| format!("%{p}")),
+                        window: l.window.map(|w| format!("@{w}")),
+                        session: l.target,
+                        command: l.command,
+                    });
+                }
+                Err(e) => {
+                    let _ = req.fail(&e);
+                }
+            }
+        }
         "list" => {
             let q: ListReq = req.json().unwrap_or_default();
             let snap = snapshot(q).await;
