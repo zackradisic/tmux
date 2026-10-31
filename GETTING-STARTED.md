@@ -531,8 +531,8 @@ an unread name is bold, a read or muted one dim, and the right column says how
 long ago the channel last spoke. The preview is the channel view itself, laid
 out at the column's width: the channel's recent messages, newest at the bottom.
 `l` (or a click in the column) hands it the keyboard, so `j`/`k`, `y`, `e`, `m`
-and `Enter` work on the messages right there and `Escape` comes back to the
-list; `n` on a row hands the previewed message (or a selection made in the
+and `Enter` (the thread, shown in the preview itself) work on the messages
+right there and `Escape` steps back, thread to channel to list; `n` on a row hands the previewed message (or a selection made in the
 preview) to a new agent, `i` composes to the channel. `Enter` on a row opens the **channel view**: a
 transcript with day separators, the new-messages line, reactions and emoji
 drawn as glyphs (Slack's names, skin tones and your workspace's custom aliases

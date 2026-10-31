@@ -797,6 +797,10 @@ fn size_box() -> SizeBox {
     SizeBox { min_w: 60, min_h: 12, max_w: 160, max_h: 50, fill_tenths: 8 }
 }
 
+/// What + and - add or take, in cells (listkit's steps).
+const RESIZE_W: u32 = 12;
+const RESIZE_H: u32 = 4;
+
 fn opt_u32(name: &str) -> Option<u32> {
     get_option(name).ok().and_then(|v| v.trim().parse::<u32>().ok()).filter(|v| *v > 0)
 }
@@ -1370,6 +1374,8 @@ pub(crate) enum After {
     Copy(Vec<usize>),
     /// Copy this text (a yank in the compose box).
     Clip(String),
+    /// Grow (true) or shrink the float by a step.
+    Resize(bool),
     /// Start an agent with these messages as its first prompt (the
     /// hand-off form, handoff.rs).
     Agent(Vec<usize>),
@@ -1442,6 +1448,10 @@ pub fn on_mode_event(st: &Shared, name: &str, event: &Event) {
             if let Some(h) = event.get_i64("height") {
                 c.height = (h.max(1)) as u32;
             }
+            // Whoever resized the float (+/-, a drag, resize-pane), the
+            // size is the one the view opens with next time.
+            let _ = set_option("@slack-chat-width", &c.width.to_string());
+            let _ = set_option("@slack-chat-height", &c.height.to_string());
             relayout(&mut s);
             if let Some(c) = s.chat.as_mut() {
                 c.reveal_cursor();
@@ -1654,6 +1664,8 @@ pub(crate) fn handle_key(c: &mut Chat, key: &str, mouse: Option<(u32, u32)>) -> 
             After::Refetch
         }
         "L" => After::Older,
+        "+" | "=" => After::Resize(true),
+        "-" => After::Resize(false),
         "b" => After::Sidebar,
         // Escape steps back one level: a thread (however it was opened)
         // to its channel's timeline, the timeline to the sidebar.
@@ -1986,6 +1998,25 @@ fn run(st: &Shared, after: After) {
             });
         }
         After::Older => load_older(st),
+        After::Resize(grow) => {
+            let (mode, w, h, client, pane) = {
+                let s = st.borrow();
+                let Some(c) = s.chat.as_ref() else { return };
+                (c.mode, c.width, c.height, c.client, c.pane)
+            };
+            let size = size_box();
+            let (ww, wh) = listkit::window_for(client, pane)
+                .and_then(|win| resolve_window(WindowId(win)).ok())
+                .map(|win| (win.width, win.height))
+                .unwrap_or((size.max_w, size.max_h));
+            let (nw, nh) = if grow {
+                ((w + RESIZE_W).min(size.max_w).min(ww), (h + RESIZE_H).min(size.max_h).min(wh))
+            } else {
+                (w.saturating_sub(RESIZE_W).max(size.min_w), h.saturating_sub(RESIZE_H).max(size.min_h))
+            };
+            // The mode-resize event that follows relays out and saves.
+            let _ = mode_resize(mode, nw, nh);
+        }
     }
 }
 

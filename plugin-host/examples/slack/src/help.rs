@@ -53,10 +53,13 @@ l, Right or a click in the column hand the preview the keyboard (the
 separator lights up): the channel view's keys then work there - j/k
 move over the messages, J/K page, g/G, y copies the message under the
 cursor (v then j/k a selection), Y its permalink, e reacts, m marks
-the channel read, Enter opens the message's thread in the full channel
-view, i and r open it composing (r in the message's thread), Space its
-menu, ? its hints. Escape, h or Left give the keyboard back to the
-list; q closes the sidebar either way.";
+the channel read, Enter opens the message's thread right there in the
+preview (Escape brings the channel back), i and r open the full view
+composing (r in the message's thread), Space its menu, ? its hints.
+Escape, h or Left give the keyboard back to the list; q closes the
+sidebar either way. + and - resize the float, in the channel view too;
+a size set any way (keys, a drag, resize-pane) is the one it opens
+with next time.";
 
 pub const OPEN: &str = "\
 open: the channel view.

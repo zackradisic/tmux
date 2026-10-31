@@ -169,10 +169,11 @@ impl Recent {
 
 /// Whether a `message` event raises a toast of its own. Slack's
 /// `desktop_notification` covers channels by the user's preferences;
-/// a direct message (one to one or a group) from someone else is told
+/// a direct message (one to one or a group) from someone else, or a
+/// message that mentions the user (@them, @here, @channel), is told
 /// here regardless, unless the conversation is muted or on screen.
-pub fn message_toasts(kind: Kind, ours: bool, muted: bool, viewing: bool) -> bool {
-    kind.is_dm() && !ours && !muted && !viewing
+pub fn message_toasts(kind: Kind, ours: bool, muted: bool, viewing: bool, mention: bool) -> bool {
+    (kind.is_dm() || mention) && !ours && !muted && !viewing
 }
 
 /// The toast's key for a message: the dedup key, and the toast plugin's
@@ -232,7 +233,11 @@ async fn handle(st: &Shared, v: Value) {
             // toasted this one already.
             let ts = s(&v, "msg").or_else(|| s(&v, "ts")).or_else(|| s(&v, "event_ts")).unwrap_or_default();
             let (dedup, key, action) = toast_keys(&channel, &ts, thread.as_deref());
-            if !st.borrow_mut().toasted.first(&dedup, now_ms()) {
+            let first = st.borrow_mut().toasted.first(&dedup, now_ms());
+            // Evidence in the log either way: whether Slack sends these
+            // at all was the question.
+            log(&format!("slack: desktop_notification {} {}", channel.chars().next().unwrap_or('?'), if first { "toast" } else { "already told" }));
+            if !first {
                 return;
             }
             toast(&title, &content, &key, action.as_deref()).await;
@@ -334,10 +339,14 @@ async fn on_chat_message(st: &Shared, v: &Value) {
             // follows with a desktop_notification for it (that one is
             // then dropped as a repeat). Title: the sender, and the
             // group for a group DM.
-            if kind.is_some_and(|k| message_toasts(k, ours, muted, viewing)) {
+            if kind.is_some_and(|k| message_toasts(k, ours, muted, viewing, mention)) {
                 let (dedup, key, action) = toast_keys(&channel, &m.ts, m.thread_ts.as_deref().filter(|_| m.is_reply()));
                 if st.borrow_mut().toasted.first(&dedup, now_ms()) {
-                    let title = if kind == Some(Kind::Mpim) { format!("{who} ({label})") } else { who.clone() };
+                    let title = match kind {
+                        Some(Kind::Mpim) => format!("{who} ({label})"),
+                        Some(k) if k.is_dm() => who.clone(),
+                        _ => format!("{label} · {who}"),
+                    };
                     toast(&title, &body, &key, action.as_deref()).await;
                 }
             }
@@ -395,15 +404,18 @@ mod tests {
     #[test]
     fn direct_messages_toast_channels_do_not() {
         // A DM or a group DM from someone else, not on screen, not muted.
-        assert!(message_toasts(Kind::Im, false, false, false));
-        assert!(message_toasts(Kind::Mpim, false, false, false));
+        assert!(message_toasts(Kind::Im, false, false, false, false));
+        assert!(message_toasts(Kind::Mpim, false, false, false, false));
         // Our own words, a muted conversation, one we are looking at.
-        assert!(!message_toasts(Kind::Im, true, false, false));
-        assert!(!message_toasts(Kind::Im, false, true, false));
-        assert!(!message_toasts(Kind::Im, false, false, true));
+        assert!(!message_toasts(Kind::Im, true, false, false, false));
+        assert!(!message_toasts(Kind::Im, false, true, false, false));
+        assert!(!message_toasts(Kind::Im, false, false, true, false));
         // Channels are Slack's call (desktop_notification by its prefs).
-        assert!(!message_toasts(Kind::Public, false, false, false));
-        assert!(!message_toasts(Kind::Private, false, false, false));
+        assert!(!message_toasts(Kind::Public, false, false, false, false));
+        assert!(message_toasts(Kind::Public, false, false, false, true), "a mention toasts in a channel");
+        assert!(!message_toasts(Kind::Public, false, false, true, true), "not while it is on screen");
+        assert!(!message_toasts(Kind::Public, true, false, false, true), "not our own @here");
+        assert!(!message_toasts(Kind::Private, false, false, false, false));
     }
 
     #[test]

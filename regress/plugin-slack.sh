@@ -395,23 +395,27 @@ screen_has 'look at this' || fail "after - the preview lost its messages"
 sep_lit || fail "after - the preview lost the keyboard"
 keys +
 until_ok 20 sep_ok || fail "after + the column crosses the separator: $(sep_ok)"
-# Enter opens the message's thread in the full channel view.
+# A resize any way round is remembered: after - the saved width is the
+# float's.
+until_ok 20 sh -c "[ \"\$($TMUX show-options -sqv @slack-width)\" = \"\$($TMUX display -p -t $FORM '#{pane_width}')\" ]" || fail "@slack-width ($($TMUX show-options -sqv @slack-width)) is not the float's width ($($TMUX display -p -t "$FORM" '#{pane_width}'))"
+# Enter opens the message's thread in the preview itself (the sidebar
+# stays, the keyboard too); Escape brings the channel back, still in
+# the preview; Escape again hands the keyboard to the list.
 keys Enter
-until_ok 40 mode_shows '· thread' || fail "Enter in the preview did not open the thread"
-FORM=$(mode_pane)
+until_ok 40 screen_has '· thread' || fail "Enter in the preview did not open the thread there: $(screen | head -2)"
+mode_shows 'slack Morph' || fail "Enter left the sidebar"
 until_ok 40 screen_has 'look at this' || fail "the thread lacks its root"
-screen_lacks 'morning' || fail "the thread shows the timeline"
-# Escape: the timeline, then the sidebar again, the keyboard on the list.
+screen_lacks 'morning' || fail "the thread preview shows the timeline"
+sep_lit || fail "the thread took the keyboard from the preview"
+screen_has 'Esc back to channel' || fail "the footer does not say Esc back to channel: $(screen | tail -1)"
 keys Escape
-until_ok 40 screen_has 'morning' || fail "Escape did not return to the timeline"
+until_ok 40 screen_has 'morning' || fail "Escape did not bring the channel back"
+screen_lacks '· thread' || fail "the header still says thread"
+sep_lit || fail "Escape out of the thread dropped the preview focus"
 keys Escape
-until_ok 40 mode_shows 'slack Morph' || fail "Escape in the timeline did not open the sidebar"
-FORM=$(mode_pane)
-until_ok 40 screen_has 'Work' || fail "the reopened sidebar shows no Work section"
-sep_lit && fail "the reopened sidebar has the keyboard on the preview"
+sep_lit && fail "Escape in the timeline did not hand the keyboard back to the list"
 screen_has 'l preview' || fail "the footer does not offer l: $(screen | tail -1)"
 # l then Escape: the keyboard comes back to the list, where j moves the cursor.
-until_ok 40 screen_has 'are you around' || fail "the preview of the first row (the unread DM) never loaded"
 keys l
 until_ok 20 sep_lit || fail "l did not light the separator the second time"
 keys Escape
@@ -446,6 +450,13 @@ until_ok 40 mode_open || fail "open opened no plugin mode"
 FORM=$(mode_pane)
 until_ok 60 screen_has 'morning' || fail "the channel view never showed the history"
 screen_has '#general' || fail "the channel view lacks its title"
+# - shrinks the float by a step and the size is remembered; + puts it back.
+CW=$($TMUX display -p -t "$FORM" '#{pane_width}')
+keys -
+until_ok 20 sh -c "[ \"\$($TMUX display -p -t $FORM '#{pane_width}')\" = $((CW - 12)) ]" || fail "- did not shrink the channel view: $($TMUX display -p -t "$FORM" '#{pane_width}') from $CW"
+until_ok 20 sh -c "[ \"\$($TMUX show-options -sqv @slack-chat-width)\" = $((CW - 12)) ]" || fail "@slack-chat-width was not saved: $($TMUX show-options -sqv @slack-chat-width)"
+keys +
+until_ok 20 sh -c "[ \"\$($TMUX display -p -t $FORM '#{pane_width}')\" = $CW ]" || fail "+ did not restore the width: $($TMUX display -p -t "$FORM" '#{pane_width}')"
 screen_has 'the town square' || fail "the channel view lacks the topic"
 screen_has '@zack look at this' || fail "mrkdwn was not resolved"
 screen_has '── new messages ──' || fail "no new-messages rule"
@@ -788,6 +799,16 @@ R=$(slack 'rtm-inject {"type":"desktop_notification","title":"Morph","subtitle":
 [ "$R" = "injected" ] || fail "rtm-inject (channel notification) did not answer: $R"
 until_ok 40 sh -c "$TMUX plugin-log slack | grep -q 'slack: toast: Morph (#general): Tejas: a channel message'" || fail "the channel notification was not toasted: $($TMUX plugin-log slack | tail -5)"
 [ "$(toasts)" = "$((T0 + 2))" ] || fail "$(( $(toasts) - T0 )) toasts, not 2 (the DM once, the channel once): $($TMUX plugin-log slack | grep 'toast:')"
+# A mention in a channel toasts on the message itself too; Slack's
+# notification for it, when it comes, is a repeat.
+R=$(slack 'rtm-inject {"type":"message","channel":"C1","user":"U2","text":"<@U1> can you look?","ts":"1700000903.000100"}')
+[ "$R" = "injected" ] || fail "rtm-inject (mention) did not answer: $R"
+until_ok 40 sh -c "$TMUX plugin-log slack | grep -q 'slack: toast: #general · Tejas: @zack can you look?'" || fail "the mention was not toasted: $($TMUX plugin-log slack | grep 'toast:' | tail -3)"
+R=$(slack 'rtm-inject {"type":"desktop_notification","title":"Morph","subtitle":"#general","msg":"1700000903.000100","channel":"C1","content":"Tejas: @zack can you look?"}')
+[ "$R" = "injected" ] || fail "rtm-inject (mention notification) did not answer: $R"
+sleep 0.5
+[ "$(toasts)" = "$((T0 + 3))" ] || fail "$(( $(toasts) - T0 )) toasts, not 3 (the mention once): $($TMUX plugin-log slack | grep 'toast:')"
+$TMUX plugin-log slack | grep -q 'desktop_notification C already told' || fail "the repeated notification left no evidence line"
 R=$(slack 'rtm-inject nonsense')
 echo "$R" | grep -q '^rtm-inject:' || fail "rtm-inject with bad json did not complain: $R"
 BEFORE=$(ncalls conversations.mark channel C1)

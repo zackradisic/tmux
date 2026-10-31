@@ -77,6 +77,11 @@ pub struct Sidebar {
     pub preview: Option<chat::Chat>,
     /// The embedded view has the keyboard.
     pub preview_focus: bool,
+    /// The thread the preview shows instead of the channel's timeline:
+    /// its root ts (Enter on a message; Escape comes back).
+    pub thread: Option<String>,
+    /// Thread messages fetched for the preview, by `channel/root`.
+    pub threads: HashMap<String, Vec<Message>>,
 }
 
 /// The preview column's geometry for a mode `w` by `h` with the list
@@ -169,6 +174,8 @@ pub fn open(st: &Shared, client: Option<u64>, pane: Option<u32>) {
             hold: None,
             preview: None,
             preview_focus: false,
+            thread: None,
+            threads: HashMap::new(),
         });
         rebuild(&mut s);
         render(&mut s);
@@ -209,7 +216,11 @@ pub fn render(s: &mut State) {
     // Seven hints at most: the footer is clipped to the list's width,
     // and the rest (o, v, R, [ ]) is on the `?` card and in the menu.
     side.engine.footer = if side.preview_focus {
-        "j/k move · Enter thread · y copy · i compose · Space menu · Esc back to list".to_string()
+        if side.preview.as_ref().is_some_and(|c| c.thread.is_some()) {
+            "j/k move · y copy · r reply · Space menu · Esc back to channel".to_string()
+        } else {
+            "j/k move · Enter thread · y copy · i compose · Space menu · Esc back to list".to_string()
+        }
     } else {
         format!(
             "Enter open · {} preview · {} read · {} compose · {} agent · {} menu · ? help · q close",
@@ -245,6 +256,9 @@ fn draw_preview(c: &chat::Chat, focused: bool, label: String, topic: Vec<Styled>
         head.extend(plain_cells("  ", 0));
         head.extend(topic);
     }
+    if c.thread.is_some() {
+        head.extend(plain_cells(" · thread", ST_BOLD | ST_DIM));
+    }
     if !focused && !c.msgs.is_empty() {
         head.extend(plain_cells(" · l to read", ST_DIM));
     }
@@ -279,21 +293,37 @@ fn sync_preview(s: &mut State) {
     let channel = key.as_deref().and_then(|k| s.channel(k).cloned());
     let Some(side) = s.side.as_mut() else { return };
     let (_, pw, body_y, body_h) = preview_geometry(side.engine.width as usize, side.engine.height as usize, side.engine.list_w());
-    let msgs = key.as_deref().and_then(|k| side.previews.get(k));
+    // A thread belongs to the channel it was opened in.
+    if let (Some(ch), Some(c)) = (channel.as_ref(), side.preview.as_ref()) {
+        if c.channel.id != ch.id {
+            side.thread = None;
+        }
+    }
+    let thread = side.thread.clone();
+    let msgs: Option<Vec<Message>> = match (&channel, &thread) {
+        (Some(ch), Some(root)) => side
+            .threads
+            .get(&thread_key(&ch.id, root))
+            .cloned()
+            // Until the replies are in: the root alone, from the timeline.
+            .or_else(|| side.previews.get(&ch.id).map(|v| v.iter().filter(|m| m.ts == *root).cloned().collect())),
+        (Some(ch), None) => side.previews.get(&ch.id).cloned(),
+        _ => None,
+    };
     let (Some(channel), Some(msgs)) = (channel, msgs) else {
         side.preview = None;
         side.preview_focus = false;
         return;
     };
-    let c = match side.preview.as_mut().filter(|c| c.channel.id == channel.id) {
+    let c = match side.preview.as_mut().filter(|c| c.channel.id == channel.id && c.thread == thread) {
         Some(c) => {
-            // The same channel: new messages (or a refetch) replace the
+            // The same view: new messages (or a refetch) replace the
             // list; following the bottom moves the cursor to the newest.
             // The row's read mark is live here (m moves the rule), unlike
             // the float's, which keeps the mark it opened with.
             let changed = c.msgs.len() != msgs.len() || c.msgs.last().map(|m| &m.ts) != msgs.last().map(|m| &m.ts) || c.msgs.first().map(|m| &m.ts) != msgs.first().map(|m| &m.ts);
             if changed {
-                c.msgs = msgs.clone();
+                c.msgs = msgs;
                 if c.follow || c.cursor_idx().is_none() {
                     let last = c.msgs.len().saturating_sub(1);
                     c.set_cursor_idx(last);
@@ -307,12 +337,19 @@ fn sync_preview(s: &mut State) {
             c
         }
         None => {
-            side.preview_focus = false;
-            // Another channel: the terminal forgets the old one's pictures.
+            // Another view: the terminal forgets the old one's pictures.
+            // Another channel also takes the keyboard back; a thread of
+            // the same channel keeps it.
             if let Some(old) = side.preview.take() {
                 old.forget_images();
+                if old.channel.id != channel.id {
+                    side.preview_focus = false;
+                }
+            } else {
+                side.preview_focus = false;
             }
-            let mut c = chat::embedded(side.engine.mode, channel, side.client, side.pane, msgs.clone(), pw as u32, body_h as u32, body_y as u32);
+            let mut c = chat::embedded(side.engine.mode, channel, side.client, side.pane, msgs, pw as u32, body_h as u32, body_y as u32);
+            c.thread = thread.clone();
             let (on, aspect, root) = chat::picture_setup(side.client, side.pane);
             c.images_on = on;
             c.cell_aspect = aspect;
@@ -702,14 +739,54 @@ fn fetch_preview(st: &Shared, id: crate::store::Identity, key: String) {
     });
 }
 
+/// The `threads` key of a thread.
+fn thread_key(channel: &str, root: &str) -> String {
+    format!("{channel}/{root}")
+}
+
+/// Fetch a thread for the preview: the cache first, then Slack, each
+/// redrawing the column when it lands.
+fn fetch_thread(st: &Shared, id: crate::store::Identity, channel: String, root: String) {
+    let st2 = Rc::clone(st);
+    spawn(async move {
+        let key = thread_key(&channel, &root);
+        let cached = crate::store::thread(&channel, &root).await;
+        if !cached.is_empty() {
+            let mut s = st2.borrow_mut();
+            let Some(side) = s.side.as_mut() else { return };
+            side.threads.insert(key.clone(), cached);
+            sync_preview(&mut s);
+            render(&mut s);
+        }
+        match api::replies(&id, &channel, &root).await {
+            Ok(msgs) => {
+                crate::absorb(&st2, &channel, &msgs).await;
+                let mut s = st2.borrow_mut();
+                let Some(side) = s.side.as_mut() else { return };
+                side.threads.insert(key, msgs);
+                sync_preview(&mut s);
+                render(&mut s);
+            }
+            Err(e) => {
+                log(&format!("slack: preview thread {channel}/{root}: {e}"));
+                preview_status(&st2, &channel, format!("thread: {e}"));
+            }
+        }
+    });
+}
+
 /// A message arrived on the feed: into the channel's preview, if the
-/// sidebar holds one (the caller redraws).
+/// sidebar holds one (the caller redraws); a reply into its thread, if
+/// the preview has fetched that.
 pub fn on_arrived(st: &Shared, m: &Message) {
-    if m.is_reply() {
-        return;
-    }
     let mut s = st.borrow_mut();
     let Some(side) = s.side.as_mut() else { return };
+    if m.is_reply() {
+        if let Some(msgs) = m.thread_ts.as_deref().and_then(|root| side.threads.get_mut(&thread_key(&m.channel, root))) {
+            chat::merge(msgs, vec![m.clone()]);
+        }
+        return;
+    }
     if let Some(msgs) = side.previews.get_mut(&m.channel) {
         chat::merge(msgs, vec![m.clone()]);
     }
@@ -877,7 +954,7 @@ fn preview_key(side: &mut Sidebar, key: &str, mouse: Option<(u32, u32)>) -> Opti
             // The float's size is the engine's whoever has the keyboard.
             "+" | "=" | "-" => return None,
             // Escape clears a selection first, as in the view itself.
-            "Escape" if c.anchor.is_some() => {}
+            "Escape" if c.anchor.is_some() || c.thread.is_some() => {}
             "Escape" | "h" | "Left" => {
                 side.preview_focus = false;
                 c.status = None;
@@ -968,7 +1045,7 @@ fn preview_after(st: &Shared, took: Took) {
             close(st);
             return;
         }
-        After::Back | After::Sidebar => {
+        After::Sidebar => {
             let mut s = st.borrow_mut();
             if let Some(side) = s.side.as_mut() {
                 side.preview_focus = false;
@@ -977,12 +1054,34 @@ fn preview_after(st: &Shared, took: Took) {
                 }
             }
         }
-        After::Switch(thread, _) => {
-            close(st);
-            chat::open(st, channel, thread, client, pane, false);
+        // Enter on a message: its thread, in the preview itself; Escape
+        // (Back) brings the timeline back. The keyboard stays.
+        After::Switch(Some(root), _) => {
+            let id = {
+                let mut s = st.borrow_mut();
+                let Some(side) = s.side.as_mut() else { return };
+                side.thread = Some(root.clone());
+                let fetch = !side.threads.contains_key(&thread_key(&channel.id, &root));
+                sync_preview(&mut s);
+                render(&mut s);
+                if fetch { s.ident.clone() } else { None }
+            };
+            if let Some(id) = id {
+                fetch_thread(st, id, channel.id.clone(), root);
+            }
+            return;
+        }
+        After::Back | After::Switch(None, _) => {
+            let mut s = st.borrow_mut();
+            let Some(side) = s.side.as_mut() else { return };
+            side.thread = None;
+            sync_preview(&mut s);
+            render(&mut s);
             return;
         }
         After::Menu => open_menu(st),
+        // +/- are the engine's before the preview sees them.
+        After::Resize(_) => {}
         After::Post(text, thread) => {
             // Not reachable from the keymap (i and r open the full view),
             // but a paste into a reaction box is not a post either; keep
@@ -1208,6 +1307,9 @@ pub fn on_mode_event(st: &Shared, name: &str, event: &Event) {
             if let Some(side) = s.side.as_mut() {
                 side.engine.resize(w, h);
             }
+            // A drag or resize-pane counts as much as +/-: remembered.
+            let _ = set_option("@slack-width", &w.to_string());
+            let _ = set_option("@slack-height", &h.to_string());
             rebuild(&mut s);
             render(&mut s);
         }
@@ -1400,6 +1502,8 @@ mod tests {
             hold: None,
             preview: None,
             preview_focus: false,
+            thread: None,
+            threads: HashMap::new(),
         };
         side.previews.insert("C1".into(), msgs.clone());
         let mut c = chat::embedded(ModeId(1), channel("C1"), None, None, msgs, pw as u32, body_h as u32, body_y as u32);
