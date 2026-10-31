@@ -27,7 +27,9 @@
 #     the message's thread in the full view, Escape twice is back on the
 #     list; `q` closes;
 #   `open #general`: the channel view with the topic, the history with
-#     mrkdwn resolved (<@U1> -> @zack, *this* -> this), emoji drawn as
+#     mrkdwn resolved (<@U1> -> @zack, *this* -> this), a link whose
+#     label is the url shortened drawn as the whole url and a labelled
+#     link followed by its url (y copies the same), emoji drawn as
 #     glyphs (:raised_hands: in the text, the `fire` reaction, a custom
 #     alias from emoji.list; an image-only custom emoji stays :morph:),
 #     the "new messages" rule before the first unread message that is not
@@ -61,7 +63,9 @@
 #   Space draws the action menu, titled with the channel, on a real tty
 #     client (a second server attached to this one, as in
 #     plugin-agents-menu.sh), with the items that do not apply dimmed;
-#   `send @Tejas ...` posts to the DM; `mark #general` reaches
+#   `send @Tejas ...` posts to the DM; a DM from Tejas injected down the
+#     feed's road (`rtm-inject`) is toasted once (its desktop_notification
+#     is a repeat) and bumps @slack_dms; `mark #general` reaches
 #     conversations.mark; `bind`/`unbind` answer; the plugin is still
 #     alive at the end.
 #
@@ -485,6 +489,19 @@ find "$HOME" -name 'a1700000028000100-0.png' | grep -q . || fail "the giphy pict
 keys k; keys k; keys j; keys j
 [ "$(ncalls _img)" = 2 ] || fail "scrolling fetched a picture again"
 [ "$(screen | grep -c "$PH")" = 10 ] || fail "the picture rows did not survive a scroll"
+# Links: g goes to the oldest message, whose abbreviated label
+# ("example.com/.../docu…") is drawn as the whole url and whose "the
+# docs" label is followed by its url in brackets; y copies the same; G
+# comes back to the newest.
+LONG='https://example.com/some/very/long/path/to/the/document.html'
+keys g
+until_ok 20 screen_has "read $LONG and" || fail "the abbreviated link is not drawn as the full url: $(screen | grep -n 'example.com')"
+screen_has 'docu…' && fail "the shortened label is still on screen"
+screen_has 'the docs <https://docs.example.com/x>' || fail "the labelled link lacks its url: $(screen | grep 'the docs')"
+keys y
+until_ok 40 buffer_has "read $LONG and the docs <https://docs.example.com/x>" || fail "y did not copy the full urls: $($TMUX show-buffer)"
+keys G
+until_ok 20 sh -c "$TMUX capture-pane -M -p -t $FORM | grep '▎' | grep -q shipped" || fail "G did not return to the newest message: $(screen | grep '▎')"
 # y copies the message under the cursor (the newest) as a transcript
 # line: author, stamp, text with the emoji as glyphs; v then k then y
 # copies the two newest, oldest first.
@@ -685,6 +702,33 @@ VIEW=
 R=$(slack 'send @Tejas see you at 3')
 [ "$R" = "posting to @Tejas…" ] || fail "send did not answer: $R"
 until_ok 40 posted D1 'see you at 3' || fail "the DM did not reach the fake: $(fetch "$BASE/_posted")"
+# The DM we just sent is read: no unread DM. A message from Tejas in it,
+# injected down the feed's road (the fake has no websocket), is told as
+# a toast titled with the sender (the plugin logs the toast; no toast
+# plugin is loaded here) and bumps @slack_dms at once; the fake is told
+# too, so the next badge poll agrees. Slack's desktop_notification for
+# the same message is a repeat and stays silent; our own message in the
+# DM, and a message in a channel, are not toasts of their own.
+until_ok 40 sh -c "[ \"\$($TMUX show-options -sv @slack_dms)\" = 0 ]" || fail "@slack_dms after our DM: $($TMUX show-options -sv @slack_dms)"
+toasts() { $TMUX plugin-log slack 2>/dev/null | grep -c 'slack: toast:'; }
+T0=$(toasts)
+R=$(slack 'rtm-inject {"type":"message","channel":"D1","user":"U1","text":"me again","ts":"1700000900.000100"}')
+[ "$R" = "injected" ] || fail "rtm-inject (ours) did not answer: $R"
+R=$(slack 'rtm-inject {"type":"message","channel":"C1","user":"U2","text":"a channel message","ts":"1700000901.000100"}')
+[ "$R" = "injected" ] || fail "rtm-inject (channel) did not answer: $R"
+R=$(slack 'rtm-inject {"type":"message","channel":"D1","user":"U2","text":"ping from the *feed*","ts":"1700000902.000100"}')
+[ "$R" = "injected" ] || fail "rtm-inject did not answer: $R"
+fetch "$BASE/_unread?channel=D1" >/dev/null
+until_ok 40 sh -c "$TMUX plugin-log slack | grep -q 'slack: toast: Tejas: ping from the feed'" || fail "the DM was not toasted: $($TMUX plugin-log slack | tail -5)"
+until_ok 40 sh -c "[ \"\$($TMUX show-options -sv @slack_dms)\" = 1 ]" || fail "@slack_dms after the DM: $($TMUX show-options -sv @slack_dms)"
+R=$(slack 'rtm-inject {"type":"desktop_notification","title":"Morph","subtitle":"Tejas","msg":"1700000902.000100","channel":"D1","content":"ping from the feed"}')
+[ "$R" = "injected" ] || fail "rtm-inject (notification) did not answer: $R"
+R=$(slack 'rtm-inject {"type":"desktop_notification","title":"Morph","subtitle":"#general","msg":"1700000901.000100","channel":"C1","content":"Tejas: a channel message"}')
+[ "$R" = "injected" ] || fail "rtm-inject (channel notification) did not answer: $R"
+until_ok 40 sh -c "$TMUX plugin-log slack | grep -q 'slack: toast: Morph (#general): Tejas: a channel message'" || fail "the channel notification was not toasted: $($TMUX plugin-log slack | tail -5)"
+[ "$(toasts)" = "$((T0 + 2))" ] || fail "$(( $(toasts) - T0 )) toasts, not 2 (the DM once, the channel once): $($TMUX plugin-log slack | grep 'toast:')"
+R=$(slack 'rtm-inject nonsense')
+echo "$R" | grep -q '^rtm-inject:' || fail "rtm-inject with bad json did not complain: $R"
 BEFORE=$(ncalls conversations.mark channel C1)
 slack 'mark #general'
 until_ok 40 marks_grew "$BEFORE" || fail "mark did not reach conversations.mark (had $BEFORE)"

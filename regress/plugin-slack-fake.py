@@ -91,6 +91,12 @@ HISTORY = {
                                       "title": {"type": "plain_text", "text": "GIF"}, "image_width": 400, "image_height": 50,
                                       "is_animated": True}]}]},
         {"type": "message", "user": "U9", "text": "ghost", "ts": "1700000025.000100"},
+        # Links as Slack delivers them: a bare url whose label is the url
+        # shortened, and a url behind real text. The view must put the
+        # whole url on screen either way (the terminal makes it clickable).
+        {"type": "message", "user": "U2",
+         "text": "read <https://example.com/some/very/long/path/to/the/document.html|example.com/some/very/long/path/to/the/docu\u2026> and <https://docs.example.com/x|the docs>",
+         "ts": "1700000020.000100"},
     ],
     "C2": [
         {"type": "message", "user": "U1", "text": "random chatter", "ts": "1700000500.000100"},
@@ -245,6 +251,10 @@ def handle(method, f):
         else:
             HISTORY[cid].insert(0, m)
             COUNTS[cid]["latest"] = m["ts"]
+            # Our own post reads the conversation, as Slack has it.
+            COUNTS[cid]["last_read"] = m["ts"]
+            COUNTS[cid]["has_unreads"] = False
+            COUNTS[cid]["mention_count"] = 0
         POSTED.append({"channel": cid, "ts": m["ts"], "text": m["text"], "thread_ts": m.get("thread_ts")})
         return ok(channel=cid, ts=m["ts"], message=m)
     if method == "reactions.add":

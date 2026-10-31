@@ -127,6 +127,12 @@ pub fn on_message(st: &Shared, m: &WsMessage) {
         return;
     }
     let Ok(v) = m.json::<Value>() else { return };
+    inject(st, v);
+}
+
+/// An event as if it had arrived on the socket: the test door
+/// (`rtm-inject`), and the one road every frame takes.
+pub fn inject(st: &Shared, v: Value) {
     let st2 = st.clone();
     spawn(async move {
         handle(&st2, v).await;
@@ -135,6 +141,61 @@ pub fn on_message(st: &Shared, m: &WsMessage) {
 
 fn s(v: &Value, k: &str) -> Option<String> {
     v.get(k).and_then(Value::as_str).map(str::to_string)
+}
+
+/// How long a `message` and the `desktop_notification` Slack sends for
+/// it may be apart and still count as one.
+const TOAST_DEDUP_MS: u64 = 10_000;
+
+/// The toasts of the last few seconds, by channel and message ts: a
+/// DM toasts on its `message` event and again, were it not for this, on
+/// Slack's `desktop_notification` for the same message.
+#[derive(Default)]
+pub struct Recent {
+    seen: Vec<(String, u64)>,
+}
+
+impl Recent {
+    /// True the first time `key` is seen within the window.
+    pub fn first(&mut self, key: &str, now_ms: u64) -> bool {
+        self.seen.retain(|(_, at)| now_ms.saturating_sub(*at) < TOAST_DEDUP_MS);
+        if self.seen.iter().any(|(k, _)| k == key) {
+            return false;
+        }
+        self.seen.push((key.to_string(), now_ms));
+        true
+    }
+}
+
+/// Whether a `message` event raises a toast of its own. Slack's
+/// `desktop_notification` covers channels by the user's preferences;
+/// a direct message (one to one or a group) from someone else is told
+/// here regardless, unless the conversation is muted or on screen.
+pub fn message_toasts(kind: Kind, ours: bool, muted: bool, viewing: bool) -> bool {
+    kind.is_dm() && !ours && !muted && !viewing
+}
+
+/// The toast's key for a message: the dedup key, and the toast plugin's
+/// (one row per conversation or thread).
+fn toast_keys(channel: &str, ts: &str, thread: Option<&str>) -> (String, String, Option<String>) {
+    let dedup = format!("{channel}@{ts}");
+    let row = format!("slack:{channel}{}", thread.map(|t| format!("/{t}")).unwrap_or_default());
+    let action = if channel.is_empty() {
+        None
+    } else {
+        Some(match thread {
+            Some(t) => format!("plugin-command slack 'open {channel} {t}'"),
+            None => format!("plugin-command slack 'open {channel}'"),
+        })
+    };
+    (dedup, row, action)
+}
+
+/// One toast, logged (the regress suite reads the line) and handed to
+/// the toast plugin.
+async fn toast(title: &str, body: &str, key: &str, action: Option<&str>) {
+    log(&format!("slack: toast: {title}: {}", listkit::text::clip(&listkit::text::one_line(body), 120)));
+    crate::notify(title, body, Some(key), action).await;
 }
 
 async fn handle(st: &Shared, v: Value) {
@@ -167,16 +228,14 @@ async fn handle(st: &Shared, v: Value) {
             let title = if subtitle.is_empty() || title.contains(&subtitle) { title } else { format!("{title} ({subtitle})") };
             let channel = s(&v, "channel").unwrap_or_default();
             let thread = s(&v, "thread_ts").filter(|t| !t.is_empty());
-            let action = if channel.is_empty() {
-                None
-            } else {
-                Some(match &thread {
-                    Some(t) => format!("plugin-command slack 'open {channel} {t}'"),
-                    None => format!("plugin-command slack 'open {channel}'"),
-                })
-            };
-            let key = format!("slack:{channel}{}", thread.map(|t| format!("/{t}")).unwrap_or_default());
-            crate::notify(&title, &content, Some(&key), action.as_deref()).await;
+            // `msg` is the message's ts; a DM's `message` event may have
+            // toasted this one already.
+            let ts = s(&v, "msg").or_else(|| s(&v, "ts")).or_else(|| s(&v, "event_ts")).unwrap_or_default();
+            let (dedup, key, action) = toast_keys(&channel, &ts, thread.as_deref());
+            if !st.borrow_mut().toasted.first(&dedup, now_ms()) {
+                return;
+            }
+            toast(&title, &content, &key, action.as_deref()).await;
         }
         "reaction_added" | "reaction_removed" => {
             let Some(item) = v.get("item") else { return };
@@ -226,13 +285,24 @@ async fn on_chat_message(st: &Shared, v: &Value) {
         }
         _ => {
             let Some(m) = api::message_from(&channel, v) else { return };
-            let (me, label, who, is_dm, muted) = {
+            let (me, label, who, kind, muted, viewing, body) = {
                 let s = st.borrow();
                 let me = s.ident.as_ref().map(|i| i.user_id.clone()).unwrap_or_default();
                 let ch = s.channel(&channel).cloned();
                 let label = ch.as_ref().map(|c| s.channel_label(c)).unwrap_or_else(|| channel.clone());
                 let who = m.user.as_deref().map(|u| s.user_label(u)).or_else(|| m.username.clone()).unwrap_or_else(|| "someone".into());
-                (me, label, who, ch.as_ref().is_some_and(|c| c.kind == Kind::Im), ch.as_ref().is_some_and(|c| c.is_muted))
+                // On screen: the channel view is on this conversation, or
+                // the sidebar's preview shows it.
+                let viewing = s.chat.as_ref().is_some_and(|c| c.channel.id == channel)
+                    || s.side.as_ref().and_then(|sd| sd.preview.as_ref()).is_some_and(|p| p.channel.id == channel);
+                let mut body = s.names.with(|n| mrkdwn::plain(&m.text, n));
+                if body.is_empty() {
+                    body = match m.files.first() {
+                        Some(f) => format!("📎 {}", f.name),
+                        None => "(attachment)".to_string(),
+                    };
+                }
+                (me, label, who, ch.as_ref().map(|c| c.kind), ch.as_ref().is_some_and(|c| c.is_muted), viewing, body)
             };
             let ours = m.user.as_deref() == Some(me.as_str());
             let mention = !ours && (m.text.contains(&format!("<@{me}>")) || m.text.contains("<!here") || m.text.contains("<!channel") || m.text.contains("<!everyone"));
@@ -260,7 +330,17 @@ async fn on_chat_message(st: &Shared, v: &Value) {
             sidebar::on_arrived(st, &m);
             sidebar::refresh(st);
             chat::on_arrived(st, m.clone());
-            let _ = (is_dm, muted, who, label);
+            // A direct message is told at once, whether or not Slack
+            // follows with a desktop_notification for it (that one is
+            // then dropped as a repeat). Title: the sender, and the
+            // group for a group DM.
+            if kind.is_some_and(|k| message_toasts(k, ours, muted, viewing)) {
+                let (dedup, key, action) = toast_keys(&channel, &m.ts, m.thread_ts.as_deref().filter(|_| m.is_reply()));
+                if st.borrow_mut().toasted.first(&dedup, now_ms()) {
+                    let title = if kind == Some(Kind::Mpim) { format!("{who} ({label})") } else { who.clone() };
+                    toast(&title, &body, &key, action.as_deref()).await;
+                }
+            }
             bridge(st, &m).await;
         }
     }
@@ -305,5 +385,43 @@ async fn bridge(st: &Shared, m: &store::Message) {
         if let Err(e) = service::call_json::<_, Value>("mailbox", "deliver", &req).await {
             log(&format!("slack: bridge to {agent}: {}", e.message));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_messages_toast_channels_do_not() {
+        // A DM or a group DM from someone else, not on screen, not muted.
+        assert!(message_toasts(Kind::Im, false, false, false));
+        assert!(message_toasts(Kind::Mpim, false, false, false));
+        // Our own words, a muted conversation, one we are looking at.
+        assert!(!message_toasts(Kind::Im, true, false, false));
+        assert!(!message_toasts(Kind::Im, false, true, false));
+        assert!(!message_toasts(Kind::Im, false, false, true));
+        // Channels are Slack's call (desktop_notification by its prefs).
+        assert!(!message_toasts(Kind::Public, false, false, false));
+        assert!(!message_toasts(Kind::Private, false, false, false));
+    }
+
+    #[test]
+    fn a_message_and_its_notification_toast_once() {
+        let mut r = Recent::default();
+        assert!(r.first("D1@1.000", 1_000));
+        // Slack's desktop_notification for the same message, 2 s later.
+        assert!(!r.first("D1@1.000", 3_000));
+        // Another message, the same channel: its own toast.
+        assert!(r.first("D1@2.000", 3_500));
+        // The window has passed: told again.
+        assert!(r.first("D1@1.000", 1_000 + TOAST_DEDUP_MS));
+        let (dedup, key, action) = toast_keys("D1", "1.000", None);
+        assert_eq!((dedup.as_str(), key.as_str()), ("D1@1.000", "slack:D1"));
+        assert_eq!(action.as_deref(), Some("plugin-command slack 'open D1'"));
+        let (_, key, action) = toast_keys("D1", "1.500", Some("1.000"));
+        assert_eq!(key, "slack:D1/1.000");
+        assert_eq!(action.as_deref(), Some("plugin-command slack 'open D1 1.000'"));
+        assert_eq!(toast_keys("", "1", None).2, None);
     }
 }

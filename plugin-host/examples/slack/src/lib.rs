@@ -134,6 +134,9 @@ pub struct State {
     /// The ts of messages this plugin posted (an agent's reply): the
     /// bridge must not hand them back to the agent.
     pub own_posts: HashSet<String>,
+    /// The toasts of the last few seconds, so a DM told on its `message`
+    /// event is not told again on Slack's `desktop_notification` for it.
+    pub toasted: feed::Recent,
     /// User ids asked of `users.info` this process (in flight, found,
     /// or refused): each is asked once. Slack Connect users are not in
     /// `users.list`, so names arrive lazily as their messages do.
@@ -271,6 +274,7 @@ impl Plugin for Slack {
             feed_error: None,
             bindings: Vec::new(),
             own_posts: HashSet::new(),
+            toasted: feed::Recent::default(),
             names_pending: HashSet::new(),
             names_queue: Vec::new(),
             names_inflight: 0,
@@ -770,6 +774,25 @@ fn on_command(st: &Shared, event: &Event) {
                 notify(&title, &body, None, None).await;
             });
         }
+        // "rtm-inject <json>": an RTM frame as if the socket had carried
+        // it, down the same road. Only for a plugin loaded with a session
+        // given outright (`-o token=`: the regress suite's fake, which has
+        // no websocket); on the desktop app's session the verb does not
+        // exist.
+        "rtm-inject" if !st.borrow().cfg.token.is_empty() => {
+            match serde_json::from_str::<serde_json::Value>(&rest) {
+                Ok(v) if v.is_object() => {
+                    feed::inject(st, v);
+                    let _ = reply("injected");
+                }
+                Ok(_) => {
+                    let _ = reply("rtm-inject: not an event object");
+                }
+                Err(e) => {
+                    let _ = reply(&format!("rtm-inject: {e}"));
+                }
+            }
+        }
         "close" => {
             handoff::close();
             sidebar::close(st);
@@ -1025,6 +1048,7 @@ mod tests {
             feed_error: None,
             bindings: Vec::new(),
             own_posts: HashSet::new(),
+            toasted: feed::Recent::default(),
             names_pending: HashSet::new(),
             names_queue: Vec::new(),
             names_inflight: 0,
