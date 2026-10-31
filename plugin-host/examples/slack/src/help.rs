@@ -34,16 +34,27 @@ pick: the sidebar, as a floating picker.
   Enter       open the channel view        m   mark read
   Space       the action menu              o   open in the Slack app
   v           sections / unread / all      n   compose to this channel
-  j/k h/l     move, fold (z: a section)    /   search (# channel, @ user,
-  ?           every key (R: refresh)           ! unread|mention|dm|muted)
+  j/k h       move, up a level (z: fold)   /   search (# channel, @ user,
+  l / Right   read the preview                 ! unread|mention|dm|muted)
+  ?           every key (R: refresh)
 
 Each row starts with its badge: a red `!` block when you were mentioned
 (the name red, the count after it as @3), a cyan dot while it has
 unread messages (the name bold), a dim dot when read or muted. The
-right column is how long ago the channel last spoke. The preview shows
-the channel's recent messages, newest at the bottom, attachments under
-their text; [ and ] scroll it. Space opens a menu of every action for
-the row, dimmed where one does not apply; each item is the key itself.";
+right column is how long ago the channel last spoke. The preview is
+the channel view itself, laid out at the column's width: the channel's
+recent messages, newest at the bottom, attachments under their text;
+[ and ] scroll it. Space opens a menu of every action for the row,
+dimmed where one does not apply; each item is the key itself.
+
+l, Right or a click in the column hand the preview the keyboard (the
+separator lights up): the channel view's keys then work there - j/k
+move over the messages, J/K page, g/G, y copies the message under the
+cursor (v then j/k a selection), Y its permalink, e reacts, m marks
+the channel read, Enter opens the message's thread in the full channel
+view, i and r open it composing (r in the message's thread), Space its
+menu, ? its hints. Escape, h or Left give the keyboard back to the
+list; q closes the sidebar either way.";
 
 pub const OPEN: &str = "\
 open: the channel view.

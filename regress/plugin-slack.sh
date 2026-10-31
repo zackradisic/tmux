@@ -20,7 +20,12 @@
 #     which a second server's pane provides by attaching) titled with
 #     the channel, "mark read" offered with its key on an unread row;
 #     `menu-key v` (the road every item takes back) switches to the
-#     unread view (no read channel in it); `q` closes;
+#     unread view (no read channel in it); `l` hands the keyboard to the
+#     preview (the channel view embedded in the column: the footer swaps,
+#     the separator lights), `k` moves its cursor bar, `y` copies that
+#     message, `-`/`+` keep the column inside the separator, Enter opens
+#     the message's thread in the full view, Escape twice is back on the
+#     list; `q` closes;
 #   `open #general`: the channel view with the topic, the history with
 #     mrkdwn resolved (<@U1> -> @zack, *this* -> this), emoji drawn as
 #     glyphs (:raised_hands: in the text, the `fire` reaction, a custom
@@ -55,8 +60,11 @@ TERM=screen
 unset TMUX TMUX_PANE AI_AGENT
 
 [ -z "$TEST_TMUX" ] && TEST_TMUX=$(readlink -f ../tmux)
-TMUX="$TEST_TMUX -Lslack-test"
-OUTER="$TEST_TMUX -Lslack-test-outer"
+# SLACK_TEST_SOCKET names the servers: two checkouts running this suite
+# at once on the default name kill each other's servers.
+SOCK=${SLACK_TEST_SOCKET:-slack-test}
+TMUX="$TEST_TMUX -L$SOCK"
+OUTER="$TEST_TMUX -L$SOCK-outer"
 WASM=$(dirname "$TEST_TMUX")/plugin-host/target/wasm32-unknown-unknown/release/slack.wasm
 FAKE=$(dirname "$0")/plugin-slack-fake.py
 FAKE=$(cd "$(dirname "$FAKE")" && pwd -P)/$(basename "$FAKE")
@@ -227,7 +235,7 @@ slack bogus | grep -q 'unknown verb' || fail "an unknown verb did not answer"
 # this one: capturing that pane shows what the user's terminal would,
 # menu and all. The sidebar is opened by a key pressed there, so the
 # plugin knows which client asked and the menu goes to it by name.
-$OUTER -f/dev/null new-session -d -x 160 -y 45 "$TEST_TMUX -Lslack-test attach -t main" || fail "outer new-session"
+$OUTER -f/dev/null new-session -d -x 160 -y 45 "$TEST_TMUX -L$SOCK attach -t main" || fail "outer new-session"
 VIEW=$($OUTER list-panes -F '#{pane_id}' | head -1)
 [ -n "$VIEW" ] || fail "no viewer pane"
 until_ok 40 sh -c "$TMUX list-clients -F '#{client_tty}' | grep -q /dev" || fail "no tty client attached"
@@ -285,6 +293,75 @@ RANDOM_AT=$(screen | grep -n '#random' | head -1 | cut -d: -f1)
 GENERAL_AT=$(screen | grep -n '#general' | head -1 | cut -d: -f1)
 [ "$RANDOM_AT" -lt "$GENERAL_AT" ] || fail "#general ($GENERAL_AT) did not drop below #random ($RANDOM_AT)"
 cursor_row | grep -q '#random' || fail "the cursor followed the marked row: $(cursor_row)"
+# --- the preview has the keyboard --------------------------------------------
+# The preview is the channel view embedded in the column, drawn by the
+# plugin at the column's width. l hands it the keyboard: the footer
+# swaps to the channel view's hints and the separator lights up (┃);
+# its keys then work on the messages; Escape hands the keyboard back.
+# Nothing the column draws may cross the separator, at any width.
+SEP_PY='
+import sys
+lines = sys.stdin.read().split("\n")
+cols = [i for i, ch in enumerate(lines[0]) if ch in "│┃"]
+if len(cols) != 1:
+    print("no single separator in the title row: %r" % lines[0]); sys.exit(1)
+c = cols[0]
+bad = [l for l in lines if len(l) > c and l[c] not in "│┃"]
+print("\n".join(bad)); sys.exit(1 if bad else 0)
+'
+sep_ok() { $TMUX capture-pane -M -p -t "$FORM" | python3 -c "$SEP_PY"; }
+sep_lit() { screen | grep -q '┃'; }
+# The cursor is on #random; down to #general, whose messages the sidebar
+# already holds.
+i=0
+while [ $i -lt 4 ] && ! cursor_row | grep -q '#general'; do keys j; i=$((i + 1)); done
+cursor_row | grep -q '#general' || fail "j did not reach #general: $(cursor_row)"
+until_ok 40 screen_has 'look at this' || fail "the preview does not show #general"
+sep_ok || fail "the preview column crosses the separator: $(sep_ok)"
+sep_lit && fail "the separator is lit before l"
+keys l
+until_ok 20 screen_has 'Esc back to list' || fail "l did not hand the keyboard to the preview: $(screen | tail -1)"
+sep_lit || fail "the separator did not light up"
+sep_ok || fail "the focused column crosses the separator: $(sep_ok)"
+screen | grep '▎' | grep -q 'shipped' || fail "the cursor bar is not on the newest message: $(screen | grep '▎')"
+keys k
+screen | grep '▎' | grep -q 'look at this' || fail "k did not move the cursor bar up: $(screen | grep '▎')"
+screen | grep '▎' | grep -q 'shipped' && fail "the cursor bar stayed on the newest message too"
+keys y
+until_ok 40 buffer_has 'Tejas (2023-11-1[45] [0-9:]*): hey @zack look at this' || fail "y did not copy the message under the preview cursor: $($TMUX show-buffer)"
+until_ok 20 screen_has 'copied 1 message' || fail "no copied status in the column: $(screen | tail -1)"
+# - and + resize the float with the keyboard on the preview; the column
+# is laid out again at each width.
+keys -
+until_ok 20 sep_ok || fail "after - the column crosses the separator: $(sep_ok)"
+screen_has 'look at this' || fail "after - the preview lost its messages"
+sep_lit || fail "after - the preview lost the keyboard"
+keys +
+until_ok 20 sep_ok || fail "after + the column crosses the separator: $(sep_ok)"
+# Enter opens the message's thread in the full channel view.
+keys Enter
+until_ok 40 mode_shows '· thread' || fail "Enter in the preview did not open the thread"
+FORM=$(mode_pane)
+until_ok 40 screen_has 'look at this' || fail "the thread lacks its root"
+screen_lacks 'morning' || fail "the thread shows the timeline"
+# Escape: the timeline, then the sidebar again, the keyboard on the list.
+keys Escape
+until_ok 40 screen_has 'morning' || fail "Escape did not return to the timeline"
+keys Escape
+until_ok 40 mode_shows 'slack Morph' || fail "Escape in the timeline did not open the sidebar"
+FORM=$(mode_pane)
+until_ok 40 screen_has 'Work' || fail "the reopened sidebar shows no Work section"
+sep_lit && fail "the reopened sidebar has the keyboard on the preview"
+screen_has 'l preview' || fail "the footer does not offer l: $(screen | tail -1)"
+# l then Escape: the keyboard comes back to the list, where j moves the cursor.
+until_ok 40 screen_has 'random chatter' || fail "the preview of the first row never loaded"
+keys l
+until_ok 20 sep_lit || fail "l did not light the separator the second time"
+keys Escape
+sep_lit && fail "Escape did not hand the keyboard back to the list"
+ROW=$(cursor_row)
+keys j
+[ "$(cursor_row)" != "$ROW" ] || fail "j after Escape did not move the list cursor: $ROW"
 keys q
 until_ok 40 mode_closed || fail "q did not close the sidebar"
 FORM=
@@ -396,7 +473,7 @@ FORM=
 # draw one. A second server's pane attaches to this one as a genuine
 # pty client, and capturing that pane is what the user would see.
 $OUTER kill-server 2>/dev/null
-$OUTER -f/dev/null new-session -d -x 160 -y 45 "$TEST_TMUX -Lslack-test attach -t main" || fail "outer new-session"
+$OUTER -f/dev/null new-session -d -x 160 -y 45 "$TEST_TMUX -L$SOCK attach -t main" || fail "outer new-session"
 until_ok 40 sh -c "$TMUX list-clients -F '#{client_tty}' | grep -q ." || fail "no tty client attached"
 VIEW=$($OUTER list-panes -F '#{pane_id}' | head -1)
 [ -n "$VIEW" ] || fail "no viewer pane"

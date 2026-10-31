@@ -523,8 +523,11 @@ as your own Slack sidebar is (its sections, then channels, then DMs). Rows look
 like the agents picker's: the badge comes first (`!` on a red block and the
 count when you were mentioned, a cyan `●` while unread, a dim `·` once read),
 an unread name is bold, a read or muted one dim, and the right column says how
-long ago the channel last spoke. The preview shows the channel's recent
-messages, newest at the bottom. `Enter` opens the **channel view**: a
+long ago the channel last spoke. The preview is the channel view itself, laid
+out at the column's width: the channel's recent messages, newest at the bottom.
+`l` (or a click in the column) hands it the keyboard, so `j`/`k`, `y`, `e`, `m`
+and `Enter` work on the messages right there and `Escape` comes back to the
+list. `Enter` on a row opens the **channel view**: a
 transcript with day separators, the new-messages line, reactions and emoji
 drawn as glyphs (Slack's names, skin tones and your workspace's custom aliases
 included), bot cards with their fields, and every author by name, Slack
