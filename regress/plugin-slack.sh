@@ -419,6 +419,18 @@ sep_lit && fail "Escape did not hand the keyboard back to the list"
 ROW=$(cursor_row)
 keys j
 [ "$(cursor_row)" != "$ROW" ] || fail "j after Escape did not move the list cursor: $ROW"
+# n on a row is the hand-off, not compose: the form opens over the
+# sidebar with the previewed DM's message; Escape puts it away.
+keys g; keys g
+until_ok 40 screen_has 'are you around' || fail "the DM preview is not showing before n"
+keys n
+until_ok 40 form_open || fail "n in the sidebar opened no hand-off form"
+HF=$(form_pane)
+until_ok 40 fscreen_has '1 message from @Tejas' || fail "the form is not about the previewed DM: $(fscreen | head -3)"
+mode_shows 'slack Morph' || fail "n opened the channel view instead of keeping the sidebar"
+fkeys Escape
+until_ok 20 form_closed || fail "Escape did not close the hand-off form"
+HF=
 keys q
 until_ok 40 mode_closed || fail "q did not close the sidebar"
 FORM=

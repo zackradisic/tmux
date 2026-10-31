@@ -95,7 +95,8 @@ pub fn keys() -> KeyTable {
     Engine::base_keys()
         .with("open_app", "o", "rows", "open the channel in the Slack app")
         .with("mark", "m", "rows", "mark the channel read")
-        .with("compose", "n", "rows", "compose a message to the channel")
+        .with("compose", "i", "rows", "compose a message to the channel")
+        .with("agent", "n", "rows", "new agent from the previewed message (or a selection made there)")
         .with("menu", "Space", "rows", "the action menu")
         .with("view", "v", "picker", "sections / unread / all")
         .with("refresh", "R", "picker", "fetch channels, sections, users and badges again")
@@ -211,10 +212,11 @@ pub fn render(s: &mut State) {
         "j/k move · Enter thread · y copy · i compose · Space menu · Esc back to list".to_string()
     } else {
         format!(
-            "Enter open · {} preview · {} read · {} compose · {} menu · ? help · q close",
+            "Enter open · {} preview · {} read · {} compose · {} agent · {} menu · ? help · q close",
             k("focus"),
             k("mark"),
             k("compose"),
+            k("agent"),
             k("menu"),
         )
     };
@@ -749,6 +751,7 @@ fn open_menu(st: &Shared) {
             items.push_str(&menu_item(NAME, "read the preview", &k("focus"), row && readable));
             items.push_str(&menu_item(NAME, "mark read", &k("mark"), row && unread));
             items.push_str(&menu_item(NAME, "compose", &k("compose"), row));
+            items.push_str(&menu_item(NAME, "new agent from the preview", &k("agent"), row && readable));
             items.push_str(&menu_item(NAME, "open in the Slack app", &k("open_app"), row));
             items.push_str(" ''");
             items.push_str(&menu_item(NAME, &format!("view: {}", side.view.next().label()), &k("view"), true));
@@ -856,6 +859,12 @@ fn preview_key(side: &mut Sidebar, key: &str, mouse: Option<(u32, u32)>) -> Opti
             let step = (c.body_h() / 2).max(1) as isize;
             c.scroll(if key == "[" { -step } else { step });
             return Some(Took::Chat(After::None));
+        }
+        // n on a row is the preview's n: the message under its cursor
+        // (or a selection made there) goes to a new agent.
+        if key == side.engine.keys.key_of("agent") && can_focus(side) {
+            let c = side.preview.as_mut()?;
+            return Some(Took::Chat(chat::handle_key(c, "n", None)));
         }
         return None;
     }
@@ -1236,6 +1245,15 @@ fn execute(st: &Shared, outcome: Outcome) {
                         None => return,
                     },
                     "open_app" => After::OpenApp(chans),
+                    // The preview took n when it had something; here it
+                    // has not loaded (or the row is a header).
+                    "agent" => {
+                        if let Some(side) = s.side.as_mut() {
+                            side.engine.status = Some("the preview has nothing to hand off yet".into());
+                        }
+                        render(&mut s);
+                        After::None
+                    }
                     "mark" => {
                         let ids: Vec<String> = chans.into_iter().map(|c| c.id).collect();
                         if let Some(side) = s.side.as_mut() {

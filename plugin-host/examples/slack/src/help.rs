@@ -33,10 +33,10 @@ pick: the sidebar, as a floating picker.
 
   Enter       open the channel view        m   mark read
   Space       the action menu              o   open in the Slack app
-  v           sections / unread / all      n   compose to this channel
-  j/k h       move, up a level (z: fold)   /   search (# channel, @ user,
-  l / Right   read the preview                 ! unread|mention|dm|muted)
-  ?           every key (R: refresh)
+  v           sections / unread / all      i   compose to this channel
+  j/k h       move, up a level (z: fold)   n   new agent from the preview
+  l / Right   read the preview             /   search (# channel, @ user,
+  ?           every key (R: refresh)           ! unread|mention|dm|muted)
 
 An Unread section sits above your own sections: every channel and DM
 with something new, DMs first, in the order of the badges; the rows
