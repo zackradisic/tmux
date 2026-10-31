@@ -841,6 +841,7 @@ pub async fn post_message(st: &Shared, channel: &str, text: &str, thread_ts: Opt
             c.mentions = 0;
         }
     }
+    sidebar::on_arrived(st, &m);
     chat::on_posted(st, m);
     sidebar::refresh(st);
     Ok(ts)

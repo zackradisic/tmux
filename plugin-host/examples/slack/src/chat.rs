@@ -38,6 +38,9 @@ use crate::{api, emoji, images, mrkdwn, sidebar, store, timefmt, NameMap, Shared
 const GROUP_SECS: i64 = 5 * 60;
 /// `mark_read` goes to Slack at most this often while the view follows.
 const MARK_DEBOUNCE_MS: u64 = 2000;
+/// The cell aspect a view assumes before it has asked the window for
+/// its own (an embedded view never does; it shows no pictures).
+const DEFAULT_CELL_ASPECT: f64 = 2.0;
 /// A page of history, for the first fetch of a thin cache and for `L`.
 const PAGE: u32 = 100;
 /// The cache has to hold at least this many timeline messages before a
@@ -211,7 +214,7 @@ impl Chat {
         }
     }
 
-    fn body_h(&self) -> usize {
+    pub(crate) fn body_h(&self) -> usize {
         (self.height as usize).saturating_sub(self.chrome as usize).max(1)
     }
 
@@ -233,22 +236,22 @@ impl Chat {
         (a.min(cur)..=a.max(cur)).contains(&i)
     }
 
-    fn max_top(&self) -> usize {
+    pub(crate) fn max_top(&self) -> usize {
         self.lines.len().saturating_sub(self.body_h())
     }
 
-    fn cursor_idx(&self) -> Option<usize> {
+    pub(crate) fn cursor_idx(&self) -> Option<usize> {
         let ts = self.cursor.as_deref()?;
         self.msgs.iter().position(|m| m.ts == ts)
     }
 
-    fn set_cursor_idx(&mut self, i: usize) {
+    pub(crate) fn set_cursor_idx(&mut self, i: usize) {
         self.cursor = self.msgs.get(i).map(|m| m.ts.clone());
     }
 
     /// Scroll so the cursor message is on screen; a message taller than
     /// the body shows from its first line.
-    fn reveal_cursor(&mut self) {
+    pub(crate) fn reveal_cursor(&mut self) {
         let Some(i) = self.cursor_idx() else { return };
         let Some((first, last)) = lines_of(&self.lines, i) else { return };
         let h = self.body_h();
@@ -262,7 +265,7 @@ impl Chat {
 
     /// Scroll by `delta` lines; moving up leaves the bottom, reaching
     /// it sticks there again.
-    fn scroll(&mut self, delta: isize) {
+    pub(crate) fn scroll(&mut self, delta: isize) {
         let was = self.top;
         let top = (self.top as isize + delta).max(0) as usize;
         self.top = top.min(self.max_top());
@@ -497,14 +500,26 @@ fn relayout(s: &mut State) {
     let now = (now_ms() / 1000) as i64;
     let State { chat, images, .. } = s;
     let Some(c) = chat.as_mut() else { return };
-    // A reader scrolled up keeps the message under the top line where it
-    // is, however many picture rows arrive above it.
+    let pics = Pictures { sizes: &images.ready, cell_aspect: c.cell_aspect };
+    let on = c.images_on;
+    layout_chat(c, &names, tz, &me, now, on.then_some(&pics));
+    let wanted = c.wanted_images(images);
+    if !wanted.is_empty() {
+        images::request(s, wanted);
+    }
+}
+
+/// Lay one view out again at its width: the float's, or a view embedded
+/// in another's column (the sidebar's preview, which passes no
+/// pictures). Following the bottom keeps it there; otherwise a reader
+/// scrolled up keeps the message under the top line where it is,
+/// however many picture rows arrive above it.
+pub(crate) fn layout_chat(c: &mut Chat, names: &NameMap, tz: i64, me: &str, now: i64, pics: Option<&Pictures>) {
     let anchor = (!c.follow)
         .then(|| c.lines.iter().skip(c.top).find_map(|l| l.msg))
         .flatten()
         .and_then(|i| Some((c.msgs.get(i)?.ts.clone(), c.top as isize - lines_of(&c.lines, i)?.0 as isize)));
-    let pics = Pictures { sizes: &images.ready, cell_aspect: c.cell_aspect };
-    c.lines = layout(&c.msgs, c.width as usize, tz, &me, c.last_read.as_deref(), &names, now, c.thread.is_some(), c.images_on.then_some(&pics));
+    c.lines = layout(&c.msgs, c.width as usize, tz, me, c.last_read.as_deref(), names, now, c.thread.is_some(), pics);
     if c.follow {
         c.top = c.max_top();
     } else {
@@ -515,17 +530,13 @@ fn relayout(s: &mut State) {
         }
         c.top = c.top.min(c.max_top());
     }
-    let wanted = c.wanted_images(images);
-    if !wanted.is_empty() {
-        images::request(s, wanted);
-    }
 }
 
 // ---------------------------------------------------------------------------
 // paint
 // ---------------------------------------------------------------------------
 
-fn hints() -> &'static str {
+pub(crate) fn hints() -> &'static str {
     "j/k move · Enter thread · i compose · r reply · e react · y copy · v select · n agent · m read · L older · Space menu · Esc back · ? help · q close"
 }
 
@@ -535,7 +546,7 @@ fn rule(width: usize) -> String {
 
 /// The compose box: `› text` with a reverse-video cursor cell; the tail
 /// of a long text, so the cursor stays on screen.
-fn compose_cells(c: &Compose, width: usize) -> Vec<Styled> {
+pub(crate) fn compose_cells(c: &Compose, width: usize) -> Vec<Styled> {
     let prompt = match &c.kind {
         ComposeKind::Message(Some(_)) => "reply › ",
         ComposeKind::Message(None) => "› ",
@@ -794,6 +805,50 @@ pub fn on_image(st: &Shared) {
     relayout_paint(&mut s);
 }
 
+/// A timeline view drawn inside another view's column (the sidebar's
+/// preview): no frame of its own, no session or poll - the owner feeds
+/// it messages and calls `layout_chat`. `width` and `height` are the
+/// body's; `body_y` its first screen row (0-based). It opens at its
+/// end with the cursor on the newest message.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn embedded(mode: ModeId, channel: Channel, client: Option<u64>, pane: Option<u32>, msgs: Vec<Message>, width: u32, height: u32, body_y: u32) -> Chat {
+    let last_read = channel.last_read.clone();
+    let mut c = Chat {
+        mode,
+        channel,
+        thread: None,
+        from_timeline: false,
+        client,
+        pane,
+        width,
+        height,
+        chrome: 0,
+        body_y,
+        msgs,
+        lines: Vec::new(),
+        top: 0,
+        cursor: None,
+        anchor: None,
+        follow: true,
+        has_more: false,
+        last_read,
+        compose: None,
+        status: None,
+        gen: 0,
+        poll: None,
+        fetching: false,
+        marked_ms: 0,
+        loaded: true,
+        images_on: false,
+        cell_aspect: DEFAULT_CELL_ASPECT,
+        data_root: String::new(),
+        placed: RefCell::new(HashMap::new()),
+    };
+    let last = c.msgs.len().saturating_sub(1);
+    c.set_cursor_idx(last);
+    c
+}
+
 /// Repaint if open (something the view shows changed).
 pub fn redraw(st: &Shared) {
     let mut s = st.borrow_mut();
@@ -921,7 +976,7 @@ pub fn on_deleted(st: &Shared, channel: &str, ts: &str) {
 // ---------------------------------------------------------------------------
 
 /// Upsert `new` into `msgs` by ts, keeping ts order.
-fn merge(msgs: &mut Vec<Message>, new: Vec<Message>) -> usize {
+pub(crate) fn merge(msgs: &mut Vec<Message>, new: Vec<Message>) -> usize {
     let mut added = 0;
     for m in new {
         match msgs.iter_mut().find(|x| x.ts == m.ts) {
@@ -1174,7 +1229,7 @@ fn switch(st: &Shared, thread: Option<String>, from_timeline: bool) {
 
 /// What a key asks for once the borrow is dropped.
 #[derive(Clone, Debug, PartialEq)]
-enum After {
+pub(crate) enum After {
     None,
     Close,
     /// Back from a thread to its channel's timeline.
@@ -1349,7 +1404,7 @@ fn compose_key(c: &mut Chat, key: &str) -> After {
 /// (any message, replies or not), Escape steps back one level (thread
 /// -> timeline -> sidebar), q closes outright, Space opens the menu,
 /// which comes back here through `replay_key`.
-fn handle_key(c: &mut Chat, key: &str, mouse: Option<(u32, u32)>) -> After {
+pub(crate) fn handle_key(c: &mut Chat, key: &str, mouse: Option<(u32, u32)>) -> After {
     if c.compose.is_some() {
         return compose_key(c, key);
     }
@@ -1539,7 +1594,7 @@ fn handle_key(c: &mut Chat, key: &str, mouse: Option<(u32, u32)>) -> After {
 /// keymap, the ones that do not apply dimmed. Each item hands its key
 /// back through `plugin-command slack 'menu-key <key>'`, so the menu is
 /// a mirror of the keymap with no logic of its own.
-fn menu_items(c: &Chat) -> String {
+pub(crate) fn menu_items(c: &Chat) -> String {
     let on_msg = c.cursor_idx().is_some();
     let in_thread = c.thread.is_some();
     let mut items = String::new();

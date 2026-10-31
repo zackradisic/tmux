@@ -526,8 +526,11 @@ as your own Slack sidebar is (its sections, then channels, then DMs). Rows look
 like the agents picker's: the badge comes first (`!` on a red block and the
 count when you were mentioned, a cyan `●` while unread, a dim `·` once read),
 an unread name is bold, a read or muted one dim, and the right column says how
-long ago the channel last spoke. The preview shows the channel's recent
-messages, newest at the bottom. `Enter` opens the **channel view**: a
+long ago the channel last spoke. The preview is the channel view itself, laid
+out at the column's width: the channel's recent messages, newest at the bottom.
+`l` (or a click in the column) hands it the keyboard, so `j`/`k`, `y`, `e`, `m`
+and `Enter` work on the messages right there and `Escape` comes back to the
+list. `Enter` on a row opens the **channel view**: a
 transcript with day separators, the new-messages line, reactions and emoji
 drawn as glyphs (Slack's names, skin tones and your workspace's custom aliases
 included), bot cards with their fields, and every author by name, Slack
@@ -535,10 +538,9 @@ Connect guests too. A shared picture (PNG, JPEG, a GIF's first frame), or a
 `/giphy` post's, is drawn under its `📎` or caption line in Ghostty or kitty
 through the kitty graphics protocol, fetched and converted once outside the
 plugin; `set -g @slack-images off` keeps the lines alone (iTerm2 would show
-blank blocks). `Enter` on a
-message opens its thread (with or without
-replies yet), `Escape` steps back: thread to channel, channel to sidebar; `q`
-closes outright. `i` composes, `r` replies in the message's thread, `e`
+blank blocks). `Enter` on a message opens its thread (with or without replies
+yet), `Escape` steps back: thread to channel, channel to sidebar; `q` closes
+outright. `i` composes, `r` replies in the message's thread, `e`
 reacts, `o` opens the message in the Slack app. `y` copies the message to the
 clipboard as `Name (2026-10-30 14:02): text`, ready to paste into an agent;
 `v` starts a selection that `j`/`k` extend, so `y` copies a whole exchange;

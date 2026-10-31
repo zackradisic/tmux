@@ -257,6 +257,7 @@ async fn on_chat_message(st: &Shared, v: &Value) {
                 }
                 crate::publish(&s);
             }
+            sidebar::on_arrived(st, &m);
             sidebar::refresh(st);
             chat::on_arrived(st, m.clone());
             let _ = (is_dm, muted, who, label);
