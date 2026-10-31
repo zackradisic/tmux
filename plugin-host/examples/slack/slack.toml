@@ -24,8 +24,15 @@ requests = [
   "write-options",
   "timers",
   # A message in a conversation bound to an agent is handed to the
-  # mailbox plugin for that agent (the agent bridge).
+  # mailbox plugin for that agent (the agent bridge); the hand-off form
+  # (`n` in the channel view) asks the agents plugin's `new` service to
+  # start an agent.
   "service-call",
+  # The hand-off form's folder field completes directories (formkit's
+  # scan). Without these two the field still takes a typed path and the
+  # list says what is missing.
+  "fs-list",
+  "fs-read-any",
   # The host's HTTP and websocket imports (the `net` branch): the live
   # RTM feed. Without it the plugin polls through curl.
   "net",

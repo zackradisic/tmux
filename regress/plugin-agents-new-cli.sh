@@ -15,6 +15,10 @@
 #   --resume <id> adds the harness's resume flag, and a roster row behind
 #     the id lends its folder, name and tag; --fork adds --fork-session;
 #   --split puts a pane beside the caller, tagged on the pane;
+#   --prompt <text> lands on the command line as the agent's argument,
+#     quoted; --prompt-file <path> as "$(cat '<path>')", which the
+#     window's shell expands: a launcher that records its $0 gets the
+#     file's three lines, newlines and quotes intact;
 #   a missing session is an error, reported in @agents_new;
 #   bare `new @host --profile dir` still means the form (not asserted
 #     here beyond "no window was made").
@@ -69,7 +73,11 @@ $TMUX -f/dev/null new-session -d -s alpha -x 200 -y 50 -c "$WORK/proj-a" 'sleep 
 $TMUX new-session -d -s beta -x 200 -y 50 -c "$WORK" 'sleep 600' || fail "new-session beta"
 PC=$($TMUX list-panes -t alpha:0 -F '#{pane_id}')
 $TMUX set-option -w -t alpha:0 @project glm
-$TMUX load-plugin -s server -o trust_env=1 -o "launch=fake = $AGENT" \
+# A second launcher that writes its first argument to a file: what the
+# window's shell handed the agent as its prompt.
+ECHOER="sh -c 'printf %s \"\$0\" >$WORK/got.txt; AI_AGENT=claude exec cat'"
+$TMUX load-plugin -s server -o trust_env=1 -o "launch=fake = $AGENT
+echoer = $ECHOER" \
     -c capture-pane -c run-command -c mode \
     -c db -c env-read -c pane-fds -c send-keys -c run-process -c fs-list -c fs-read-any \
     "$DEPLOY/agents.wasm" || fail "load-plugin"
@@ -136,6 +144,28 @@ P6=${R%% *}
 [ "$($TMUX show-options -pqv -t "$P6" @project)" = beside ] || fail "the split pane was not tagged"
 [ "$(fmt "$PC" '#{pane_active}')" = 1 ] || fail "the split took the focus"
 
+# --- a first prompt: --prompt and --prompt-file -------------------------------
+R=$(new --command fake --name p1 --prompt "'fix the flaky test'")
+case "$R" in %*\ @*\ alpha) ;; *) fail "unexpected result for p1: $R" ;; esac
+P7=${R%% *}
+fmt "$P7" '#{pane_start_command}' | grep -q -- " 'fix the flaky test'" ||
+    fail "--prompt did not land as the argument: $(fmt "$P7" '#{pane_start_command}')"
+printf 'From Slack #general on 2026-10-30:\n\nTejas (2026-10-30 14:02): it'"'"'s broken\n' >"$WORK/prompt.md"
+R=$(new --command echoer --name p2 --prompt-file "$WORK/prompt.md")
+case "$R" in %*\ @*\ alpha) ;; *) fail "unexpected result for p2: $R" ;; esac
+P8=${R%% *}
+fmt "$P8" '#{pane_start_command}' | grep -qF -- "\$(cat '$WORK/prompt.md')" ||
+    fail "--prompt-file did not land as \$(cat): $(fmt "$P8" '#{pane_start_command}')"
+# The window's shell expanded it: the launcher saw the file's text.
+i=0; while [ $i -lt 40 ] && [ ! -s "$WORK/got.txt" ]; do sleep 0.25; i=$((i + 1)); done
+[ -s "$WORK/got.txt" ] || fail "the echoer launcher wrote nothing"
+[ "$(cat "$WORK/got.txt")" = "$(cat "$WORK/prompt.md")" ] || fail "the prompt the agent got differs: $(cat "$WORK/got.txt")"
+# The file wins over the text when both are given.
+R=$(new --command fake --name p3 --prompt x --prompt-file "$WORK/prompt.md")
+P9=${R%% *}
+fmt "$P9" '#{pane_start_command}' | grep -q -- " 'x'" && fail "--prompt was used beside --prompt-file"
+fmt "$P9" '#{pane_start_command}' | grep -qF -- "\$(cat" || fail "--prompt-file lost to --prompt: $(fmt "$P9" '#{pane_start_command}')"
+
 # --- errors ------------------------------------------------------------------
 R=$(new --command fake --session nope)
 [ "$R" = "error: new: no session 'nope'" ] || fail "a missing session was not reported: $R"
@@ -155,6 +185,8 @@ after=$($TMUX list-windows -a | wc -l)
 $TMUX plugin-command agents help | grep -q 'new \[flags\]' || fail "agents help printed nothing"
 $TMUX plugin-command agents 'help new' | grep -q -- '--new-session' || fail "help new printed nothing"
 $TMUX plugin-command agents 'new --project x --help' | grep -q -- '--new-session' || fail "new --help printed nothing"
+$TMUX plugin-command agents 'new --help' | grep -q -- '--prompt-file <path>' || fail "new --help does not list --prompt-file"
+$TMUX plugin-command agents 'new --help' | grep -q -- '--prompt <text>' || fail "new --help does not list --prompt"
 $TMUX plugin-command agents 'project --help' | grep -q 'project -w' || fail "project --help printed nothing"
 $TMUX plugin-command agents 'bogus-verb' | grep -q 'unknown verb' || fail "an unknown verb did not answer"
 # A verb that answers nothing prints nothing, and a command for a plugin

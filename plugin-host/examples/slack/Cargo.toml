@@ -9,6 +9,9 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 tmux-plugin-sdk = { path = "../../sdk" }
 listkit = { path = "../../listkit" }
+# The hand-off form (`n` in the channel view): the agents plugin's
+# new-agent fields, through the shared form crate.
+formkit = { path = "../../formkit" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # The Slack desktop app's `d` cookie: AES-128-CBC under a PBKDF2-SHA1 key

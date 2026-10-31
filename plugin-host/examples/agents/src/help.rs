@@ -66,6 +66,12 @@ in the caller pane's @agents_new option (a plugin's work is asynchronous):
   --window <w>       with --split: in that window of the session (index,
                      name or @id)
   --focus            switch the user to it (default: made in the background)
+  --prompt <text>    its first prompt (one word: quote it); claude and codex
+                     take it as the argument, opencode as --prompt
+  --prompt-file <path>
+                     its first prompt read from that file, as
+                     \"$(cat '<path>')\" on the command line - the shape for
+                     a long prompt, or one with quotes or newlines in it
   --profile <dir>    CLAUDE_CONFIG_DIR for it (a per-window login)
   --client <name>    form only: the client to open it on
   @<host>            on that linked server (the session must be mirrored

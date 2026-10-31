@@ -33,6 +33,17 @@
 #     then Enter posts there with its thread_ts and the reply shows;
 #     Escape goes back to the timeline, Escape again to the sidebar;
 #     `q` closes;
+#   `n` on a selection: the prompt file is written under the plugin's
+#     data directory with the `From Slack #general on <date>:` header
+#     and the two messages' transcript lines, and the hand-off form
+#     opens over the view (a second float) naming the channel, the
+#     count and the file; `C-e` runs $EDITOR on the file in a popup and
+#     the form comes back with the new line count; the ask typed in,
+#     the command set to the fake launcher, Enter starts the agent
+#     through the real agents plugin (loaded beside slack): a window
+#     named after the channel runs `fake "$(cat '<file>')"`, the file
+#     begins with the ask and then the header, the form closes by
+#     itself and the view reports where the agent landed;
 #   `open #general <ts>` shows the thread directly and Escape opens the
 #     channel's timeline rather than closing; `menu-key Enter`/`Escape`
 #     (the Space menu's road back) drive the same keys; `q` closes from
@@ -47,8 +58,8 @@
 # The fake refuses rtm.connect, so the websocket feed backs off and the
 # plugin polls (the websocket half is the host unit test).
 #
-# Needs the wasm example built:
-#   cargo build -p slack --target wasm32-unknown-unknown --release
+# Needs the wasm examples built (the agents plugin answers the `n` form):
+#   cargo build -p slack -p agents --target wasm32-unknown-unknown --release
 
 PATH=/bin:/usr/bin:/usr/local/bin:/opt/homebrew/bin
 TERM=screen
@@ -58,6 +69,7 @@ unset TMUX TMUX_PANE AI_AGENT
 TMUX="$TEST_TMUX -Lslack-test"
 OUTER="$TEST_TMUX -Lslack-test-outer"
 WASM=$(dirname "$TEST_TMUX")/plugin-host/target/wasm32-unknown-unknown/release/slack.wasm
+AGENTS=$(dirname "$TEST_TMUX")/plugin-host/target/wasm32-unknown-unknown/release/agents.wasm
 FAKE=$(dirname "$0")/plugin-slack-fake.py
 FAKE=$(cd "$(dirname "$FAKE")" && pwd -P)/$(basename "$FAKE")
 
@@ -66,6 +78,16 @@ XDG_DATA_HOME="$HOME/.local/share"; export XDG_DATA_HOME
 # The wasm alone: with no sidecar next to it the `net` host allowlist
 # does not apply and 127.0.0.1 is allowed.
 DEPLOY=$(mktemp -d); cp "$WASM" "$DEPLOY/slack.wasm"
+# The agents plugin beside it, with its own sidecar (as in
+# plugin-agents-new-cli.sh, plus service-serve for the `new` service
+# the hand-off form calls). Its store lands under this run's HOME.
+cp "$AGENTS" "$DEPLOY/agents.wasm" 2>/dev/null
+cat >"$DEPLOY/agents.toml" <<'TOML'
+[caps]
+requests = ["capture-pane","run-command","mode","db","env-read","pane-fds","send-keys","run-process","fs-list","fs-read-any","service-serve"]
+[caps.env-read]
+names = ["AI_AGENT","OPENCODE"]
+TOML
 
 FAKEPID=
 WATCHDOG=
@@ -154,10 +176,19 @@ marks_grew() { [ "$(ncalls conversations.mark channel C1)" -gt "$1" ]; }
 # The row under the cursor (reverse video), its attributes stripped.
 cursor_row() { $TMUX capture-pane -M -p -e -t "$FORM" | grep -E "$(printf '\033')\[([0-9]+;)*7m" | head -1 | sed "s/$(printf '\033')\[[0-9;]*m//g"; }
 buffer_has() { $TMUX show-buffer 2>/dev/null | grep -q -- "$1"; }
+# The hand-off form: a second plugin-mode pane beside the view's.
+form_pane() { $TMUX list-panes -a -F '#{pane_id} #{pane_mode}' | awk -v skip="$FORM" '/plugin-mode/ && $1 != skip { print $1; exit }'; }
+form_open() { [ -n "$(form_pane)" ]; }
+form_closed() { [ -z "$(form_pane)" ]; }
+fscreen() { $TMUX capture-pane -M -p -t "$HF" | sed '/^ *$/d'; }
+fscreen_has() { fscreen | grep -q -- "$1"; }
+fkeys() { $TMUX send-keys -t "$HF" "$@"; sleep 0.4; }
 FORM=
 VIEW=
+HF=
 
 [ -f "$WASM" ] || fail "slack.wasm not built"
+[ -f "$AGENTS" ] || fail "agents.wasm not built"
 [ -f "$FAKE" ] || fail "no $FAKE"
 command -v python3 >/dev/null || fail "python3 not found"
 
@@ -196,6 +227,9 @@ until_ok 20 sh -c "$TMUX list-clients | grep -q ." || fail "the control client d
 $TMUX load-plugin -s server -o workspace=test -o "api_base=$BASE" -o token=xoxc-fake -o cookie=xoxd-fake \
     -c mode -c db -c fs-read -c fs-write -c run-process -c run-command -c write-options -c timers \
     -c net -c service-call "$DEPLOY/slack.wasm" || fail "load-plugin"
+$TMUX load-plugin -s server -o trust_env=1 -o "launch=fake = sh -c 'exec cat'" \
+    -c capture-pane -c run-command -c mode -c db -c env-read -c pane-fds -c send-keys \
+    -c run-process -c fs-list -c fs-read-any -c service-serve "$DEPLOY/agents.wasm" || fail "load-plugin agents"
 
 # --- boot: identity and the first sync --------------------------------------
 until_ok 80 status_ready || fail "status never named the user: $(slack status)"
@@ -331,6 +365,71 @@ until_ok 40 buffer_has 'look at this' || fail "y did not copy the selection: $($
 [ "$($TMUX show-buffer | grep -c '^Tejas (')" = 2 ] || fail "the selection copy is not two messages: $($TMUX show-buffer)"
 [ "$($TMUX show-buffer | head -1 | grep -c 'look at this')" = 1 ] || fail "the selection is not oldest first: $($TMUX show-buffer)"
 screen_has 'copied 2 messages' || fail "no copied status: $(screen | tail -2)"
+# n hands the same two messages to a new agent. The transcript goes to
+# a file under the plugin's data directory and the hand-off form opens
+# over the view as a second float; the view stays.
+keys '?'
+screen_has 'n agent' || fail "the footer does not offer n: $(screen | tail -1)"
+printf '#!/bin/sh\nprintf "edited in the popup\\n" >>"$1"\n' >"$HOME/ed.sh"; chmod +x "$HOME/ed.sh"
+$TMUX set-environment -g EDITOR "$HOME/ed.sh"
+keys v
+screen_has 'n agent' || fail "the selecting status does not offer n: $(screen | tail -1)"
+keys k
+keys n
+until_ok 40 form_open || fail "n opened no form"
+HF=$(form_pane)
+mode_open || fail "the view closed under the form"
+until_ok 40 fscreen_has 'Agent from Slack' || fail "the form has no title: $(fscreen)"
+fscreen_has '2 messages from #general' || fail "the banner does not count the selection: $(fscreen)"
+fscreen_has 'file: prompts/general-' || fail "the prompt field does not name the file: $(fscreen)"
+fscreen_has 'C-e edit the prompt' || fail "the hint does not offer C-e: $(fscreen | tail -1)"
+fscreen | grep -q '^  name  *general' || fail "the name does not default to the channel: $(fscreen | grep name)"
+fscreen | grep -q '^  session  *main' || fail "the session does not default to the pane's: $(fscreen | grep session)"
+fscreen | grep -q '^  command  *claude' || fail "the command does not default to claude: $(fscreen | grep command)"
+PROMPT=$(find "$XDG_DATA_HOME" -path '*/slack/prompts/general-*.md' | head -1)
+[ -n "$PROMPT" ] || fail "no prompt file under $XDG_DATA_HOME"
+head -1 "$PROMPT" | grep -q '^From Slack #general on 20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]:$' || fail "the file has no header: $(head -1 "$PROMPT")"
+[ -z "$(sed -n 2p "$PROMPT")" ] || fail "no blank line under the header: $(sed -n 2p "$PROMPT")"
+grep -q '^Tejas (20[0-9-]* [0-9:]*): .*look at this' "$PROMPT" || fail "the file lacks the first message: $(cat "$PROMPT")"
+grep -q '^Tejas (20[0-9-]* [0-9:]*): shipped' "$PROMPT" || fail "the file lacks the second message: $(cat "$PROMPT")"
+LINES_BEFORE=$(fscreen | sed -n 's/.*(\([0-9]*\) lines).*/\1/p' | head -1)
+[ -n "$LINES_BEFORE" ] || fail "the prompt field shows no line count: $(fscreen | grep prompt)"
+# C-e: $EDITOR on the file in a popup (on the tty client); the form
+# waits for it and shows the new count.
+fkeys C-e
+until_ok 60 fscreen_has "($((LINES_BEFORE + 1)) lines)" || fail "C-e did not come back with the edited file: $(fscreen)"
+grep -q '^edited in the popup$' "$PROMPT" || fail "the editor's line is not in the file: $(cat "$PROMPT")"
+# The ask goes above the transcript; the command is the fake launcher.
+$TMUX send-keys -t "$HF" -l 'summarise this for me'; sleep 0.4
+fscreen_has 'summarise this for me' || fail "the ask was not typed: $(fscreen)"
+fkeys C-j; fkeys C-j; fkeys C-j; fkeys C-j
+fkeys C-u
+$TMUX send-keys -t "$HF" -l 'fake'; sleep 0.4
+fscreen | grep -q '^  command  *fake' || fail "the command was not replaced: $(fscreen | grep command)"
+# The prompt field is a toggle: Tab swaps to the clipboard and back.
+fkeys C-j; fkeys C-j
+fkeys Tab
+fscreen_has 'clipboard' || fail "Tab did not toggle the prompt to the clipboard: $(fscreen | grep prompt)"
+fkeys Tab
+fscreen_has 'file: prompts/general-' || fail "Tab did not toggle the prompt back to the file: $(fscreen | grep prompt)"
+fkeys Enter
+until_ok 60 fscreen_has 'started in main' || fail "Enter did not start the agent: $(fscreen)"
+NP=$($TMUX list-panes -t main:general -F '#{pane_id}' 2>/dev/null | head -1)
+[ -n "$NP" ] || fail "no window named general in main: $($TMUX list-windows -t main)"
+SC=$($TMUX display-message -p -t "$NP" '#{pane_start_command}')
+echo "$SC" | grep -qF -- "exec cat" || fail "the window does not run the fake launcher: $SC"
+echo "$SC" | grep -qF -- "\$(cat '$PROMPT')" || fail "the window's command does not read the prompt file: $SC"
+[ "$(head -1 "$PROMPT")" = "summarise this for me" ] || fail "the ask is not the file's first line: $(head -3 "$PROMPT")"
+[ -z "$(sed -n 2p "$PROMPT")" ] || fail "no blank line under the ask"
+sed -n 3p "$PROMPT" | grep -q '^From Slack #general on ' || fail "the header does not follow the ask: $(sed -n 3p "$PROMPT")"
+grep -q '^edited in the popup$' "$PROMPT" || fail "the edit was lost at submit: $(cat "$PROMPT")"
+# The form closes by itself after a beat; the view reports the landing.
+until_ok 40 form_closed || fail "the form did not close after the agent started"
+HF=
+mode_open || fail "the view closed with the form"
+screen_has 'agent started in main' || fail "the view does not report the agent: $(screen | tail -1)"
+screen_has 'selecting' && fail "the selection survived n"
+$TMUX kill-window -t main:general
 keys j
 # Compose: i, the text, Enter.
 keys i

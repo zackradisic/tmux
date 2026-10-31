@@ -61,10 +61,11 @@
 //! `plugin-command -t $TMUX_PANE agents "new --resume <id> --project
 //! <tag>"` - any flag that says what to start or where (`--resume`,
 //! `--fork`, `--command`, `--folder`, `--session`, `--new-session`,
-//! `--name`, `--project`, `--split`, `--window`, `--focus`) runs it at
-//! once, in the background, with the caller pane's folder, session and
-//! `@project` as the defaults and the resumed row's folder, name and tag
-//! behind those. The answer is left in the caller pane's `@agents_new`
+//! `--name`, `--project`, `--split`, `--window`, `--focus`, `--prompt`,
+//! `--prompt-file`) runs it at once, in the background, with the caller
+//! pane's folder, session and `@project` as the defaults and the resumed
+//! row's folder, name and tag behind those. The answer is left in the
+//! caller pane's `@agents_new`
 //! option ("%pane @window session", or "error: <why>"), since a plugin
 //! command cannot print to its caller. See `newagent::direct`.
 //! `plugin-command agents "pick id <agent-id>"` opens on that agent
@@ -214,7 +215,7 @@
 //!
 //! Two halves, one crate (see `provider.rs` and `view.rs`). The provider
 //! half sees one server: it detects, resolves, keeps the store and answers
-//! the `list`, `capture`, `search` and `act` services and publishes the
+//! the `list`, `capture`, `search`, `act` and `new` services and publishes the
 //! `changed` topic. The view half owns the picker and merges the local
 //! roster with the rosters of the providers on every linked server
 //! (`remote-attach` pushes this plugin there as a provider), grouped by

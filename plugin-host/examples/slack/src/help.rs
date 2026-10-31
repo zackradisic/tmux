@@ -55,8 +55,9 @@ open: the channel view.
   o    open in the Slack app   y          copy the message (or selection)
   m    mark read               Y          copy the permalink
   R    refetch                 v          select from here (j/k extend)
-  b    back to the sidebar     Space      the action menu (every key)
-  q    close                   Escape     back: thread, channel, sidebar
+  b    back to the sidebar     n          new agent from the message(s)
+  q    close                   Space      the action menu (every key)
+                               Escape     back: thread, channel, sidebar
 
 Enter opens the thread of any message, with or without replies, so
 Enter then i is \"reply in this thread\". Escape steps back one level:
@@ -70,6 +71,16 @@ buffer, and the terminal's clipboard over OSC 52) as
 a selection at the cursor and j/k extend it; y then copies every
 message in it, one after the other, ready to hand to an agent. Y
 copies the message's Slack permalink instead.
+
+n hands the same messages to a new agent: they are written to a file
+(prompts/<channel>-<ts>.md under the plugin's data directory, under a
+`From Slack #channel on <date>:` line) and the new-agent form opens
+over the view - an instruction to put above them (ask), the folder,
+session (`new` for one of its own), window name, command and project,
+and where the prompt comes from (that file, or the tmux paste buffer:
+Tab toggles). C-e opens the file in $EDITOR in a popup; Enter starts
+the agent through the agents plugin, in the background, and says where
+it landed.
 
 While composing, keys type; Enter sends, Escape drops the text, a paste
 goes in as is (newlines kept).";
