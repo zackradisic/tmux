@@ -11,7 +11,7 @@ usage: tmux2 plugin-command slack '<verb> [args...]'
   reply <#chan> <thread_ts> <text...>
                             post into a thread
   mark <#chan>              mark the channel read
-  unread                    list channels with unread messages (one per line)
+  unread                    list channels and threads with unread messages
   status                    who you are, badges, last sync
   refresh                   fetch channels, sections, users and badges now
   auth                      forget the stored session and derive it again
@@ -26,24 +26,37 @@ Channels are named `#name`, DMs `@user` (a display name or handle), or
 by Slack id (C…, D…, G…). The plugin acts as the Slack desktop app's
 signed-in user: sign in there once, nothing else to configure.
 Status line: #{@slack_unread} channels with unread, #{@slack_mentions}
-mentions, #{@slack_dms} unread DMs.";
+mentions (threads counted), #{@slack_dms} unread DMs, #{@slack_threads}
+threads with unread replies.";
 
 pub const PICK: &str = "\
 pick: the sidebar, as a floating picker.
 
-  Enter       open the channel view        m   mark read
+  Enter       open the channel view        m   mark read (a thread too)
   Space       the action menu              o   open in the Slack app
   v           sections / unread / all      i   compose to this channel
   j/k h       move, up a level (z: fold)   n   new agent from the preview
-  l / Right   read the preview             /   search (# channel, @ user,
-  ?           every key (R: refresh)           ! unread|mention|dm|muted)
+  l / Right   read the preview             @   go to where you were mentioned
+  ?           every key (R: refresh)       /   search (# channel, @ user,
+                                               ! unread|mention|dm|thread)
 
 An Unread section sits above your own sections: every channel and DM
-with something new, DMs first, in the order of the badges; the rows
-stay in their own sections too. Each row starts with its badge: a red `!` block when you were mentioned
-(the name red, the count after it as @3), a cyan dot while it has
-unread messages (the name bold), a dim dot when read or muted. The
-right column is how long ago the channel last spoke. The preview is
+with something new, DMs first, then channels and threads in the order
+of the badges; the channel rows stay in their own sections too. A
+thread you follow that has replies you have not read (what Slack's
+Threads view lists) is a row of its own there: `↳`, its channel, the
+root's first words and `+N` new replies. Each row starts with its
+badge: a red `!` block when you were mentioned (the name red, the
+count after it as @3), a cyan dot while it has unread messages (the
+name bold), a dim dot when read or muted. The right column is how
+long ago the channel (or the thread) last spoke.
+
+@ on a row with a mention hands the preview the keyboard with the
+cursor on the message that mentions you (the first unread one), and
+marks it: a message that addresses you carries a red `@` in its gutter
+wherever it is drawn; @ again goes to the next. m on a thread row
+marks the thread read on Slack (the channel is left alone) and the
+row goes; Enter opens the thread in the channel view, i replies in it. The preview is
 the channel view itself, laid out at the column's width: the channel's
 recent messages, newest at the bottom, attachments under their text;
 [ and ] scroll it. Space opens a menu of every action for the row,
@@ -70,10 +83,16 @@ open: the channel view.
   L    load older              e          react (type :name: then Enter)
   o    open in the Slack app   y          copy the message (or selection)
   m    mark read               Y          copy the permalink
+  @    next mention of you
   R    refetch                 v          select from here (j/k extend)
   b    back to the sidebar     n          new agent from the message(s)
   q    close                   Space      the action menu (every key)
                                Escape     back: thread, channel, sidebar
+
+A message that mentions you (@you, @here, @channel) carries a red `@`
+in its gutter; @ moves the cursor to the next one, round again at the
+end, and the foot says which of how many. In a thread, m (and reading
+it to the end) marks the thread read, not its channel.
 
 Enter opens the thread of any message, with or without replies, so
 Enter then i is \"reply in this thread\". Escape steps back one level:

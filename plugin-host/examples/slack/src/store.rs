@@ -655,6 +655,31 @@ impl Message {
     }
 }
 
+/// A thread with replies the user has not read, as Slack's Threads view
+/// (`subscriptions.thread.getView`) lists it. Held in memory and fetched
+/// whole each time; its messages go to the cache like any other.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Thread {
+    pub channel: String,
+    /// The root message (`ts` is the thread's ts).
+    pub root: Message,
+    /// Where the user has read to in the thread.
+    pub last_read: Option<String>,
+    /// The replies after that, oldest first.
+    pub unread: Vec<Message>,
+    pub reply_count: i64,
+    pub latest_reply: Option<String>,
+    /// An unread reply mentions the user (@them, @here, @channel).
+    pub mention: bool,
+}
+
+impl Thread {
+    /// `channel/root_ts`: how the views key a thread.
+    pub fn key(&self) -> String {
+        format!("{}/{}", self.channel, self.root.ts)
+    }
+}
+
 pub async fn upsert_messages(msgs: &[Message]) -> Result<(), HostError> {
     if msgs.is_empty() {
         return Ok(());

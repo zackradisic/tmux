@@ -281,6 +281,12 @@ pub fn plain_lines(text: &str, names: &Names) -> Vec<String> {
 
 /// The text without markup, one line, names resolved: for a
 /// notification body or a preview row.
+/// Does `text` address user `me`: `<@me>`, or the whole room (`<!here>`,
+/// `<!channel>`, `<!everyone>`)? What the badges count as a mention.
+pub fn mentions(text: &str, me: &str) -> bool {
+    (!me.is_empty() && text.contains(&format!("<@{me}>"))) || text.contains("<!here") || text.contains("<!channel") || text.contains("<!everyone")
+}
+
 pub fn plain(text: &str, names: &Names) -> String {
     let flat = text.replace("```", " ").replace('\n', " ");
     let cells = inline(&flat, 0, names);
@@ -385,6 +391,16 @@ mod tests {
         // The glyph is one cell plus its filler; the code span is literal.
         assert_eq!(c.len(), "ok ** at 12:30 :+1: :nope:".len());
         assert_eq!(plain("*:raised_hands:* <@U1>", &names()), "\u{1F64C} @zack");
+    }
+
+    #[test]
+    fn a_mention_is_me_or_the_room() {
+        assert!(mentions("hey <@U1> look", "U1"));
+        assert!(!mentions("hey <@U2> look", "U1"));
+        assert!(mentions("<!here> standup", "U1"));
+        assert!(mentions("<!channel|channel> ship it", "U1"));
+        assert!(!mentions("<@U1>", ""), "no user, no mention");
+        assert!(!mentions("plain words", "U1"));
         let lines = render("```\n:+1:\n```", 20, 0, &names());
         assert_eq!(cells_text(&lines[0]).trim(), ":+1:");
     }

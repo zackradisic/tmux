@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""A fake Slack web API for regress/plugin-slack.sh: one workspace, three
-conversations, enough state to answer what the slack plugin asks.
+"""A fake Slack web API for regress/plugin-slack.sh: one workspace, four
+conversations and one followed thread, enough state to answer what the
+slack plugin asks.
 `users.list` comes in two pages (the cursor must be followed) and leaves
 out U3, a Slack Connect user from another workspace whom only `users.info`
 knows; U9 is nobody.
@@ -15,9 +16,11 @@ Every request is logged to stderr as `METHOD field=value ...`.
   GET  /_calls         JSON list of [method, fields] seen so far
   GET  /_posted        JSON list of the messages chat.postMessage took
   GET  /_unread?channel=C1
+                       give the channel its initial unread state back
+  GET  /_unread?thread=C1/<root ts>
+                       give the thread its initial read mark back
   GET  /_img/<name>     a small real PNG (400x50), logged and counted as
                         a call of method "_img" with the auth it carried
-                       give the channel its initial unread state back
 
 Standard library only.
 """
@@ -33,8 +36,20 @@ ME = "U1"
 LOCK = threading.Lock()
 CALLS = []   # [method, {field: value}]
 POSTED = []  # {"channel", "ts", "text", "thread_ts"}
-REPLIES = []  # thread replies, as messages plus "channel": what conversations.replies returns
+# Thread replies, as messages plus "channel": what conversations.replies
+# returns. The first two are in a thread we follow and have not read: the
+# Threads view (subscriptions.thread.getView) lists it, and one of them
+# mentions us.
+REPLIES = [
+    {"type": "message", "user": "U2", "text": "<@U1> can you review the plan?", "ts": "1700000310.000100",
+     "thread_ts": "1700000022.000100", "channel": "C1"},
+    {"type": "message", "user": "U2", "text": "thanks!", "ts": "1700000320.000100",
+     "thread_ts": "1700000022.000100", "channel": "C1"},
+]
 MARKS = {}   # channel -> ts
+# (channel, root ts) -> how far the thread is read (subscriptions.thread.mark).
+THREAD_READ = {("C1", "1700000022.000100"): "1700000022.000100"}
+INITIAL_THREAD_READ = dict(THREAD_READ)
 
 USERS = [
     {"id": "U1", "name": "zack", "real_name": "Zack R", "tz_offset": -25200,
@@ -91,6 +106,11 @@ HISTORY = {
                                       "title": {"type": "plain_text", "text": "GIF"}, "image_width": 400, "image_height": 50,
                                       "is_animated": True}]}]},
         {"type": "message", "user": "U9", "text": "ghost", "ts": "1700000025.000100"},
+        # The root of the thread we follow (REPLIES above); the links
+        # message below stays the oldest.
+        {"type": "message", "user": "U2", "text": "planning the sprint", "ts": "1700000022.000100",
+         "thread_ts": "1700000022.000100", "reply_count": 2, "latest_reply": "1700000320.000100",
+         "reply_users": ["U2"], "subscribed": True},
         # Links as Slack delivers them: a bare url whose label is the url
         # shortened, and a url behind real text. The view must put the
         # whole url on screen either way (the terminal makes it clickable).
@@ -162,6 +182,23 @@ def err(code):
     return {"ok": False, "error": code}
 
 
+def thread_unread(cid, root):
+    """The replies of a thread past its read mark, oldest first."""
+    lr = THREAD_READ.get((cid, root), root)
+    return sorted((m for m in REPLIES if m["channel"] == cid and m["thread_ts"] == root and m["ts"] > lr),
+                  key=lambda m: m["ts"])
+
+
+def thread_roots():
+    """(channel, root) of every thread with replies."""
+    return sorted({(m["channel"], m["thread_ts"]) for m in REPLIES})
+
+
+def thread_counts():
+    unread = [m for cid, root in thread_roots() for m in thread_unread(cid, root)]
+    return {"has_unreads": bool(unread), "mention_count": sum(1 for m in unread if "<@%s>" % ME in m["text"])}
+
+
 def count_row(cid):
     c = COUNTS[cid]
     return {"id": cid, "has_unreads": c["has_unreads"], "mention_count": c["mention_count"],
@@ -201,7 +238,33 @@ def handle(method, f):
                          "party": "alias:tada", "yay": "alias:party"})
     if method == "client.counts":
         return ok(channels=[count_row("C1"), count_row("C2"), count_row("G1")], mpims=[], ims=[count_row("D1")],
-                  threads={"has_unreads": False, "mention_count": 0})
+                  threads=thread_counts())
+    if method == "subscriptions.thread.getView":
+        # The Threads view: the threads we follow that have unread replies,
+        # newest reply first, each with its root (carrying the channel and
+        # the read mark) and the unread replies.
+        threads = []
+        for cid, root in thread_roots():
+            unread = thread_unread(cid, root)
+            if not unread:
+                continue
+            rm = next((m for m in HISTORY.get(cid, []) if m["ts"] == root), None)
+            if rm is None:
+                continue
+            rm = dict(rm, channel=cid, last_read=THREAD_READ.get((cid, root), root))
+            threads.append({"root_msg": rm,
+                            "unread_replies": [{k: v for k, v in m.items() if k != "channel"} for m in unread],
+                            "latest_replies": []})
+        threads.sort(key=lambda t: t["root_msg"].get("latest_reply", ""), reverse=True)
+        total = sum(len(t["unread_replies"]) for t in threads)
+        return ok(threads=threads, total_unread_replies=total, new_threads_count=len(threads), has_more=False,
+                  max_ts="%d.000000" % int(time.time()))
+    if method == "subscriptions.thread.mark":
+        cid, root, ts = f.get("channel", ""), f.get("thread_ts", ""), f.get("ts", "")
+        if not (cid and root and ts):
+            return err("invalid_arguments")
+        THREAD_READ[(cid, root)] = ts
+        return ok()
     if method == "conversations.history":
         cid = f.get("channel", "")
         if cid not in HISTORY:
@@ -243,6 +306,8 @@ def handle(method, f):
         if f.get("thread_ts"):
             m["thread_ts"] = f["thread_ts"]
             REPLIES.append(dict(m, channel=cid))
+            # Our own reply reads the thread, as on Slack.
+            THREAD_READ[(cid, f["thread_ts"])] = m["ts"]
             # As Slack does: the root in the history grows a reply count.
             for root in HISTORY[cid]:
                 if root["ts"] == f["thread_ts"]:
@@ -315,9 +380,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(MARKS)
             elif path == "/_unread":
                 q = self.path.split("?", 1)[1] if "?" in self.path else ""
-                cid = dict(p.split("=", 1) for p in q.split("&") if "=" in p).get("channel", "")
+                args = dict(p.split("=", 1) for p in q.split("&") if "=" in p)
+                cid = args.get("channel", "")
                 if cid in INITIAL_COUNTS:
                     COUNTS[cid] = dict(INITIAL_COUNTS[cid])
+                thread = args.get("thread", "")
+                if "/" in thread:
+                    key = tuple(thread.split("/", 1))
+                    if key in INITIAL_THREAD_READ:
+                        THREAD_READ[key] = INITIAL_THREAD_READ[key]
                 self.send_json(ok())
             else:
                 self.send_json(err("unknown_path"), 404)

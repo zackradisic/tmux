@@ -12,6 +12,7 @@
 //! full view composing - and Escape/h/Left give the keyboard back to the
 //! list. The separator lights while it has the keyboard.
 
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
@@ -24,7 +25,7 @@ use listkit::{Engine, Node, Outcome, Preview, SigilSpec};
 use tmux_plugin_sdk::prelude::*;
 
 use crate::chat::After;
-use crate::store::{Channel, Kind, Message};
+use crate::store::{Channel, Kind, Message, Thread};
 use crate::{api, chat, mrkdwn, timefmt, Shared, State, NAME};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -102,6 +103,7 @@ pub fn keys() -> KeyTable {
         .with("mark", "m", "rows", "mark the channel read")
         .with("compose", "i", "rows", "compose a message to the channel")
         .with("agent", "n", "rows", "new agent from the previewed message (or a selection made there)")
+        .with("mention", "@", "rows", "go to where you were mentioned (the preview takes the keyboard; @ again: the next)")
         .with("menu", "Space", "rows", "the action menu")
         .with("view", "v", "picker", "sections / unread / all")
         .with("refresh", "R", "picker", "fetch channels, sections, users and badges again")
@@ -217,9 +219,12 @@ pub fn render(s: &mut State) {
     // and the rest (o, v, R, [ ]) is on the `?` card and in the menu.
     side.engine.footer = if side.preview_focus {
         if side.preview.as_ref().is_some_and(|c| c.thread.is_some()) {
-            "j/k move · y copy · r reply · Space menu · Esc back to channel".to_string()
+            // A thread row's Escape goes to the list: the row is the thread.
+            let back = if side.engine.selected_key().as_deref().and_then(thread_of).is_some() { "list" } else { "channel" };
+            format!("j/k move · @ mention · y copy · r reply · Space menu · Esc back to {back}")
         } else {
-            "j/k move · Enter thread · y copy · i compose · Space menu · Esc back to list".to_string()
+            // i and m are in the menu and on the ? card: the footer is clipped to the list's width.
+            "j/k move · Enter thread · @ mention · y copy · Space menu · Esc back to list".to_string()
         }
     } else {
         format!(
@@ -289,27 +294,42 @@ fn sync_preview(s: &mut State) {
     let now = (now_ms() / 1000) as i64;
     let cache = s.images.clone();
     let Some(side) = s.side.as_ref() else { return };
-    let key = side.engine.selected_key().filter(|k| !k.starts_with("sec:")).map(|k| chan_key(&k).to_string());
-    let channel = key.as_deref().and_then(|k| s.channel(k).cloned());
+    let key = side.engine.selected_key().filter(|k| !k.starts_with("sec:"));
+    // A thread row is its own thread; a channel row shows the thread
+    // opened in it with Enter, as long as the channel is the same.
+    let row_thread: Option<String> = key.as_deref().and_then(thread_of).map(|(_, r)| r.to_string());
+    let channel = key.as_deref().and_then(|k| s.channel(chan_key(k)).cloned());
+    let channel_changed = side.preview.as_ref().zip(channel.as_ref()).is_some_and(|(c, ch)| c.channel.id != ch.id);
+    let thread: Option<String> = match &row_thread {
+        Some(r) => Some(r.clone()),
+        None if channel_changed => None,
+        None => side.thread.clone(),
+    };
+    // The Threads view's row for it, if any: its own read mark (the
+    // channel's says nothing about a thread), and its messages until
+    // the whole thread is fetched.
+    let viewed: Option<&Thread> = thread.as_deref().zip(channel.as_ref()).and_then(|(r, ch)| view_thread(s, &ch.id, r));
+    let thread_read: Option<String> = viewed.and_then(|t| t.last_read.clone());
+    let seeded: Option<Vec<Message>> = viewed.map(|t| {
+        let mut v = vec![t.root.clone()];
+        v.extend(t.unread.iter().cloned());
+        v
+    });
     let Some(side) = s.side.as_mut() else { return };
     let (_, pw, body_y, body_h) = preview_geometry(side.engine.width as usize, side.engine.height as usize, side.engine.list_w());
-    // A thread belongs to the channel it was opened in.
-    if let (Some(ch), Some(c)) = (channel.as_ref(), side.preview.as_ref()) {
-        if c.channel.id != ch.id {
-            side.thread = None;
-        }
-    }
-    let thread = side.thread.clone();
+    side.thread = if row_thread.is_some() { None } else { thread.clone() };
     let msgs: Option<Vec<Message>> = match (&channel, &thread) {
         (Some(ch), Some(root)) => side
             .threads
             .get(&thread_key(&ch.id, root))
             .cloned()
+            .or_else(|| seeded.clone())
             // Until the replies are in: the root alone, from the timeline.
             .or_else(|| side.previews.get(&ch.id).map(|v| v.iter().filter(|m| m.ts == *root).cloned().collect())),
         (Some(ch), None) => side.previews.get(&ch.id).cloned(),
         _ => None,
     };
+    let last_read = if thread.is_some() { thread_read } else { channel.as_ref().and_then(|c| c.last_read.clone()) };
     let (Some(channel), Some(msgs)) = (channel, msgs) else {
         side.preview = None;
         side.preview_focus = false;
@@ -329,7 +349,8 @@ fn sync_preview(s: &mut State) {
                     c.set_cursor_idx(last);
                 }
             }
-            c.last_read = channel.last_read.clone();
+            c.last_read = last_read;
+            c.me = me.clone();
             c.channel = channel;
             c.width = pw as u32;
             c.height = body_h as u32;
@@ -350,6 +371,8 @@ fn sync_preview(s: &mut State) {
             }
             let mut c = chat::embedded(side.engine.mode, channel, side.client, side.pane, msgs, pw as u32, body_h as u32, body_y as u32);
             c.thread = thread.clone();
+            c.last_read = last_read;
+            c.me = me.clone();
             let (on, aspect, root) = chat::picture_setup(side.client, side.pane);
             c.images_on = on;
             c.cell_aspect = aspect;
@@ -389,10 +412,39 @@ pub fn on_image(st: &Shared) {
 /// The key prefix of a row in the Unread section, which repeats a
 /// channel that has a row in its own section too.
 const UNREAD_PREFIX: &str = "u:";
+/// The key prefix of a thread row (the Threads view's unread threads):
+/// `t:<channel>/<root ts>`.
+const THREAD_PREFIX: &str = "t:";
 
-/// The channel id behind a row key, whichever section the row is in.
-fn chan_key(key: &str) -> &str {
+/// The row behind a key, whichever section it is in: a channel's id, or
+/// `t:<channel>/<root>` for a thread.
+fn row_id(key: &str) -> &str {
     key.strip_prefix(UNREAD_PREFIX).unwrap_or(key)
+}
+
+/// The channel id behind a row key: a channel row's own, a thread row's
+/// channel.
+fn chan_key(key: &str) -> &str {
+    let id = row_id(key);
+    match id.strip_prefix(THREAD_PREFIX) {
+        Some(rest) => rest.split('/').next().unwrap_or(rest),
+        None => id,
+    }
+}
+
+/// A thread row's channel and root ts.
+fn thread_of(key: &str) -> Option<(&str, &str)> {
+    row_id(key).strip_prefix(THREAD_PREFIX)?.split_once('/')
+}
+
+fn thread_row_key(t: &Thread) -> String {
+    format!("{THREAD_PREFIX}{}", t.key())
+}
+
+/// The thread view's row for `channel/root`, if the thread has unread
+/// replies.
+fn view_thread<'a>(s: &'a State, channel: &str, root: &str) -> Option<&'a Thread> {
+    s.threads.iter().find(|t| t.channel == channel && t.root.ts == root)
 }
 
 /// Is the channel one the sidebar shows at all?
@@ -519,6 +571,87 @@ fn channel_node(s: &State, side: &Sidebar, c: &Channel, depth: u8, now: u64) -> 
     n
 }
 
+/// A thread with unread replies as a row: the badge (red `!` when a
+/// reply mentions the user, else the cyan dot), `↳`, the channel, the
+/// root's first words dim, and how many replies are new; the right
+/// column is how long ago the last reply came.
+fn thread_node(s: &State, t: &Thread, depth: u8, now: u64) -> Node {
+    let mut n = Node::item(thread_row_key(t), depth);
+    let label = s.channel(&t.channel).map(|c| s.channel_label(c)).unwrap_or_else(|| t.channel.clone());
+    let (glyph, rest) = label.split_at(label.chars().next().map_or(0, char::len_utf8));
+    let style = if t.mention { ST_BOLD | ST_RED } else { ST_BOLD };
+    let badge: Styled = if t.mention {
+        ('!', ST_BOLD | ST_RED | ST_BRIGHT | ST_INVERT)
+    } else {
+        ('●', ST_BOLD | ST_BRIGHT | ST_CYAN)
+    };
+    let mut cells: Vec<Styled> = vec![badge, (' ', 0)];
+    cells.extend(plain_cells("↳ ", ST_DIM));
+    cells.extend(plain_cells(glyph, ST_DIM | (style & ST_RED)));
+    cells.extend(plain_cells(rest, style));
+    let mut snippet = clip(&listkit::text::one_line(&s.names.with(|nm| mrkdwn::plain(&t.root.text, nm))), 36);
+    if snippet.trim().is_empty() {
+        snippet = t.root.files.first().map(|f| format!("📎 {}", f.name)).unwrap_or_else(|| "(attachment)".into());
+    }
+    cells.extend(plain_cells(&format!("  {snippet}"), ST_DIM));
+    let new = t.unread.len();
+    cells.extend(plain_cells(&format!("  +{new}"), ST_DIM | if t.mention { ST_RED } else { ST_CYAN }));
+    n.left = cells;
+    let age = t.latest_reply.as_deref().map(|ts| timefmt::age(ts, now)).unwrap_or_default();
+    n.right = plain_cells(&format!("{age:>4}"), ST_DIM);
+    n.haystack = format!("{label} {snippet}");
+    if let Some(c) = s.channel(&t.channel) {
+        if c.kind.is_dm() {
+            n.tokens.push(('@', label.trim_start_matches('@').to_string()));
+            n.tokens.push(('!', "dm".into()));
+        } else {
+            n.tokens.push(('#', c.name.clone()));
+        }
+    }
+    n.tokens.push(('!', "thread".into()));
+    n.tokens.push(('!', "unread".into()));
+    if t.mention {
+        n.tokens.push(('!', "mention".into()));
+    }
+    // The root and its unread replies are in hand: the column is drawn
+    // by `render` as an embedded thread view from the start.
+    n.preview = Preview::None;
+    n
+}
+
+/// A row with something new: a channel or DM with unread messages, or
+/// a thread with unread replies.
+#[derive(Clone, Copy)]
+enum Fresh<'a> {
+    Chan(&'a Channel),
+    Thr(&'a Thread),
+}
+
+/// The order of the Unread rows: mentions first, then by when the
+/// conversation last spoke, newest first.
+fn fresh_rank(s: &State, f: Fresh) -> (u8, Reverse<String>, String) {
+    match f {
+        Fresh::Chan(c) => rank(c),
+        Fresh::Thr(t) => (
+            if t.mention { 0 } else { 1 },
+            Reverse(t.latest_reply.clone().unwrap_or_default()),
+            s.channel(&t.channel).map(|c| s.channel_label(c)).unwrap_or_default().to_lowercase(),
+        ),
+    }
+}
+
+/// Everything with something new, for the Unread section and view: DMs
+/// first, then channels and threads together in rank order.
+fn fresh_rows<'a>(s: &'a State, chans: &[&'a Channel]) -> Vec<Fresh<'a>> {
+    let fresh = |c: &&Channel| (c.has_unreads || c.mentions > 0) && !c.is_muted;
+    let mut dms: Vec<Fresh> = chans.iter().copied().filter(|c| c.kind.is_dm() && fresh(c)).map(Fresh::Chan).collect();
+    let mut rest: Vec<Fresh> = chans.iter().copied().filter(|c| !c.kind.is_dm() && fresh(c)).map(Fresh::Chan).collect();
+    rest.extend(s.threads.iter().filter(|t| s.channel(&t.channel).is_none_or(|c| !c.is_muted)).map(Fresh::Thr));
+    rest.sort_by_key(|f| fresh_rank(s, *f));
+    dms.append(&mut rest);
+    dms
+}
+
 fn build_nodes(s: &State) -> Vec<Node> {
     let Some(side) = s.side.as_ref() else { return Vec::new() };
     let now = now_ms();
@@ -537,9 +670,11 @@ fn build_nodes(s: &State) -> Vec<Node> {
     };
     match side.view {
         View::Unread => {
-            let rows: Vec<&Channel> = chans.iter().copied().filter(|c| (c.has_unreads || c.mentions > 0) && !c.is_muted).collect();
-            for c in rows {
-                nodes.push(channel_node(s, side, c, 0, now));
+            for f in fresh_rows(s, &chans) {
+                nodes.push(match f {
+                    Fresh::Chan(c) => channel_node(s, side, c, 0, now),
+                    Fresh::Thr(t) => thread_node(s, t, 0, now),
+                });
             }
         }
         View::All => {
@@ -551,22 +686,22 @@ fn build_nodes(s: &State) -> Vec<Node> {
             group(&mut nodes, "sec:dms", "Direct messages", &dm);
         }
         View::Sections => {
-            // Everything with something new first, DMs before channels,
-            // each in rank order. The rows stay in their own sections
-            // below as well, so these carry a key prefix of their own.
-            let fresh = |c: &&Channel| (c.has_unreads || c.mentions > 0) && !c.is_muted;
-            let unread: Vec<&Channel> = chans
-                .iter()
-                .copied()
-                .filter(|c| c.kind.is_dm() && fresh(c))
-                .chain(chans.iter().copied().filter(|c| !c.kind.is_dm() && fresh(c)))
-                .collect();
+            // Everything with something new first: DMs, then channels
+            // and unread threads in rank order. The channel rows stay in
+            // their own sections below as well, so these carry a key
+            // prefix of their own; a thread has no other row.
+            let unread = fresh_rows(s, &chans);
             if !unread.is_empty() {
                 nodes.push(group_node("sec:unread", "Unread", unread.len(), 0));
-                for c in &unread {
-                    let mut n = channel_node(s, side, c, 1, now);
-                    n.key = format!("{UNREAD_PREFIX}{}", c.id);
-                    nodes.push(n);
+                for f in &unread {
+                    nodes.push(match f {
+                        Fresh::Chan(c) => {
+                            let mut n = channel_node(s, side, c, 1, now);
+                            n.key = format!("{UNREAD_PREFIX}{}", c.id);
+                            n
+                        }
+                        Fresh::Thr(t) => thread_node(s, t, 1, now),
+                    });
                 }
             }
             let base = nodes.len();
@@ -653,8 +788,10 @@ pub fn rebuild(s: &mut State) {
             (u, 0) => format!("{u} unread"),
             (u, m) => format!("{u} unread, {m} mentions"),
         });
-        if s.threads_unread {
-            parts.push("threads".into());
+        match (s.threads_unread, s.threads.len()) {
+            (false, _) => {}
+            (true, 0) => parts.push("threads".into()),
+            (true, n) => parts.push(format!("{n} thread{}", if n == 1 { "" } else { "s" })),
         }
         if s.syncing {
             parts.push("syncing…".into());
@@ -671,7 +808,12 @@ pub fn rebuild(s: &mut State) {
     };
     let view = s.side.as_ref().map(|p| p.view).unwrap_or(View::Sections);
     let held = s.side.as_ref().and_then(|p| p.hold.clone());
-    let held_done = held.as_ref().is_some_and(|(_, ids)| ids.iter().all(|id| s.channel(id).is_none_or(|c| !c.has_unreads)));
+    let held_done = held.as_ref().is_some_and(|(_, ids)| {
+        ids.iter().all(|id| match thread_of(id) {
+            Some((ch, root)) => view_thread(s, ch, root).is_none(),
+            None => s.channel(id).is_none_or(|c| !c.has_unreads),
+        })
+    });
     if let Some(side) = s.side.as_mut() {
         side.engine.header_tag = format!("{tag} · by {}", view.label());
         side.engine.empty_text = empty;
@@ -679,7 +821,7 @@ pub fn rebuild(s: &mut State) {
         if let Some((pos, ids)) = held {
             // set_nodes followed the marked row by key; put the cursor
             // back where it was.
-            if side.engine.selected_key().is_some_and(|k| ids.iter().any(|id| id == chan_key(&k))) {
+            if side.engine.selected_key().is_some_and(|k| ids.iter().any(|id| id == row_id(&k))) {
                 side.engine.select_pos(pos);
             }
             if held_done {
@@ -692,19 +834,38 @@ pub fn rebuild(s: &mut State) {
 /// Fetch recent messages for the highlighted channel if the preview has
 /// none yet.
 fn ensure_preview(st: &Shared) {
-    let (id, key) = {
+    enum Want {
+        Channel(String),
+        Thread(String, String),
+    }
+    let (id, want) = {
         let mut s = st.borrow_mut();
         let Some(ident) = s.ident.clone() else { return };
         let Some(side) = s.side.as_mut() else { return };
         let Some(key) = side.engine.selected_key() else { return };
-        let key = chan_key(&key).to_string();
-        if key.starts_with("sec:") || side.previews.contains_key(&key) || side.fetching.contains(&key) {
+        if key.starts_with("sec:") {
             return;
         }
-        side.fetching.insert(key.clone());
-        (ident, key)
+        if let Some((ch, root)) = thread_of(&key) {
+            // A thread row: the whole thread (the view's row has only
+            // the unread replies).
+            let tk = thread_key(ch, root);
+            if side.threads.contains_key(&tk) || !side.fetching.insert(tk) {
+                return;
+            }
+            (ident, Want::Thread(ch.to_string(), root.to_string()))
+        } else {
+            let key = chan_key(&key).to_string();
+            if side.previews.contains_key(&key) || !side.fetching.insert(key.clone()) {
+                return;
+            }
+            (ident, Want::Channel(key))
+        }
     };
-    fetch_preview(st, id, key);
+    match want {
+        Want::Channel(key) => fetch_preview(st, id, key),
+        Want::Thread(ch, root) => fetch_thread(st, id, ch, root),
+    }
 }
 
 /// Fetch `key`'s recent messages into `previews` (the caller has put the
@@ -714,8 +875,26 @@ fn fetch_preview(st: &Shared, id: crate::store::Identity, key: String) {
     let st2 = Rc::clone(st);
     spawn(async move {
         let fetched = match api::history(&id, &key, None, None, 25).await {
-            Ok((mut msgs, _)) => {
+            Ok((mut msgs, more)) => {
                 msgs.reverse();
+                // The row says the user was mentioned but the page has no
+                // such message since the read mark: the rest of the unread
+                // (one more page) so that @ has somewhere to land.
+                let (me, last_read, mentions) = {
+                    let s = st2.borrow();
+                    let me = s.ident.as_ref().map(|i| i.user_id.clone()).unwrap_or_default();
+                    let c = s.channel(&key);
+                    (me, c.and_then(|c| c.last_read.clone()), c.map_or(0, |c| c.mentions))
+                };
+                if let (true, true, Some(lr)) = (more, mentions > 0, last_read.as_deref()) {
+                    let seen = msgs.iter().any(|m| m.ts.as_str() > lr && m.user.as_deref() != Some(me.as_str()) && mrkdwn::mentions(&m.text, &me));
+                    if !seen {
+                        if let Ok((mut older, _)) = api::history(&id, &key, Some(lr), None, 100).await {
+                            older.reverse();
+                            chat::merge(&mut msgs, older.into_iter().filter(|m| !m.is_reply()).collect());
+                        }
+                    }
+                }
                 crate::absorb(&st2, &key, &msgs).await;
                 msgs
             }
@@ -763,12 +942,16 @@ fn fetch_thread(st: &Shared, id: crate::store::Identity, channel: String, root: 
                 crate::absorb(&st2, &channel, &msgs).await;
                 let mut s = st2.borrow_mut();
                 let Some(side) = s.side.as_mut() else { return };
+                side.fetching.remove(&key);
                 side.threads.insert(key, msgs);
                 sync_preview(&mut s);
                 render(&mut s);
             }
             Err(e) => {
                 log(&format!("slack: preview thread {channel}/{root}: {e}"));
+                if let Some(side) = st2.borrow_mut().side.as_mut() {
+                    side.fetching.remove(&key);
+                }
                 preview_status(&st2, &channel, format!("thread: {e}"));
             }
         }
@@ -809,8 +992,12 @@ fn open_menu(st: &Shared) {
         let k = |action: &str| side.engine.keys.key_of(action).to_string();
         let sel = side.engine.selected_key().and_then(|key| s.channel(chan_key(&key)).cloned());
         let row = sel.is_some();
-        let unread = sel.as_ref().is_some_and(|c| c.has_unreads || c.mentions > 0);
+        let thread_row = side.engine.selected_key().as_deref().and_then(thread_of).map(|(c, r)| (c.to_string(), r.to_string()));
+        let viewed = thread_row.as_ref().and_then(|(c, r)| view_thread(&s, c, r));
+        let unread = viewed.is_some() || sel.as_ref().is_some_and(|c| c.has_unreads || c.mentions > 0);
+        let mention = viewed.is_some_and(|t| t.mention) || (thread_row.is_none() && sel.as_ref().is_some_and(|c| c.mentions > 0));
         let title = match &sel {
+            Some(c) if thread_row.is_some() => menu_safe(&format!("{} thread", s.channel_label(c)), 30),
             Some(c) => menu_safe(&s.channel_label(c), 30),
             None => NAME.to_string(),
         };
@@ -827,7 +1014,8 @@ fn open_menu(st: &Shared) {
             items.push_str(&menu_item(NAME, "open", &k("activate"), row));
             items.push_str(&menu_item(NAME, "read the preview", &k("focus"), row && readable));
             items.push_str(&menu_item(NAME, "mark read", &k("mark"), row && unread));
-            items.push_str(&menu_item(NAME, "compose", &k("compose"), row));
+            items.push_str(&menu_item(NAME, "go to your mention", &k("mention"), row && mention && readable));
+            items.push_str(&menu_item(NAME, if thread_row.is_some() { "reply in the thread" } else { "compose" }, &k("compose"), row));
             items.push_str(&menu_item(NAME, "new agent from the preview", &k("agent"), row && readable));
             items.push_str(&menu_item(NAME, "open in the Slack app", &k("open_app"), row));
             items.push_str(" ''");
@@ -943,6 +1131,23 @@ fn preview_key(side: &mut Sidebar, key: &str, mouse: Option<(u32, u32)>) -> Opti
             let c = side.preview.as_mut()?;
             return Some(Took::Chat(chat::handle_key(c, "n", None)));
         }
+        // @ on a row: the keyboard goes to the preview with its cursor
+        // on the first unread mention of the user (the first at all,
+        // failing that).
+        if key == side.engine.keys.key_of("mention") && can_focus(side) {
+            let c = side.preview.as_mut()?;
+            match c.first_unread_mention() {
+                Some(i) => {
+                    side.preview_focus = true;
+                    c.set_cursor_idx(i);
+                    c.follow = false;
+                    c.reveal_cursor();
+                    c.status = Some("your mention · @ next".into());
+                }
+                None => c.status = Some("no mention of you in the preview".into()),
+            }
+            return Some(Took::Chat(After::None));
+        }
         return None;
     }
     let Some(c) = side.preview.as_mut() else {
@@ -960,7 +1165,8 @@ fn preview_key(side: &mut Sidebar, key: &str, mouse: Option<(u32, u32)>) -> Opti
                 c.status = None;
                 return Some(Took::Chat(After::None));
             }
-            "i" => return Some(Took::Open(None, true)),
+            // i composes where the preview is: the thread shown, or the channel.
+            "i" => return Some(Took::Open(c.thread.clone(), true)),
             "r" => {
                 let Some(i) = c.cursor_idx() else { return Some(Took::Chat(After::None)) };
                 let m = &c.msgs[i];
@@ -1074,7 +1280,15 @@ fn preview_after(st: &Shared, took: Took) {
         After::Back | After::Switch(None, _) => {
             let mut s = st.borrow_mut();
             let Some(side) = s.side.as_mut() else { return };
-            side.thread = None;
+            if side.engine.selected_key().as_deref().and_then(thread_of).is_some() {
+                // The row is the thread: back is to the list.
+                side.preview_focus = false;
+                if let Some(c) = side.preview.as_mut() {
+                    c.status = None;
+                }
+            } else {
+                side.thread = None;
+            }
             sync_preview(&mut s);
             render(&mut s);
             return;
@@ -1200,10 +1414,15 @@ fn preview_after(st: &Shared, took: Took) {
         After::Mark => {
             // No hold here: the reader is in this channel, so the cursor
             // follows its row down the list and the preview stays put.
+            // In a thread it is the thread that is read, not the channel.
+            let thread = st.borrow().side.as_ref().and_then(|sd| sd.preview.as_ref()).and_then(|c| c.thread.clone());
             let st2 = Rc::clone(st);
             let cid = channel.id.clone();
             spawn(async move {
-                crate::mark_read(&st2, &cid).await;
+                match thread {
+                    Some(root) => crate::mark_thread_read(&st2, &cid, &root).await,
+                    None => crate::mark_read(&st2, &cid).await,
+                }
             });
         }
         After::Refetch => {
@@ -1323,8 +1542,10 @@ pub fn on_mode_event(st: &Shared, name: &str, event: &Event) {
 fn execute(st: &Shared, outcome: Outcome) {
     enum After {
         None,
-        OpenChat(Channel, bool),
-        OpenApp(Vec<Channel>),
+        /// The channel view on the channel (a thread of it), composing.
+        OpenChat(Channel, Option<String>, bool),
+        OpenApp(Vec<(Channel, Option<String>)>),
+        /// Row ids: channels, and `t:channel/root` threads.
         Mark(Vec<String>),
         Refresh,
         Menu,
@@ -1347,17 +1568,28 @@ fn execute(st: &Shared, outcome: Outcome) {
                 After::None
             }
             Outcome::Activate(key) => match s.channel(chan_key(&key)).cloned() {
-                Some(c) => After::OpenChat(c, false),
+                Some(c) => After::OpenChat(c, thread_of(&key).map(|(_, r)| r.to_string()), false),
                 None => return,
             },
             Outcome::Action(action, targets) => {
-                let chans: Vec<Channel> = targets.iter().filter_map(|k| s.channel(chan_key(k)).cloned()).collect();
+                let rows: Vec<(Channel, Option<String>)> = targets
+                    .iter()
+                    .filter_map(|k| Some((s.channel(chan_key(k)).cloned()?, thread_of(k).map(|(_, r)| r.to_string()))))
+                    .collect();
                 match action {
-                    "compose" => match chans.into_iter().next() {
-                        Some(c) => After::OpenChat(c, true),
+                    "compose" => match rows.into_iter().next() {
+                        Some((c, thread)) => After::OpenChat(c, thread, true),
                         None => return,
                     },
-                    "open_app" => After::OpenApp(chans),
+                    "open_app" => After::OpenApp(rows),
+                    // The preview took @ when it had a mention to go to.
+                    "mention" => {
+                        if let Some(side) = s.side.as_mut() {
+                            side.engine.status = Some("no mention to go to in the preview".into());
+                        }
+                        render(&mut s);
+                        After::None
+                    }
                     // The preview took n when it had something; here it
                     // has not loaded (or the row is a header).
                     "agent" => {
@@ -1368,7 +1600,13 @@ fn execute(st: &Shared, outcome: Outcome) {
                         After::None
                     }
                     "mark" => {
-                        let ids: Vec<String> = chans.into_iter().map(|c| c.id).collect();
+                        let ids: Vec<String> = rows
+                            .iter()
+                            .map(|(c, t)| match t {
+                                Some(r) => format!("{THREAD_PREFIX}{}/{r}", c.id),
+                                None => c.id.clone(),
+                            })
+                            .collect();
                         if let Some(side) = s.side.as_mut() {
                             side.engine.clear_marks();
                             side.hold = Some((side.engine.sel(), ids.clone()));
@@ -1405,16 +1643,19 @@ fn execute(st: &Shared, outcome: Outcome) {
     match after {
         After::None => {}
         After::Close => close(st),
-        After::OpenChat(c, compose) => {
+        After::OpenChat(c, thread, compose) => {
             let (client, pane) = st.borrow().side.as_ref().map(|p| (p.client, p.pane)).unwrap_or((None, None));
             close(st);
-            chat::open(st, c, None, client, pane, compose);
+            chat::open(st, c, thread, client, pane, compose);
             return;
         }
-        After::OpenApp(chans) => {
+        After::OpenApp(rows) => {
             let team = st.borrow().ident.as_ref().map(|i| i.team_id.clone()).unwrap_or_default();
-            for c in chans {
-                let url = format!("slack://channel?team={team}&id={}", c.id);
+            for (c, thread) in rows {
+                let mut url = format!("slack://channel?team={team}&id={}", c.id);
+                if let Some(root) = thread {
+                    url.push_str(&format!("&message={root}&thread_ts={root}"));
+                }
                 spawn(async move {
                     let _ = run_job(&format!("command -v open >/dev/null 2>&1 && open {u} || xdg-open {u}", u = crate::http::sq(&url)), None).await;
                 });
@@ -1424,7 +1665,10 @@ fn execute(st: &Shared, outcome: Outcome) {
             for id in ids {
                 let st2 = Rc::clone(st);
                 spawn(async move {
-                    crate::mark_read(&st2, &id).await;
+                    match thread_of(&id).map(|(c, r)| (c.to_string(), r.to_string())) {
+                        Some((ch, root)) => crate::mark_thread_read(&st2, &ch, &root).await,
+                        None => crate::mark_read(&st2, &id).await,
+                    }
                 });
             }
         }
@@ -1514,6 +1758,19 @@ mod tests {
 
     fn three() -> Vec<Message> {
         vec![msg("1.000100", "one"), msg("2.000100", "two"), msg("3.000100", "three")]
+    }
+
+    #[test]
+    fn row_keys_name_channels_and_threads_in_any_section() {
+        assert_eq!(chan_key("C1"), "C1");
+        assert_eq!(chan_key("u:C1"), "C1");
+        assert_eq!(row_id("u:C1"), "C1");
+        assert_eq!(chan_key("t:C1/1700000010.000100"), "C1");
+        assert_eq!(thread_of("t:C1/1700000010.000100"), Some(("C1", "1700000010.000100")));
+        assert_eq!(thread_of("u:C1"), None);
+        let t = Thread { channel: "C1".into(), root: msg("1700000010.000100", "root"), ..Default::default() };
+        assert_eq!(thread_row_key(&t), "t:C1/1700000010.000100");
+        assert_eq!(thread_of(&thread_row_key(&t)).map(|(c, _)| c), Some("C1"));
     }
 
     #[test]

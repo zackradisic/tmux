@@ -524,11 +524,20 @@ workspace name. Everything the desktop client can do, the plugin can.
 The **sidebar** (`prefix + C-s`) is a picker over your conversations, grouped
 as your own Slack sidebar is (its sections, then channels, then DMs), under an
 **Unread** section that gathers every channel and DM with something new, DMs
-first (the rows stay in their own sections too). Rows look
+first (the rows stay in their own sections too), and every thread you follow
+that has replies you have not read, as Slack's own Threads view lists them:
+`↳ #channel`, the root's first words and `+N` new replies, its preview the
+thread itself with the new-messages rule before the unread replies. Rows look
 like the agents picker's: the badge comes first (`!` on a red block and the
 count when you were mentioned, a cyan `●` while unread, a dim `·` once read),
 an unread name is bold, a read or muted one dim, and the right column says how
-long ago the channel last spoke. The preview is the channel view itself, laid
+long ago the channel last spoke. A mention is also shown where it is: a message
+that addresses you (`@you`, `@here`, `@channel`) carries a red `@` in its
+gutter in every view, and `@` on a sidebar row hands the preview the keyboard
+with the cursor on the first unread mention (`@` again: the next, in the
+channel view too). `m` on a thread row marks the thread read on Slack and the
+row goes; so does reading the thread to its end in the channel view, which
+leaves the channel's own badge alone. The preview is the channel view itself, laid
 out at the column's width: the channel's recent messages, newest at the bottom.
 `l` (or a click in the column) hands it the keyboard, so `j`/`k`, `y`, `e`, `m`
 and `Enter` (the thread, shown in the preview itself) work on the messages

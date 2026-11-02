@@ -52,9 +52,12 @@ mod sidebar;
 mod store;
 mod timefmt;
 
-use store::{Binding, Channel, Identity, Kind, Message, Section, User};
+use store::{Binding, Channel, Identity, Kind, Message, Section, Thread, User};
 
 pub const NAME: &str = "slack";
+
+/// How soon after one Threads-view fetch the feed may ask for another.
+const THREADS_DEBOUNCE_MS: u64 = 3000;
 
 /// `load-plugin -o workspace=<subdomain> -o poll_secs=10 -o pick_<action>=<key>`;
 /// `-o api_base=<url> -o token=<xoxc> -o cookie=<xoxd>` for a workspace
@@ -122,6 +125,10 @@ pub struct State {
     pub syncing: bool,
     pub threads_unread: bool,
     pub thread_mentions: i64,
+    /// The threads with unread replies (the Threads view), newest first,
+    /// fetched whenever the thread badge says there are any.
+    pub threads: Vec<Thread>,
+    pub threads_ms: u64,
     pub last_error: Option<String>,
     /// The RTM socket, while it is open.
     pub feed: Option<WsId>,
@@ -266,6 +273,8 @@ impl Plugin for Slack {
             syncing: false,
             threads_unread: false,
             thread_mentions: 0,
+            threads: Vec::new(),
+            threads_ms: 0,
             last_error: None,
             feed: None,
             feed_connecting: false,
@@ -429,6 +438,7 @@ async fn full_sync_inner(st: &Shared, id: &Identity) -> Result<(), String> {
         s.last_error = None;
         publish(&s);
     }
+    sync_threads(st, counts.threads_unread).await;
     sidebar::refresh(st);
     chat::refresh_names(st);
     // DM peers `users.list` did not have (Slack Connect DMs).
@@ -449,6 +459,8 @@ pub async fn refresh_counts(st: &Shared) -> Result<(), String> {
     store::apply_counts(&counts.channels).await.map_err(|e| e.message.clone())?;
     let mut pings: Vec<Ping> = Vec::new();
     let mut read_elsewhere: Vec<(String, String)> = Vec::new();
+    let threads_changed;
+    let threads_wanted;
     {
         let mut s = st.borrow_mut();
         let first = s.counts_ms == 0;
@@ -484,6 +496,8 @@ pub async fn refresh_counts(st: &Shared) -> Result<(), String> {
             }
         }
         s.counts_ms = now_ms();
+        threads_changed = s.threads_unread != counts.threads_unread || s.thread_mentions != counts.thread_mentions;
+        threads_wanted = counts.threads_unread && (threads_changed || s.side.is_some() || s.threads.is_empty());
         s.threads_unread = counts.threads_unread;
         s.thread_mentions = counts.thread_mentions;
         publish(&s);
@@ -491,11 +505,105 @@ pub async fn refresh_counts(st: &Shared) -> Result<(), String> {
     for (cid, ts) in read_elsewhere {
         store::mark_read(&cid, &ts).await;
     }
+    // The Threads view costs a call of its own: when the badge moved,
+    // while the sidebar shows the list, or when we have none to show.
+    if threads_wanted || (!counts.threads_unread && threads_changed) {
+        sync_threads(st, counts.threads_unread).await;
+    }
     sidebar::refresh(st);
     for p in pings {
         announce(st, &id, p).await;
     }
     Ok(())
+}
+
+/// The unread threads, from Slack when the badge says there are any,
+/// none otherwise. The roots and replies go to the cache and their
+/// authors get names; the sidebar redraws its Unread section.
+async fn sync_threads(st: &Shared, any: bool) {
+    if !any {
+        let mut s = st.borrow_mut();
+        if !s.threads.is_empty() {
+            s.threads.clear();
+            s.threads_ms = now_ms();
+        }
+        return;
+    }
+    let Some(id) = st.borrow().ident.clone() else { return };
+    match api::thread_view(&id).await {
+        Ok(view) => {
+            for t in &view.threads {
+                let mut msgs = vec![t.root.clone()];
+                msgs.extend(t.unread.iter().cloned());
+                absorb(st, &t.channel, &msgs).await;
+            }
+            let mut s = st.borrow_mut();
+            s.threads = view.threads;
+            s.threads_ms = now_ms();
+            s.threads_unread = !s.threads.is_empty() || s.threads_unread;
+            publish(&s);
+        }
+        Err(e) => log(&format!("slack: threads: {e}")),
+    }
+}
+
+/// Fetch the Threads view again, now (a reply arrived, a thread was
+/// read elsewhere): the feed's road, outside the poll.
+pub fn refresh_threads(st: &Shared) {
+    // A burst of replies is one fetch; the poll has the rest.
+    if now_ms().saturating_sub(st.borrow().threads_ms) < THREADS_DEBOUNCE_MS {
+        return;
+    }
+    st.borrow_mut().threads_ms = now_ms();
+    let st2 = Rc::clone(st);
+    spawn(async move {
+        sync_threads(&st2, true).await;
+        // No unread thread left: the badge follows on the next poll;
+        // say so now.
+        if st2.borrow().threads.is_empty() {
+            let mut s = st2.borrow_mut();
+            s.threads_unread = false;
+            s.thread_mentions = 0;
+            publish(&s);
+        }
+        sidebar::refresh(&st2);
+    });
+}
+
+/// Mark a thread read up to its newest reply, on Slack and here: its
+/// row leaves the Unread section, the badges follow.
+pub async fn mark_thread_read(st: &Shared, channel: &str, root: &str) {
+    let (id, ts) = {
+        let s = st.borrow();
+        let Some(id) = s.ident.clone() else { return };
+        let ts = s.threads.iter().find(|t| t.channel == channel && t.root.ts == root).and_then(|t| t.unread.last().map(|m| m.ts.clone()));
+        (id, ts)
+    };
+    let ts = match ts {
+        Some(t) => t,
+        None => store::thread(channel, root).await.last().map(|m| m.ts.clone()).unwrap_or_else(|| root.to_string()),
+    };
+    if let Err(e) = api::mark_thread(&id, channel, root, &ts).await {
+        log(&format!("slack: thread mark {channel}/{root}: {e}"));
+        return;
+    }
+    {
+        let mut s = st.borrow_mut();
+        if let Some(pos) = s.threads.iter().position(|t| t.channel == channel && t.root.ts == root) {
+            let t = s.threads.remove(pos);
+            if t.mention {
+                let me = s.ident.as_ref().map(|i| i.user_id.clone()).unwrap_or_default();
+                let n = t.unread.iter().filter(|m| m.user.as_deref() != Some(me.as_str()) && mrkdwn::mentions(&m.text, &me)).count() as i64;
+                s.thread_mentions = (s.thread_mentions - n).max(0);
+            }
+        }
+        if s.threads.is_empty() {
+            s.threads_unread = false;
+            s.thread_mentions = 0;
+        }
+        publish(&s);
+    }
+    sidebar::refresh(st);
 }
 
 /// Tell the user about a new mention or DM: its text on the status line
@@ -559,6 +667,7 @@ pub fn publish(s: &State) {
     let _ = set_option("@slack_unread", &unread.to_string());
     let _ = set_option("@slack_mentions", &mentions.to_string());
     let _ = set_option("@slack_dms", &dms.to_string());
+    let _ = set_option("@slack_threads", &s.threads.len().to_string());
 }
 
 /// The sidebar and the chat view, after a change to what they show.
@@ -658,7 +767,13 @@ fn on_command(st: &Shared, event: &Event) {
                     format!("{}{m}", s.channel_label(c))
                 })
                 .collect();
-            if s.threads_unread {
+            for t in &s.threads {
+                let label = s.channel(&t.channel).map(|c| s.channel_label(c)).unwrap_or_else(|| t.channel.clone());
+                let snippet = listkit::text::clip(&listkit::text::one_line(&s.names.with(|n| mrkdwn::plain(&t.root.text, n))), 40);
+                let n = t.unread.len();
+                lines.push(format!("{label} ↳ {snippet} ({n} new{})", if t.mention { ", mention" } else { "" }));
+            }
+            if s.threads_unread && s.threads.is_empty() {
                 lines.push("threads".into());
             }
             let _ = reply(&if lines.is_empty() { "nothing unread".to_string() } else { lines.join("\n") });
@@ -687,7 +802,11 @@ fn on_command(st: &Shared, event: &Event) {
                         s.users.len(),
                         unread,
                         mentions,
-                        if s.threads_unread { ", threads unread" } else { "" },
+                        match (s.threads_unread, s.threads.len()) {
+                            (false, _) => String::new(),
+                            (true, 0) => ", threads unread".to_string(),
+                            (true, n) => format!(", {n} thread{} unread", if n == 1 { "" } else { "s" }),
+                        },
                         age(s.counts_ms),
                         age(s.synced_ms),
                         s.last_error.as_ref().map(|e| format!("\nlast error: {e}")).unwrap_or_default()
@@ -1040,6 +1159,8 @@ mod tests {
             syncing: false,
             threads_unread: false,
             thread_mentions: 0,
+            threads: Vec::new(),
+            threads_ms: 0,
             last_error: None,
             feed: None,
             feed_connecting: false,

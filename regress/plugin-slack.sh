@@ -6,7 +6,8 @@
 # `auth.test` alone. Check:
 #
 #   boot: `status` names the user and team and counts the 4 channels;
-#   `unread` lists the channel with a mention and the DM, not the read
+#   `unread` lists the channel with a mention, the DM and the followed
+#     thread with its 2 new replies (one a mention), not the read
 #     private channel; the @slack_unread/@slack_mentions/@slack_dms
 #     options carry the badges;
 #   `help`, `open --help`, an unknown verb answer on the caller's
@@ -268,7 +269,10 @@ echo "$U" | grep -qx '#general (1 mention)' || fail "unread lacks #general (1 me
 echo "$U" | grep -qx '@Tejas' || fail "unread lacks @Tejas: $U"
 echo "$U" | grep -q 'secret' && fail "unread lists the read channel: $U"
 [ "$($TMUX show-options -sv @slack_unread)" = 2 ] || fail "@slack_unread: $($TMUX show-options -sv @slack_unread)"
-[ "$($TMUX show-options -sv @slack_mentions)" = 1 ] || fail "@slack_mentions: $($TMUX show-options -sv @slack_mentions)"
+# One mention in #general, one in the thread we follow.
+[ "$($TMUX show-options -sv @slack_mentions)" = 2 ] || fail "@slack_mentions: $($TMUX show-options -sv @slack_mentions)"
+[ "$($TMUX show-options -sv @slack_threads)" = 1 ] || fail "@slack_threads: $($TMUX show-options -sv @slack_threads)"
+echo "$U" | grep -qx '#general ↳ planning the sprint (2 new, mention)' || fail "unread lacks the thread line: $U"
 [ "$($TMUX show-options -sv @slack_dms)" = 1 ] || fail "@slack_dms: $($TMUX show-options -sv @slack_dms)"
 
 # --- help on the caller's terminal -----------------------------------------
@@ -300,11 +304,11 @@ screen_has '●1' && fail "the old right-hand badge is still drawn"
 screen_has 'by sections' || fail "the sidebar is not tagged by sections"
 # The Unread section comes first: every unread row, the DM before the
 # channel; #general is there and in Work. The cursor opens on the DM.
-screen | grep -q '▪ Unread  2' || fail "no Unread section of 2 rows: $(screen | grep Unread)"
+screen | grep -q '▪ Unread  3' || fail "no Unread section of 3 rows (the DM, #general, the thread): $(screen | grep Unread)"
 TEJ=$(screen | grep -n '● @Tejas' | head -1 | cut -d: -f1)
 GEN=$(screen | grep -n '! #general' | head -1 | cut -d: -f1)
 [ "$TEJ" -lt "$GEN" ] || fail "the DM ($TEJ) is not before the channel ($GEN) in Unread"
-[ "$(screen | grep -c '#general')" = 2 ] || fail "#general is not in Unread and in Work: $(screen | grep -c '#general')"
+[ "$(screen | grep -c '#general')" = 3 ] || fail "#general is not in Unread (its row and its thread's) and in Work: $(screen | grep -c '#general')"
 until_ok 60 screen_has 'are you around' || fail "the DM preview never loaded"
 keys j
 # The preview of the selected channel names the stranger, lazily.
@@ -336,7 +340,8 @@ screen_has '#general' || fail "the unread view lacks #general"
 screen_has '@Tejas' || fail "the unread view lacks @Tejas"
 # Back to sections. m on #general (the first row of Work): the row loses
 # its badge and, read now, sorts below #random, which spoke later. The
-# cursor does not follow it down: it stays on the first row, #random.
+# cursor does not follow it down: it stays where it was, on the row that
+# takes the place (the unread thread's).
 $TMUX plugin-command slack 'menu-key v'; sleep 0.3
 $TMUX plugin-command slack 'menu-key v'
 until_ok 20 screen_has 'by sections' || fail "menu-key v twice did not return to sections"
@@ -347,9 +352,10 @@ keys m
 until_ok 40 marks_grew "$BEFORE_M" || fail "m did not mark #general read"
 until_ok 40 sh -c "$TMUX capture-pane -M -p -t $FORM | grep -q '· #general'" || fail "#general kept its badge: $(screen | grep general)"
 RANDOM_AT=$(screen | grep -n '#random' | head -1 | cut -d: -f1)
-GENERAL_AT=$(screen | grep -n '#general' | head -1 | cut -d: -f1)
+GENERAL_AT=$(screen | grep -n '· #general' | head -1 | cut -d: -f1)
 [ "$RANDOM_AT" -lt "$GENERAL_AT" ] || fail "#general ($GENERAL_AT) did not drop below #random ($RANDOM_AT)"
-cursor_row | grep -q '#random' || fail "the cursor followed the marked row: $(cursor_row)"
+# The row that takes its place in Unread is the thread's.
+cursor_row | grep -q '↳ #general' || fail "the cursor followed the marked row: $(cursor_row)"
 # --- the preview has the keyboard --------------------------------------------
 # The preview is the channel view embedded in the column, drawn by the
 # plugin at the column's width. l hands it the keyboard: the footer
@@ -368,6 +374,46 @@ print("\n".join(bad)); sys.exit(1 if bad else 0)
 '
 sep_ok() { $TMUX capture-pane -M -p -t "$FORM" | python3 -c "$SEP_PY"; }
 sep_lit() { screen | grep -q '┃'; }
+
+# --- a thread with unread replies -------------------------------------------
+# The thread we follow (Slack's Threads view) is a row of the Unread
+# section: a red badge because a reply mentions us, ↳, the channel, the
+# root's first words and how many replies are new. Its preview is the
+# thread itself, the new-messages rule before the unread replies; @
+# hands the keyboard to the preview with the cursor on the mention,
+# which carries a red @ in its gutter; Escape goes back to the list (the
+# row is the thread); m marks the thread read on Slack at its last reply
+# and the row goes, the badges with it.
+screen | grep -q '! ↳ #general  planning the sprint  +2' || fail "no thread row in Unread: $(screen | grep '↳')"
+keys g; keys g; keys j
+cursor_row | grep -q '↳ #general' || fail "gg j is not on the thread row: $(cursor_row)"
+until_ok 40 screen_has 'can you review the plan' || fail "the thread preview did not show the unread reply"
+screen_has '· thread' || fail "the preview header does not say thread: $(screen | head -1)"
+screen_has 'planning the sprint' || fail "the thread preview lacks its root"
+screen_has '── new messages ──' || fail "no new-messages rule before the unread replies"
+NEW=$(screen | grep -n 'new messages' | head -1 | cut -d: -f1)
+REV=$(screen | grep -n 'can you review' | head -1 | cut -d: -f1)
+[ "$NEW" -lt "$REV" ] || fail "the rule ($NEW) is not before the unread reply ($REV)"
+replies_fetched() { [ "$(ncalls conversations.replies ts 1700000022.000100)" -ge 1 ]; }
+thread_marked() { [ "$(ncalls subscriptions.thread.mark thread_ts 1700000022.000100)" -ge 1 ]; }
+until_ok 40 replies_fetched || fail "the thread row did not fetch the whole thread"
+sep_ok || fail "the thread preview crosses the separator: $(sep_ok)"
+keys @
+until_ok 20 sep_lit || fail "@ did not hand the keyboard to the preview: $(screen | tail -1)"
+screen | grep '▎' | grep -q 'can you review' || fail "the cursor bar is not on the mention: $(screen | grep '▎')"
+screen | grep -q '@ @zack can you review the plan' || fail "the mention has no @ mark in its gutter: $(screen | grep 'review')"
+screen_has 'Esc back to list' || fail "a thread row's footer does not say back to list: $(screen | tail -1)"
+keys Escape
+sep_lit && fail "Escape did not hand the keyboard back to the list"
+screen_has '· thread' || fail "Escape dropped the thread preview"
+keys m
+until_ok 40 thread_marked || fail "m did not mark the thread read on Slack"
+[ "$(ncalls subscriptions.thread.mark ts 1700000320.000100)" -ge 1 ] || fail "the thread mark is not at the last reply: $(fetch "$BASE/_calls" | tr ',' '\n' | grep -A3 thread.mark | head -8)"
+until_ok 40 screen_lacks '↳ #general' || fail "the thread row stayed after m: $(screen | grep '↳')"
+until_ok 40 sh -c "[ \"\$($TMUX show-options -sv @slack_mentions)\" = 0 ]" || fail "@slack_mentions after reading the thread: $($TMUX show-options -sv @slack_mentions)"
+[ "$($TMUX show-options -sv @slack_threads)" = 0 ] || fail "@slack_threads after reading the thread: $($TMUX show-options -sv @slack_threads)"
+U=$(slack unread)
+echo "$U" | grep -q '↳' && fail "unread still lists the thread: $U"
 # The cursor is on #random; down to #general, whose messages the sidebar
 # already holds.
 i=0
@@ -459,6 +505,14 @@ keys +
 until_ok 20 sh -c "[ \"\$($TMUX display -p -t $FORM '#{pane_width}')\" = $CW ]" || fail "+ did not restore the width: $($TMUX display -p -t "$FORM" '#{pane_width}')"
 screen_has 'the town square' || fail "the channel view lacks the topic"
 screen_has '@zack look at this' || fail "mrkdwn was not resolved"
+# @ puts the cursor on the message that mentions us and says so; the
+# message carries a red @ in its gutter. G goes back to the bottom.
+keys @
+until_ok 20 screen_has 'your mention' || fail "@ did not find the mention: $(screen | tail -1)"
+screen | grep '▎' | grep -q 'look at this' || fail "the cursor bar is not on the mention: $(screen | grep '▎')"
+screen | grep -q '@ hey @zack look at this' || fail "the mention has no @ mark in its gutter: $(screen | grep 'look at this')"
+screen | grep -c '^.\{0,3\}@ ' | grep -qx 1 || fail "more than one message carries the @ mark: $(screen | grep '@ ')"
+keys G
 screen_has '── new messages ──' || fail "no new-messages rule"
 until_ok 60 screen_has 'gregor  ' || fail "the channel view did not name U3"
 screen_lacks 'U3 ' || fail "the channel view shows the raw id U3"

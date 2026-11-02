@@ -5,7 +5,8 @@
 use serde_json::Value;
 
 use crate::http;
-use crate::store::{Channel, Count, FileRef, Identity, Kind, Message, Section, User};
+use crate::mrkdwn;
+use crate::store::{Channel, Count, FileRef, Identity, Kind, Message, Section, Thread, User};
 
 fn s(v: &Value, k: &str) -> Option<String> {
     v.get(k).and_then(Value::as_str).map(str::to_string)
@@ -54,6 +55,52 @@ pub async fn counts(id: &Identity) -> Result<Counts, String> {
         out.thread_mentions = i(t, "mention_count");
     }
     Ok(out)
+}
+
+/// The Threads view: every thread the user follows that has replies
+/// they have not read, newest first, with those replies.
+#[derive(Debug, Default)]
+pub struct ThreadView {
+    pub threads: Vec<Thread>,
+    /// Unread replies over every thread, read ones included.
+    pub total_unread: i64,
+    /// How many threads have unread replies (the list may be shorter).
+    pub new_threads: i64,
+}
+
+/// `subscriptions.thread.getView`: what the desktop client's Threads
+/// page shows. The call takes a `limit` but pages no further than its
+/// first answer (`has_more` is about the read threads below), so one
+/// call is the view.
+pub async fn thread_view(id: &Identity) -> Result<ThreadView, String> {
+    let v = http::call(id, "subscriptions.thread.getView", &[("limit", "50")]).await?;
+    let mut out = ThreadView { threads: Vec::new(), total_unread: i(&v, "total_unread_replies"), new_threads: i(&v, "new_threads_count") };
+    for t in v.get("threads").and_then(Value::as_array).into_iter().flatten() {
+        let Some(rm) = t.get("root_msg") else { continue };
+        let Some(channel) = s(rm, "channel") else { continue };
+        let Some(root) = message_from(&channel, rm) else { continue };
+        let mut unread: Vec<Message> = t
+            .get("unread_replies")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|m| message_from(&channel, m))
+            .collect();
+        unread.sort_by(|a, b| a.ts.cmp(&b.ts));
+        if unread.is_empty() {
+            continue;
+        }
+        let mention = unread.iter().any(|m| m.user.as_deref() != Some(id.user_id.as_str()) && mrkdwn::mentions(&m.text, &id.user_id));
+        let latest_reply = root.latest_reply.clone().or_else(|| unread.last().map(|m| m.ts.clone()));
+        out.threads.push(Thread { channel, last_read: s(rm, "last_read"), reply_count: root.reply_count, latest_reply, unread, mention, root });
+    }
+    Ok(out)
+}
+
+/// Mark a thread read up to `ts` (`subscriptions.thread.mark`, what the
+/// desktop client sends when the thread is looked at).
+pub async fn mark_thread(id: &Identity, channel: &str, thread_ts: &str, ts: &str) -> Result<(), String> {
+    http::call(id, "subscriptions.thread.mark", &[("channel", channel), ("thread_ts", thread_ts), ("ts", ts)]).await.map(|_| ())
 }
 
 fn channel_from(c: &Value) -> Option<Channel> {

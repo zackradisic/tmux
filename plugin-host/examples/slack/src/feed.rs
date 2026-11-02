@@ -259,6 +259,25 @@ async fn handle(st: &Shared, v: Value) {
                 chat::on_changed(st, m.clone());
             }
         }
+        // The Threads view moved: a thread read elsewhere (the phone),
+        // followed or left. The one read is dropped at once; Slack is
+        // asked for the rest.
+        "thread_marked" | "thread_subscribed" | "thread_unsubscribed" | "update_thread_state" => {
+            if let Some(sub) = v.get("subscription") {
+                if let (Some(channel), Some(root)) = (s(sub, "channel"), s(sub, "thread_ts")) {
+                    let last_read = s(sub, "last_read").unwrap_or_default();
+                    let mut st_ = st.borrow_mut();
+                    if let Some(i) = st_.threads.iter().position(|t| t.channel == channel && t.root.ts == root) {
+                        let done = st_.threads[i].unread.last().is_none_or(|m| m.ts <= last_read);
+                        if kind == "thread_marked" && done {
+                            st_.threads.remove(i);
+                            crate::publish(&st_);
+                        }
+                    }
+                }
+            }
+            crate::refresh_threads(st);
+        }
         "goodbye" => {
             // Slack is about to close the socket: be first.
             if let Some(ws) = st.borrow_mut().feed.take() {
@@ -310,11 +329,51 @@ async fn on_chat_message(st: &Shared, v: &Value) {
                 (me, label, who, ch.as_ref().map(|c| c.kind), ch.as_ref().is_some_and(|c| c.is_muted), viewing, body)
             };
             let ours = m.user.as_deref() == Some(me.as_str());
-            let mention = !ours && (m.text.contains(&format!("<@{me}>")) || m.text.contains("<!here") || m.text.contains("<!channel") || m.text.contains("<!everyone"));
+            let mention = !ours && mrkdwn::mentions(&m.text, &me);
             crate::absorb(st, &channel, std::slice::from_ref(&m)).await;
             // A reply does not change the channel's unread state; a channel
             // message does (unless it is ours).
-            if !m.is_reply() {
+            if m.is_reply() {
+                // Into the Threads view's row for its thread when we hold
+                // one (our own reply reads the thread); a thread we have
+                // no row for may still be one we follow: ask Slack.
+                let root = m.thread_ts.clone().unwrap_or_default();
+                let refetch = {
+                    let mut s = st.borrow_mut();
+                    match s.threads.iter().position(|t| t.channel == channel && t.root.ts == root) {
+                        Some(i) if ours => {
+                            s.threads.remove(i);
+                            if s.threads.is_empty() {
+                                s.threads_unread = false;
+                                s.thread_mentions = 0;
+                            }
+                            crate::publish(&s);
+                            false
+                        }
+                        Some(i) => {
+                            let t = &mut s.threads[i];
+                            if !t.unread.iter().any(|x| x.ts == m.ts) {
+                                t.unread.push(m.clone());
+                                t.reply_count += 1;
+                            }
+                            t.latest_reply = Some(m.ts.clone());
+                            if mention && !t.mention {
+                                t.mention = true;
+                            }
+                            if mention {
+                                s.thread_mentions += 1;
+                            }
+                            s.threads_unread = true;
+                            crate::publish(&s);
+                            false
+                        }
+                        None => !ours,
+                    }
+                };
+                if refetch {
+                    crate::refresh_threads(st);
+                }
+            } else {
                 store::note_message(&channel, &m.ts, ours, mention).await;
                 let mut s = st.borrow_mut();
                 if let Some(c) = s.channels.iter_mut().find(|c| c.id == channel) {

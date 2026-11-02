@@ -213,6 +213,8 @@ pub struct Chat {
     /// cell, not a field the paint borrows mutably: `paint` reads the
     /// state and this is the one thing it records.
     pub placed: RefCell<HashMap<String, Placed>>,
+    /// The user's id: whose mentions `@` finds and the gutter marks.
+    pub me: String,
 }
 
 impl Chat {
@@ -300,6 +302,39 @@ impl Chat {
 
     pub(crate) fn set_cursor_idx(&mut self, i: usize) {
         self.cursor = self.msgs.get(i).map(|m| m.ts.clone());
+    }
+
+    /// Message `i` addresses the user (and is not their own).
+    pub(crate) fn mentions_me(&self, i: usize) -> bool {
+        self.msgs.get(i).is_some_and(|m| m.user.as_deref() != Some(self.me.as_str()) && mrkdwn::mentions(&m.text, &self.me))
+    }
+
+    /// Where `@` lands from the list: the first mention after the read
+    /// mark, else the first mention at all.
+    pub(crate) fn first_unread_mention(&self) -> Option<usize> {
+        let lr = self.last_read.as_deref().unwrap_or("");
+        (0..self.msgs.len())
+            .find(|&i| self.msgs[i].ts.as_str() > lr && self.mentions_me(i))
+            .or_else(|| (0..self.msgs.len()).find(|&i| self.mentions_me(i)))
+    }
+
+    /// `@`: the cursor to the next message that mentions the user, after
+    /// the cursor and round again; the status says which of how many.
+    pub(crate) fn next_mention(&mut self) {
+        let n = self.msgs.len();
+        let start = self.cursor_idx().map(|i| i + 1).unwrap_or(0).min(n);
+        let hit = (start..n).chain(0..start).find(|&i| self.mentions_me(i));
+        match hit {
+            Some(i) => {
+                let total = (0..n).filter(|&j| self.mentions_me(j)).count();
+                let k = (0..=i).filter(|&j| self.mentions_me(j)).count();
+                self.set_cursor_idx(i);
+                self.follow = false;
+                self.reveal_cursor();
+                self.status = Some(if total == 1 { "your mention".to_string() } else { format!("mention {k} of {total}") });
+            }
+            None => self.status = Some("no mention of you here".into()),
+        }
     }
 
     /// Scroll so the cursor message is on screen; a message taller than
@@ -410,7 +445,17 @@ pub fn layout(
             }
             out.push(Line { cells, msg: Some(i), image: None });
         }
-        let indent = || plain_cells("  ", 0);
+        // A message that addresses the user carries a red `@` in the
+        // indent of its first line, grouped under a header or not.
+        let mut mark = m.user.as_deref() != Some(me) && mrkdwn::mentions(&m.text, me);
+        let mut indent = || {
+            if mark {
+                mark = false;
+                plain_cells("@ ", ST_BOLD | ST_RED)
+            } else {
+                plain_cells("  ", 0)
+            }
+        };
         if m.deleted {
             let mut cells = indent();
             cells.extend(plain_cells("(deleted)", ST_DIM));
@@ -590,7 +635,8 @@ pub(crate) fn layout_chat(c: &mut Chat, names: &NameMap, tz: i64, me: &str, now:
 // ---------------------------------------------------------------------------
 
 pub(crate) fn hints() -> &'static str {
-    "j/k move · Enter thread · i compose · r reply · e react · y copy · v select · n agent · m read · L older · Space menu · Esc back · ? help · q close"
+    // e (react) and L (older) are in the menu: the foot must fit a 60-cell float.
+    "j/k move · Enter thread · @ mention · i compose · r reply · y copy · v select · n agent · m read · Space menu · Esc back · ? help · q close"
 }
 
 fn rule(width: usize) -> String {
@@ -866,6 +912,7 @@ pub fn open(st: &Shared, ch: Channel, thread: Option<String>, client: Option<u64
         // since the caller's copy was taken.
         let channel = s.channel(&ch.id).cloned().unwrap_or(ch);
         let last_read = channel.last_read.clone();
+        let me = s.ident.as_ref().map(|i| i.user_id.clone()).unwrap_or_default();
         s.chat = Some(Chat {
             mode,
             channel,
@@ -896,6 +943,7 @@ pub fn open(st: &Shared, ch: Channel, thread: Option<String>, client: Option<u64
             cell_aspect,
             data_root,
             placed: RefCell::new(HashMap::new()),
+            me,
         });
         paint(&s);
     }
@@ -968,6 +1016,7 @@ pub(crate) fn embedded(mode: ModeId, channel: Channel, client: Option<u64>, pane
         cell_aspect: DEFAULT_CELL_ASPECT,
         data_root: String::new(),
         placed: RefCell::new(HashMap::new()),
+        me: String::new(),
     };
     let last = c.msgs.len().saturating_sub(1);
     c.set_cursor_idx(last);
@@ -1241,9 +1290,11 @@ async fn fetch(st: &Shared, gen: u64) {
     }
 }
 
-/// `mark_read` for the open channel, at most once per debounce window.
+/// `mark_read` for the open conversation, at most once per debounce
+/// window: the channel in the timeline, the thread alone in a thread
+/// (reading a thread does not read its channel).
 fn maybe_mark_read(st: &Shared) {
-    let channel = {
+    let (channel, thread) = {
         let mut s = st.borrow_mut();
         let Some(c) = s.chat.as_mut() else { return };
         let now = now_ms();
@@ -1251,11 +1302,14 @@ fn maybe_mark_read(st: &Shared) {
             return;
         }
         c.marked_ms = now;
-        c.channel.id.clone()
+        (c.channel.id.clone(), c.thread.clone())
     };
     let st2 = Rc::clone(st);
     spawn(async move {
-        crate::mark_read(&st2, &channel).await;
+        match thread {
+            Some(root) => crate::mark_thread_read(&st2, &channel, &root).await,
+            None => crate::mark_read(&st2, &channel).await,
+        }
     });
 }
 
@@ -1659,6 +1713,10 @@ pub(crate) fn handle_key(c: &mut Chat, key: &str, mouse: Option<(u32, u32)>) -> 
             c.status = Some("marked read".into());
             After::Mark
         }
+        "@" => {
+            c.next_mention();
+            After::None
+        }
         "R" => {
             c.status = Some("refetching…".into());
             After::Refetch
@@ -1731,6 +1789,7 @@ pub(crate) fn menu_items(c: &Chat) -> String {
     items.push_str(&menu_item(NAME, "open in Slack app", "o", true));
     items.push_str(" ''");
     items.push_str(&menu_item(NAME, "mark read", "m", true));
+    items.push_str(&menu_item(NAME, "next mention of you", "@", (0..c.msgs.len()).any(|i| c.mentions_me(i))));
     items.push_str(&menu_item(NAME, "load older", "L", !in_thread));
     items.push_str(" ''");
     let back = if in_thread { "back to channel" } else { "back to sidebar" };
@@ -1972,15 +2031,18 @@ fn run(st: &Shared, after: After) {
             spawn(crate::handoff::open(req));
         }
         After::Mark => {
-            let channel = {
+            let (channel, thread) = {
                 let mut s = st.borrow_mut();
                 let Some(c) = s.chat.as_mut() else { return };
                 c.marked_ms = now_ms();
-                c.channel.id.clone()
+                (c.channel.id.clone(), c.thread.clone())
             };
             let st2 = Rc::clone(st);
             spawn(async move {
-                crate::mark_read(&st2, &channel).await;
+                match thread {
+                    Some(root) => crate::mark_thread_read(&st2, &channel, &root).await,
+                    None => crate::mark_read(&st2, &channel).await,
+                }
             });
         }
         After::Refetch => {
@@ -2220,6 +2282,7 @@ mod tests {
             cell_aspect: 2.0,
             data_root: "/d".into(),
             placed: RefCell::new(HashMap::new()),
+            me: String::new(),
         };
         c.set_cursor_idx(1);
         c
@@ -2507,6 +2570,43 @@ mod tests {
     }
 
     #[test]
+    fn at_walks_the_mentions_and_the_gutter_marks_them() {
+        let mut c = chat();
+        c.me = "U1".into();
+        c.msgs = vec![
+            msg(NOON, "U2", "morning"),
+            msg(NOON + 10, "U2", "hey <@U1> look"),
+            msg(NOON + 20, "U1", "<@U1> is me, not a mention"),
+            msg(NOON + 30, "U2", "<!here> standup"),
+            msg(NOON + 40, "U2", "bye"),
+        ];
+        c.last_read = Some(format!("{}.000100", NOON + 10));
+        c.lines = layout(&c.msgs, 40, 0, "U1", c.last_read.as_deref(), &names(), NOON + 3600, false, None);
+        c.set_cursor_idx(4);
+        // The rows of the two mentions carry the mark; nothing else does.
+        let t = texts(&c.lines);
+        assert!(t.iter().any(|l| l == "@ hey @zack look"), "{t:?}");
+        assert!(t.iter().any(|l| l.starts_with("@ @here standup")), "{t:?}");
+        assert_eq!(t.iter().filter(|l| l.starts_with("@ ")).count(), 2, "{t:?}");
+        assert!(t.iter().any(|l| l == "  @zack is me, not a mention"), "our own text is not a mention of us: {t:?}");
+        // @ from the end wraps to the first mention, then walks on.
+        assert_eq!(c.first_unread_mention(), Some(3), "the first mention after the read mark");
+        c.next_mention();
+        assert_eq!(c.cursor_idx(), Some(1));
+        assert_eq!(c.status.as_deref(), Some("mention 1 of 2"));
+        c.next_mention();
+        assert_eq!(c.cursor_idx(), Some(3));
+        assert_eq!(c.status.as_deref(), Some("mention 2 of 2"));
+        c.next_mention();
+        assert_eq!(c.cursor_idx(), Some(1), "round again");
+        let mut none = chat();
+        none.me = "U1".into();
+        none.next_mention();
+        assert_eq!(none.status.as_deref(), Some("no mention of you here"));
+        assert_eq!(none.first_unread_mention(), None);
+    }
+
+    #[test]
     fn menu_mirrors_the_keymap() {
         let items = menu_items(&chat());
         assert!(items.contains(" 'open thread' 'Enter' \"plugin-command slack 'menu-key Enter'\""), "{items}");
@@ -2518,7 +2618,14 @@ mod tests {
         let mut sel = chat();
         sel.anchor = Some(sel.msgs[0].ts.clone());
         assert!(menu_items(&sel).contains(" 'new agent from the selection' 'n' "), "{}", menu_items(&sel));
-        assert!(!items.contains("'-"), "everything applies on a message in a timeline: {items}");
+        // Nobody mentions anybody in the fixture: that item alone is dimmed.
+        assert!(items.contains(" '-next mention of you' '@' "), "{items}");
+        assert_eq!(items.matches("'-").count(), 1, "everything else applies on a message in a timeline: {items}");
+        let mut at = chat();
+        at.me = "U1".into();
+        at.msgs[0].text = "<@U1> look".into();
+        at.msgs[0].user = Some("U2".into());
+        assert!(menu_items(&at).contains(" 'next mention of you' '@' "), "{}", menu_items(&at));
         // In a thread: no thread to open, nothing older to load, back
         // goes to the channel.
         let items = menu_items(&in_thread(false));
