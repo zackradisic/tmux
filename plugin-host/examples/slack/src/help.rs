@@ -39,8 +39,8 @@ pick: the sidebar, as a floating picker.
   l / Right   read the preview             @   go to where you were mentioned
   ?           every key (R: refresh)       /   search (# channel, @ user,
   C-o / Tab   back / forward through the        ! unread|mention|dm|thread)
-              conversations you opened      w   toast every message of the
-  N           new agent from the preview        channel (w again: Slack's rule)
+              conversations you opened      w   quiet this channel's toasts
+  N           new agent from the preview        (w again: every message)
 
 An Unread section sits above your own sections: every channel and DM
 with something new, DMs first, then channels and threads in the order
@@ -64,11 +64,12 @@ recent messages, newest at the bottom, attachments under their text;
 [ and ] scroll it. Space opens a menu of every action for the row,
 dimmed where one does not apply; each item is the key itself.
 
-Toasts (the notifications pane): a DM, a message that mentions you,
-and whatever Slack itself would notify by its preference for the
-channel (mentions only, unless you changed it there). w on a channel
-row tells every message of it too (`all` before its age) until w
-again. C-o opens the conversation you opened before this one, Tab
+Toasts (the notifications pane): every message of every channel you
+are in, unless it is yours, the channel is muted, or it is on screen.
+w on a channel row quiets it (`quiet` before its age: only DMs and
+mentions there toast) until w again. `set -g @slack-notify slack` is
+Slack's own rule instead (DMs, mentions, its per-channel preference);
+w then watches a channel (`all`). C-o opens the conversation you opened before this one, Tab
 (C-i) the one after, through a history that survives closing the
 float (the sidebar opens on its newest entry, a thread in the
 preview). N hands everything the preview shows to a new agent, for a

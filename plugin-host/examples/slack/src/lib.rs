@@ -57,6 +57,14 @@ use store::{Binding, Channel, Identity, Kind, Message, Section, Thread, User};
 pub const NAME: &str = "slack";
 /// The settings key holding the channels whose every message is toasted (w).
 pub const WATCH_SETTING: &str = "watch";
+/// `@slack-notify`: `all` (the default) toasts every message of every
+/// channel the user is in; `slack` toasts what Slack itself would (DMs,
+/// mentions, its per-channel preference). `w` on a row is the exception
+/// either way: a quiet channel under `all`, a watched one under `slack`.
+pub fn notify_all() -> bool {
+    get_option("@slack-notify").ok().is_none_or(|v| v.trim() != "slack")
+}
+
 /// The settings key holding the history of conversations opened (C-o / Tab).
 pub const VISITS_SETTING: &str = "visits";
 const VISITS_MAX: usize = 50;
@@ -162,7 +170,8 @@ pub struct State {
     /// or refused): each is asked once. Slack Connect users are not in
     /// `users.list`, so names arrive lazily as their messages do.
     pub names_pending: HashSet<String>,
-    /// Channels whose every message is toasted (w in the sidebar).
+    /// Channels `w` toggled: quiet under `@slack-notify all`, watched
+    /// (every message) under `slack`.
     pub watched: HashSet<String>,
     /// The conversations opened, oldest first; `visit_at == visits.len()`
     /// is the present, less after C-o. Kept in the store.

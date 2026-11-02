@@ -94,6 +94,9 @@ pub struct Sidebar {
     pub thread: Option<String>,
     /// Thread messages fetched for the preview, by `channel/root`.
     pub threads: HashMap<String, Vec<Message>>,
+    /// `@slack-notify` is `all` (read once per rebuild): a `w` row is
+    /// quiet; else `w` rows are the watched ones.
+    pub notify_all: bool,
 }
 
 /// The preview column's geometry for a mode `w` by `h` with the list
@@ -116,7 +119,7 @@ pub fn keys() -> KeyTable {
         .with("agent", "n", "rows", "new agent from the previewed message (or a selection made there)")
         .with("agent_all", "N", "rows", "new agent from everything the preview shows (a summary of the channel)")
         .with("mention", "@", "rows", "go to where you were mentioned (the preview takes the keyboard; @ again: the next)")
-        .with("watch", "w", "rows", "toast every message of the channel (w again: Slack's own rule)")
+        .with("watch", "w", "rows", "quiet this channel's toasts (only DMs and mentions), w again: every message")
         .with("menu", "Space", "rows", "the action menu")
         .with("view", "v", "picker", "sections / unread / all")
         .with("refresh", "R", "picker", "fetch channels, sections, users and badges again")
@@ -193,6 +196,7 @@ pub fn open(st: &Shared, client: Option<u64>, pane: Option<u32>) {
             preview_focus: false,
             thread: None,
             threads: HashMap::new(),
+            notify_all: true,
         });
         rebuild(&mut s);
         land_on_last_visit(&mut s);
@@ -553,12 +557,13 @@ fn row_left(s: &State, c: &Channel) -> Vec<Styled> {
 }
 
 /// The right column: how long ago the channel last spoke.
-fn row_right(c: &Channel, now: u64, watched: bool) -> Vec<Styled> {
+fn row_right(c: &Channel, now: u64, mark: &str) -> Vec<Styled> {
     let age = c.latest.as_deref().map(|t| timefmt::age(t, now)).unwrap_or_default();
     let mut v = Vec::new();
-    if watched {
-        // Every message here is toasted (w).
-        v.extend(plain_cells("all ", ST_DIM | ST_CYAN));
+    if !mark.is_empty() {
+        // The w exception: `quiet` (only DMs and mentions toast) or
+        // `all` (every message does).
+        v.extend(plain_cells(&format!("{mark} "), ST_DIM | ST_CYAN));
     }
     v.extend(plain_cells(&format!("{age:>4}"), ST_DIM));
     v
@@ -589,7 +594,12 @@ fn group_node(key: &str, name: &str, count: usize, unread: usize) -> Node {
 fn channel_node(s: &State, side: &Sidebar, c: &Channel, depth: u8, now: u64) -> Node {
     let mut n = Node::item(c.id.clone(), depth);
     n.left = row_left(s, c);
-    n.right = row_right(c, now, s.watched.contains(&c.id));
+    let toggled = s.watched.contains(&c.id);
+    n.right = row_right(c, now, match (toggled, side.notify_all) {
+        (false, _) => "",
+        (true, true) => "quiet",
+        (true, false) => "all",
+    });
     let label = s.channel_label(c);
     n.haystack = format!("{label} {} {}", c.topic, c.purpose);
     if c.kind.is_dm() {
@@ -610,8 +620,8 @@ fn channel_node(s: &State, side: &Sidebar, c: &Channel, depth: u8, now: u64) -> 
     if c.is_starred {
         n.tokens.push(('!', "starred".into()));
     }
-    if s.watched.contains(&c.id) {
-        n.tokens.push(('!', "watched".into()));
+    if toggled {
+        n.tokens.push(('!', if side.notify_all { "quiet" } else { "watched" }.into()));
     }
     n.dim = c.is_muted;
     n.preview = preview_for(side, c);
@@ -822,6 +832,9 @@ fn build_nodes(s: &State) -> Vec<Node> {
 }
 
 pub fn rebuild(s: &mut State) {
+    if let Some(side) = s.side.as_mut() {
+        side.notify_all = crate::notify_all();
+    }
     let nodes = build_nodes(s);
     let unread = s.channels.iter().filter(|c| c.has_unreads && !c.is_muted && shown(c)).count();
     let mentions: i64 = s.channels.iter().filter(|c| !c.is_muted).map(|c| c.mentions).sum();
@@ -1122,7 +1135,13 @@ fn open_menu(st: &Shared) {
             items.push_str(&menu_item(NAME, "open", &k("activate"), row));
             items.push_str(&menu_item(NAME, "read the preview", &k("focus"), row && readable));
             items.push_str(&menu_item(NAME, "mark read", &k("mark"), row && unread));
-            items.push_str(&menu_item(NAME, if watched { "toasts: Slack's rule again" } else { "toast every message here" }, &k("watch"), row && thread_row.is_none()));
+            let watch_label = match (watched, side.notify_all) {
+                (true, true) => "toast every message here again",
+                (false, true) => "quiet: only DMs and mentions here",
+                (true, false) => "toasts: Slack's rule again",
+                (false, false) => "toast every message here",
+            };
+            items.push_str(&menu_item(NAME, watch_label, &k("watch"), row && thread_row.is_none()));
             items.push_str(&menu_item(NAME, "go to your mention", &k("mention"), row && mention && readable));
             items.push_str(&menu_item(NAME, if thread_row.is_some() { "reply in the thread" } else { "compose" }, &k("compose"), row));
             items.push_str(&menu_item(NAME, "new agent from the preview", &k("agent"), row && readable));
@@ -1791,10 +1810,13 @@ fn execute(st: &Shared, outcome: Outcome) {
                         ids.sort();
                         let json = serde_json::to_string(&ids).unwrap_or_default();
                         spawn(async move { crate::store::set_setting(crate::WATCH_SETTING, &json).await });
-                        let status = match (on.is_empty(), off.is_empty()) {
-                            (false, true) => format!("every message in {} is toasted (w again: Slack's rule)", on.join(", ")),
-                            (true, false) => format!("{} back to Slack's rule: DMs, mentions, its preferences", off.join(", ")),
-                            _ => "watch toggled".to_string(),
+                        let all = crate::notify_all();
+                        let status = match (on.is_empty(), off.is_empty(), all) {
+                            (false, true, true) => format!("{} is quiet: only DMs and mentions toast (w again: every message)", on.join(", ")),
+                            (true, false, true) => format!("every message in {} toasts again", off.join(", ")),
+                            (false, true, false) => format!("every message in {} is toasted (w again: Slack's rule)", on.join(", ")),
+                            (true, false, false) => format!("{} back to Slack's rule: DMs, mentions, its preferences", off.join(", ")),
+                            _ => "w toggled".to_string(),
                         };
                         if let Some(side) = s.side.as_mut() {
                             side.engine.status = Some(status);
@@ -1949,6 +1971,7 @@ mod tests {
             preview_focus: false,
             thread: None,
             threads: HashMap::new(),
+            notify_all: true,
         };
         side.previews.insert("C1".into(), msgs.clone());
         let mut c = chat::embedded(ModeId(1), channel("C1"), None, None, msgs, pw as u32, body_h as u32, body_y as u32);

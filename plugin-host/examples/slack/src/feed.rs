@@ -171,10 +171,11 @@ impl Recent {
 /// `desktop_notification` covers channels by the user's preferences;
 /// a direct message (one to one or a group) from someone else, or a
 /// message that mentions the user (@them, @here, @channel), or any
-/// message of a channel the user watches (w in the sidebar), is told
+/// message of a channel whose every message is wanted (`every`: the
+/// default under `@slack-notify all`, or w under `slack`), is told
 /// here regardless, unless the conversation is muted or on screen.
-pub fn message_toasts(kind: Kind, ours: bool, muted: bool, viewing: bool, mention: bool, watched: bool) -> bool {
-    (kind.is_dm() || mention || watched) && !ours && !muted && !viewing
+pub fn message_toasts(kind: Kind, ours: bool, muted: bool, viewing: bool, mention: bool, every: bool) -> bool {
+    (kind.is_dm() || mention || every) && !ours && !muted && !viewing
 }
 
 /// The toast's key for a message: the dedup key, and the toast plugin's
@@ -327,7 +328,7 @@ async fn on_chat_message(st: &Shared, v: &Value) {
                         None => "(attachment)".to_string(),
                     };
                 }
-                (me, label, who, ch.as_ref().map(|c| c.kind), ch.as_ref().is_some_and(|c| c.is_muted), viewing, s.watched.contains(&channel), body)
+                (me, label, who, ch.as_ref().map(|c| c.kind), ch.as_ref().is_some_and(|c| c.is_muted), viewing, crate::notify_all() != s.watched.contains(&channel), body)
             };
             let ours = m.user.as_deref() == Some(me.as_str());
             let mention = !ours && mrkdwn::mentions(&m.text, &me);

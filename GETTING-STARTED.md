@@ -542,9 +542,11 @@ out at the column's width: the channel's recent messages, newest at the bottom.
 `l` (or a click in the column) hands it the keyboard, so `j`/`k`, `y`, `e`, `m`
 and `Enter` (the thread, shown in the preview itself) work on the messages
 right there and `Escape` steps back, thread to channel to list; `n` on a row hands the previewed message (or a selection made in the
-preview) to a new agent, `i` composes to the channel. `w` on a channel toasts
-every message there, not only Slack's own picks (DMs, mentions and whatever the
-channel's notification preference says); `C-o` and `Tab` reopen the
+preview) to a new agent, `i` composes to the channel. Every message of every channel
+you are in is toasted to the notifications pane (not your own, not a muted
+channel, not one on screen); `w` quiets a channel (only DMs and mentions
+there), `set -g @slack-notify slack` keeps to Slack's own rule instead, with
+`w` watching a channel; `C-o` and `Tab` reopen the
 conversations you opened before and after this one, a history that survives
 closing the float (the sidebar opens on its newest entry); `N` hands everything
 the preview shows to a new agent, for a summary. `Enter` on a row opens the **channel view**: a

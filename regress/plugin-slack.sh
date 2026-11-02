@@ -436,12 +436,13 @@ keys m
 until_ok 40 marks_grew "$BEFORE_M" || fail "m in Work did not mark #general read"
 until_ok 40 sh -c "$TMUX capture-pane -M -p -t $FORM | grep -q '· #general'" || fail "#general kept its badge (Work): $(screen | grep general)"
 cursor_row | grep -q '#random' || fail "the cursor is not on the row that took #general's place: $(cursor_row)"
-# --- w: every message of the channel toasts -----------------------------
-# w on #random: the row says `all` before its age and the status says
-# so; a plain message there is toasted later (the feed section below).
+# --- w: a quiet channel -----------------------------------------------------
+# Every channel message toasts by default; w on #random quiets it: the
+# row says `quiet` before its age, the status says so, and a plain
+# message there is not toasted later (the feed section below).
 keys w
-until_ok 20 sh -c "$TMUX capture-pane -M -p -t $FORM | grep '#random' | grep -q 'all '" || fail "w did not mark #random watched: $(screen | grep random)"
-screen_has 'every message in #random is toasted' || fail "w said nothing: $(screen | tail -2)"
+until_ok 20 sh -c "$TMUX capture-pane -M -p -t $FORM | grep '#random' | grep -q 'quiet '" || fail "w did not mark #random quiet: $(screen | grep random)"
+screen_has '#random is quiet' || fail "w said nothing: $(screen | tail -2)"
 # Down to #general, whose messages the sidebar already holds.
 keys j
 cursor_row | grep -q '#general' || fail "j from #random is not on #general: $(cursor_row)"
@@ -926,7 +927,10 @@ R=$(slack 'rtm-inject {"type":"desktop_notification","title":"Morph","subtitle":
 [ "$R" = "injected" ] || fail "rtm-inject (notification) did not answer: $R"
 R=$(slack 'rtm-inject {"type":"desktop_notification","title":"Morph","subtitle":"#general","msg":"1700000901.000100","channel":"C1","content":"Tejas: a channel message"}')
 [ "$R" = "injected" ] || fail "rtm-inject (channel notification) did not answer: $R"
-until_ok 40 sh -c "$TMUX plugin-log slack | grep -q 'slack: toast: Morph (#general): Tejas: a channel message'" || fail "the channel notification was not toasted: $($TMUX plugin-log slack | tail -5)"
+# The channel message was toasted on arrival (every channel message
+# is, by default); Slack's notification for it is the repeat.
+until_ok 40 sh -c "$TMUX plugin-log slack | grep -q 'slack: toast: #general · Tejas: a channel message'" || fail "the channel message was not toasted: $($TMUX plugin-log slack | grep 'toast:' | tail -3)"
+sleep 0.5
 [ "$(toasts)" = "$((T0 + 2))" ] || fail "$(( $(toasts) - T0 )) toasts, not 2 (the DM once, the channel once): $($TMUX plugin-log slack | grep 'toast:')"
 # A mention in a channel toasts on the message itself too; Slack's
 # notification for it, when it comes, is a repeat.
@@ -938,12 +942,13 @@ R=$(slack 'rtm-inject {"type":"desktop_notification","title":"Morph","subtitle":
 sleep 0.5
 [ "$(toasts)" = "$((T0 + 3))" ] || fail "$(( $(toasts) - T0 )) toasts, not 3 (the mention once): $($TMUX plugin-log slack | grep 'toast:')"
 $TMUX plugin-log slack | grep -q 'desktop_notification C already told' || fail "the repeated notification left no evidence line"
-# A message in a watched channel (w on #random in the sidebar above)
-# toasts as a DM does, titled with the channel and the sender.
-R=$(slack 'rtm-inject {"type":"message","channel":"C2","user":"U2","text":"watched words","ts":"1700000904.000100"}')
-[ "$R" = "injected" ] || fail "rtm-inject (watched) did not answer: $R"
-until_ok 40 sh -c "$TMUX plugin-log slack | grep -q 'slack: toast: #random · Tejas: watched words'" || fail "the watched channel's message was not toasted: $($TMUX plugin-log slack | grep 'toast:' | tail -3)"
-[ "$(toasts)" = "$((T0 + 4))" ] || fail "$(( $(toasts) - T0 )) toasts, not 4 (the watched channel once): $($TMUX plugin-log slack | grep 'toast:')"
+# A message in a quiet channel (w on #random in the sidebar above) is
+# not toasted: w is the exception to "every message".
+R=$(slack 'rtm-inject {"type":"message","channel":"C2","user":"U2","text":"quiet words","ts":"1700000904.000100"}')
+[ "$R" = "injected" ] || fail "rtm-inject (quiet) did not answer: $R"
+sleep 1
+$TMUX plugin-log slack | grep -q 'quiet words' && fail "the quiet channel's message was toasted: $($TMUX plugin-log slack | grep 'toast:' | tail -3)"
+[ "$(toasts)" = "$((T0 + 3))" ] || fail "$(( $(toasts) - T0 )) toasts, not 3 (the quiet channel none): $($TMUX plugin-log slack | grep 'toast:')"
 R=$(slack 'rtm-inject nonsense')
 echo "$R" | grep -q '^rtm-inject:' || fail "rtm-inject with bad json did not complain: $R"
 BEFORE=$(ncalls conversations.mark channel C1)
