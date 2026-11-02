@@ -57,6 +57,18 @@ use store::{Binding, Channel, Identity, Kind, Message, Section, Thread, User};
 pub const NAME: &str = "slack";
 /// The settings key holding the channels whose every message is toasted (w).
 pub const WATCH_SETTING: &str = "watch";
+/// The settings key holding the history of conversations opened (C-o / Tab).
+pub const VISITS_SETTING: &str = "visits";
+const VISITS_MAX: usize = 50;
+
+/// A conversation opened: the channel view on a channel or a thread, a
+/// thread opened in the sidebar's preview, a preview read (`l`).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Visit {
+    pub channel: String,
+    #[serde(default)]
+    pub thread: Option<String>,
+}
 
 /// How soon after one Threads-view fetch the feed may ask for another.
 const THREADS_DEBOUNCE_MS: u64 = 3000;
@@ -152,6 +164,12 @@ pub struct State {
     pub names_pending: HashSet<String>,
     /// Channels whose every message is toasted (w in the sidebar).
     pub watched: HashSet<String>,
+    /// The conversations opened, oldest first; `visit_at == visits.len()`
+    /// is the present, less after C-o. Kept in the store.
+    pub visits: Vec<Visit>,
+    pub visit_at: usize,
+    /// A jump is opening a conversation: `note_visit` leaves the history alone.
+    pub jumping: bool,
     /// Ids waiting for a resolver worker, and how many workers run.
     pub names_queue: Vec<String>,
     pub names_inflight: usize,
@@ -290,6 +308,9 @@ impl Plugin for Slack {
             toasted: feed::Recent::default(),
             names_pending: HashSet::new(),
             watched: HashSet::new(),
+            visits: Vec::new(),
+            visit_at: 0,
+            jumping: false,
             names_queue: Vec::new(),
             names_inflight: 0,
         }));
@@ -368,6 +389,12 @@ async fn boot(st: Shared) {
     if let Some(json) = store::setting(WATCH_SETTING).await {
         let ids: Vec<String> = serde_json::from_str(&json).unwrap_or_default();
         st.borrow_mut().watched = ids.into_iter().collect();
+    }
+    if let Some(json) = store::setting(VISITS_SETTING).await {
+        let visits: Vec<Visit> = serde_json::from_str(&json).unwrap_or_default();
+        let mut s = st.borrow_mut();
+        s.visit_at = visits.len();
+        s.visits = visits;
     }
     let cfg = st.borrow().cfg.clone();
     match auth::ensure(&cfg).await {
@@ -999,6 +1026,78 @@ pub async fn post_message(st: &Shared, channel: &str, text: &str, thread_ts: Opt
     Ok(ts)
 }
 
+/// A conversation was opened: the newest entry of the history C-o walks
+/// (an older identical entry goes, so a conversation is in it once),
+/// kept in the store so it survives closing the views. A jump (C-o /
+/// Tab) opens a conversation without recording it.
+pub fn note_visit(st: &Shared, channel: &str, thread: Option<&str>) {
+    let json = {
+        let mut s = st.borrow_mut();
+        if s.jumping {
+            s.jumping = false;
+            return;
+        }
+        let v = Visit { channel: channel.to_string(), thread: thread.map(str::to_string) };
+        s.visits.retain(|x| *x != v);
+        s.visits.push(v);
+        if s.visits.len() > VISITS_MAX {
+            s.visits.remove(0);
+        }
+        s.visit_at = s.visits.len();
+        serde_json::to_string(&s.visits).unwrap_or_default()
+    };
+    spawn(async move { store::set_setting(VISITS_SETTING, &json).await });
+}
+
+/// C-o (back) / Tab (forward): the conversation opened before / after
+/// the one in view, opened in the channel view (a thread as a thread).
+/// From the present, back goes to the newest entry, or to the one
+/// before it when the newest is the view itself. A conversation gone
+/// from the workspace is dropped. False when there is nowhere to go.
+pub fn jump_visit(st: &Shared, back: bool, client: Option<u64>, pane: Option<u32>) -> bool {
+    let (ch, thread) = {
+        let mut s = st.borrow_mut();
+        let n = s.visits.len();
+        let mut at = s.visit_at.min(n);
+        if back && at >= n {
+            let viewing = s.chat.as_ref().map(|c| Visit { channel: c.channel.id.clone(), thread: c.thread.clone() });
+            if viewing.is_some() && s.visits.last() == viewing.as_ref() {
+                at = n.saturating_sub(1);
+            }
+        }
+        loop {
+            let idx = if back {
+                if at == 0 {
+                    return false;
+                }
+                at - 1
+            } else {
+                if at + 1 >= s.visits.len() {
+                    return false;
+                }
+                at + 1
+            };
+            let v = s.visits[idx].clone();
+            match s.channel(&v.channel).cloned() {
+                Some(ch) => {
+                    s.visit_at = idx;
+                    s.jumping = true;
+                    break (ch, v.thread);
+                }
+                None => {
+                    s.visits.remove(idx);
+                    if back {
+                        at = idx;
+                    }
+                }
+            }
+        }
+    };
+    sidebar::close(st);
+    chat::open(st, ch, thread, client, pane, false);
+    true
+}
+
 /// Mark a channel read up to its latest message, on Slack and here.
 pub async fn mark_read(st: &Shared, channel: &str, why: &str) {
     let (id, ts) = {
@@ -1183,6 +1282,9 @@ mod tests {
             toasted: feed::Recent::default(),
             names_pending: HashSet::new(),
             watched: HashSet::new(),
+            visits: Vec::new(),
+            visit_at: 0,
+            jumping: false,
             names_queue: Vec::new(),
             names_inflight: 0,
         }

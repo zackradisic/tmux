@@ -39,8 +39,8 @@ pick: the sidebar, as a floating picker.
   l / Right   read the preview             @   go to where you were mentioned
   ?           every key (R: refresh)       /   search (# channel, @ user,
   C-o / Tab   back / forward through the        ! unread|mention|dm|thread)
-              rows you rested on            w   toast every message of the
-                                               channel (w again: Slack's rule)
+              conversations you opened      w   toast every message of the
+  N           new agent from the preview        channel (w again: Slack's rule)
 
 An Unread section sits above your own sections: every channel and DM
 with something new, DMs first, then channels and threads in the order
@@ -68,8 +68,11 @@ Toasts (the notifications pane): a DM, a message that mentions you,
 and whatever Slack itself would notify by its preference for the
 channel (mentions only, unless you changed it there). w on a channel
 row tells every message of it too (`all` before its age) until w
-again. C-o goes back through the rows the cursor rested on, Tab (C-i)
-forward again, vim's jump list; a row that is gone is skipped.
+again. C-o opens the conversation you opened before this one, Tab
+(C-i) the one after, through a history that survives closing the
+float (the sidebar opens on its newest entry, a thread in the
+preview). N hands everything the preview shows to a new agent, for a
+summary of the channel; n the message under its cursor or a selection.
 
 l, Right or a click in the column hand the preview the keyboard (the
 separator lights up): the channel view's keys then work there - j/k
@@ -92,11 +95,12 @@ open: the channel view.
   L    load older              e          react (type :name: then Enter)
   o    open in the Slack app   y          copy the message (or selection)
   m    mark read               Y          copy the permalink
-  @    next mention of you
+  @    next mention of you     E          edit your message (Enter saves)
   R    refetch                 v          select from here (j/k extend)
   b    back to the sidebar     n          new agent from the message(s)
-  q    close                   Space      the action menu (every key)
-                               Escape     back: thread, channel, sidebar
+  q    close                   N          new agent from everything shown
+  C-o / Tab  the conversation  Space      the action menu (every key)
+       opened before / after   Escape     back: thread, channel, sidebar
 
 A message that mentions you (@you, @here, @channel) carries a red `@`
 in its gutter; @ moves the cursor to the next one, round again at the

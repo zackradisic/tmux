@@ -115,6 +115,8 @@ pub enum ComposeKind {
     Message(Option<String>),
     /// Add the named emoji to the message with this ts.
     Reaction(String),
+    /// Replace the text of the user's own message with this ts.
+    Edit(String),
 }
 
 pub struct Compose {
@@ -148,6 +150,7 @@ impl Compose {
             ComposeKind::Message(Some(_)) => "reply › ",
             ComposeKind::Message(None) => "› ",
             ComposeKind::Reaction(_) => "react :",
+            ComposeKind::Edit(_) => "edit › ",
         }
     }
 }
@@ -647,6 +650,7 @@ fn rule(width: usize) -> String {
 pub(crate) fn compose_hints(kind: &ComposeKind) -> &'static str {
     match kind {
         ComposeKind::Reaction(_) => "Enter react · Esc normal/close",
+        ComposeKind::Edit(_) => "Enter save · Esc normal/close",
         ComposeKind::Message(_) => "Enter send · C-j newline · Esc normal/close",
     }
 }
@@ -906,6 +910,7 @@ pub fn open(st: &Shared, ch: Channel, thread: Option<String>, client: Option<u64
     let images_on = opt_flag("@slack-images", true);
     let cell_aspect = listkit::image::cell_aspect(window);
     let data_root = fs_root().unwrap_or_default();
+    crate::note_visit(st, &ch.id, thread.as_deref());
     {
         let mut s = st.borrow_mut();
         // The freshest channel row we have: the badge may have moved
@@ -1383,6 +1388,12 @@ fn load_older(st: &Shared) {
 /// Switch the open view to another conversation of the same channel (a
 /// thread, or back to the timeline) without reopening the float.
 fn switch(st: &Shared, thread: Option<String>, from_timeline: bool) {
+    if let Some(root) = thread.as_deref() {
+        let cid = st.borrow().chat.as_ref().map(|c| c.channel.id.clone());
+        if let Some(cid) = cid {
+            crate::note_visit(st, &cid, Some(root));
+        }
+    }
     let gen = next_gen();
     {
         let mut s = st.borrow_mut();
@@ -1433,9 +1444,24 @@ pub(crate) enum After {
     /// Start an agent with these messages as its first prompt (the
     /// hand-off form, handoff.rs).
     Agent(Vec<usize>),
+    /// Save an edit of the user's message: its ts, the new text.
+    Edit(String, String),
+    /// C-o (true) / Tab: the conversation opened before / after this.
+    Jump(bool),
     Mark,
     Refetch,
     Older,
+}
+
+/// The compose box as an edit of the user's message `ts`, holding its
+/// `text` (the sidebar's E opens the view and then this).
+pub fn start_edit(st: &Shared, ts: String, text: String) {
+    let mut s = st.borrow_mut();
+    if let Some(c) = s.chat.as_mut() {
+        c.compose = Some(Compose::with_text(ComposeKind::Edit(ts), &text));
+        c.fit_box();
+    }
+    paint(&s);
 }
 
 /// A key arriving by another road than the mode (the Space menu's
@@ -1546,6 +1572,16 @@ fn compose_key(c: &mut Chat, key: &str) -> After {
                         cp.editor.insert();
                         c.status = Some("posting…".into());
                         After::Post(text, thread)
+                    }
+                }
+                ComposeKind::Edit(ts) => {
+                    if text.trim().is_empty() {
+                        c.status = Some("an empty edit: Esc Esc leaves the message as it is".into());
+                        After::None
+                    } else {
+                        c.compose = None;
+                        c.status = Some("saving the edit…".into());
+                        After::Edit(ts, text)
                     }
                 }
                 ComposeKind::Reaction(ts) => {
@@ -1704,6 +1740,31 @@ pub(crate) fn handle_key(c: &mut Chat, key: &str, mouse: Option<(u32, u32)>) -> 
             c.status = Some("new agent…".into());
             After::Agent(sel)
         }
+        // E edits the message under the cursor when it is the user's
+        // own: the box opens on its text, Enter saves it.
+        "E" => {
+            let Some(i) = c.cursor_idx() else { return After::None };
+            let m = &c.msgs[i];
+            if c.me.is_empty() || m.user.as_deref() != Some(c.me.as_str()) {
+                c.status = Some("only your own messages can be edited".into());
+                return After::None;
+            }
+            c.compose = Some(Compose::with_text(ComposeKind::Edit(m.ts.clone()), &m.text));
+            c.fit_box();
+            After::None
+        }
+        // N hands everything shown (the whole thread, the loaded
+        // timeline) to a new agent: a summary, a digest.
+        "N" => {
+            if c.msgs.is_empty() {
+                return After::None;
+            }
+            c.anchor = None;
+            c.status = Some("new agent from everything shown…".into());
+            After::Agent((0..c.msgs.len()).collect())
+        }
+        "C-o" => After::Jump(true),
+        "Tab" => After::Jump(false),
         "Y" => {
             let Some(i) = c.cursor_idx() else { return After::None };
             c.status = Some("fetching the permalink…".into());
@@ -1782,15 +1843,20 @@ pub(crate) fn menu_items(c: &Chat) -> String {
     items.push_str(&menu_item(NAME, "compose", "i", true));
     items.push_str(&menu_item(NAME, "reply in thread", "r", on_msg));
     items.push_str(&menu_item(NAME, "react", "e", on_msg));
+    let own = c.cursor_idx().is_some_and(|i| !c.me.is_empty() && c.msgs[i].user.as_deref() == Some(c.me.as_str()));
+    items.push_str(&menu_item(NAME, "edit your message", "E", own));
     items.push_str(&menu_item(NAME, if c.anchor.is_some() { "copy the selection" } else { "copy message" }, "y", on_msg));
     items.push_str(&menu_item(NAME, "copy permalink", "Y", on_msg));
     items.push_str(&menu_item(NAME, if c.anchor.is_some() { "cancel selection" } else { "select from here" }, "v", on_msg));
     items.push_str(&menu_item(NAME, if c.anchor.is_some() { "new agent from the selection" } else { "new agent from message" }, "n", on_msg));
+    items.push_str(&menu_item(NAME, "new agent from everything shown", "N", !c.msgs.is_empty()));
     items.push_str(&menu_item(NAME, "open in Slack app", "o", true));
     items.push_str(" ''");
     items.push_str(&menu_item(NAME, "mark read", "m", true));
     items.push_str(&menu_item(NAME, "next mention of you", "@", (0..c.msgs.len()).any(|i| c.mentions_me(i))));
     items.push_str(&menu_item(NAME, "load older", "L", !in_thread));
+    items.push_str(&menu_item(NAME, "the conversation opened before", "C-o", true));
+    items.push_str(&menu_item(NAME, "forward again", "Tab", true));
     items.push_str(" ''");
     let back = if in_thread { "back to channel" } else { "back to sidebar" };
     items.push_str(&menu_item(NAME, back, "Escape", true));
@@ -1908,6 +1974,56 @@ fn run(st: &Shared, after: After) {
                     }
                 }
             });
+        }
+        After::Edit(ts, text) => {
+            let Some((id, channel, gen)) = view_ctx(st) else { return };
+            let st2 = Rc::clone(st);
+            spawn(async move {
+                let r = api::update(&id, &channel, &ts, &text).await;
+                let changed = {
+                    let mut s = st2.borrow_mut();
+                    let Some(c) = s.chat.as_mut().filter(|c| c.gen == gen) else { return };
+                    let out = match r {
+                        Ok(()) => {
+                            c.status = Some("edited".into());
+                            Ok(c.msgs.iter_mut().find(|m| m.ts == ts).map(|m| {
+                                m.text = text.clone();
+                                m.clone()
+                            }))
+                        }
+                        Err(e) => {
+                            c.status = Some(format!("edit failed: {e}"));
+                            // The text back into the box rather than lost.
+                            c.compose = Some(Compose::with_text(ComposeKind::Edit(ts.clone()), &text));
+                            c.fit_box();
+                            Err(())
+                        }
+                    };
+                    match out {
+                        Ok(m) => {
+                            relayout_paint(&mut s);
+                            m
+                        }
+                        Err(()) => {
+                            paint(&s);
+                            None
+                        }
+                    }
+                };
+                if let Some(m) = changed {
+                    let _ = store::upsert_messages(std::slice::from_ref(&m)).await;
+                }
+            });
+        }
+        After::Jump(back) => {
+            let (client, pane) = st.borrow().chat.as_ref().map(|c| (c.client, c.pane)).unwrap_or((None, None));
+            if !crate::jump_visit(st, back, client, pane) {
+                let mut s = st.borrow_mut();
+                if let Some(c) = s.chat.as_mut() {
+                    c.status = Some(if back { "no conversation opened before this one" } else { "at the newest conversation opened" }.into());
+                }
+                paint(&s);
+            }
         }
         After::React(ts, name) => {
             let Some((id, channel, gen)) = view_ctx(st) else { return };
@@ -2618,9 +2734,15 @@ mod tests {
         let mut sel = chat();
         sel.anchor = Some(sel.msgs[0].ts.clone());
         assert!(menu_items(&sel).contains(" 'new agent from the selection' 'n' "), "{}", menu_items(&sel));
-        // Nobody mentions anybody in the fixture: that item alone is dimmed.
+        // Nobody mentions anybody in the fixture and the message under
+        // the cursor is not ours: those two items alone are dimmed.
         assert!(items.contains(" '-next mention of you' '@' "), "{items}");
-        assert_eq!(items.matches("'-").count(), 1, "everything else applies on a message in a timeline: {items}");
+        assert!(items.contains(" '-edit your message' 'E' "), "{items}");
+        assert!(items.contains(" 'new agent from everything shown' 'N' "), "{items}");
+        assert_eq!(items.matches("'-").count(), 2, "everything else applies on a message in a timeline: {items}");
+        let mut own = chat();
+        own.me = own.msgs[own.cursor_idx().unwrap()].user.clone().unwrap_or_default();
+        assert!(!own.me.is_empty() && menu_items(&own).contains(" 'edit your message' 'E' "), "{}", menu_items(&own));
         let mut at = chat();
         at.me = "U1".into();
         at.msgs[0].text = "<@U1> look".into();

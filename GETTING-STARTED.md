@@ -544,8 +544,10 @@ and `Enter` (the thread, shown in the preview itself) work on the messages
 right there and `Escape` steps back, thread to channel to list; `n` on a row hands the previewed message (or a selection made in the
 preview) to a new agent, `i` composes to the channel. `w` on a channel toasts
 every message there, not only Slack's own picks (DMs, mentions and whatever the
-channel's notification preference says); `C-o` and `Tab` walk back and forward
-through the rows the cursor rested on, vim's jump list. `Enter` on a row opens the **channel view**: a
+channel's notification preference says); `C-o` and `Tab` reopen the
+conversations you opened before and after this one, a history that survives
+closing the float (the sidebar opens on its newest entry); `N` hands everything
+the preview shows to a new agent, for a summary. `Enter` on a row opens the **channel view**: a
 transcript with day separators, the new-messages line, reactions and emoji
 drawn as glyphs (Slack's names, skin tones and your workspace's custom aliases
 included), bot cards with their fields, and every author by name, Slack
@@ -556,7 +558,8 @@ plugin; `set -g @slack-images off` keeps the lines alone (iTerm2 would show
 blank blocks). `Enter` on a message opens its thread (with or without replies
 yet), `Escape` steps back: thread to channel, channel to sidebar; `q` closes
 outright. `i` composes, `r` replies in the message's thread, `e`
-reacts, `o` opens the message in the Slack app. The compose box is a small
+reacts, `E` edits your own message in the compose box (Enter saves it), `N` hands
+everything shown to a new agent, `o` opens the message in the Slack app. The compose box is a small
 vim: it opens in insert mode, `Enter` sends and keeps it open for the next
 message, `C-j` puts a newline inside a message, `Escape` switches to normal
 mode (`dd`, `cw`, `o`, `v`, `/` and friends edit the draft; `Enter` still

@@ -442,22 +442,9 @@ cursor_row | grep -q '#random' || fail "the cursor is not on the row that took #
 keys w
 until_ok 20 sh -c "$TMUX capture-pane -M -p -t $FORM | grep '#random' | grep -q 'all '" || fail "w did not mark #random watched: $(screen | grep random)"
 screen_has 'every message in #random is toasted' || fail "w said nothing: $(screen | tail -2)"
-# --- the jump list ---------------------------------------------------------
-# A row the cursor rests on (a second) is a place: C-o goes back to the
-# places in turn, Tab forward again.
-sleep 1.2
+# Down to #general, whose messages the sidebar already holds.
 keys j
 cursor_row | grep -q '#general' || fail "j from #random is not on #general: $(cursor_row)"
-sleep 1.2
-keys j
-cursor_row | grep -q '#general' && fail "j did not leave #general: $(cursor_row)"
-keys C-o
-cursor_row | grep -q '#general' || fail "C-o did not go back to #general: $(cursor_row)"
-keys C-o
-cursor_row | grep -q '#random' || fail "C-o twice did not go back to #random: $(cursor_row)"
-keys Tab
-cursor_row | grep -q '#general' || fail "Tab did not go forward to #general: $(cursor_row)"
-# The cursor is on #general, whose messages the sidebar already holds.
 i=0
 while [ $i -lt 4 ] && ! cursor_row | grep -q '#general'; do keys j; i=$((i + 1)); done
 cursor_row | grep -q '#general' || fail "j did not reach #general: $(cursor_row)"
@@ -770,6 +757,18 @@ keys Escape
 screen_has -- '-- NORMAL --' || fail "Escape did not switch the reply box to normal mode"
 keys Escape
 screen | grep -q 'reply › ' && fail "the second Escape did not close the reply box"
+# E on our own message (the reply just posted, under the cursor at the
+# bottom) opens the box on its text; Enter saves it through chat.update
+# and the thread shows the new text.
+screen | grep '▎' | grep -q 'in the thread' || fail "the cursor is not on our reply: $(screen | grep '▎')"
+keys E
+until_ok 20 screen_has 'edit › in the thread' || fail "E did not open the box on the message's text: $(screen | tail -3)"
+$TMUX send-keys -t "$FORM" -l ' (edited)'; sleep 0.3
+keys Enter
+updated() { [ "$(ncalls chat.update channel C1)" -ge 1 ]; }
+until_ok 40 updated || fail "Enter did not reach chat.update"
+until_ok 40 screen_has 'in the thread (edited)' || fail "the edit is not shown: $(screen | grep 'in the thread')"
+screen | grep -q 'edit › ' && fail "the edit box stayed open after Enter"
 # Escape: back to the timeline, then back to the sidebar.
 keys Escape
 until_ok 40 screen_has 'morning' || fail "Escape did not return to the timeline"
@@ -862,6 +861,40 @@ screen | grep -q '›  x' && fail "the second Escape did not close the box"
 mode_open || fail "Escape while composing left the view"
 keys q
 until_ok 40 mode_closed || fail "q did not close the channel view (menu)"
+# --- the history: C-o reopens what was opened before -----------------------
+# The sidebar opens on the conversation opened last (the thread, in the
+# preview). C-o opens it in the channel view; C-o again the one before
+# it (the channel's timeline); Tab comes forward to the thread again.
+slack pick
+until_ok 40 mode_open || fail "pick did not reopen the sidebar"
+FORM=$(mode_pane)
+until_ok 40 screen_has 'by sections' || fail "the sidebar did not draw"
+cursor_row | grep -q '#general' || fail "the sidebar did not open on #general, the conversation opened last: $(cursor_row)"
+until_ok 40 screen_has '· thread' || fail "the preview does not show the thread opened last: $(screen | head -1)"
+until_ok 40 screen_has 'in the thread (edited)' || fail "the preview's thread lacks its reply: $(screen | head -8)"
+# Every jump closes the view and opens another: a new mode pane each time.
+view_swapped() { [ -n "$(mode_pane)" ] && [ "$(mode_pane)" != "$OLD" ]; }
+OLD=$FORM
+keys C-o
+until_ok 40 view_swapped || fail "C-o did not swap the sidebar for a view"
+FORM=$(mode_pane)
+until_ok 40 screen_has '· thread' || fail "C-o did not open the thread opened last: $(screen | head -1)"
+until_ok 40 screen_has 'in the thread (edited)' || fail "the reopened thread lacks its reply"
+OLD=$FORM
+keys C-o
+until_ok 40 view_swapped || fail "C-o again did not open another view"
+FORM=$(mode_pane)
+until_ok 40 screen_has 'the town square' || fail "C-o again did not go back to the timeline: $(screen | head -1)"
+screen_has '· thread' && fail "the timeline view says thread: $(screen | head -1)"
+OLD=$FORM
+keys Tab
+until_ok 40 view_swapped || fail "Tab did not open a view"
+FORM=$(mode_pane)
+until_ok 40 screen_has '· thread' || fail "Tab did not come forward to the thread: $(screen | head -1)"
+keys Tab
+until_ok 20 screen_has 'at the newest conversation opened' || fail "Tab at the newest entry said nothing: $(screen | tail -2)"
+keys q
+until_ok 40 mode_closed || fail "q did not close the reopened view"
 FORM=
 $OUTER kill-server 2>/dev/null
 VIEW=

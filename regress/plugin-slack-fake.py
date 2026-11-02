@@ -298,6 +298,14 @@ def handle(method, f):
         c["has_unreads"] = latest_of(cid) > ts
         c["mention_count"] = 0
         return ok()
+    if method == "chat.update":
+        cid, ts = f.get("channel", ""), f.get("ts", "")
+        for m in HISTORY.get(cid, []) + [r for r in REPLIES if r.get("channel") == cid]:
+            if m["ts"] == ts:
+                m["text"] = f.get("text", "")
+                m["edited"] = {"user": ME, "ts": fresh_ts()}
+                return ok(channel=cid, ts=ts, text=m["text"])
+        return err("message_not_found")
     if method == "chat.postMessage":
         cid = f.get("channel", "")
         if cid not in HISTORY:

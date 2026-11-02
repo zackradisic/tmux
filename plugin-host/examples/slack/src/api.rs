@@ -632,6 +632,11 @@ pub async fn post(id: &Identity, channel: &str, text: &str, thread_ts: Option<&s
         .ok_or_else(|| "chat.postMessage: no message".into())
 }
 
+/// Replace the text of one of the user's messages (`chat.update`).
+pub async fn update(id: &Identity, channel: &str, ts: &str, text: &str) -> Result<(), String> {
+    http::call(id, "chat.update", &[("channel", channel), ("ts", ts), ("text", text), ("as_user", "true")]).await.map(|_| ())
+}
+
 pub async fn react(id: &Identity, channel: &str, ts: &str, name: &str) -> Result<(), String> {
     let name = name.trim_matches(':');
     match http::call(id, "reactions.add", &[("channel", channel), ("timestamp", ts), ("name", name)]).await {

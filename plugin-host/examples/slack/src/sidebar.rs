@@ -83,12 +83,6 @@ pub struct Sidebar {
     /// rather than following them. Dropped once they are all read, or
     /// when the user moves.
     pub hold: Option<Hold>,
-    /// The rows the cursor rested on, oldest last, for C-o / Tab;
-    /// `jump_at == jumps.len()` is the present.
-    pub jumps: Vec<String>,
-    pub jump_at: usize,
-    /// The row under the cursor and since when (ms).
-    pub cur: Option<(String, u64)>,
     /// The highlighted channel's recent messages as an embedded channel
     /// view, laid out at the preview column's width; `None` while the
     /// row is a header or its messages are still loading.
@@ -120,6 +114,7 @@ pub fn keys() -> KeyTable {
         .with("mark", "m", "rows", "mark the channel read")
         .with("compose", "i", "rows", "compose a message to the channel")
         .with("agent", "n", "rows", "new agent from the previewed message (or a selection made there)")
+        .with("agent_all", "N", "rows", "new agent from everything the preview shows (a summary of the channel)")
         .with("mention", "@", "rows", "go to where you were mentioned (the preview takes the keyboard; @ again: the next)")
         .with("watch", "w", "rows", "toast every message of the channel (w again: Slack's own rule)")
         .with("menu", "Space", "rows", "the action menu")
@@ -127,8 +122,8 @@ pub fn keys() -> KeyTable {
         .with("refresh", "R", "picker", "fetch channels, sections, users and badges again")
         .with("fold", "z", "moving", "fold / unfold the section under the cursor")
         .with("fold_all", "Z", "moving", "fold or unfold every section")
-        .with("back", "C-o", "moving", "back to the row you rested on before (the jump list)")
-        .with("forward", "Tab", "moving", "forward again in the jump list (C-i)")
+        .with("back", "C-o", "moving", "open the conversation you opened before this one (the history)")
+        .with("forward", "Tab", "moving", "forward again in the history (C-i)")
         // The engine's `focus` (l) means "type into the pane"; here it
         // hands the keyboard to the preview, so say so on the card.
         .with("focus", "l", "moving", "read the preview: the channel view's keys there (click too), Esc/h back")
@@ -194,18 +189,32 @@ pub fn open(st: &Shared, client: Option<u64>, pane: Option<u32>) {
             previews: HashMap::new(),
             fetching: HashSet::new(),
             hold: None,
-            jumps: Vec::new(),
-            jump_at: 0,
-            cur: None,
             preview: None,
             preview_focus: false,
             thread: None,
             threads: HashMap::new(),
         });
         rebuild(&mut s);
+        land_on_last_visit(&mut s);
         render(&mut s);
     }
     ensure_preview(st);
+}
+
+/// The sidebar opens on the conversation opened last (the history's
+/// newest entry): its thread row when the thread has one, else the
+/// channel's row with the thread in the preview.
+fn land_on_last_visit(s: &mut State) {
+    let Some(v) = s.visits.last().cloned() else { return };
+    let Some(side) = s.side.as_mut() else { return };
+    if let Some(root) = &v.thread {
+        if side.engine.select_key(&format!("{THREAD_PREFIX}{}/{root}", v.channel)) {
+            return;
+        }
+    }
+    if select_row(&mut side.engine, &v.channel) {
+        side.thread = v.thread.clone();
+    }
 }
 
 pub fn close(st: &Shared) {
@@ -904,42 +913,6 @@ fn settle_hold(engine: &mut Engine, h: &Hold) {
     engine.select_pos(h.pos);
 }
 
-/// How long the cursor rests on a row before the row counts as a place
-/// the user was at: rows passed over with j/k are not.
-const JUMP_DWELL_MS: u64 = 1000;
-const JUMPS_MAX: usize = 100;
-
-/// The cursor may have moved: the row it rested on goes on the jump
-/// list, the row under it now starts its own rest.
-fn note_selection(side: &mut Sidebar) {
-    note_selection_at(side, now_ms());
-}
-
-fn note_selection_at(side: &mut Sidebar, now: u64) {
-    let key = side.engine.selected_key().filter(|k| !k.starts_with("sec:"));
-    if side.cur.as_ref().map(|(k, _)| k) == key.as_ref() {
-        return;
-    }
-    if let Some((k, since)) = side.cur.take() {
-        if now.saturating_sub(since) >= JUMP_DWELL_MS {
-            push_jump(side, k);
-        }
-    }
-    side.cur = key.map(|k| (k, now));
-}
-
-/// A visited row onto the end of the jump list (not twice in a row);
-/// the pointer comes back to the present.
-fn push_jump(side: &mut Sidebar, key: String) {
-    if !side.jumps.last().is_some_and(|l| row_id(l) == row_id(&key)) {
-        side.jumps.push(key);
-        if side.jumps.len() > JUMPS_MAX {
-            side.jumps.remove(0);
-        }
-    }
-    side.jump_at = side.jumps.len();
-}
-
 /// A row by its key, in whichever section it is: the Unread copy or
 /// the channel's own row.
 fn select_row(engine: &mut Engine, key: &str) -> bool {
@@ -952,46 +925,6 @@ fn select_row(engine: &mut Engine, key: &str) -> bool {
     }
 }
 
-/// C-o / Tab: the row rested on before / after this one, vim's jump
-/// list. A row no longer in the list (read away, folded) is dropped
-/// from it. False when there is nowhere to go.
-fn jump(side: &mut Sidebar, back: bool) -> bool {
-    let cur = side.engine.selected_key().filter(|k| !k.starts_with("sec:"));
-    if back && side.jump_at >= side.jumps.len() {
-        // Leaving the present: it goes on the list so Tab comes back.
-        if let Some(c) = cur.clone() {
-            push_jump(side, c);
-        }
-        side.jump_at = side.jumps.len().saturating_sub(1);
-    }
-    loop {
-        let idx = if back {
-            if side.jump_at == 0 {
-                return false;
-            }
-            side.jump_at - 1
-        } else {
-            if side.jump_at + 1 >= side.jumps.len() {
-                return false;
-            }
-            side.jump_at + 1
-        };
-        let k = side.jumps[idx].clone();
-        if cur.as_deref().is_some_and(|c| row_id(c) == row_id(&k)) {
-            side.jump_at = idx;
-            continue;
-        }
-        if select_row(&mut side.engine, &k) {
-            side.jump_at = idx;
-            side.cur = side.engine.selected_key().map(|k| (k, now_ms()));
-            return true;
-        }
-        side.jumps.remove(idx);
-        if back {
-            side.jump_at = idx;
-        }
-    }
-}
 
 /// Fetch recent messages for the highlighted channel if the preview has
 /// none yet.
@@ -1000,7 +933,7 @@ fn ensure_preview(st: &Shared) {
         Channel(String),
         Thread(String, String),
     }
-    let (id, want) = {
+    let (id, wants) = {
         let mut s = st.borrow_mut();
         let Some(ident) = s.ident.clone() else { return };
         let Some(side) = s.side.as_mut() else { return };
@@ -1008,25 +941,35 @@ fn ensure_preview(st: &Shared) {
         if key.starts_with("sec:") {
             return;
         }
+        let mut wants = Vec::new();
         if let Some((ch, root)) = thread_of(&key) {
             // A thread row: the whole thread (the view's row has only
             // the unread replies).
             let tk = thread_key(ch, root);
-            if side.threads.contains_key(&tk) || !side.fetching.insert(tk) {
-                return;
+            if !side.threads.contains_key(&tk) && side.fetching.insert(tk) {
+                wants.push(Want::Thread(ch.to_string(), root.to_string()));
             }
-            (ident, Want::Thread(ch.to_string(), root.to_string()))
         } else {
             let key = chan_key(&key).to_string();
-            if side.previews.contains_key(&key) || !side.fetching.insert(key.clone()) {
-                return;
+            // The thread the preview shows instead of the timeline (the
+            // sidebar opened on it) wants fetching as much.
+            if let Some(root) = side.thread.clone() {
+                let tk = thread_key(&key, &root);
+                if !side.threads.contains_key(&tk) && side.fetching.insert(tk) {
+                    wants.push(Want::Thread(key.clone(), root));
+                }
             }
-            (ident, Want::Channel(key))
+            if !side.previews.contains_key(&key) && side.fetching.insert(key.clone()) {
+                wants.push(Want::Channel(key));
+            }
         }
+        (ident, wants)
     };
-    match want {
-        Want::Channel(key) => fetch_preview(st, id, key),
-        Want::Thread(ch, root) => fetch_thread(st, id, ch, root),
+    for want in wants {
+        match want {
+            Want::Channel(key) => fetch_preview(st, id.clone(), key),
+            Want::Thread(ch, root) => fetch_thread(st, id.clone(), ch, root),
+        }
     }
 }
 
@@ -1183,11 +1126,14 @@ fn open_menu(st: &Shared) {
             items.push_str(&menu_item(NAME, "go to your mention", &k("mention"), row && mention && readable));
             items.push_str(&menu_item(NAME, if thread_row.is_some() { "reply in the thread" } else { "compose" }, &k("compose"), row));
             items.push_str(&menu_item(NAME, "new agent from the preview", &k("agent"), row && readable));
+            items.push_str(&menu_item(NAME, "new agent from the whole preview", &k("agent_all"), row && readable));
             items.push_str(&menu_item(NAME, "open in the Slack app", &k("open_app"), row));
             items.push_str(" ''");
             items.push_str(&menu_item(NAME, &format!("view: {}", side.view.next().label()), &k("view"), true));
             items.push_str(&menu_item(NAME, "fold the section", &k("fold"), side.view != View::Unread));
             items.push_str(&menu_item(NAME, "refresh", &k("refresh"), true));
+            items.push_str(&menu_item(NAME, "the conversation opened before", &k("back"), true));
+            items.push_str(&menu_item(NAME, "forward again", &k("forward"), true));
             items.push_str(" ''");
             items.push_str(&menu_item(NAME, "help", "?", true));
             items.push_str(&menu_item(NAME, "close", "q", true));
@@ -1237,6 +1183,12 @@ enum Took {
     /// Open the full channel view on the previewed channel: a thread
     /// (Enter), composing (i, r).
     Open(Option<String>, bool),
+    /// Open the full view editing the user's message: the thread, the
+    /// message's ts and its text.
+    Edit(Option<String>, String, String),
+    /// The preview took the keyboard (l / Right): reading the
+    /// conversation, which the history notes.
+    Focus,
 }
 
 /// Can the preview take the keyboard: a channel row whose messages are
@@ -1283,7 +1235,7 @@ fn preview_key(side: &mut Sidebar, key: &str, mouse: Option<(u32, u32)>) -> Opti
     if !side.preview_focus {
         if (key == side.engine.keys.key_of("focus") || key == "Right") && can_focus(side) {
             side.preview_focus = true;
-            return Some(Took::Chat(After::None));
+            return Some(Took::Focus);
         }
         if key == "[" || key == "]" {
             let c = side.preview.as_mut()?;
@@ -1296,6 +1248,10 @@ fn preview_key(side: &mut Sidebar, key: &str, mouse: Option<(u32, u32)>) -> Opti
         if key == side.engine.keys.key_of("agent") && can_focus(side) {
             let c = side.preview.as_mut()?;
             return Some(Took::Chat(chat::handle_key(c, "n", None)));
+        }
+        if key == side.engine.keys.key_of("agent_all") && can_focus(side) {
+            let c = side.preview.as_mut()?;
+            return Some(Took::Chat(chat::handle_key(c, "N", None)));
         }
         // @ on a row: the keyboard goes to the preview with its cursor
         // on the first unread mention of the user (the first at all,
@@ -1333,6 +1289,17 @@ fn preview_key(side: &mut Sidebar, key: &str, mouse: Option<(u32, u32)>) -> Opti
             }
             // i composes where the preview is: the thread shown, or the channel.
             "i" => return Some(Took::Open(c.thread.clone(), true)),
+            // E edits the user's own message: in the full view, whose
+            // box it is; the preview only says no to another's.
+            "E" => {
+                let Some(i) = c.cursor_idx() else { return Some(Took::Chat(After::None)) };
+                let m = &c.msgs[i];
+                if c.me.is_empty() || m.user.as_deref() != Some(c.me.as_str()) {
+                    c.status = Some("only your own messages can be edited".into());
+                    return Some(Took::Chat(After::None));
+                }
+                return Some(Took::Edit(c.thread.clone(), m.ts.clone(), m.text.clone()));
+            }
             "r" => {
                 let Some(i) = c.cursor_idx() else { return Some(Took::Chat(After::None)) };
                 let m = &c.msgs[i];
@@ -1409,6 +1376,17 @@ fn preview_after(st: &Shared, took: Took) {
             chat::open(st, channel, thread, client, pane, compose);
             return;
         }
+        Took::Edit(thread, ts, text) => {
+            close(st);
+            chat::open(st, channel, thread, client, pane, false);
+            chat::start_edit(st, ts, text);
+            return;
+        }
+        Took::Focus => {
+            let thread = st.borrow().side.as_ref().and_then(|sd| sd.thread.clone());
+            crate::note_visit(st, &channel.id, thread.as_deref());
+            After::None
+        }
         Took::Chat(a) => a,
     };
     match after {
@@ -1429,11 +1407,13 @@ fn preview_after(st: &Shared, took: Took) {
         // Enter on a message: its thread, in the preview itself; Escape
         // (Back) brings the timeline back. The keyboard stays.
         After::Switch(Some(root), _) => {
+            crate::note_visit(st, &channel.id, Some(&root));
             let id = {
                 let mut s = st.borrow_mut();
                 let Some(side) = s.side.as_mut() else { return };
                 side.thread = Some(root.clone());
-                let fetch = !side.threads.contains_key(&thread_key(&channel.id, &root));
+                let tk = thread_key(&channel.id, &root);
+                let fetch = !side.threads.contains_key(&tk) && side.fetching.insert(tk);
                 sync_preview(&mut s);
                 render(&mut s);
                 if fetch { s.ident.clone() } else { None }
@@ -1609,6 +1589,17 @@ fn preview_after(st: &Shared, took: Took) {
                 c.status = Some("older history is in the channel view (Enter opens it)".into());
             }
         }
+        // E is taken before the view sees it (Took::Edit).
+        After::Edit(..) => {}
+        After::Jump(back) => {
+            if crate::jump_visit(st, back, client, pane) {
+                return;
+            }
+            let mut s = st.borrow_mut();
+            if let Some(side) = s.side.as_mut() {
+                side.engine.status = Some(if back { "nothing opened before this: the history is empty" } else { "at the newest conversation opened" }.into());
+            }
+        }
     }
     let mut s = st.borrow_mut();
     render(&mut s);
@@ -1718,6 +1709,8 @@ fn execute(st: &Shared, outcome: Outcome) {
         Refresh,
         Menu,
         Close,
+        /// C-o / Tab: the conversation opened before / after.
+        Jump(bool),
     }
     let after = {
         let mut s = st.borrow_mut();
@@ -1781,16 +1774,7 @@ fn execute(st: &Shared, outcome: Outcome) {
                         }
                         After::Mark(ids)
                     }
-                    "back" | "forward" => {
-                        let back = action == "back";
-                        if let Some(side) = s.side.as_mut() {
-                            if !jump(side, back) {
-                                side.engine.status = Some(if back { "no row before this one in the jump list" } else { "at the newest row of the jump list" }.into());
-                            }
-                        }
-                        render(&mut s);
-                        After::None
-                    }
+                    "back" | "forward" => After::Jump(action == "back"),
                     "watch" => {
                         let mut on = Vec::new();
                         let mut off = Vec::new();
@@ -1879,6 +1863,17 @@ fn execute(st: &Shared, outcome: Outcome) {
             }
         }
         After::Menu => open_menu(st),
+        After::Jump(back) => {
+            let (client, pane) = st.borrow().side.as_ref().map(|sd| (sd.client, sd.pane)).unwrap_or((None, None));
+            if crate::jump_visit(st, back, client, pane) {
+                return;
+            }
+            let mut s = st.borrow_mut();
+            if let Some(side) = s.side.as_mut() {
+                side.engine.status = Some(if back { "nothing opened before this: the history is empty" } else { "at the newest conversation opened" }.into());
+            }
+            render(&mut s);
+        }
         After::Refresh => {
             let st2 = Rc::clone(st);
             spawn(async move {
@@ -1894,9 +1889,6 @@ fn execute(st: &Shared, outcome: Outcome) {
                 ensure_preview(&st2);
             });
         }
-    }
-    if let Some(side) = st.borrow_mut().side.as_mut() {
-        note_selection(side);
     }
     ensure_preview(st);
 }
@@ -1953,9 +1945,6 @@ mod tests {
             previews: HashMap::new(),
             fetching: HashSet::new(),
             hold: None,
-            jumps: Vec::new(),
-            jump_at: 0,
-            cur: None,
             preview: None,
             preview_focus: false,
             thread: None,
@@ -2036,40 +2025,6 @@ mod tests {
         assert_eq!(e.selected_key().as_deref(), Some("u:C2"));
     }
 
-    #[test]
-    fn the_jump_list_goes_back_to_rested_rows_and_forward_again() {
-        let mut side = side(three(), false);
-        side.engine.set_nodes(nodes_of(&["sec:work", "C1", "C2", "C3"]));
-        assert!(side.engine.select_key("C1"));
-        // Rested on C1 (since long ago), moved to C2: C1 is a place.
-        side.cur = Some(("C1".into(), 0));
-        side.engine.select_key("C2");
-        note_selection_at(&mut side, 5_000);
-        assert_eq!(side.jumps, vec!["C1".to_string()]);
-        // A row passed over is not: C2 was reached just now.
-        side.engine.select_key("C3");
-        note_selection_at(&mut side, 5_100);
-        assert_eq!(side.jumps, vec!["C1".to_string()]);
-        // Rested on C3 then: back goes to C1 past C2, having noted the
-        // present so Tab comes back to it.
-        side.cur = Some(("C3".into(), 0));
-        assert!(jump(&mut side, true));
-        assert_eq!(side.engine.selected_key().as_deref(), Some("C1"));
-        assert_eq!(side.jumps, vec!["C1".to_string(), "C3".into()]);
-        assert!(!jump(&mut side, true), "nothing before C1");
-        assert!(jump(&mut side, false));
-        assert_eq!(side.engine.selected_key().as_deref(), Some("C3"));
-        assert!(!jump(&mut side, false), "nothing after the present");
-        // A place that is gone is dropped; the Unread copy of a channel
-        // stands in for its own row and the other way round.
-        side.jumps = vec!["u:C2".into(), "C9".into(), "C1".into()];
-        side.jump_at = 3;
-        assert!(jump(&mut side, true));
-        assert_eq!(side.engine.selected_key().as_deref(), Some("C1"));
-        assert!(jump(&mut side, true));
-        assert_eq!(side.engine.selected_key().as_deref(), Some("C2"), "u:C2 found as C2, C9 skipped");
-        assert_eq!(side.jumps, vec!["u:C2".to_string(), "C1".into(), "C3".into()]);
-    }
 
     #[test]
     fn geometry_fills_the_column_right_of_the_separator() {
@@ -2091,7 +2046,7 @@ mod tests {
         let mut s = side(three(), true);
         assert_eq!(preview_key(&mut s, "l", None), None, "on a header l is the engine's (down a level)");
         let mut s = side(three(), false);
-        assert_eq!(preview_key(&mut s, "Right", None), Some(Took::Chat(After::None)));
+        assert_eq!(preview_key(&mut s, "Right", None), Some(Took::Focus), "the keyboard goes to the preview, the history notes the read");
         assert!(s.preview_focus);
         assert_eq!(s.preview.as_ref().unwrap().cursor_idx(), Some(2), "the cursor opens on the newest message");
     }
