@@ -26,7 +26,12 @@ fail()
 	exit 1
 }
 
+# A private HOME: the server plants the stubs there when it starts.
+HOME=$TMP/home; export HOME
 $TMUX new-session -d -s main -x 80 -y 24 || fail "new-session"
+sleep 0.5
+[ -f "$TMP/home/.claude/skills/tmux2-mailbox/SKILL.md" ] || fail "the server did not plant the stub under HOME"
+grep -q 'skill -t "$TMUX_PANE" show mailbox' "$TMP/home/.claude/skills/tmux2-mailbox/SKILL.md" || fail "the planted stub does not say to run skill show"
 
 # list: the mailbox guide is there, with its description.
 $TMUX skill list > "$TMP/list" || fail "skill list"

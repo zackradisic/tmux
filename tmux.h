@@ -4382,6 +4382,7 @@ struct skill {
 	const char	*text;		/* body after the frontmatter */
 };
 extern const struct skill skills[];
+void	 skill_install_default(void);
 
 #ifdef ENABLE_PLUGINS
 /* plugin.c */

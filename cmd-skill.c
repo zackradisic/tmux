@@ -283,6 +283,44 @@ cmd_skill_write(const char *path, const char *content)
 	return (rc == 0 ? 1 : -1);
 }
 
+/*
+ * At server start: the stubs under ~/.claude/skills, written only when
+ * they differ, so every install and every update (a restart) plants the
+ * skills the harness loads without anyone running "skill install". Quiet:
+ * no home, or a directory that cannot be written, is nobody's error here.
+ */
+void
+skill_install_default(void)
+{
+	const struct skill	*sk;
+	const char		*home;
+	char			*path, *stub;
+	int			 rc;
+
+	home = find_home();
+	if (home == NULL)
+		return;
+	for (sk = skills; sk->name != NULL; sk++) {
+		xasprintf(&path, "%s/.claude/skills/%s", home, sk->stub);
+		if (cmd_skill_mkdirs(path) != 0) {
+			log_debug("skill: mkdir %s: %s", path, strerror(errno));
+			free(path);
+			continue;
+		}
+		free(path);
+		xasprintf(&path, "%s/.claude/skills/%s/SKILL.md", home,
+		    sk->stub);
+		stub = cmd_skill_stub(sk);
+		rc = cmd_skill_write(path, stub);
+		if (rc < 0)
+			log_debug("skill: write %s: %s", path, strerror(errno));
+		else if (rc == 1)
+			log_debug("skill: wrote %s", path);
+		free(stub);
+		free(path);
+	}
+}
+
 static enum cmd_retval
 cmd_skill_install(struct cmdq_item *item, const char *dir,
     const struct skill *only)

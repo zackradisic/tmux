@@ -2942,8 +2942,11 @@ server_client_dispatch_identify(struct client *c, struct imsg *imsg)
 	 */
 	if ((~c->flags & CLIENT_EXIT) &&
 	     !cfg_finished &&
-	     c == TAILQ_FIRST(&clients))
+	     c == TAILQ_FIRST(&clients)) {
 		start_cfg();
+		/* The agent skills under ~/.claude/skills, kept current. */
+		skill_install_default();
+	}
 
 	return (0);
 }
