@@ -55,6 +55,8 @@ mod timefmt;
 use store::{Binding, Channel, Identity, Kind, Message, Section, Thread, User};
 
 pub const NAME: &str = "slack";
+/// The settings key holding the channels whose every message is toasted (w).
+pub const WATCH_SETTING: &str = "watch";
 
 /// How soon after one Threads-view fetch the feed may ask for another.
 const THREADS_DEBOUNCE_MS: u64 = 3000;
@@ -148,6 +150,8 @@ pub struct State {
     /// or refused): each is asked once. Slack Connect users are not in
     /// `users.list`, so names arrive lazily as their messages do.
     pub names_pending: HashSet<String>,
+    /// Channels whose every message is toasted (w in the sidebar).
+    pub watched: HashSet<String>,
     /// Ids waiting for a resolver worker, and how many workers run.
     pub names_queue: Vec<String>,
     pub names_inflight: usize,
@@ -285,6 +289,7 @@ impl Plugin for Slack {
             own_posts: HashSet::new(),
             toasted: feed::Recent::default(),
             names_pending: HashSet::new(),
+            watched: HashSet::new(),
             names_queue: Vec::new(),
             names_inflight: 0,
         }));
@@ -360,6 +365,10 @@ async fn load_cache(st: &Shared) {
 async fn boot(st: Shared) {
     load_cache(&st).await;
     emoji::load_custom().await;
+    if let Some(json) = store::setting(WATCH_SETTING).await {
+        let ids: Vec<String> = serde_json::from_str(&json).unwrap_or_default();
+        st.borrow_mut().watched = ids.into_iter().collect();
+    }
     let cfg = st.borrow().cfg.clone();
     match auth::ensure(&cfg).await {
         Ok(id) => {
@@ -1173,6 +1182,7 @@ mod tests {
             own_posts: HashSet::new(),
             toasted: feed::Recent::default(),
             names_pending: HashSet::new(),
+            watched: HashSet::new(),
             names_queue: Vec::new(),
             names_inflight: 0,
         }

@@ -59,6 +59,17 @@ impl View {
     }
 }
 
+/// The row `m` was pressed on, its position, its nearest unmarked
+/// neighbours in its section, and the rows marked.
+#[derive(Clone, Debug)]
+pub struct Hold {
+    pub at: String,
+    pub pos: usize,
+    pub next: Option<String>,
+    pub prev: Option<String>,
+    pub ids: Vec<String>,
+}
+
 pub struct Sidebar {
     pub engine: Engine,
     pub client: Option<u64>,
@@ -67,11 +78,17 @@ pub struct Sidebar {
     /// Recent messages per channel, for the preview column.
     pub previews: HashMap<String, Vec<Message>>,
     pub fetching: HashSet<String>,
-    /// The cursor's position and the channels just marked read: as those
-    /// rows move down the list the cursor stays put, on the row that
-    /// takes their place, rather than following them. Dropped once they
-    /// are all read, or when the user moves.
-    pub hold: Option<(usize, Vec<String>)>,
+    /// What `m` remembers: as the marked rows move down the list or out
+    /// of it the cursor stays put, on the row that takes their place,
+    /// rather than following them. Dropped once they are all read, or
+    /// when the user moves.
+    pub hold: Option<Hold>,
+    /// The rows the cursor rested on, oldest last, for C-o / Tab;
+    /// `jump_at == jumps.len()` is the present.
+    pub jumps: Vec<String>,
+    pub jump_at: usize,
+    /// The row under the cursor and since when (ms).
+    pub cur: Option<(String, u64)>,
     /// The highlighted channel's recent messages as an embedded channel
     /// view, laid out at the preview column's width; `None` while the
     /// row is a header or its messages are still loading.
@@ -104,11 +121,14 @@ pub fn keys() -> KeyTable {
         .with("compose", "i", "rows", "compose a message to the channel")
         .with("agent", "n", "rows", "new agent from the previewed message (or a selection made there)")
         .with("mention", "@", "rows", "go to where you were mentioned (the preview takes the keyboard; @ again: the next)")
+        .with("watch", "w", "rows", "toast every message of the channel (w again: Slack's own rule)")
         .with("menu", "Space", "rows", "the action menu")
         .with("view", "v", "picker", "sections / unread / all")
         .with("refresh", "R", "picker", "fetch channels, sections, users and badges again")
         .with("fold", "z", "moving", "fold / unfold the section under the cursor")
         .with("fold_all", "Z", "moving", "fold or unfold every section")
+        .with("back", "C-o", "moving", "back to the row you rested on before (the jump list)")
+        .with("forward", "Tab", "moving", "forward again in the jump list (C-i)")
         // The engine's `focus` (l) means "type into the pane"; here it
         // hands the keyboard to the preview, so say so on the card.
         .with("focus", "l", "moving", "read the preview: the channel view's keys there (click too), Esc/h back")
@@ -174,6 +194,9 @@ pub fn open(st: &Shared, client: Option<u64>, pane: Option<u32>) {
             previews: HashMap::new(),
             fetching: HashSet::new(),
             hold: None,
+            jumps: Vec::new(),
+            jump_at: 0,
+            cur: None,
             preview: None,
             preview_focus: false,
             thread: None,
@@ -521,9 +544,15 @@ fn row_left(s: &State, c: &Channel) -> Vec<Styled> {
 }
 
 /// The right column: how long ago the channel last spoke.
-fn row_right(c: &Channel, now: u64) -> Vec<Styled> {
+fn row_right(c: &Channel, now: u64, watched: bool) -> Vec<Styled> {
     let age = c.latest.as_deref().map(|t| timefmt::age(t, now)).unwrap_or_default();
-    plain_cells(&format!("{age:>4}"), ST_DIM)
+    let mut v = Vec::new();
+    if watched {
+        // Every message here is toasted (w).
+        v.extend(plain_cells("all ", ST_DIM | ST_CYAN));
+    }
+    v.extend(plain_cells(&format!("{age:>4}"), ST_DIM));
+    v
 }
 
 /// The engine's own preview of a channel row: only the loading line,
@@ -551,7 +580,7 @@ fn group_node(key: &str, name: &str, count: usize, unread: usize) -> Node {
 fn channel_node(s: &State, side: &Sidebar, c: &Channel, depth: u8, now: u64) -> Node {
     let mut n = Node::item(c.id.clone(), depth);
     n.left = row_left(s, c);
-    n.right = row_right(c, now);
+    n.right = row_right(c, now, s.watched.contains(&c.id));
     let label = s.channel_label(c);
     n.haystack = format!("{label} {} {}", c.topic, c.purpose);
     if c.kind.is_dm() {
@@ -571,6 +600,9 @@ fn channel_node(s: &State, side: &Sidebar, c: &Channel, depth: u8, now: u64) -> 
     }
     if c.is_starred {
         n.tokens.push(('!', "starred".into()));
+    }
+    if s.watched.contains(&c.id) {
+        n.tokens.push(('!', "watched".into()));
     }
     n.dim = c.is_muted;
     n.preview = preview_for(side, c);
@@ -814,8 +846,8 @@ pub fn rebuild(s: &mut State) {
     };
     let view = s.side.as_ref().map(|p| p.view).unwrap_or(View::Sections);
     let held = s.side.as_ref().and_then(|p| p.hold.clone());
-    let held_done = held.as_ref().is_some_and(|(_, ids)| {
-        ids.iter().all(|id| match thread_of(id) {
+    let held_done = held.as_ref().is_some_and(|h| {
+        h.ids.iter().all(|id| match thread_of(id) {
             Some((ch, root)) => view_thread(s, ch, root).is_none(),
             None => s.channel(id).is_none_or(|c| !c.has_unreads),
         })
@@ -824,15 +856,139 @@ pub fn rebuild(s: &mut State) {
         side.engine.header_tag = format!("{tag} · by {}", view.label());
         side.engine.empty_text = empty;
         side.engine.set_nodes(nodes);
-        if let Some((pos, ids)) = held {
-            // set_nodes followed the marked row by key; put the cursor
-            // back where it was.
-            if side.engine.selected_key().is_some_and(|k| ids.iter().any(|id| id == row_id(&k))) {
-                side.engine.select_pos(pos);
-            }
+        if let Some(h) = held {
+            settle_hold(&mut side.engine, &h);
             if held_done {
                 side.hold = None;
             }
+        }
+    }
+}
+
+/// What `m` remembers: the row under the cursor and its nearest
+/// unmarked neighbours in its section (the rows, not the headers).
+fn hold_for(engine: &Engine, ids: Vec<String>) -> Option<Hold> {
+    let keys: Vec<String> = engine.visible().map(|n| n.key.clone()).collect();
+    let pos = engine.sel();
+    let at = keys.get(pos)?.clone();
+    let marked = |k: &&String| !ids.iter().any(|id| id == row_id(k));
+    let next = keys[pos + 1..].iter().take_while(|k| !k.starts_with("sec:")).find(marked).cloned();
+    let prev = keys[..pos].iter().rev().take_while(|k| !k.starts_with("sec:")).find(marked).cloned();
+    Some(Hold { at, pos, next, prev, ids })
+}
+
+/// After a rebuild under a hold: the marked row still sits before the
+/// same neighbour, so nothing around it moved (a section whose order
+/// did not change, rows above it gone) and the cursor stays on it;
+/// else it went, or dropped below its neighbours, and the cursor takes
+/// the row that took its place: the next one, else the previous, else
+/// the old position.
+fn settle_hold(engine: &mut Engine, h: &Hold) {
+    let keys: Vec<String> = engine.visible().map(|n| n.key.clone()).collect();
+    if let Some(i) = keys.iter().position(|k| *k == h.at) {
+        let after = keys.get(i + 1).filter(|k| !k.starts_with("sec:"));
+        let same_place = match &h.next {
+            Some(n) => after == Some(n),
+            None => after.is_none(),
+        };
+        if same_place {
+            engine.select_pos(i);
+            return;
+        }
+    }
+    for k in h.next.iter().chain(h.prev.iter()) {
+        if engine.select_key(k) {
+            return;
+        }
+    }
+    engine.select_pos(h.pos);
+}
+
+/// How long the cursor rests on a row before the row counts as a place
+/// the user was at: rows passed over with j/k are not.
+const JUMP_DWELL_MS: u64 = 1000;
+const JUMPS_MAX: usize = 100;
+
+/// The cursor may have moved: the row it rested on goes on the jump
+/// list, the row under it now starts its own rest.
+fn note_selection(side: &mut Sidebar) {
+    note_selection_at(side, now_ms());
+}
+
+fn note_selection_at(side: &mut Sidebar, now: u64) {
+    let key = side.engine.selected_key().filter(|k| !k.starts_with("sec:"));
+    if side.cur.as_ref().map(|(k, _)| k) == key.as_ref() {
+        return;
+    }
+    if let Some((k, since)) = side.cur.take() {
+        if now.saturating_sub(since) >= JUMP_DWELL_MS {
+            push_jump(side, k);
+        }
+    }
+    side.cur = key.map(|k| (k, now));
+}
+
+/// A visited row onto the end of the jump list (not twice in a row);
+/// the pointer comes back to the present.
+fn push_jump(side: &mut Sidebar, key: String) {
+    if !side.jumps.last().is_some_and(|l| row_id(l) == row_id(&key)) {
+        side.jumps.push(key);
+        if side.jumps.len() > JUMPS_MAX {
+            side.jumps.remove(0);
+        }
+    }
+    side.jump_at = side.jumps.len();
+}
+
+/// A row by its key, in whichever section it is: the Unread copy or
+/// the channel's own row.
+fn select_row(engine: &mut Engine, key: &str) -> bool {
+    if engine.select_key(key) {
+        return true;
+    }
+    match key.strip_prefix(UNREAD_PREFIX) {
+        Some(bare) => engine.select_key(bare),
+        None => engine.select_key(&format!("{UNREAD_PREFIX}{key}")),
+    }
+}
+
+/// C-o / Tab: the row rested on before / after this one, vim's jump
+/// list. A row no longer in the list (read away, folded) is dropped
+/// from it. False when there is nowhere to go.
+fn jump(side: &mut Sidebar, back: bool) -> bool {
+    let cur = side.engine.selected_key().filter(|k| !k.starts_with("sec:"));
+    if back && side.jump_at >= side.jumps.len() {
+        // Leaving the present: it goes on the list so Tab comes back.
+        if let Some(c) = cur.clone() {
+            push_jump(side, c);
+        }
+        side.jump_at = side.jumps.len().saturating_sub(1);
+    }
+    loop {
+        let idx = if back {
+            if side.jump_at == 0 {
+                return false;
+            }
+            side.jump_at - 1
+        } else {
+            if side.jump_at + 1 >= side.jumps.len() {
+                return false;
+            }
+            side.jump_at + 1
+        };
+        let k = side.jumps[idx].clone();
+        if cur.as_deref().is_some_and(|c| row_id(c) == row_id(&k)) {
+            side.jump_at = idx;
+            continue;
+        }
+        if select_row(&mut side.engine, &k) {
+            side.jump_at = idx;
+            side.cur = side.engine.selected_key().map(|k| (k, now_ms()));
+            return true;
+        }
+        side.jumps.remove(idx);
+        if back {
+            side.jump_at = idx;
         }
     }
 }
@@ -1004,6 +1160,7 @@ fn open_menu(st: &Shared) {
         let viewed = thread_row.as_ref().and_then(|(c, r)| view_thread(&s, c, r));
         let unread = viewed.is_some() || sel.as_ref().is_some_and(|c| c.has_unreads || c.mentions > 0);
         let mention = viewed.is_some_and(|t| t.mention) || (thread_row.is_none() && sel.as_ref().is_some_and(|c| c.mentions > 0));
+        let watched = sel.as_ref().is_some_and(|c| s.watched.contains(&c.id));
         let title = match &sel {
             Some(c) if thread_row.is_some() => menu_safe(&format!("{} thread", s.channel_label(c)), 30),
             Some(c) => menu_safe(&s.channel_label(c), 30),
@@ -1022,6 +1179,7 @@ fn open_menu(st: &Shared) {
             items.push_str(&menu_item(NAME, "open", &k("activate"), row));
             items.push_str(&menu_item(NAME, "read the preview", &k("focus"), row && readable));
             items.push_str(&menu_item(NAME, "mark read", &k("mark"), row && unread));
+            items.push_str(&menu_item(NAME, if watched { "toasts: Slack's rule again" } else { "toast every message here" }, &k("watch"), row && thread_row.is_none()));
             items.push_str(&menu_item(NAME, "go to your mention", &k("mention"), row && mention && readable));
             items.push_str(&menu_item(NAME, if thread_row.is_some() { "reply in the thread" } else { "compose" }, &k("compose"), row));
             items.push_str(&menu_item(NAME, "new agent from the preview", &k("agent"), row && readable));
@@ -1619,9 +1777,47 @@ fn execute(st: &Shared, outcome: Outcome) {
                             .collect();
                         if let Some(side) = s.side.as_mut() {
                             side.engine.clear_marks();
-                            side.hold = Some((side.engine.sel(), ids.clone()));
+                            side.hold = hold_for(&side.engine, ids.clone());
                         }
                         After::Mark(ids)
+                    }
+                    "back" | "forward" => {
+                        let back = action == "back";
+                        if let Some(side) = s.side.as_mut() {
+                            if !jump(side, back) {
+                                side.engine.status = Some(if back { "no row before this one in the jump list" } else { "at the newest row of the jump list" }.into());
+                            }
+                        }
+                        render(&mut s);
+                        After::None
+                    }
+                    "watch" => {
+                        let mut on = Vec::new();
+                        let mut off = Vec::new();
+                        for (c, _) in &rows {
+                            let label = s.channel_label(c);
+                            if s.watched.remove(&c.id) {
+                                off.push(label);
+                            } else {
+                                s.watched.insert(c.id.clone());
+                                on.push(label);
+                            }
+                        }
+                        let mut ids: Vec<&String> = s.watched.iter().collect();
+                        ids.sort();
+                        let json = serde_json::to_string(&ids).unwrap_or_default();
+                        spawn(async move { crate::store::set_setting(crate::WATCH_SETTING, &json).await });
+                        let status = match (on.is_empty(), off.is_empty()) {
+                            (false, true) => format!("every message in {} is toasted (w again: Slack's rule)", on.join(", ")),
+                            (true, false) => format!("{} back to Slack's rule: DMs, mentions, its preferences", off.join(", ")),
+                            _ => "watch toggled".to_string(),
+                        };
+                        if let Some(side) = s.side.as_mut() {
+                            side.engine.status = Some(status);
+                        }
+                        rebuild(&mut s);
+                        render(&mut s);
+                        After::None
                     }
                     "view" => {
                         let v = s.side.as_ref().map(|p| p.view).unwrap_or(View::Sections).next();
@@ -1699,6 +1895,9 @@ fn execute(st: &Shared, outcome: Outcome) {
             });
         }
     }
+    if let Some(side) = st.borrow_mut().side.as_mut() {
+        note_selection(side);
+    }
     ensure_preview(st);
 }
 
@@ -1754,6 +1953,9 @@ mod tests {
             previews: HashMap::new(),
             fetching: HashSet::new(),
             hold: None,
+            jumps: Vec::new(),
+            jump_at: 0,
+            cur: None,
             preview: None,
             preview_focus: false,
             thread: None,
@@ -1781,6 +1983,92 @@ mod tests {
         let t = Thread { channel: "C1".into(), root: msg("1700000010.000100", "root"), ..Default::default() };
         assert_eq!(thread_row_key(&t), "t:C1/1700000010.000100");
         assert_eq!(thread_of(&thread_row_key(&t)).map(|(c, _)| c), Some("C1"));
+    }
+
+    /// Rows by key: a `sec:` key is a section header, the rest items.
+    fn nodes_of(rows: &[&str]) -> Vec<Node> {
+        rows.iter().map(|k| if k.starts_with("sec:") { group_node(k, k, 1, 0) } else { Node::item(*k, 1) }).collect()
+    }
+
+    fn engine_of(rows: &[&str]) -> Engine {
+        let mut e = Engine::new(ModeId(1), 144, 40, "t", keys(), sigils());
+        e.set_nodes(nodes_of(rows));
+        e
+    }
+
+    #[test]
+    fn m_leaves_the_cursor_on_the_row_that_took_the_marked_rows_place() {
+        // Sections: Unread [C1, C2], Work [C1, C2, C3]; m on Work's C1.
+        let mut e = engine_of(&["sec:unread", "u:C1", "u:C2", "sec:work", "C1", "C2", "C3"]);
+        assert!(e.select_key("C1"));
+        let h = hold_for(&e, vec!["C1".into()]).unwrap();
+        assert_eq!((h.at.as_str(), h.pos, h.next.as_deref(), h.prev.as_deref()), ("C1", 4, Some("C2"), None));
+        // Read: its Unread copy goes (every row below shifts up) and it
+        // sorts below C2. The cursor takes C2, the row in its place, not
+        // the row its old position points at now (C1 itself, by luck).
+        e.set_nodes(nodes_of(&["sec:unread", "u:C2", "sec:work", "C2", "C1", "C3"]));
+        settle_hold(&mut e, &h);
+        assert_eq!(e.selected_key().as_deref(), Some("C2"));
+        // Nothing around it moved (C1 still before C2): the cursor stays
+        // on C1 although the rows above it went.
+        let mut e = engine_of(&["sec:unread", "u:C1", "u:C2", "sec:work", "C1", "C2"]);
+        assert!(e.select_key("C1"));
+        let h = hold_for(&e, vec!["C1".into()]).unwrap();
+        e.set_nodes(nodes_of(&["sec:unread", "u:C2", "sec:work", "C1", "C2"]));
+        settle_hold(&mut e, &h);
+        assert_eq!(e.selected_key().as_deref(), Some("C1"));
+        // In Unread the row goes: the next row (a thread's) takes its place.
+        let mut e = engine_of(&["sec:unread", "u:C1", "t:C1/1.000100", "sec:work", "C1"]);
+        assert!(e.select_key("u:C1"));
+        let h = hold_for(&e, vec!["C1".into()]).unwrap();
+        assert_eq!(h.next.as_deref(), Some("t:C1/1.000100"));
+        e.set_nodes(nodes_of(&["sec:unread", "t:C1/1.000100", "sec:work", "C1"]));
+        settle_hold(&mut e, &h);
+        assert_eq!(e.selected_key().as_deref(), Some("t:C1/1.000100"));
+        // The last row of a section falls back on the one before it; a
+        // header never counts as a neighbour.
+        let mut e = engine_of(&["sec:unread", "u:C2", "u:C1", "sec:work", "C1", "C2"]);
+        assert!(e.select_key("u:C1"));
+        let h = hold_for(&e, vec!["C1".into()]).unwrap();
+        assert_eq!((h.next.as_deref(), h.prev.as_deref()), (None, Some("u:C2")));
+        e.set_nodes(nodes_of(&["sec:unread", "u:C2", "sec:work", "C2", "C1"]));
+        settle_hold(&mut e, &h);
+        assert_eq!(e.selected_key().as_deref(), Some("u:C2"));
+    }
+
+    #[test]
+    fn the_jump_list_goes_back_to_rested_rows_and_forward_again() {
+        let mut side = side(three(), false);
+        side.engine.set_nodes(nodes_of(&["sec:work", "C1", "C2", "C3"]));
+        assert!(side.engine.select_key("C1"));
+        // Rested on C1 (since long ago), moved to C2: C1 is a place.
+        side.cur = Some(("C1".into(), 0));
+        side.engine.select_key("C2");
+        note_selection_at(&mut side, 5_000);
+        assert_eq!(side.jumps, vec!["C1".to_string()]);
+        // A row passed over is not: C2 was reached just now.
+        side.engine.select_key("C3");
+        note_selection_at(&mut side, 5_100);
+        assert_eq!(side.jumps, vec!["C1".to_string()]);
+        // Rested on C3 then: back goes to C1 past C2, having noted the
+        // present so Tab comes back to it.
+        side.cur = Some(("C3".into(), 0));
+        assert!(jump(&mut side, true));
+        assert_eq!(side.engine.selected_key().as_deref(), Some("C1"));
+        assert_eq!(side.jumps, vec!["C1".to_string(), "C3".into()]);
+        assert!(!jump(&mut side, true), "nothing before C1");
+        assert!(jump(&mut side, false));
+        assert_eq!(side.engine.selected_key().as_deref(), Some("C3"));
+        assert!(!jump(&mut side, false), "nothing after the present");
+        // A place that is gone is dropped; the Unread copy of a channel
+        // stands in for its own row and the other way round.
+        side.jumps = vec!["u:C2".into(), "C9".into(), "C1".into()];
+        side.jump_at = 3;
+        assert!(jump(&mut side, true));
+        assert_eq!(side.engine.selected_key().as_deref(), Some("C1"));
+        assert!(jump(&mut side, true));
+        assert_eq!(side.engine.selected_key().as_deref(), Some("C2"), "u:C2 found as C2, C9 skipped");
+        assert_eq!(side.jumps, vec!["u:C2".to_string(), "C1".into(), "C3".into()]);
     }
 
     #[test]

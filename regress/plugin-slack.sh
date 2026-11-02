@@ -196,7 +196,9 @@ seen_lacks() { ! seen_has "$1"; }
 VIEW=
 marks_grew() { [ "$(ncalls conversations.mark channel C1)" -gt "$1" ]; }
 # The row under the cursor (reverse video), its attributes stripped.
-cursor_row() { $TMUX capture-pane -M -p -e -t "$FORM" | grep -E "$(printf '\033')\[([0-9]+;)*7m" | head -1 | sed "s/$(printf '\033')\[[0-9;]*m//g"; }
+# The engine marks the cursor row with ▸ in its first column (reverse
+# video would not do: a mention badge is drawn inverted too).
+cursor_row() { $TMUX capture-pane -M -p -t "$FORM" | grep '^▸' | head -1; }
 buffer_has() { $TMUX show-buffer 2>/dev/null | grep -q -- "$1"; }
 # The hand-off form: a second plugin-mode pane beside the view's.
 form_pane() { $TMUX list-panes -a -F '#{pane_id} #{pane_mode}' | awk -v skip="$FORM" '/plugin-mode/ && $1 != skip { print $1; exit }'; }
@@ -417,8 +419,45 @@ until_ok 40 sh -c "[ \"\$($TMUX show-options -sv @slack_mentions)\" = 0 ]" || fa
 [ "$($TMUX show-options -sv @slack_threads)" = 0 ] || fail "@slack_threads after reading the thread: $($TMUX show-options -sv @slack_threads)"
 U=$(slack unread)
 echo "$U" | grep -q '↳' && fail "unread still lists the thread: $U"
-# The cursor is on #random; down to #general, whose messages the sidebar
-# already holds.
+# --- m in a channel's own section ---------------------------------------
+# #general unread again (the fake resets it; the badge poll brings it
+# back). m on its row in Work, not in Unread: its Unread copy goes, so
+# every row below shifts up, and read now it sorts below #random. The
+# cursor is left on the row that took its place, #random, not one row
+# further down (where its old position points now).
+fetch "$BASE/_unread?channel=C1" >/dev/null
+until_ok 60 sh -c "$TMUX capture-pane -M -p -t $FORM | grep -q '! #general'" || fail "#general did not come back unread: $(screen | grep general)"
+keys G
+i=0
+while [ $i -lt 12 ] && ! cursor_row | grep -q '#general'; do keys k; i=$((i + 1)); done
+cursor_row | grep -q '! #general' || fail "k from the bottom did not reach Work's #general: $(cursor_row)"
+BEFORE_M=$(ncalls conversations.mark channel C1)
+keys m
+until_ok 40 marks_grew "$BEFORE_M" || fail "m in Work did not mark #general read"
+until_ok 40 sh -c "$TMUX capture-pane -M -p -t $FORM | grep -q '· #general'" || fail "#general kept its badge (Work): $(screen | grep general)"
+cursor_row | grep -q '#random' || fail "the cursor is not on the row that took #general's place: $(cursor_row)"
+# --- w: every message of the channel toasts -----------------------------
+# w on #random: the row says `all` before its age and the status says
+# so; a plain message there is toasted later (the feed section below).
+keys w
+until_ok 20 sh -c "$TMUX capture-pane -M -p -t $FORM | grep '#random' | grep -q 'all '" || fail "w did not mark #random watched: $(screen | grep random)"
+screen_has 'every message in #random is toasted' || fail "w said nothing: $(screen | tail -2)"
+# --- the jump list ---------------------------------------------------------
+# A row the cursor rests on (a second) is a place: C-o goes back to the
+# places in turn, Tab forward again.
+sleep 1.2
+keys j
+cursor_row | grep -q '#general' || fail "j from #random is not on #general: $(cursor_row)"
+sleep 1.2
+keys j
+cursor_row | grep -q '#general' && fail "j did not leave #general: $(cursor_row)"
+keys C-o
+cursor_row | grep -q '#general' || fail "C-o did not go back to #general: $(cursor_row)"
+keys C-o
+cursor_row | grep -q '#random' || fail "C-o twice did not go back to #random: $(cursor_row)"
+keys Tab
+cursor_row | grep -q '#general' || fail "Tab did not go forward to #general: $(cursor_row)"
+# The cursor is on #general, whose messages the sidebar already holds.
 i=0
 while [ $i -lt 4 ] && ! cursor_row | grep -q '#general'; do keys j; i=$((i + 1)); done
 cursor_row | grep -q '#general' || fail "j did not reach #general: $(cursor_row)"
@@ -866,6 +905,12 @@ R=$(slack 'rtm-inject {"type":"desktop_notification","title":"Morph","subtitle":
 sleep 0.5
 [ "$(toasts)" = "$((T0 + 3))" ] || fail "$(( $(toasts) - T0 )) toasts, not 3 (the mention once): $($TMUX plugin-log slack | grep 'toast:')"
 $TMUX plugin-log slack | grep -q 'desktop_notification C already told' || fail "the repeated notification left no evidence line"
+# A message in a watched channel (w on #random in the sidebar above)
+# toasts as a DM does, titled with the channel and the sender.
+R=$(slack 'rtm-inject {"type":"message","channel":"C2","user":"U2","text":"watched words","ts":"1700000904.000100"}')
+[ "$R" = "injected" ] || fail "rtm-inject (watched) did not answer: $R"
+until_ok 40 sh -c "$TMUX plugin-log slack | grep -q 'slack: toast: #random · Tejas: watched words'" || fail "the watched channel's message was not toasted: $($TMUX plugin-log slack | grep 'toast:' | tail -3)"
+[ "$(toasts)" = "$((T0 + 4))" ] || fail "$(( $(toasts) - T0 )) toasts, not 4 (the watched channel once): $($TMUX plugin-log slack | grep 'toast:')"
 R=$(slack 'rtm-inject nonsense')
 echo "$R" | grep -q '^rtm-inject:' || fail "rtm-inject with bad json did not complain: $R"
 BEFORE=$(ncalls conversations.mark channel C1)

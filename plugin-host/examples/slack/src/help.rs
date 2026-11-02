@@ -38,7 +38,9 @@ pick: the sidebar, as a floating picker.
   j/k h       move, up a level (z: fold)   n   new agent from the preview
   l / Right   read the preview             @   go to where you were mentioned
   ?           every key (R: refresh)       /   search (# channel, @ user,
-                                               ! unread|mention|dm|thread)
+  C-o / Tab   back / forward through the        ! unread|mention|dm|thread)
+              rows you rested on            w   toast every message of the
+                                               channel (w again: Slack's rule)
 
 An Unread section sits above your own sections: every channel and DM
 with something new, DMs first, then channels and threads in the order
@@ -61,6 +63,13 @@ the channel view itself, laid out at the column's width: the channel's
 recent messages, newest at the bottom, attachments under their text;
 [ and ] scroll it. Space opens a menu of every action for the row,
 dimmed where one does not apply; each item is the key itself.
+
+Toasts (the notifications pane): a DM, a message that mentions you,
+and whatever Slack itself would notify by its preference for the
+channel (mentions only, unless you changed it there). w on a channel
+row tells every message of it too (`all` before its age) until w
+again. C-o goes back through the rows the cursor rested on, Tab (C-i)
+forward again, vim's jump list; a row that is gone is skipped.
 
 l, Right or a click in the column hand the preview the keyboard (the
 separator lights up): the channel view's keys then work there - j/k

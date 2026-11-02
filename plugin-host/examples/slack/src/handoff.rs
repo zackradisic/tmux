@@ -94,6 +94,9 @@ pub struct Handoff {
     pane: Option<u32>,
     /// `<tmux_binary> -S <socket_path>`, for the popup's `wait-for`.
     tmux: Option<(String, String)>,
+    /// The projects in use (`@project` on a session or a window), with
+    /// how many windows carry each, for the project field's dropdown.
+    projects: Vec<(String, String)>,
     /// The editor popup is up; keys wait for it.
     editing: bool,
     /// The agent started: what the status says; any key closes.
@@ -113,6 +116,7 @@ impl Model for Handoff {
             // says so instead of completing, and the field still takes
             // a typed path.
             "folder" => Some(Source::Dirs { base: scan_base(&fields[i].value) }),
+            "project" => Some(Source::Words { title: "projects".into(), words: self.projects.clone() }),
             _ => None,
         }
     }
@@ -358,6 +362,32 @@ fn client_name(client: Option<u64>) -> Option<String> {
         .map(|c| c.name.clone())
 }
 
+/// Every `@project` set on a window or a session (a window without
+/// its own shows its session's), with how many windows carry it: what
+/// the project field completes from. The agents picker's own roster
+/// is not readable from here; the projects of the running sessions are
+/// the ones an agent is handed to anyway.
+fn projects_in_use() -> Vec<(String, String)> {
+    let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
+    for w in list_windows().unwrap_or_default() {
+        if let Ok(p) = format_expand(OptionTarget::Window(WindowId(w.id)), "#{@project}") {
+            let p = p.trim().to_string();
+            if !p.is_empty() {
+                *counts.entry(p).or_insert(0) += 1;
+            }
+        }
+    }
+    for s in list_sessions().unwrap_or_default() {
+        if let Ok(p) = format_expand(OptionTarget::Session(SessionId(s.id)), "#{@project}") {
+            let p = p.trim().to_string();
+            if !p.is_empty() {
+                counts.entry(p).or_insert(0);
+            }
+        }
+    }
+    counts.into_iter().map(|(n, c)| (n, format!("{c} window{}", if c == 1 { "" } else { "s" }))).collect()
+}
+
 pub async fn open(req: Request) {
     if state().borrow().is_some() {
         return;
@@ -419,6 +449,7 @@ pub async fn open(req: Request) {
             return;
         }
     };
+    let projects = projects_in_use();
     let model = Handoff {
         st: Rc::clone(&req.st),
         label: req.label.clone(),
@@ -430,6 +461,7 @@ pub async fn open(req: Request) {
         client_name: client_name(req.client),
         pane,
         tmux,
+        projects,
         editing: false,
         done: None,
     };

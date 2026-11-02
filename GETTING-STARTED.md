@@ -542,7 +542,10 @@ out at the column's width: the channel's recent messages, newest at the bottom.
 `l` (or a click in the column) hands it the keyboard, so `j`/`k`, `y`, `e`, `m`
 and `Enter` (the thread, shown in the preview itself) work on the messages
 right there and `Escape` steps back, thread to channel to list; `n` on a row hands the previewed message (or a selection made in the
-preview) to a new agent, `i` composes to the channel. `Enter` on a row opens the **channel view**: a
+preview) to a new agent, `i` composes to the channel. `w` on a channel toasts
+every message there, not only Slack's own picks (DMs, mentions and whatever the
+channel's notification preference says); `C-o` and `Tab` walk back and forward
+through the rows the cursor rested on, vim's jump list. `Enter` on a row opens the **channel view**: a
 transcript with day separators, the new-messages line, reactions and emoji
 drawn as glyphs (Slack's names, skin tones and your workspace's custom aliases
 included), bot cards with their fields, and every author by name, Slack
