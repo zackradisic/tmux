@@ -28,6 +28,10 @@ requests = [
   # (`n` in the channel view) asks the agents plugin's `new` service to
   # start an agent.
   "service-call",
+  # The notifications pane asks `preview` for its picture of a
+  # conversation (the last messages, laid out). Without it the pane
+  # shows the toast's text.
+  "service-serve",
   # The hand-off form's folder field completes directories (formkit's
   # scan). Without these two the field still takes a typed path and the
   # list says what is missing.

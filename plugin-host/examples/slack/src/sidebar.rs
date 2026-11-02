@@ -1975,7 +1975,7 @@ mod tests {
         };
         side.previews.insert("C1".into(), msgs.clone());
         let mut c = chat::embedded(ModeId(1), channel("C1"), None, None, msgs, pw as u32, body_h as u32, body_y as u32);
-        c.lines = c.msgs.iter().enumerate().map(|(i, m)| chat::Line { cells: plain_cells(&m.text, 0), msg: Some(i), image: None }).collect();
+        c.lines = c.msgs.iter().enumerate().map(|(i, m)| chat::Line { cells: plain_cells(&m.text, 0), msg: Some(i), image: None, unread: false }).collect();
         side.preview = Some(c);
         side
     }

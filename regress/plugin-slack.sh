@@ -88,6 +88,7 @@ TMUX="$TEST_TMUX -L$SOCK"
 OUTER="$TEST_TMUX -L$SOCK-outer"
 WASM=$(dirname "$TEST_TMUX")/plugin-host/target/wasm32-unknown-unknown/release/slack.wasm
 AGENTS=$(dirname "$TEST_TMUX")/plugin-host/target/wasm32-unknown-unknown/release/agents.wasm
+TOAST=$(dirname "$TEST_TMUX")/plugin-host/target/wasm32-unknown-unknown/release/notify_toast.wasm
 FAKE=$(dirname "$0")/plugin-slack-fake.py
 FAKE=$(cd "$(dirname "$FAKE")" && pwd -P)/$(basename "$FAKE")
 
@@ -100,6 +101,9 @@ DEPLOY=$(mktemp -d); cp "$WASM" "$DEPLOY/slack.wasm"
 # plugin-agents-new-cli.sh, plus service-serve for the `new` service
 # the hand-off form calls). Its store lands under this run's HOME.
 cp "$AGENTS" "$DEPLOY/agents.wasm" 2>/dev/null
+# The toast plugin, loaded before the feed section: its chooser shows
+# the toasts and asks this plugin to draw the conversation.
+cp "$TOAST" "$DEPLOY/notify_toast.wasm" 2>/dev/null
 cat >"$DEPLOY/agents.toml" <<'TOML'
 [caps]
 requests = ["capture-pane","run-command","mode","db","env-read","pane-fds","send-keys","run-process","fs-list","fs-read-any","service-serve"]
@@ -250,7 +254,7 @@ exec 3>"$HOME/ctl"
 until_ok 20 sh -c "$TMUX list-clients | grep -q ." || fail "the control client did not attach"
 $TMUX load-plugin -s server -o workspace=test -o "api_base=$BASE" -o token=xoxc-fake -o cookie=xoxd-fake \
     -c mode -c db -c fs-read -c fs-write -c run-process -c run-command -c write-options -c timers \
-    -c net -c service-call "$DEPLOY/slack.wasm" || fail "load-plugin"
+    -c net -c service-call -c service-serve "$DEPLOY/slack.wasm" || fail "load-plugin"
 $TMUX load-plugin -s server -o trust_env=1 -o "launch=fake = sh -c 'exec cat'" \
     -c capture-pane -c run-command -c mode -c db -c env-read -c pane-fds -c send-keys \
     -c run-process -c fs-list -c fs-read-any -c service-serve "$DEPLOY/agents.wasm" || fail "load-plugin agents"
@@ -901,13 +905,18 @@ $OUTER kill-server 2>/dev/null
 VIEW=
 
 # --- send, mark, bind ---------------------------------------------------------
+# The toast plugin from here on (rows never expire): the feed section's
+# toasts become its rows, checked in the chooser below.
+[ -f "$DEPLOY/notify_toast.wasm" ] || fail "notify_toast.wasm not built"
+$TMUX load-plugin -s server -o duration_ms=0 -o chooser_width=140 -o chooser_height=40 -c run-command -c mode -c service-call -c service-serve \
+    "$DEPLOY/notify_toast.wasm" || fail "load-plugin notify_toast"
 R=$(slack 'send @Tejas see you at 3')
 [ "$R" = "posting to @Tejas…" ] || fail "send did not answer: $R"
 until_ok 40 posted D1 'see you at 3' || fail "the DM did not reach the fake: $(fetch "$BASE/_posted")"
 # The DM we just sent is read: no unread DM. A message from Tejas in it,
 # injected down the feed's road (the fake has no websocket), is told as
-# a toast titled with the sender (the plugin logs the toast; no toast
-# plugin is loaded here) and bumps @slack_dms at once; the fake is told
+# a toast titled with the sender (the plugin logs the toast, and the
+# toast plugin holds the row) and bumps @slack_dms at once; the fake is told
 # too, so the next badge poll agrees. Slack's desktop_notification for
 # the same message is a repeat and stays silent; our own message in the
 # DM, and a message in a channel, are not toasts of their own.
@@ -942,6 +951,7 @@ R=$(slack 'rtm-inject {"type":"desktop_notification","title":"Morph","subtitle":
 sleep 0.5
 [ "$(toasts)" = "$((T0 + 3))" ] || fail "$(( $(toasts) - T0 )) toasts, not 3 (the mention once): $($TMUX plugin-log slack | grep 'toast:')"
 $TMUX plugin-log slack | grep -q 'desktop_notification C already told' || fail "the repeated notification left no evidence line"
+
 # A message in a quiet channel (w on #random in the sidebar above) is
 # not toasted: w is the exception to "every message".
 R=$(slack 'rtm-inject {"type":"message","channel":"C2","user":"U2","text":"quiet words","ts":"1700000904.000100"}')
@@ -951,6 +961,37 @@ $TMUX plugin-log slack | grep -q 'quiet words' && fail "the quiet channel's mess
 [ "$(toasts)" = "$((T0 + 3))" ] || fail "$(( $(toasts) - T0 )) toasts, not 3 (the quiet channel none): $($TMUX plugin-log slack | grep 'toast:')"
 R=$(slack 'rtm-inject nonsense')
 echo "$R" | grep -q '^rtm-inject:' || fail "rtm-inject with bad json did not complain: $R"
+
+# --- the notifications pane ---------------------------------------------------
+# The toasts are rows of the toast plugin's chooser: the newest first
+# (the mention took the channel message's row, same key, and came last),
+# each with its age at the right edge, and the selected row's column is
+# the slack plugin's picture of the conversation (its `preview` service):
+# the messages as the sidebar previews them, the unread bar included.
+# One more message in #general, dated after the suite's own posts (the
+# view read the channel at those): the unread bar has something to mark.
+R=$(slack 'rtm-inject {"type":"message","channel":"C1","user":"U2","text":"fresh after the mark","ts":"2000000000.000100"}')
+[ "$R" = "injected" ] || fail "rtm-inject (fresh) did not answer: $R"
+until_ok 40 sh -c "$TMUX plugin-log slack | grep -q 'slack: toast: #general · Tejas: fresh after the mark'" || fail "the fresh message was not toasted"
+$TMUX plugin-command -t "$PANE" notify_toast chooser || fail "chooser did not open"
+until_ok 40 mode_open || fail "the chooser opened no plugin mode"
+FORM=$(mode_pane)
+until_ok 40 screen_has 'slack: 4 notifications' || fail "the chooser lacks the slack group (two rows, four pings): $(screen | head -3)"
+screen | grep -q '^(1).*#general · Tejas: fresh after the mark ×3' || fail "the newest row is not first: $(screen | head -3 | tr '\n' '~')"
+screen | grep -q '^(2).*Tejas: ping from the' || fail "the DM row is not second: $(screen | head -3 | tr '\n' '~')"
+screen | grep -Eq '^\(1\).* (now|[0-9]+s) *│' || fail "the first row shows no age: $(screen | head -2 | tr '\n' '~')"
+# The cursor opens on the group row; the column follows the cursor.
+keys j
+until_ok 60 screen_has 'a channel message' || fail "the column did not draw #general: $(screen | head -8 | tr '\n' '~')"
+screen_has 'can you look?' || fail "the column lacks the mention: $(screen | head -8 | tr '\n' '~')"
+screen_has '── new messages ──' || fail "no read mark in the column: $(screen | tail -8 | tr '\n' '~')"
+screen | grep -q '▏  fresh after the mark' || fail "the unread message is not barred: $(screen | tail -8 | tr '\n' '~')"
+screen | grep -q '▏.*can you look?' && fail "a message read before is barred: $(screen | tail -8 | tr '\n' '~')"
+keys j
+until_ok 60 screen_has 'are you around?' || fail "the column did not draw the DM: $(screen | head -8 | tr '\n' '~')"
+keys q
+until_ok 40 mode_closed || fail "q did not close the chooser"
+FORM=
 BEFORE=$(ncalls conversations.mark channel C1)
 slack 'mark #general'
 until_ok 40 marks_grew "$BEFORE" || fail "mark did not reach conversations.mark (had $BEFORE)"

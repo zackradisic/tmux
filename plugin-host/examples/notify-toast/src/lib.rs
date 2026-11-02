@@ -195,6 +195,13 @@ struct Entry {
     /// snapshot, which the preview then leaves unaged.
     #[serde(default)]
     at_ms: u64,
+    /// The plugin that draws this row's detail in the chooser: the
+    /// chooser calls its `preview` method with the row's key and the
+    /// column's size and shows the rows it answers with. None = the
+    /// title and body. A forwarded row's names its server too
+    /// (`plugin@server`).
+    #[serde(default)]
+    preview: Option<String>,
 }
 
 impl Entry {
@@ -271,6 +278,8 @@ struct NotifyReq {
     action: Option<String>,
     #[serde(default)]
     ttl_ms: Option<u64>,
+    #[serde(default)]
+    preview: Option<String>,
 }
 
 /// Synthetic pane ids for service rows, clear of real pane ids and of
@@ -316,6 +325,10 @@ impl NotifyReq {
                 .filter(|a| !a.is_empty()),
             ttl_ms,
             at_ms: now,
+            preview: self
+                .preview
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty()),
         })
     }
 }
@@ -411,6 +424,24 @@ struct Chooser {
     folded: HashSet<NodeId>,
     /// First tree row on screen; the tree can outgrow the panel.
     offset: usize,
+    width: u32,
+    height: u32,
+    /// What a row's preview plugin answered for the column at that size
+    /// (or why it did not), by (seq, width, height): j/k back onto a row
+    /// draws it at once. A replaced row has a fresh seq, so a
+    /// conversation that moved on is asked again.
+    details: HashMap<(u64, u32, u32), Result<Vec<String>, String>>,
+    /// The calls out, so a redraw while one is in flight does not ask
+    /// twice.
+    pending: HashSet<(u64, u32, u32)>,
+}
+
+/// A preview the chooser wants and has not got: `redraw_chooser` sends
+/// the call and redraws when the answer lands.
+struct Fetch {
+    seq: u64,
+    target: String,
+    key: String,
     width: u32,
     height: u32,
 }
@@ -884,11 +915,43 @@ async fn sync_views(
 /// the feed ends in sync_views, so this is where the panel keeps up with
 /// notifications arriving and expiring underneath it.
 fn redraw_chooser(state: &State) {
-    let mut guard = state.borrow_mut();
-    let st = &mut *guard;
-    if let Some(ch) = st.chooser.as_mut() {
-        chooser_render(ch, &st.entries);
-    }
+    let fetch = {
+        let mut guard = state.borrow_mut();
+        let st = &mut *guard;
+        match st.chooser.as_mut() {
+            Some(ch) => chooser_render(ch, &st.entries),
+            None => None,
+        }
+    };
+    let Some(f) = fetch else { return };
+    let state = Rc::clone(state);
+    spawn(async move {
+        #[derive(Deserialize)]
+        struct Reply {
+            #[serde(default)]
+            lines: Vec<String>,
+        }
+        let req = serde_json::json!({ "key": f.key, "width": f.width, "height": f.height });
+        let got = service::call_json::<_, Reply>(&f.target, "preview", &req)
+            .await
+            .map(|r| r.lines)
+            .map_err(|e| e.message);
+        let slot = (f.seq, f.width, f.height);
+        let mut guard = state.borrow_mut();
+        let st = &mut *guard;
+        let Some(ch) = st.chooser.as_mut() else { return };
+        ch.pending.remove(&slot);
+        ch.details.insert(slot, got);
+        if ch.details.len() > 64 {
+            // Keep the panel's memory bounded over a long session.
+            let drop: Vec<_> = ch.details.keys().filter(|k| k.0 != f.seq).take(32).cloned().collect();
+            for k in drop {
+                ch.details.remove(&k);
+            }
+        }
+        drop(guard);
+        redraw_chooser(&state);
+    });
 }
 
 // ---- chooser: the expanded view, a plugin UI mode ----
@@ -910,6 +973,9 @@ struct Seg(&'static str, String);
 
 const DIM: &str = "2";
 const BOLD: &str = "1";
+/// A line another plugin styled itself: written as it is, no SGR of
+/// ours around it and no cut (it was laid out for the width).
+const RAW: &str = "raw";
 const RED: &str = "31";
 const GREEN: &str = "32";
 
@@ -952,6 +1018,9 @@ struct Row {
     preview: Option<u64>,
     /// Seq of the notification, for rows that are one.
     note: Option<u64>,
+    /// How long ago the notification arrived, drawn at the row's right
+    /// edge; empty on grouping rows and rows whose arrival is unknown.
+    age: String,
 }
 
 /// Every notification a node stands for. Read from the feed, not from
@@ -1000,6 +1069,7 @@ fn build_rows(
         /// Pings folded into this row, for the session tally.
         count: u32,
         text: Vec<Seg>,
+        at_ms: u64,
     }
     struct Win {
         id: Option<u64>,
@@ -1023,6 +1093,7 @@ fn build_rows(
         title: String,
         body: String,
         count: u32,
+        at_ms: u64,
     }
     /// Every row one source sent; a top-level group beside the sessions.
     struct Group {
@@ -1049,6 +1120,7 @@ fn build_rows(
                 title: e.title.clone(),
                 body: e.msg.clone(),
                 count: e.count.max(1),
+                at_ms: e.at_ms,
             });
             continue;
         }
@@ -1098,15 +1170,17 @@ fn build_rows(
             pane: e.src_pane,
             count: e.count.max(1),
             text: note_text(e),
+            at_ms: e.at_ms,
         });
     }
+    let now = now_ms();
 
     tree.sort_by(|a, b| a.name.cmp(&b.name));
     groups.sort_by(|a, b| a.name.cmp(&b.name));
     for g in groups.iter_mut() {
-        // Arrival order: a replaced row took a fresh seq, so it moves
-        // to the bottom like a new one.
-        g.notes.sort_by_key(|n| n.seq);
+        // Newest first: a replaced row took a fresh seq, so a
+        // conversation that spoke again rises to the top.
+        g.notes.sort_by_key(|n| std::cmp::Reverse(n.seq));
     }
     for s in tree.iter_mut() {
         s.windows.sort_by_key(|w| (w.index, w.id));
@@ -1166,6 +1240,7 @@ fn build_rows(
             // session's current window, the window's active pane.
             preview: s.preview,
             note: None,
+            age: String::new(),
         });
         if !session_open {
             continue;
@@ -1211,6 +1286,7 @@ fn build_rows(
                     parent: Some(sid.clone()),
                     preview: Some(n.pane),
                     note: Some(n.seq),
+                    age: age_short(now, n.at_ms),
                 });
                 continue;
             }
@@ -1229,6 +1305,7 @@ fn build_rows(
                 parent: Some(sid.clone()),
                 preview: w.preview,
                 note: None,
+                age: String::new(),
             });
             if !window_open {
                 continue;
@@ -1253,6 +1330,7 @@ fn build_rows(
                     parent: Some(wid.clone()),
                     preview: Some(n.pane),
                     note: Some(n.seq),
+                    age: age_short(now, n.at_ms),
                 });
             }
         }
@@ -1287,6 +1365,7 @@ fn build_rows(
             parent: None,
             preview: None,
             note: None,
+            age: String::new(),
         });
         if !open {
             continue;
@@ -1326,6 +1405,7 @@ fn build_rows(
                 parent: Some(gid.clone()),
                 preview: None,
                 note: Some(n.seq),
+                age: age_short(now, n.at_ms),
             });
         }
     }
@@ -1346,6 +1426,22 @@ fn age(now: u64, at: u64) -> String {
         60..=3599 => format!("{}m ago", secs / 60),
         3600..=86_399 => format!("{}h ago", secs / 3600),
         _ => format!("{}d ago", secs / 86_400),
+    }
+}
+
+/// A row's age in the list, as short as it goes: "now", "42s", "6m",
+/// "3h", "2d". Empty when the arrival time is unknown.
+fn age_short(now: u64, at: u64) -> String {
+    if at == 0 || now < at {
+        return String::new();
+    }
+    let secs = (now - at) / 1000;
+    match secs {
+        0..=4 => "now".into(),
+        5..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=86_399 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86_400),
     }
 }
 
@@ -1489,16 +1585,23 @@ fn draw_row(
         s.push('m');
         s
     };
+    // The age sits at the right edge, the text cut short of it.
+    let age_w = row.age.chars().count();
+    let text_w = if age_w == 0 {
+        width
+    } else {
+        width.saturating_sub(age_w + 1)
+    };
     let mut out = String::new();
     let mut used = 0usize;
     for Seg(style, text) in segs.iter() {
-        if used >= width {
+        if used >= text_w {
             break;
         }
         let take: String = text
             .chars()
             .filter(|c| !c.is_control())
-            .take(width - used)
+            .take(text_w - used)
             .collect();
         if take.is_empty() {
             continue;
@@ -1506,6 +1609,13 @@ fn draw_row(
         used += take.chars().count();
         out.push_str(&sgr(style));
         out.push_str(&take);
+    }
+    if age_w > 0 && age_w + 1 <= width {
+        out.push_str(&sgr(""));
+        out.push_str(&" ".repeat(text_w.saturating_sub(used) + 1));
+        out.push_str(&sgr(DIM));
+        out.push_str(&row.age);
+        used = width;
     }
     // A selected row is highlighted across the whole list column.
     if selected && used < width {
@@ -1547,7 +1657,8 @@ fn selected_row(ch: &Chooser, rows: &[Row]) -> Option<usize> {
 /// Full redraw of the chooser screen plus the preview rect. Rebuilt from
 /// the live feed each time, so it is safe to call with a selection that
 /// expiry has made stale.
-fn chooser_render(ch: &mut Chooser, entries: &VecDeque<Entry>) {
+fn chooser_render(ch: &mut Chooser, entries: &VecDeque<Entry>) -> Option<Fetch> {
+    let mut fetch = None;
     let topo = Topo::fetch();
     let rows = build_rows(entries, &topo, &ch.folded);
     let height = ch.height as usize;
@@ -1624,10 +1735,41 @@ fn chooser_render(ch: &mut Chooser, entries: &VecDeque<Entry>) {
         if let Some(e) = service_note {
             let col = list_w + 3;
             let pw = (ch.width as usize).saturating_sub(col).max(1);
-            let lines = service_preview(e, now_ms(), pw, visible);
+            // The row's plugin draws the column when it offered to:
+            // its rows under the title, the source and age at the
+            // foot. Until it answers, the text, with the title.
+            let detail = e.preview.as_ref().and_then(|target| {
+                let body_h = visible.saturating_sub(3) as u32;
+                let slot = (e.seq, pw as u32, body_h);
+                match ch.details.get(&slot) {
+                    Some(Ok(lines)) => Some(lines.clone()),
+                    Some(Err(_)) => None,
+                    None => {
+                        if body_h > 0 && pw >= 10 && ch.pending.insert(slot) {
+                            fetch = Some(Fetch {
+                                seq: e.seq,
+                                target: target.clone(),
+                                key: e.key.clone(),
+                                width: pw as u32,
+                                height: body_h,
+                            });
+                        }
+                        None
+                    }
+                }
+            });
+            let lines = match detail {
+                Some(rows) => detail_preview(e, rows, now_ms(), visible),
+                None => service_preview(e, now_ms(), pw, visible),
+            };
             for (i, Seg(style, text)) in lines.iter().enumerate() {
-                let text: String = text.chars().take(pw).collect();
-                let sgr = if style.is_empty() {
+                let raw = *style == RAW;
+                let text: String = if raw {
+                    text.clone()
+                } else {
+                    text.chars().take(pw).collect()
+                };
+                let sgr = if style.is_empty() || raw {
                     String::new()
                 } else {
                     format!("\x1b[{style}m")
@@ -1646,6 +1788,34 @@ fn chooser_render(ch: &mut Chooser, entries: &VecDeque<Entry>) {
 
     let _ = mode_write(ch.mode, out.as_bytes());
     let _ = mode_preview(ch.mode, chooser_preview_rect(ch, &rows).as_ref());
+    fetch
+}
+
+/// The preview column when the row's plugin drew it: the title, its
+/// rows (already styled and cut to the width, taken as they are), and
+/// the source and age at the foot. One Seg per line, `height` of them.
+fn detail_preview(e: &Entry, rows: Vec<String>, now: u64, height: usize) -> Vec<Seg> {
+    let mut lines: Vec<Seg> = Vec::new();
+    let title = if e.title.is_empty() { e.msg.clone() } else { e.title.clone() };
+    lines.push(Seg(BOLD, title));
+    let body_h = height.saturating_sub(3);
+    lines.extend(rows.into_iter().take(body_h).map(|r| Seg(RAW, r)));
+    if height >= 3 {
+        while lines.len() < height - 1 {
+            lines.push(Seg("", String::new()));
+        }
+        let when = age(now, e.at_ms);
+        lines.push(Seg(
+            DIM,
+            if when.is_empty() {
+                e.source.clone()
+            } else {
+                format!("{} \u{b7} {when}", e.source)
+            },
+        ));
+    }
+    lines.truncate(height);
+    lines
 }
 
 /// Config -> (duration, width, show_when_visible, chooser_w, chooser_h,
@@ -1760,9 +1930,22 @@ impl NotifyToast {
                     offset: 0,
                     width,
                     height,
+                    details: HashMap::new(),
+                    pending: HashSet::new(),
                 };
                 self.state.borrow_mut().chooser = Some(ch);
                 redraw_chooser(&self.state);
+                // The ages on the rows tick while the panel is open:
+                // nothing else redraws it in a quiet minute.
+                let state = Rc::clone(&self.state);
+                spawn(async move {
+                    while sleep_ms(30_000).await.is_ok() {
+                        if state.borrow().chooser.is_none() {
+                            break;
+                        }
+                        redraw_chooser(&state);
+                    }
+                });
             }
             Err(e) => log(&format!("chooser open failed: {}", e.message)),
         }
@@ -2526,6 +2709,7 @@ impl Plugin for NotifyToast {
                     action: None,
                     ttl_ms: None,
                     at_ms: now_ms(),
+                    preview: None,
                 };
                 let loc = locate(&Topo::fetch(), &probe);
                 Entry {
@@ -2571,6 +2755,7 @@ impl Plugin for NotifyToast {
             entry.src_window = None;
             entry.source = format!("{}/{}", ev.server, entry.source);
             entry.action = None;
+            entry.preview = entry.preview.take().map(|p| format!("{p}@{}", ev.server));
         } else {
             // The pane the notification names is on the other server.
             // When a shadow pane mirrors it here, the toast points at
@@ -2853,6 +3038,7 @@ mod tests {
             action: None,
             ttl_ms: None,
             at_ms: 0,
+            preview: None,
         };
         let mut feed = VecDeque::new();
         assert_eq!(insert_entry(&mut feed, pane(1, 5)), 1);
@@ -2900,5 +3086,94 @@ mod tests {
         assert_eq!(lines[0].1, "#general · Tejas");
         assert_eq!(lines[2].1, "the text, one line");
         assert_eq!(lines.last().unwrap().1, "slack \u{b7} 5s ago");
+    }
+
+    #[test]
+    fn a_row_names_the_plugin_that_previews_it() {
+        let e = req(r##"{"source":"slack","key":"slack:C1","title":"#general · Tejas","body":"hi","preview":" slack "}"##)
+            .unwrap();
+        assert_eq!(e.preview.as_deref(), Some("slack"));
+        let none = req(r##"{"source":"slack","body":"hi","preview":""}"##).unwrap();
+        assert_eq!(none.preview, None);
+        // The plugin's rows go under the title, the foot stays ours.
+        let rows = vec!["\x1b[1mTejas\x1b[0m".to_string(), "  hi".to_string()];
+        let lines = detail_preview(&e, rows, 1_005_000, 6);
+        assert_eq!(lines.len(), 6);
+        assert_eq!((lines[0].0, lines[0].1.as_str()), (BOLD, "#general · Tejas"));
+        assert_eq!((lines[1].0, lines[1].1.as_str()), (RAW, "\x1b[1mTejas\x1b[0m"));
+        assert_eq!(lines[2].1, "  hi");
+        assert_eq!(lines[3].1, "");
+        assert_eq!(lines[5].1, "slack \u{b7} 5s ago");
+        // More rows than fit: cut to the body, the foot kept.
+        let many: Vec<String> = (0..20).map(|i| i.to_string()).collect();
+        let lines = detail_preview(&e, many, 1_005_000, 6);
+        assert_eq!(lines.len(), 6);
+        assert_eq!(lines[3].1, "2");
+        assert_eq!(lines[5].1, "slack \u{b7} 5s ago");
+    }
+
+    #[test]
+    fn service_rows_come_newest_first_with_their_ages() {
+        let mut feed = VecDeque::new();
+        for (seq, body) in [(1, "first"), (2, "second"), (3, "third")] {
+            let e = req(&format!(r#"{{"source":"slack","title":"t{seq}","body":"{body}"}}"#)).unwrap();
+            feed.push_back(Entry { seq, ..e });
+        }
+        let topo = Topo { pane_window: HashMap::new(), windows: HashMap::new(), sessions: HashMap::new() };
+        let rows = build_rows(&feed, &topo, &HashSet::new());
+        let notes: Vec<u64> = rows.iter().filter_map(|r| r.note).collect();
+        assert_eq!(notes, vec![3, 2, 1], "the latest arrival at the top");
+        let keys: Vec<usize> = rows.iter().filter_map(|r| r.key).collect();
+        assert_eq!(keys, vec![1, 2, 3], "jump keys follow the drawn order");
+        assert_eq!(rows[0].age, "", "a group has no age");
+
+        assert_eq!(age_short(1_000_000, 0), "");
+        assert_eq!(age_short(1_000_000, 999_000), "now");
+        assert_eq!(age_short(1_000_000, 940_000), "1m");
+        assert_eq!(age_short(10_000_000, 1_000_000), "2h");
+        assert_eq!(age_short(900_000_000, 1_000_000), "10d");
+
+        // The age sits at the right edge and the text stops short of it.
+        let mut row = Row {
+            service: true,
+            depth: 1,
+            last: true,
+            parent_last: true,
+            has_children: false,
+            expanded: false,
+            key: Some(1),
+            name: "#general · Tejas".into(),
+            text: vec![Seg("", "a body long enough to run into the age column".into())],
+            id: NodeId::Note(1),
+            parent: None,
+            preview: None,
+            note: Some(1),
+            age: "6m".into(),
+        };
+        let strip = |s: &str| {
+            let mut out = String::new();
+            let mut it = s.chars();
+            while let Some(c) = it.next() {
+                if c == '\x1b' {
+                    for c in it.by_ref() {
+                        if c == 'm' {
+                            break;
+                        }
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        };
+        let drawn = strip(&draw_row(&row, 4, 0, false, 40));
+        assert_eq!(drawn.chars().count(), 40, "{drawn:?}");
+        assert!(drawn.ends_with(" 6m"), "{drawn:?}");
+        assert!(drawn.contains("a body long"), "{drawn:?}");
+        // No age: the text has the whole width.
+        row.age.clear();
+        let drawn = strip(&draw_row(&row, 4, 0, false, 40));
+        assert_eq!(drawn.chars().count(), 40, "{drawn:?}");
+        assert!(drawn.ends_with("long en"), "cut at the width, not padded: {drawn:?}");
     }
 }

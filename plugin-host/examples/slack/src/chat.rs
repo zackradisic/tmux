@@ -66,6 +66,10 @@ pub struct Line {
     pub cells: Vec<Styled>,
     pub msg: Option<usize>,
     pub image: Option<ImageRow>,
+    /// The message is newer than the read mark and not ours: the
+    /// gutter bars it, so what is new reads at a glance under the
+    /// `new messages` rule.
+    pub unread: bool,
 }
 
 /// Row `row` of the `cols`×`rows` block showing file `file`.
@@ -407,7 +411,7 @@ pub fn layout(
         let pad = cw.saturating_sub(text.chars().count()) / 2;
         let mut cells: Vec<Styled> = plain_cells(&" ".repeat(pad), 0);
         cells.extend(plain_cells(&text, style));
-        out.push(Line { cells, msg: None, image: None });
+        out.push(Line { cells, msg: None, image: None, unread: false });
     };
     let author = |m: &Message| m.user.clone().or_else(|| m.username.clone()).unwrap_or_default();
     // The read mark goes before the first message newer than it that is
@@ -433,6 +437,7 @@ pub fn layout(
         }
         let grouped = !separated
             && prev.is_some_and(|p| author(p) == author(m) && secs - timefmt::secs(&p.ts) < GROUP_SECS);
+        let first_line = out.len();
         if !grouped {
             let who = m
                 .user
@@ -446,7 +451,7 @@ pub fn layout(
             if m.edited {
                 cells.extend(plain_cells(" (edited)", ST_DIM));
             }
-            out.push(Line { cells, msg: Some(i), image: None });
+            out.push(Line { cells, msg: Some(i), image: None, unread: false });
         }
         // A message that addresses the user carries a red `@` in the
         // indent of its first line, grouped under a header or not.
@@ -462,13 +467,13 @@ pub fn layout(
         if m.deleted {
             let mut cells = indent();
             cells.extend(plain_cells("(deleted)", ST_DIM));
-            out.push(Line { cells, msg: Some(i), image: None });
+            out.push(Line { cells, msg: Some(i), image: None, unread: false });
         } else if !m.text.trim().is_empty() {
             let body = names.with(|n| mrkdwn::render(&m.text, body_w, 0, n));
             for mut l in body {
                 let mut cells = indent();
                 cells.append(&mut l);
-                out.push(Line { cells, msg: Some(i), image: None });
+                out.push(Line { cells, msg: Some(i), image: None, unread: false });
             }
         }
         for a in &m.attachments {
@@ -478,7 +483,7 @@ pub fn layout(
                     let mut cells = indent();
                     cells.extend(plain_cells("│ ", ST_DIM));
                     cells.append(&mut w);
-                    out.push(Line { cells, msg: Some(i), image: None });
+                    out.push(Line { cells, msg: Some(i), image: None, unread: false });
                 }
             }
         }
@@ -487,18 +492,18 @@ pub fn layout(
         for p in &m.pictures {
             if let Some((cols, rows)) = pics.and_then(|px| image_block(px, p, body_w)) {
                 for row in 0..rows {
-                    out.push(Line { cells: indent(), msg: Some(i), image: Some(ImageRow { file: p.id.clone(), row, cols, rows }) });
+                    out.push(Line { cells: indent(), msg: Some(i), image: Some(ImageRow { file: p.id.clone(), row, cols, rows }), unread: false });
                 }
             }
         }
         for f in &m.files {
             let mut cells = indent();
             cells.extend(plain_cells(&format!("📎 {}", f.name), ST_DIM));
-            out.push(Line { cells, msg: Some(i), image: None });
+            out.push(Line { cells, msg: Some(i), image: None, unread: false });
             // The picture, once it is on disk: a block under the line.
             if let Some((cols, rows)) = pics.and_then(|p| image_block(p, f, body_w)) {
                 for row in 0..rows {
-                    out.push(Line { cells: indent(), msg: Some(i), image: Some(ImageRow { file: f.id.clone(), row, cols, rows }) });
+                    out.push(Line { cells: indent(), msg: Some(i), image: Some(ImageRow { file: f.id.clone(), row, cols, rows }), unread: false });
                 }
             }
         }
@@ -506,7 +511,7 @@ pub fn layout(
             let text = m.reactions.iter().map(|(n, c)| format!(":{n}: {c}")).collect::<Vec<_>>().join(" · ");
             let mut cells = indent();
             emoji::push_text(&mut cells, &text, ST_DIM);
-            out.push(Line { cells, msg: Some(i), image: None });
+            out.push(Line { cells, msg: Some(i), image: None, unread: false });
         }
         if !in_thread && m.reply_count > 0 {
             let when = m.latest_reply.as_deref().unwrap_or(&m.ts);
@@ -518,7 +523,13 @@ pub fn layout(
             );
             let mut cells = indent();
             cells.extend(plain_cells(&text, ST_CYAN));
-            out.push(Line { cells, msg: Some(i), image: None });
+            out.push(Line { cells, msg: Some(i), image: None, unread: false });
+        }
+        // Newer than the read mark and not ours: every line of it.
+        if last_read.is_some_and(|lr| m.ts.as_str() > lr) && m.user.as_deref() != Some(me) {
+            for l in &mut out[first_line..] {
+                l.unread = true;
+            }
         }
         prev = Some(m);
     }
@@ -787,16 +798,7 @@ pub(crate) fn paint_body(c: &Chat, out: &mut String, x0: usize, y0: usize) {
     }
     for (k, line) in c.lines.iter().skip(c.top).take(body_h).enumerate() {
         let row = y0 + 1 + k;
-        let on_cursor = cursor.is_some() && line.msg == cursor;
-        let selected = line.msg.is_some_and(|i| c.in_selection(i));
-        let gutter = if on_cursor {
-            ('▎', ST_CYAN | ST_BRIGHT)
-        } else if selected {
-            ('▎', ST_ORANGE)
-        } else {
-            (' ', 0)
-        };
-        let mut cells: Vec<Styled> = vec![gutter];
+        let mut cells: Vec<Styled> = vec![gutter(c, line, cursor)];
         if let Some(img) = &line.image {
             // The indent as text, then the placeholders: the terminal
             // draws row `img.row` of the picture over them.
@@ -813,6 +815,40 @@ pub(crate) fn paint_body(c: &Chat, out: &mut String, x0: usize, y0: usize) {
         cells.extend(fit_cells(&line.cells, w.saturating_sub(1)));
         out.push_str(&format!("\x1b[{row};{}H{}", x0 + 1, emit_cells(&cells, false)));
     }
+}
+
+/// The gutter cell of a line: the cursor's bar, the selection's, the
+/// unread bar, or blank.
+fn gutter(c: &Chat, line: &Line, cursor: Option<usize>) -> Styled {
+    if cursor.is_some() && line.msg == cursor {
+        ('▎', ST_CYAN | ST_BRIGHT)
+    } else if line.msg.is_some_and(|i| c.in_selection(i)) {
+        ('▎', ST_ORANGE)
+    } else if line.unread {
+        ('▏', ST_RED)
+    } else {
+        (' ', 0)
+    }
+}
+
+/// The body as rows of styled text with no cursor movement in them:
+/// the lines from `top`, `body_h` of them, each behind its gutter cell
+/// and cut to the width. For a view drawn by another plugin (the
+/// notifications pane's preview), which puts them where it likes; no
+/// pictures there, so image rows are not expected.
+pub(crate) fn render_lines(c: &Chat) -> Vec<String> {
+    let w = c.width as usize;
+    let cursor = c.cursor_idx();
+    c.lines
+        .iter()
+        .skip(c.top)
+        .take(c.body_h())
+        .map(|line| {
+            let mut cells: Vec<Styled> = vec![gutter(c, line, cursor)];
+            cells.extend(fit_cells(&line.cells, w.saturating_sub(1)));
+            emit_cells(&cells, false)
+        })
+        .collect()
 }
 
 /// The kitty id showing `img`'s file at its block size: the one already
@@ -2720,6 +2756,56 @@ mod tests {
         none.next_mention();
         assert_eq!(none.status.as_deref(), Some("no mention of you here"));
         assert_eq!(none.first_unread_mention(), None);
+    }
+
+    #[test]
+    fn unread_messages_are_barred_in_the_gutter() {
+        let mut c = chat();
+        c.me = "U1".into();
+        c.width = 40;
+        c.height = 20;
+        c.msgs = vec![
+            msg(NOON, "U2", "read already"),
+            msg(NOON + 20, "U1", "mine, after the mark"),
+            msg(NOON + 30, "U2", "new one"),
+            msg(NOON + 40, "U2", "and another"),
+        ];
+        c.last_read = Some(format!("{}.000100", NOON + 10));
+        c.lines = layout(&c.msgs, 40, 0, "U1", c.last_read.as_deref(), &names(), NOON + 3600, false, None);
+        let unread: Vec<Option<usize>> = c.lines.iter().filter(|l| l.unread).map(|l| l.msg).collect();
+        assert!(!unread.is_empty());
+        assert!(unread.iter().all(|m| matches!(m, Some(2) | Some(3))), "only the two messages after the mark that are not ours: {unread:?}");
+        assert!(c.lines.iter().filter(|l| l.msg == Some(2) || l.msg == Some(3)).all(|l| l.unread), "every line of them");
+        assert!(c.lines.iter().filter(|l| l.msg.is_none()).all(|l| !l.unread), "separators are not messages");
+        // Rendered for another plugin: the bar leads the unread rows,
+        // the cursor is not drawn, nothing moves the cursor.
+        c.cursor = None;
+        c.top = 0;
+        let rows = render_lines(&c);
+        assert_eq!(rows.len(), c.lines.len().min(c.body_h()));
+        assert!(rows.iter().all(|r| !r.contains("\x1b[") || !r.contains('H')), "no cursor moves: {rows:?}");
+        let plain: Vec<String> = rows.iter().map(|r| strip_sgr(r)).collect();
+        assert!(plain.iter().any(|r| r.starts_with("▏") && r.contains("new one")), "{plain:?}");
+        assert!(plain.iter().any(|r| r.starts_with(' ') && r.contains("read already")), "{plain:?}");
+        assert!(plain.iter().any(|r| r.contains("new messages")), "the rule is there too: {plain:?}");
+        assert!(plain.iter().all(|r| !r.contains('▎')), "no cursor bar: {plain:?}");
+    }
+
+    fn strip_sgr(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' {
+                for c in chars.by_ref() {
+                    if c == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+        out
     }
 
     #[test]

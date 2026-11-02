@@ -48,6 +48,7 @@ mod help;
 mod http;
 mod images;
 mod mrkdwn;
+mod peek;
 mod sidebar;
 mod store;
 mod timefmt;
@@ -324,6 +325,11 @@ impl Plugin for Slack {
             names_inflight: 0,
         }));
         images::attach(&st);
+        // The notifications pane asks for its preview of a conversation
+        // through this; without service-serve the pane shows the text.
+        if let Err(e) = service::register("preview") {
+            log(&format!("slack: preview service not registered: {} (service-serve not granted?)", e.message));
+        }
         ctx.spawn(boot(Rc::clone(&st)));
         ctx.spawn(images::prune());
         Ok(Self { st })
@@ -361,6 +367,14 @@ impl Plugin for Slack {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn on_service_request(&mut self, _ctx: &Ctx, req: ServiceRequest) {
+        if req.method == "preview" {
+            peek::serve(&self.st, req);
+        } else {
+            let _ = req.fail("slack: unknown method");
         }
     }
 
@@ -936,7 +950,7 @@ fn on_command(st: &Shared, event: &Event) {
             }
             let (title, body) = (title.to_string(), body.to_string());
             spawn(async move {
-                notify(&title, &body, None, None).await;
+                notify(&title, &body, None, None, false).await;
             });
         }
         // "rtm-inject <json>": an RTM frame as if the socket had carried
@@ -986,8 +1000,10 @@ fn on_command(st: &Shared, event: &Event) {
 }
 
 /// A line for the notification feed (the notify-toast plugin's `notify`
-/// service); the status line when that plugin is not there.
-pub async fn notify(title: &str, body: &str, key: Option<&str>, action: Option<&str>) {
+/// service); the status line when that plugin is not there. `preview`
+/// names the row's key a conversation the pane can ask this plugin to
+/// draw (`peek`).
+pub async fn notify(title: &str, body: &str, key: Option<&str>, action: Option<&str>, preview: bool) {
     #[derive(serde::Serialize)]
     struct Req<'a> {
         source: &'a str,
@@ -997,8 +1013,10 @@ pub async fn notify(title: &str, body: &str, key: Option<&str>, action: Option<&
         body: &'a str,
         #[serde(skip_serializing_if = "Option::is_none")]
         action: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        preview: Option<&'a str>,
     }
-    let req = Req { source: "slack", key, title, body, action };
+    let req = Req { source: "slack", key, title, body, action, preview: preview.then_some("slack") };
     if let Err(e) = service::call_json::<_, serde_json::Value>("notify_toast", "notify", &req).await {
         log(&format!("slack: notify: {} (toast plugin not loaded?)", e.message));
         let line = format!("Slack {title}: {body}");

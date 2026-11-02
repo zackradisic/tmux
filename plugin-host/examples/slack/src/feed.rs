@@ -198,7 +198,7 @@ fn toast_keys(channel: &str, ts: &str, thread: Option<&str>) -> (String, String,
 /// the toast plugin.
 async fn toast(title: &str, body: &str, key: &str, action: Option<&str>) {
     log(&format!("slack: toast: {title}: {}", listkit::text::clip(&listkit::text::one_line(body), 120)));
-    crate::notify(title, body, Some(key), action).await;
+    crate::notify(title, body, Some(key), action, true).await;
 }
 
 async fn handle(st: &Shared, v: Value) {

@@ -544,9 +544,12 @@ and `Enter` (the thread, shown in the preview itself) work on the messages
 right there and `Escape` steps back, thread to channel to list; `n` on a row hands the previewed message (or a selection made in the
 preview) to a new agent, `i` composes to the channel. Every message of every channel
 you are in is toasted to the notifications pane (not your own, not a muted
-channel, not one on screen); `w` quiets a channel (only DMs and mentions
-there), `set -g @slack-notify slack` keeps to Slack's own rule instead, with
-`w` watching a channel; `C-o` and `Tab` reopen the
+channel, not one on screen), where the row's column is this preview of the
+conversation, drawn by the plugin on request; `w` quiets a channel (only DMs
+and mentions there), `set -g @slack-notify slack` keeps to Slack's own rule
+instead, with `w` watching a channel. Messages newer than the read mark that
+are not yours carry a red bar in the gutter, in every view, under the
+`new messages` line; `C-o` and `Tab` reopen the
 conversations you opened before and after this one, a history that survives
 closing the float (the sidebar opens on its newest entry); `N` hands everything
 the preview shows to a new agent, for a summary. `Enter` on a row opens the **channel view**: a
@@ -614,9 +617,12 @@ posts are not echoed back to it.
 ### notify-toast — `prefix + N`
 A notification feed: a toast in a floating pane, top-right, in whatever window
 you're looking at, and `prefix + N` for a `choose-tree`-style chooser of the
-feed with a preview. Any plugin can post to it through its `notify` service
-(Slack does, on every notification Slack itself would have shown); `Enter`
-runs the row's action (open that channel), `d` dismisses, `h`/`l` fold. With
+feed with a preview: rows newest first, each with its age at the right edge.
+Any plugin can post to it through its `notify` service (Slack does, on every
+message it toasts); a row that names a `preview` plugin gets its column drawn
+by that plugin's `preview` service (Slack draws the conversation as its
+sidebar previews it, the unread bar included), the others show the text.
+`Enter` runs the row's action (open that channel), `d` dismisses, `h`/`l` fold. With
 `pane_notifications = "1"`, programs that emit OSC 9 or OSC 777 (an agent's
 stop hook running `printf '\e]9;done\a'`) show up too, one line per pane.
 
