@@ -356,6 +356,9 @@ GENERAL_AT=$(screen | grep -n '· #general' | head -1 | cut -d: -f1)
 [ "$RANDOM_AT" -lt "$GENERAL_AT" ] || fail "#general ($GENERAL_AT) did not drop below #random ($RANDOM_AT)"
 # The row that takes its place in Unread is the thread's.
 cursor_row | grep -q '↳ #general' || fail "the cursor followed the marked row: $(cursor_row)"
+# The row came under the cursor without a key: its preview is fetched
+# all the same (it used to say loading… until the next j/k).
+until_ok 40 screen_has 'can you review the plan' || fail "the thread row that took the cursor's place was not fetched: $(screen | grep -c 'loading')"
 # --- the preview has the keyboard --------------------------------------------
 # The preview is the channel view embedded in the column, drawn by the
 # plugin at the column's width. l hands it the keyboard: the footer

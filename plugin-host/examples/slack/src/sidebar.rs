@@ -196,12 +196,18 @@ pub fn close(st: &Shared) {
 
 /// Redraw an open sidebar from the current state.
 pub fn refresh(st: &Shared) {
-    let mut s = st.borrow_mut();
-    if s.side.is_none() {
-        return;
+    {
+        let mut s = st.borrow_mut();
+        if s.side.is_none() {
+            return;
+        }
+        rebuild(&mut s);
+        render(&mut s);
     }
-    rebuild(&mut s);
-    render(&mut s);
+    // The rows may have moved under the cursor (a message arrived, a
+    // row was read, threads came in): the row there now wants its
+    // messages too, which only a key press asked for before.
+    ensure_preview(st);
 }
 
 /// Draw the sidebar: the engine's frame, then the embedded channel view
@@ -915,6 +921,8 @@ fn fetch_preview(st: &Shared, id: crate::store::Identity, key: String) {
         }
         rebuild(&mut s);
         render(&mut s);
+        drop(s);
+        ensure_preview(&st2);
     });
 }
 
@@ -1531,6 +1539,8 @@ pub fn on_mode_event(st: &Shared, name: &str, event: &Event) {
             let _ = set_option("@slack-height", &h.to_string());
             rebuild(&mut s);
             render(&mut s);
+            drop(s);
+            ensure_preview(st);
         }
         "mode-closed" => {
             st.borrow_mut().side = None;
