@@ -469,9 +469,15 @@ from a file, as `"$(cat '<path>')"`, for a long prompt or one with quotes
 and newlines); the caller pane's folder,
 session and `@project` are the defaults. The window is made in the
 background and the result is left in the caller pane's `@agents_new`
-option (`%pane @window session`, or `error: …`). `tmux2 plugin-command
-agents help` lists every verb and `agents 'new --help'` every flag, printed
-on your terminal by the plugin itself.
+option (`%pane @window session`, or `error: …`). The roster reads the same
+way: `agents ls` (every live agent on every linked server, `--project` for
+one, `--all` with the ended ones, `--json` for a script), `agents 'show
+<id>'` (the `i` card as text), `agents 'transcript <id> -n 50'` (its stored
+conversation), `agents 'search <words>'` and `-t "$TMUX_PANE" agents whoami`
+(the agent's own id and reply address), all printed on the caller's terminal
+from the store at once. `tmux2 plugin-command agents help` lists every verb
+and `agents 'new --help'` every flag, printed on your terminal by the plugin
+itself.
 
 ### mailbox — cross-agent messages
 The delivery primitive behind `agents message`. Each agent id gets a box in a

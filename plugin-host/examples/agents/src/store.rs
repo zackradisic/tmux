@@ -970,6 +970,157 @@ pub async fn live_agents() -> Result<Vec<Agent>, HostError> {
     Ok(agents)
 }
 
+// ---------------------------------------------------------------------------
+// synchronous readers (the command line)
+// ---------------------------------------------------------------------------
+//
+// A plugin-command's answer must be given before its handler returns:
+// that is when the host prints it. The verbs that answer on the caller's
+// terminal (`cli`) read the store through the host's synchronous query,
+// one round trip each, and never wait on a remote.
+
+pub fn live_agents_sync() -> Result<Vec<Agent>, HostError> {
+    let rows = db_query_sync(
+        &format!(
+            "SELECT {COLS} FROM agents WHERE ended_ms IS NULL \
+             AND life != 'archived'"
+        ),
+        params![],
+    )?;
+    Ok(agents_from(&rows))
+}
+
+/// Ended or archived agents, most recent first, at most `limit`.
+pub fn history_sync(limit: i64) -> Result<Vec<Agent>, HostError> {
+    let rows = db_query_sync(
+        &format!(
+            "SELECT {COLS} FROM agents WHERE ended_ms IS NOT NULL \
+             OR life = 'archived' \
+             ORDER BY COALESCE(ended_ms, last_active_ms, last_status_ms) DESC \
+             LIMIT ?1"
+        ),
+        params![limit],
+    )?;
+    Ok(agents_from(&rows))
+}
+
+pub fn by_id_sync(id: &str) -> Result<Option<Agent>, HostError> {
+    let rows = db_query_sync(
+        &format!("SELECT {COLS} FROM agents WHERE id = ?1 LIMIT 1"),
+        params![id],
+    )?;
+    Ok(agents_from(&rows).into_iter().next())
+}
+
+pub fn live_by_pane_sync(pane: i64) -> Result<Option<Agent>, HostError> {
+    let rows = db_query_sync(
+        &format!(
+            "SELECT {COLS} FROM agents WHERE pane = ?1 AND ended_ms IS NULL \
+             LIMIT 1"
+        ),
+        params![pane],
+    )?;
+    Ok(agents_from(&rows).into_iter().next())
+}
+
+/// The last `n` turns stored for an agent, oldest first, and how many
+/// it has in all.
+pub fn turns_tail_sync(id: &str, n: i64) -> Result<(Vec<TurnRow>, i64), HostError> {
+    let total = db_query_sync(
+        "SELECT COUNT(*) AS n FROM turns WHERE id = ?1",
+        params![id],
+    )?
+    .scalar()
+    .and_then(DbValue::as_i64)
+    .unwrap_or(0);
+    let rows = db_query_sync(
+        &format!(
+            "SELECT {TURN_COLS} FROM turns WHERE id = ?1 \
+             AND seq > (SELECT COALESCE(MAX(seq), 0) FROM turns WHERE id = ?1) - ?2 \
+             ORDER BY seq"
+        ),
+        params![id, n],
+    )?;
+    Ok((turns_from(&rows), total))
+}
+
+pub fn turns_range_sync(id: &str, from: i64, to: i64) -> Result<Vec<TurnRow>, HostError> {
+    let rows = db_query_sync(
+        &format!(
+            "SELECT {TURN_COLS} FROM turns WHERE id = ?1 AND seq >= ?2 AND seq < ?3 \
+             ORDER BY seq"
+        ),
+        params![id, from, to],
+    )?;
+    Ok(turns_from(&rows))
+}
+
+/// [`search_fts`], synchronously.
+pub fn search_fts_sync(match_query: &str, limit: usize) -> Result<Vec<(String, i64, f32)>, HostError> {
+    if match_query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = db_query_sync(
+        "SELECT d.id AS id, d.seq AS seq, bm25(docs_fts) AS score \
+         FROM docs_fts JOIN docs d ON d.rowid = docs_fts.rowid \
+         WHERE docs_fts MATCH ?1 \
+         ORDER BY bm25(docs_fts) LIMIT ?2",
+        params![match_query, limit as i64],
+    )?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            let id = s(r.get_named("id"))?;
+            let seq = i(r.get_named("seq"))?;
+            let score = r.get_named("score").and_then(DbValue::as_f64).unwrap_or(0.0);
+            Some((id, seq, -score as f32))
+        })
+        .collect())
+}
+
+/// [`stats`], synchronously.
+pub fn stats_sync(id: &str) -> Result<Stats, HostError> {
+    let mut st = Stats::default();
+    let rows = db_query_sync(
+        "SELECT kind, COUNT(*) AS n FROM turns WHERE id = ?1 GROUP BY kind",
+        params![id],
+    )?;
+    for r in rows.iter() {
+        let n = i(r.get_named("n")).unwrap_or(0);
+        match s(r.get_named("kind")).as_deref() {
+            Some("user") => st.prompts = n,
+            Some("assistant") => st.replies = n,
+            Some("tool") => st.tools = n,
+            _ => {}
+        }
+    }
+    let rows = db_query_sync(
+        "SELECT substr(text, 1, instr(text || ' ', ' ') - 1) AS verb, COUNT(*) AS n \
+         FROM turns WHERE id = ?1 AND kind = 'tool' AND typeof(text) = 'text' \
+         GROUP BY verb",
+        params![id],
+    )?;
+    for r in rows.iter() {
+        let n = i(r.get_named("n")).unwrap_or(0);
+        match s(r.get_named("verb")).as_deref() {
+            Some("Edit" | "MultiEdit" | "Write" | "NotebookEdit" | "apply_patch") => st.edits += n,
+            Some("Read" | "Glob" | "Grep" | "LS" | "NotebookRead") => st.reads += n,
+            Some("Bash" | "shell") => st.commands += n,
+            _ => {}
+        }
+    }
+    let rows = db_query_sync(
+        "SELECT path, COUNT(*) AS n FROM turns WHERE id = ?1 AND path IS NOT NULL \
+         GROUP BY path ORDER BY n DESC, path LIMIT 6",
+        params![id],
+    )?;
+    st.files = rows
+        .iter()
+        .filter_map(|r| Some((s(r.get_named("path"))?, i(r.get_named("n")).unwrap_or(0))))
+        .collect();
+    Ok(st)
+}
+
 /// The setting that holds the ids of the agents parked on a background
 /// shell (see [`Agent::shell`]). A setting, not a column: every reader
 /// of the roster must agree on the flag or a row blinks between the

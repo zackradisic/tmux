@@ -133,7 +133,7 @@ pub struct Hit {
 /// usable terms. Each term is a quoted string (so a token can never be
 /// read as an FTS operator), the terms AND together, and the last one is
 /// a prefix (`"term"*`) while it is still being typed.
-fn fts_match(query: &str) -> Option<String> {
+pub(crate) fn fts_match(query: &str) -> Option<String> {
     let (terms, prefix) = index::query_terms(query);
     if terms.is_empty() {
         return None;

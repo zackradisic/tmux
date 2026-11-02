@@ -180,6 +180,15 @@ no roster yet (a message right after linking) the view fetches the rosters
 once, then routes. Each server's mailbox is asked for its unread counts,
 and a row with unread shows an envelope badge with the number.
 
+An agent reads the roster the same way: `plugin-command agents ls` (every
+live agent on every linked server, `--project` for one project, `--json`
+for a script), `agents 'show <id>'` (the `i` card as text), `agents
+'transcript <id> -n 50'` (its stored conversation: prompts, replies and
+tool lines, as of its last turn end; a remote agent's is on its host),
+`agents 'search <words>'` (who talked about this) and `-t "$TMUX_PANE"
+agents whoami` (its own id and reply address). The answers print on the
+caller's terminal from the store alone, so one call is one answer.
+
 An agent can also start another agent: `plugin-command -t "$TMUX_PANE"
 agents "new --resume <id> --project <tag>"` (and `--command`, `--folder`,
 `--session`, `--new-session`, `--name`, `--split`, `--focus`) runs the

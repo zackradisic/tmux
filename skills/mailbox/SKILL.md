@@ -108,40 +108,33 @@ so it is the fallback, never the default.
 
 ## Find agents
 
-There is no `list` or `search` verb on the command line. `plugin-command`
-cannot write to your stdout, so the roster is read in one of these ways.
-
-**Your own id**, from your pane:
+The roster answers on your terminal; nothing needs the store's SQLite file.
 
 ```bash
-sqlite3 ~/.local/share/tmux/plugins/agents/store.db \
-  "select id from agents where ended_ms is null and pane = ${TMUX_PANE#%}"
+tmux2 plugin-command -t "$TMUX_PANE" agents whoami          # your id, name, project, reply address
+tmux2 plugin-command agents ls                              # live agents on every linked server
+tmux2 plugin-command agents 'ls --project "Deepseek problems"'   # those of one project
+tmux2 plugin-command agents 'ls --all'                      # ended and archived ones too
+tmux2 plugin-command agents 'ls --json'                     # one JSON object per line, for a script
+tmux2 plugin-command agents 'show <agent-id>'               # one agent: where, project, cwd, status, transcript
+tmux2 plugin-command agents 'transcript <agent-id> -n 50'   # its last 50 turns (--all for every one)
+tmux2 plugin-command agents 'search <words...>'             # who talked about this, with the matching line
 ```
 
-**Live agents on this machine**, with name, status and working directory:
+`ls` prints `id  state  project  name  directory`, and `@<server>` after an
+agent on a linked host: that id with `@<server>` is its message address. The
+project is what the picker groups by (the tag, else the `@project` option,
+else the session, else the directory). `show` is the picker's `i` card as
+text, with the line that resumes the agent. `transcript` prints the prompts,
+the replies and one line per tool call, as stored at the agent's last turn
+end (tool results are never kept; a long turn is cut, the file has the rest);
+a remote agent's conversation is on its host, so run the same verb there over
+ssh. A row that reads `prov-claude-1` is an agent whose session file has not
+been read yet: ask again a second later.
 
-```bash
-sqlite3 -header ~/.local/share/tmux/plugins/agents/store.db \
-  "select id, coalesce(user_name,name) as name, status, cwd, pane, git_branch
-   from agents where ended_ms is null"
-```
-
-Filter with a `where cwd like '%repo%'` or `name like '%kernel%'` clause to
-search. Finished agents have `ended_ms` set and stay in the table, so drop
-that condition to find one that already exited.
-
-**Agents on a linked remote host** are not cached in this store (the local
-`server` column is always `local`). Query the same path on that host:
-
-```bash
-ssh <host> sqlite3 -header ~/.local/share/tmux/plugins/agents/store.db \
-  "\"select id, coalesce(user_name,name) as name, status, cwd from agents where ended_ms is null\""
-```
-
-**The picker** (`prefix a`) shows every agent on every linked server under a
-server heading, with a search box, an `i` card that shows the full id, and
-`m` to compose a message on a row. It is for the user. If you are stuck, ask
-the user to paste an id from it, or to open it on a known id with
+**The picker** (`prefix a`) is the same roster for the user, with a search
+box, an `i` card and `m` to compose a message on a row. If you are stuck, ask
+the user to open it on a known id with
 `tmux2 plugin-command agents "pick id <agent-id>"`.
 
 **Ids on screen**: a message names its sender by id, so a reply address is
@@ -173,9 +166,9 @@ at the new pane and you can message it by the id you resumed.
 
 ## Every verb
 
-`tmux2 plugin-command agents help` lists the verbs (`pick`, `open`, `new`,
-`message`, `project`, the state words, `identify`), and `agents '<verb>
---help'` explains one. That text is printed by the installed plugin, so it
+`tmux2 plugin-command agents help` lists the verbs (`pick`, `open`, `ls`,
+`show`, `transcript`, `search`, `whoami`, `new`, `message`, `project`, the
+state words, `identify`), and `agents '<verb> --help'` explains one. That text is printed by the installed plugin, so it
 matches what this host runs; prefer it to memory.
 
 ## Remote links

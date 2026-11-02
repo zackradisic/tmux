@@ -267,6 +267,7 @@ use std::rc::Rc;
 use serde::Deserialize;
 use tmux_plugin_sdk::prelude::*;
 
+mod cli;
 mod help;
 mod index;
 mod newagent;
@@ -774,6 +775,31 @@ impl Agents {
             let _ = reply(help::topic(Some(&verb)));
             return;
         }
+        if cli::is_verb(&verb) {
+            // "ls", "show", "transcript", "search", "whoami": the roster
+            // and the conversations, printed on the caller's terminal.
+            // Answered here, before the handler returns, from the store
+            // alone: the host prints what the handler replied.
+            let remotes = self.remotes.borrow();
+            let (text, ingest) = cli::answer(&text, event.scope.pane, &remotes);
+            drop(remotes);
+            let _ = reply(&text);
+            if let Some(id) = ingest {
+                // The turns shown are the ones stored at the last turn
+                // end; read the transcript again now so the next call is
+                // fresher.
+                ctx.spawn(async move { transcript::ingest(&id, false).await });
+            } else if self.role.provides() {
+                // A row the session files have not been read for yet is
+                // provisional (prov-<kind>-<n>, no cwd); resolve them now
+                // so the next call, a second later, has the durable ids.
+                ctx.spawn(async move {
+                    let mut rows = store::live_agents().await.unwrap_or_default();
+                    provider::enrich_live(&mut rows).await;
+                });
+            }
+            return;
+        }
         if verb == "pick" {
             if !self.role.views() {
                 let _ = display_message("agents: a provider has no picker");
@@ -1082,7 +1108,7 @@ impl Agents {
         }
         let _ = reply(&format!("agents: unknown verb {verb:?} - `agents help` lists them"));
         let _ = display_message(&format!(
-            "agents: unknown verb {verb:?} (pick|new|open|message|project|working|needs_input|waiting|done)"
+            "agents: unknown verb {verb:?} (pick|new|open|ls|show|transcript|search|whoami|message|project|working|needs_input|waiting|done)"
         ));
     }
 }

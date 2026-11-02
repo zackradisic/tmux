@@ -3135,7 +3135,7 @@ pub fn project_of(a: &Agent) -> String {
 }
 
 /// [`project_of`] with where the answer came from, for the info card.
-fn project_with_source(a: &Agent) -> (String, &'static str) {
+pub(crate) fn project_with_source(a: &Agent) -> (String, &'static str) {
     let clean = |s: &str| Some(s.trim()).filter(|s| !s.is_empty()).map(str::to_string);
     if let Some(t) = a.project.as_deref().and_then(clean) {
         return (t, "tag");

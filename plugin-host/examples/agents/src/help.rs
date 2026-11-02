@@ -12,6 +12,12 @@ usage: tmux2 plugin-command [-t <pane>] agents '<verb> [args...]'
   pick id <agent-id>          open on that agent (any server, history, archive)
   pick ids                    open on the agent ids on this pane's screen
   open <agent-id>             the picker on that agent, on the user's screen
+  ls [--project <p>] [--all]  the live agents, every server, one per line
+  show <agent-id>             one agent's card: where, project, cwd, status…
+  transcript <agent-id> [-n N]
+                              its conversation's last N turns (default 30)
+  search <words...>           the agents whose conversations match
+  whoami                      this pane's agent: its id and address
   new [flags]                 start an agent: a form, or at once with flags
   message <agent-id> <text>   leave a message in that agent's mailbox
   project [-w|-s] <name>      tag this pane's agent / its window / its session
@@ -28,10 +34,56 @@ Pass -t \"$TMUX_PANE\" from an agent's own pane: it is the sender of a
 message, what a new agent inherits from (folder, session, project), the
 agent a project or state applies to.
 
-Agent ids are durable: claude:<uuid>, codex:<id>, opencode:<id>. The i card
-in the picker shows one; the store has them all:
-  sqlite3 ~/.local/share/tmux/plugins/agents/store.db \\
-    'select id, coalesce(user_name,name), cwd from agents where ended_ms is null'
+Agent ids are durable: claude:<uuid>, codex:<id>, opencode:<id>. `ls`
+prints them, `whoami` yours, the i card in the picker shows one.
+";
+
+pub const LS: &str = "\
+agents ls - the agents, one per line
+
+  plugin-command agents ls                         the live agents, every server
+  plugin-command agents 'ls --project <name>'      those of one project
+  plugin-command agents 'ls --all'                 ended and archived ones too
+  plugin-command agents 'ls --json'                one JSON object per line
+
+Columns: id, state (working, needs_input, waiting, done; ended for a
+finished one), project (as the picker groups: the tag, else the @project
+option, else the session, else the directory), name, directory, and the
+server for an agent on a linked host (its id takes @<server> in a message
+address). Sorted by project, then by state.
+
+  plugin-command agents 'show <agent-id>'          one agent, every field
+  plugin-command -t \"$TMUX_PANE\" agents whoami    the agent in your pane
+
+show prints what the picker's i card shows: name, harness and model,
+where it runs (session:window, pane, server), project and where that
+came from, directory and branch, when it started and was last active,
+its state and task, how many prompts, replies and tool calls it has
+made and the files it touched most, its transcript file, and the line
+that resumes it. whoami prints your id, name, project, and your address
+for a reply from another server (<id>@<this server's peer name>).
+";
+
+pub const TRANSCRIPT: &str = "\
+agents transcript - read another agent's conversation
+
+  plugin-command agents 'transcript <agent-id>'          its last 30 turns
+  plugin-command agents 'transcript <agent-id> -n 200'   its last 200
+  plugin-command agents 'transcript <agent-id> --all'    all of it
+  plugin-command agents 'search <words...>'              who talked about this
+
+The roster reads each agent's transcript as its turns end (Claude's and
+Codex's session files, opencode's database) and keeps the prompts, the
+replies and one line per tool call (`Edit run.py +12 −3`); tool results
+are not kept. transcript prints those, oldest first: `## user`, `## agent`
+and `· tool` blocks, each with its age. The turns are the ones stored at
+the agent's last turn end; the call also reads the file again, so a
+second call a moment later is fresher. A remote agent's turns live on
+its host: run the same verb there.
+
+search matches whole words against every stored conversation (the same
+index the picker's search box uses), best first: the id, the name and
+the line that matched, `-n` for more than 10.
 ";
 
 pub const NEW: &str = "\
@@ -147,6 +199,8 @@ session file the roster can read (a pi hook), and a way to correct a guess.
 pub fn topic(verb: Option<&str>) -> &'static str {
     match verb {
         Some("new") => NEW,
+        Some("ls") | Some("list") | Some("show") | Some("whoami") => LS,
+        Some("transcript") | Some("search") => TRANSCRIPT,
         Some("message") => MESSAGE,
         Some("project") => PROJECT,
         Some("pick") | Some("open") => PICK,
