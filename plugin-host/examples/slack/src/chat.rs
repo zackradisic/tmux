@@ -1307,8 +1307,8 @@ fn maybe_mark_read(st: &Shared) {
     let st2 = Rc::clone(st);
     spawn(async move {
         match thread {
-            Some(root) => crate::mark_thread_read(&st2, &channel, &root).await,
-            None => crate::mark_read(&st2, &channel).await,
+            Some(root) => crate::mark_thread_read(&st2, &channel, &root, "open in the channel view").await,
+            None => crate::mark_read(&st2, &channel, "open in the channel view").await,
         }
     });
 }
@@ -2040,8 +2040,8 @@ fn run(st: &Shared, after: After) {
             let st2 = Rc::clone(st);
             spawn(async move {
                 match thread {
-                    Some(root) => crate::mark_thread_read(&st2, &channel, &root).await,
-                    None => crate::mark_read(&st2, &channel).await,
+                    Some(root) => crate::mark_thread_read(&st2, &channel, &root, "m in the channel view").await,
+                    None => crate::mark_read(&st2, &channel, "m in the channel view").await,
                 }
             });
         }

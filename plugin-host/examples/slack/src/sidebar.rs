@@ -1420,8 +1420,8 @@ fn preview_after(st: &Shared, took: Took) {
             let cid = channel.id.clone();
             spawn(async move {
                 match thread {
-                    Some(root) => crate::mark_thread_read(&st2, &cid, &root).await,
-                    None => crate::mark_read(&st2, &cid).await,
+                    Some(root) => crate::mark_thread_read(&st2, &cid, &root, "m in the preview").await,
+                    None => crate::mark_read(&st2, &cid, "m in the preview").await,
                 }
             });
         }
@@ -1666,8 +1666,8 @@ fn execute(st: &Shared, outcome: Outcome) {
                 let st2 = Rc::clone(st);
                 spawn(async move {
                     match thread_of(&id).map(|(c, r)| (c.to_string(), r.to_string())) {
-                        Some((ch, root)) => crate::mark_thread_read(&st2, &ch, &root).await,
-                        None => crate::mark_read(&st2, &id).await,
+                        Some((ch, root)) => crate::mark_thread_read(&st2, &ch, &root, "m in the list").await,
+                        None => crate::mark_read(&st2, &id, "m in the list").await,
                     }
                 });
             }

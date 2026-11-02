@@ -572,7 +572,7 @@ pub fn refresh_threads(st: &Shared) {
 
 /// Mark a thread read up to its newest reply, on Slack and here: its
 /// row leaves the Unread section, the badges follow.
-pub async fn mark_thread_read(st: &Shared, channel: &str, root: &str) {
+pub async fn mark_thread_read(st: &Shared, channel: &str, root: &str, why: &str) {
     let (id, ts) = {
         let s = st.borrow();
         let Some(id) = s.ident.clone() else { return };
@@ -587,6 +587,7 @@ pub async fn mark_thread_read(st: &Shared, channel: &str, root: &str) {
         log(&format!("slack: thread mark {channel}/{root}: {e}"));
         return;
     }
+    log(&format!("slack: marked thread {channel}/{root} read at {ts} ({why})"));
     {
         let mut s = st.borrow_mut();
         if let Some(pos) = s.threads.iter().position(|t| t.channel == channel && t.root.ts == root) {
@@ -753,7 +754,7 @@ fn on_command(st: &Shared, event: &Event) {
             };
             let st2 = Rc::clone(st);
             spawn(async move {
-                mark_read(&st2, &ch.id).await;
+                mark_read(&st2, &ch.id, "the mark verb").await;
             });
         }
         "unread" => {
@@ -990,7 +991,7 @@ pub async fn post_message(st: &Shared, channel: &str, text: &str, thread_ts: Opt
 }
 
 /// Mark a channel read up to its latest message, on Slack and here.
-pub async fn mark_read(st: &Shared, channel: &str) {
+pub async fn mark_read(st: &Shared, channel: &str, why: &str) {
     let (id, ts) = {
         let s = st.borrow();
         let Some(id) = s.ident.clone() else { return };
@@ -1008,6 +1009,7 @@ pub async fn mark_read(st: &Shared, channel: &str) {
         log(&format!("slack: mark {channel}: {e}"));
         return;
     }
+    log(&format!("slack: marked {channel} read at {ts} ({why})"));
     store::mark_read(channel, &ts).await;
     {
         let mut s = st.borrow_mut();
