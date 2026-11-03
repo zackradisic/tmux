@@ -57,7 +57,9 @@
 //! jump to a pane row's source pane, run a service row's action - and
 //! drop the entry (a click on a service row does the same), `d`
 //! dismisses one - or, on a grouping row, everything under it, folded
-//! away or not - and `q`/`Escape` closes the panel.
+//! away or not - and `q`/`Escape` closes the panel. A dismissed service
+//! row is reported to the plugin that draws its column (`dismissed`
+//! with the row's key), so Slack marks the conversation read.
 //!
 //! Load (tmux.conf):
 //!   load-plugin -s server -c run-command -c mode -c service-serve \
@@ -1483,6 +1485,18 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 /// What the preview column shows for a service row, where a pane row
 /// shows its pane: the title, the body wrapped, then source and age dim.
 /// One Seg per line, at most `height` of them.
+/// The `dismissed` calls a dismissal owes: one per dropped row that
+/// names a preview plugin and a key, (plugin, key). The plugin is the
+/// same one that draws the row's column, on its own server when the
+/// row was forwarded (`plugin@server`).
+fn dismiss_calls<'a>(entries: impl IntoIterator<Item = &'a Entry>, seqs: &[u64]) -> Vec<(String, String)> {
+    entries
+        .into_iter()
+        .filter(|e| seqs.contains(&e.seq) && !e.key.is_empty())
+        .filter_map(|e| Some((e.preview.clone()?, e.key.clone())))
+        .collect()
+}
+
 fn service_preview(e: &Entry, now: u64, width: usize, height: usize) -> Vec<Seg> {
     let mut lines: Vec<Seg> = Vec::new();
     if !e.title.is_empty() {
@@ -2064,6 +2078,19 @@ impl NotifyToast {
         }
         {
             let mut st = self.state.borrow_mut();
+            // The plugin behind a service row hears that its row was
+            // dismissed (Slack marks the conversation read); a plain row
+            // has nobody to tell.
+            for (target, key) in dismiss_calls(st.entries.iter(), seqs) {
+                spawn(async move {
+                    let req = serde_json::json!({ "key": key });
+                    if let Err(e) =
+                        service::call_json::<_, serde_json::Value>(&target, "dismissed", &req).await
+                    {
+                        log(&format!("notify_toast: dismissed {key} -> {target}: {}", e.message));
+                    }
+                });
+            }
             st.entries.retain(|e| !seqs.contains(&e.seq));
             if let (Some(ch), Some(next)) = (st.chooser.as_mut(), next) {
                 ch.selected = next;
@@ -3110,6 +3137,23 @@ mod tests {
         assert_eq!(lines.len(), 6);
         assert_eq!(lines[3].1, "2");
         assert_eq!(lines[5].1, "slack \u{b7} 5s ago");
+    }
+
+    #[test]
+    fn a_dismissal_tells_the_previewing_plugin() {
+        let mut a = req(r##"{"source":"slack","key":"slack:C1","body":"hi","preview":"slack"}"##).unwrap();
+        a.seq = 1;
+        let mut b = req(r##"{"source":"slack","key":"slack:D1/17.1","body":"yo","preview":"slack@box"}"##).unwrap();
+        b.seq = 2;
+        let mut c = req(r##"{"source":"cron","body":"tick"}"##).unwrap();
+        c.seq = 3;
+        let entries = vec![a, b, c];
+        let calls = dismiss_calls(&entries, &[1, 2, 3]);
+        assert_eq!(
+            calls,
+            vec![("slack".to_string(), "slack:C1".to_string()), ("slack@box".to_string(), "slack:D1/17.1".to_string())]
+        );
+        assert!(dismiss_calls(&entries, &[3]).is_empty());
     }
 
     #[test]

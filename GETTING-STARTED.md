@@ -628,7 +628,8 @@ Any plugin can post to it through its `notify` service (Slack does, on every
 message it toasts); a row that names a `preview` plugin gets its column drawn
 by that plugin's `preview` service (Slack draws the conversation as its
 sidebar previews it, the unread bar included), the others show the text.
-`Enter` runs the row's action (open that channel), `d` dismisses, `h`/`l` fold. With
+`Enter` runs the row's action (open that channel), `d` dismisses and tells the
+preview plugin (Slack marks the conversation read), `h`/`l` fold. With
 `pane_notifications = "1"`, programs that emit OSC 9 or OSC 777 (an agent's
 stop hook running `printf '\e]9;done\a'`) show up too, one line per pane.
 

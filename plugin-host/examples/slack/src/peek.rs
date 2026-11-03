@@ -38,6 +38,40 @@ struct Reply {
 /// feed was up, with nothing older to read it against.
 const CACHE_ENOUGH: usize = 10;
 
+/// A `dismissed` call: the key of the row the user dropped.
+#[derive(serde::Deserialize)]
+struct Dismissed {
+    key: String,
+}
+
+/// Answer a `dismissed` call: the user dropped this conversation's row
+/// from the notifications pane, so it is read for them. A channel is
+/// marked read at its latest message, a thread at its last reply, on
+/// Slack and here (the sidebar's badges follow). The reply goes out
+/// at once; the mark runs on its own.
+pub fn dismissed(st: &Shared, req: ServiceRequest) {
+    let key = match req.json::<Dismissed>() {
+        Ok(r) => r.key,
+        Err(e) => {
+            let _ = req.fail(&format!("dismissed: {}", e.message));
+            return;
+        }
+    };
+    let Some((channel, thread)) = conversation_of(&key) else {
+        let _ = req.fail(&format!("dismissed: not a conversation key: {key:?}"));
+        return;
+    };
+    let _ = req.reply_json(&serde_json::json!({ "ok": true }));
+    let st = Rc::clone(st);
+    spawn(async move {
+        const WHY: &str = "dismissed in the notifications pane";
+        match thread {
+            Some(root) => crate::mark_thread_read(&st, &channel, &root, WHY).await,
+            None => crate::mark_read(&st, &channel, WHY).await,
+        }
+    });
+}
+
 /// How much history a preview shows at most.
 const PAGE: usize = 25;
 

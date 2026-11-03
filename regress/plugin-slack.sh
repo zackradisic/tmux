@@ -140,6 +140,7 @@ fail() {
 	echo "--- server: $($TMUX list-panes -a -F '#{pane_id} #{pane_mode} #{window_name}' 2>&1 | tr '\n' ';')" >&2
 	echo "--- plugin log (tail):" >&2
 	$TMUX plugin-log slack 2>&1 | tail -25 >&2
+	$TMUX plugin-log notify_toast 2>&1 | tail -5 >&2
 	$TMUX show-messages 2>/dev/null | tail -8 >&2
 	cleanup
 	exit 1
@@ -989,6 +990,14 @@ screen | grep -q '▏  fresh after the mark' || fail "the unread message is not 
 screen | grep -q '▏.*can you look?' && fail "a message read before is barred: $(screen | tail -8 | tr '\n' '~')"
 keys j
 until_ok 60 screen_has 'are you around?' || fail "the column did not draw the DM: $(screen | head -8 | tr '\n' '~')"
+# d on the #general row drops it and marks #general read on Slack (the
+# row's plugin hears `dismissed` with its key); the DM row moves up.
+keys k
+BEFORE_M=$(ncalls conversations.mark channel C1)
+keys d
+until_ok 40 marks_grew "$BEFORE_M" || fail "d did not mark #general read on Slack"
+until_ok 40 sh -c "$TMUX capture-pane -M -p -t $FORM | grep -q '^(1).*Tejas: ping from the'" || fail "the dismissed row is still there: $(screen | head -3 | tr '\n' '~')"
+screen | grep -q 'fresh after the mark ×3' && fail "the #general row survived d: $(screen | head -3 | tr '\n' '~')"
 keys q
 until_ok 40 mode_closed || fail "q did not close the chooser"
 FORM=

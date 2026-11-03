@@ -327,8 +327,12 @@ impl Plugin for Slack {
         images::attach(&st);
         // The notifications pane asks for its preview of a conversation
         // through this; without service-serve the pane shows the text.
-        if let Err(e) = service::register("preview") {
-            log(&format!("slack: preview service not registered: {} (service-serve not granted?)", e.message));
+        // It tells us through `dismissed` when such a row is dropped:
+        // the conversation is marked read.
+        for method in ["preview", "dismissed"] {
+            if let Err(e) = service::register(method) {
+                log(&format!("slack: {method} service not registered: {} (service-serve not granted?)", e.message));
+            }
         }
         ctx.spawn(boot(Rc::clone(&st)));
         ctx.spawn(images::prune());
@@ -373,6 +377,8 @@ impl Plugin for Slack {
     fn on_service_request(&mut self, _ctx: &Ctx, req: ServiceRequest) {
         if req.method == "preview" {
             peek::serve(&self.st, req);
+        } else if req.method == "dismissed" {
+            peek::dismissed(&self.st, req);
         } else {
             let _ = req.fail("slack: unknown method");
         }
