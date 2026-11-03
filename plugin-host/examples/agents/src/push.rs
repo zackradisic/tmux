@@ -111,6 +111,57 @@ async fn claude(a: &Agent, text: &str) -> Result<(), String> {
     claude_notify(&sock, text).map_err(|e| e.message)
 }
 
+/// A local Claude agent's inbox socket, as its session file names it,
+/// and whether it is still there.
+///
+/// The socket sits under a temp directory (`/tmp/cc-socks/<pid>.sock`
+/// unless `CLAUDE_CODE_TMPDIR` or `XDG_RUNTIME_DIR` moved it), and macOS
+/// prunes `/tmp` entries older than three days when the disk is full,
+/// sockets included. Claude never binds a new one: the session runs on,
+/// but a push to it fails and the message waits in the box, which
+/// `deliver` only logs. The verbs read this so the sender and the user
+/// hear it where they are looking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Inbox {
+    /// Not a live local Claude agent, or no socket named yet.
+    None,
+    /// The socket exists.
+    Live(String),
+    /// The session file names a socket that is no longer there.
+    Gone(String),
+    /// Named, but outside this plugin's fs-read grant: not probed.
+    Unchecked(String),
+}
+
+/// Synchronous (two small reads), so the terminal verbs can answer with
+/// it. A socket cannot be opened as a file (EOPNOTSUPP on macOS, ENXIO
+/// on Linux), so the probe read fails either way; only "no such file"
+/// means the socket is gone.
+pub fn inbox_sync(a: &Agent) -> Inbox {
+    if a.kind != "claude" || !a.live() || !a.is_local() {
+        return Inbox::None;
+    }
+    let Some(path) = a.source_path.as_deref() else { return Inbox::None };
+    let mut buf = Vec::with_capacity(16 * 1024);
+    if fs_read_sync(path, 0, &mut buf).is_err() {
+        return Inbox::None;
+    }
+    let Some(sock) = serde_json::from_slice::<serde_json::Value>(&buf)
+        .ok()
+        .and_then(|v| v.get("messagingSocketPath")?.as_str().map(str::to_string))
+        .filter(|s| !s.is_empty())
+    else {
+        return Inbox::None;
+    };
+    use tmux_plugin_sdk::abi::ErrorCode;
+    let mut probe = Vec::with_capacity(16);
+    match fs_read_sync(&sock, 0, &mut probe) {
+        Err(e) if e.code == ErrorCode::NoSuchObject => Inbox::Gone(sock),
+        Err(e) if e.code == ErrorCode::BadRequest => Inbox::Unchecked(sock),
+        _ => Inbox::Live(sock),
+    }
+}
+
 /// opencode: one prompt posted to the session through its service. The
 /// service answers with the enqueued inbox item (2xx) or an error; a
 /// service that is not registered or not listening is reported, and the

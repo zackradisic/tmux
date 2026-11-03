@@ -62,6 +62,15 @@ its state and task, how many prompts, replies and tool calls it has
 made and the files it touched most, its transcript file, and the line
 that resumes it. whoami prints your id, name, project, and your address
 for a reply from another server (<id>@<this server's peer name>).
+
+A Claude agent's inbox line is the socket a message is pushed through.
+GONE means the socket was removed under the running session (macOS
+prunes /tmp entries older than three days when the disk is full): the
+agent still works, but a message waits in its box until its next
+`mailbox inbox`; `claude --resume <uuid>` gives it a new socket. ls marks
+such a row \"⚠ inbox gone\" (--json: \"inbox\": \"gone\"). Launching
+claude with CLAUDE_CODE_TMPDIR set to a directory of your own keeps the
+socket out of /tmp.
 ";
 
 pub const TRANSCRIPT: &str = "\
@@ -151,6 +160,11 @@ message is stored unread and nothing visible happens.
 
 The result goes to the status line and the server log:
   tmux2 show-messages | grep 'plugin agents:' | tail -1
+
+One case is answered on your terminal at once: a local Claude agent whose
+inbox socket is gone (`agents show <id>` says GONE on its inbox line).
+The message is stored, but it cannot be pushed; the agent reads it on its
+next `mailbox inbox`, or is restarted with `claude --resume <uuid>`.
 ";
 
 pub const PROJECT: &str = "\

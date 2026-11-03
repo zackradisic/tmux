@@ -1010,6 +1010,12 @@ impl Agents {
                 let _ = display_message("agents: an empty message");
                 return;
             }
+            // A local Claude whose inbox socket is gone cannot be woken:
+            // say so on the sender's terminal now (the push below only
+            // logs its failure), and still store the message.
+            if let Some(note) = cli::gone_note(&id) {
+                let _ = reply(&note);
+            }
             let remotes = Rc::clone(&self.remotes);
             let picker = Rc::clone(&self.picker);
             let pane = event.scope.pane;

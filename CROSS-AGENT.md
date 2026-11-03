@@ -122,6 +122,20 @@ The chain, all inside the tmux event loop:
 4. On success it asks the mailbox to `mark_read` the message. The picker
    badge clears.
 
+The socket is a temp file. macOS prunes `/private/tmp` entries older
+than about three days when the disk is full (Apple's CacheDelete; sockets
+included), and Claude never binds a new one, so a session can run for
+weeks with no inbox: the push fails, the message stays unread, and the
+pusher only logs it. The verbs tell it where someone is looking:
+`agents message` answers "will not be woken: its inbox socket ... is
+gone" on the sender's terminal (the message is still stored), `agents ls`
+marks the row `⚠ inbox gone` (`--json`: `"inbox": "gone"`), `show` and
+`whoami` print the socket on their `inbox` line. The only way back is a
+restart with `claude --resume <uuid>` (same id, new socket). Launching
+claude with `CLAUDE_CODE_TMPDIR` (or `XDG_RUNTIME_DIR`) set to a directory
+of the user's own puts the socket at `<dir>/cc-socks/<pid>.sock`, out of
+the pruner's reach; the host accepts any socket in a `cc-socks` directory.
+
 Across a link nothing is added: the message rides the bridge to the
 reader's server as before, and that server's agents plugin does the push
 locally. A box that is not a Claude or opencode agent here (a plain box,

@@ -274,7 +274,9 @@ tmux2 plugin-command -t "$TMUX_PANE" agents "message claude:<uuid>@<server> <tex
 ```
 
 If a message could not be pushed (no socket, no capability), it waits in the
-box. Pull it by hand:
+box. `agents whoami` prints your own inbox line: GONE there means nothing
+reaches you by push any more, so pull by hand (or ask the user to restart you
+with `claude --resume`):
 
 ```bash
 tmux2 plugin-command mailbox "inbox <your-agent-id>"      # unread only; add -a for all
@@ -289,6 +291,7 @@ The raw store is `~/.local/share/tmux/plugins/mailbox/store.db`, table
 
 | Symptom | Cause | Check |
 |---|---|---|
+| Sent, and the reply to your `message` says "will not be woken: its inbox socket ... is gone" | the receiver's `/tmp/cc-socks/<pid>.sock` was pruned under its running session (macOS, disk full, 3+ days old); nothing rebinds it | the message is stored: the receiver reads it with `mailbox inbox`, or is restarted with `claude --resume <uuid>` (same id, new socket). `agents ls` marks such rows `⚠ inbox gone`, `agents show <id>` prints the socket |
 | Sent, receiver never reacts, row has `read=0` in its mailbox store | receiver's agents plugin lacks `claude-notify`, or `crossSessionInbound` unset | caps in the receiver's `plugins.toml`; its settings.json |
 | Same, receiver is opencode | row still provisional, service not registered, or no `curl` | `i` card shows `opencode:<id>`; `~/.local/state/opencode/service.json` exists; the tmux2 log line `agents: push to opencode:...` |
 | `unknown agent` from the remote side | bare id, roster never pulled there | add `@<peer-name>` |

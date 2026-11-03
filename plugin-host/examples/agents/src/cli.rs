@@ -12,7 +12,7 @@ use tmux_plugin_sdk::prelude::*;
 
 use crate::store::{self, Agent, TurnRow};
 use crate::view::{self, Remotes};
-use crate::{newagent, transcript};
+use crate::{newagent, push, transcript};
 
 /// How many turns `transcript` prints when not told.
 const TURNS_DEFAULT: i64 = 30;
@@ -149,6 +149,8 @@ fn ls(args: &[&str], remotes: &Remotes) -> String {
                     "server": if a.is_local() { "local" } else { a.server.as_str() },
                     "started_ms": a.started(),
                     "last_active_ms": a.last_active_ms,
+                    "inbox": inbox_state(a),
+                    "inbox_socket": inbox_socket(a),
                 })
                 .to_string()
             })
@@ -159,7 +161,9 @@ fn ls(args: &[&str], remotes: &Remotes) -> String {
     let st_w = list.iter().map(|(_, s, _, _)| s.len()).max().unwrap_or(0);
     let pj_w = list.iter().map(|(p, ..)| p.chars().count()).max().unwrap_or(0);
     let nm_w = list.iter().map(|(_, _, n, _)| n.chars().count()).max().unwrap_or(0).min(40);
-    list.iter()
+    let mut gone = false;
+    let mut lines: Vec<String> = list
+        .iter()
         .map(|(p, st, name, a)| {
             let mut line = format!(
                 "{:<id_w$}  {:<st_w$}  {:<pj_w$}  {:<nm_w$}  {}",
@@ -173,10 +177,76 @@ fn ls(args: &[&str], remotes: &Remotes) -> String {
                 line.push_str("  @");
                 line.push_str(&a.server);
             }
+            if matches!(push::inbox_sync(a), push::Inbox::Gone(_)) {
+                gone = true;
+                line.push_str("  ");
+                line.push_str(INBOX_GONE);
+            }
             line.trim_end().to_string()
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect::<Vec<_>>();
+    if gone {
+        lines.push(format!(
+            "{INBOX_GONE}: its inbox socket was removed (the /tmp cleaner), so a message \
+             waits in its box until its next `mailbox inbox`; `claude --resume <uuid>` \
+             gives it a new socket"
+        ));
+    }
+    lines.join("\n")
+}
+
+/// The row marker for a Claude agent whose inbox socket is gone.
+const INBOX_GONE: &str = "⚠ inbox gone";
+
+fn inbox_state(a: &Agent) -> Option<&'static str> {
+    match push::inbox_sync(a) {
+        push::Inbox::None => None,
+        push::Inbox::Live(_) => Some("live"),
+        push::Inbox::Gone(_) => Some("gone"),
+        push::Inbox::Unchecked(_) => Some("unchecked"),
+    }
+}
+
+fn inbox_socket(a: &Agent) -> Option<String> {
+    match push::inbox_sync(a) {
+        push::Inbox::None => None,
+        push::Inbox::Live(s) | push::Inbox::Gone(s) | push::Inbox::Unchecked(s) => Some(s),
+    }
+}
+
+/// The `inbox` line of show and whoami: the socket a push writes to,
+/// and what to do when it is gone. `you` phrases it for the agent itself.
+fn inbox_line(a: &Agent, you: bool) -> Option<String> {
+    let bare = a.id.strip_prefix("claude:").unwrap_or(&a.id);
+    Some(match push::inbox_sync(a) {
+        push::Inbox::None => return None,
+        push::Inbox::Live(s) => format!("{s}  (a message is pushed into the session)"),
+        push::Inbox::Unchecked(s) => format!("{s}  (not checked: outside this plugin's fs-read paths)"),
+        push::Inbox::Gone(s) if you => format!(
+            "{s}  GONE: messages are not pushed to you any more; read them with \
+             `tmux2 plugin-command mailbox \"inbox {}\"`, or restart with `claude --resume {bare}` \
+             for a new socket",
+            a.id
+        ),
+        push::Inbox::Gone(s) => format!(
+            "{s}  GONE: a message waits in its box until its next `mailbox inbox`; \
+             `claude --resume {bare}` gives it a new socket"
+        ),
+    })
+}
+
+/// For `message`: the line the sender hears when the local Claude agent
+/// it addresses cannot be woken. None when the push can go ahead, or the
+/// agent is not here (the reader's server knows its own sockets).
+pub fn gone_note(id: &str) -> Option<String> {
+    let a = store::by_id_sync(id).ok().flatten()?;
+    let push::Inbox::Gone(sock) = push::inbox_sync(&a) else { return None };
+    let bare = a.id.strip_prefix("claude:").unwrap_or(&a.id);
+    Some(format!(
+        "agents: {id} will not be woken: its inbox socket {sock} is gone (removed by the \
+         /tmp cleaner?). The message is stored; the agent reads it on its next \
+         `mailbox inbox`, and `claude --resume {bare}` gives it a new socket."
+    ))
 }
 
 /// The id a message to this agent is addressed to: the bare id here,
@@ -289,6 +359,9 @@ fn show(args: &[&str], remotes: &Remotes) -> String {
         }
         if let Some(tp) = a.transcript_path.as_deref() {
             rows.push(("transcript", format!("{} · {} KB read", tilde_of(&home, tp), a.transcript_cursor.max(0) / 1024)));
+        }
+        if let Some(l) = inbox_line(&a, false) {
+            rows.push(("inbox", l));
         }
     }
     let bare = a.id.strip_prefix(&format!("{}:", a.kind)).unwrap_or(&a.id);
@@ -440,6 +513,9 @@ fn whoami(pane: Option<u32>) -> String {
     ];
     if let Some(p) = peer {
         rows.push(("address", format!("{}@{p}  (for a reply from another server)", a.id)));
+    }
+    if let Some(l) = inbox_line(&a, true) {
+        rows.push(("inbox", l));
     }
     rows.iter().map(|(k, v)| format!("{k:<8}  {v}")).collect::<Vec<_>>().join("\n")
 }

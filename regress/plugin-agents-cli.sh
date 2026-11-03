@@ -6,7 +6,9 @@
 # conversation (prompts, replies, tool lines; never a tool result);
 # `search` finds the agent that talked about a word; `whoami` names the
 # agent in the -t pane. Everything is read from the store at once, so a
-# script gets its answer in one call.
+# script gets its answer in one call. A Claude agent whose inbox socket
+# is gone (the /tmp cleaner) is marked in ls, show, whoami and by
+# `message`, since a push to it cannot work.
 #
 # Needs the wasm example built:
 #   cargo build -p agents --target wasm32-unknown-unknown --release
@@ -32,11 +34,12 @@ requests = ["capture-pane", "run-command", "mode", "db", "env-read",
 [caps.env-read]
 names = ["AI_AGENT", "OPENCODE"]
 [caps.fs-read]
-paths = ["~/.claude/sessions", "~/.claude/projects"]
+paths = ["~/.claude/sessions", "~/.claude/projects", "~/cc-socks"]
 TOML
 
-trap '$TMUX kill-server 2>/dev/null; rm -rf "$HOME" "$DEPLOY"' EXIT
-fail() { echo "FAIL: $*" >&2; $TMUX kill-server 2>/dev/null; rm -rf "$HOME" "$DEPLOY"; exit 1; }
+SOCKPID=
+trap '$TMUX kill-server 2>/dev/null; [ -n "$SOCKPID" ] && kill $SOCKPID 2>/dev/null; rm -rf "$HOME" "$DEPLOY"' EXIT
+fail() { echo "FAIL: $*" >&2; $TMUX kill-server 2>/dev/null; [ -n "$SOCKPID" ] && kill $SOCKPID 2>/dev/null; rm -rf "$HOME" "$DEPLOY"; exit 1; }
 agents() { $TMUX plugin-command agents "$*"; }
 agents_t() { p=$1; shift; $TMUX plugin-command -t "$p" agents "$*"; }
 
@@ -58,10 +61,16 @@ sess() {
 	now=$(date +%s)000
 	cat >"$HOME/.claude/sessions/$PID.json" <<EOF
 {"pid":424242,"sessionId":"$2","cwd":"$HOME","startedAt":$((now - 3600000)),
- "tmux":"alpha:$WIN.${PANE}","name":"$3","status":"busy","updatedAt":$now}
+ "tmux":"alpha:$WIN.${PANE}","name":"$3","status":"busy","updatedAt":$now,
+ "messagingSocketPath":"$HOME/cc-socks/$3.sock"}
 EOF
 	echo "$PANE"
 }
+# The second agent's inbox socket is bound; the first names one that is
+# not there (as after the /tmp cleaner took it).
+mkdir -p "$HOME/cc-socks"
+nc -lU "$HOME/cc-socks/glm-drafter.sock" >/dev/null 2>&1 &
+SOCKPID=$!
 SID1=25a936a2-cf9b-407d-9e4e-89e04a9636e7
 SID2=35a936a2-cf9b-407d-9e4e-89e04a963602
 P1=$(sess 1 $SID1 hyperyaml-91)
@@ -99,7 +108,7 @@ R=$(agents ls)
 echo "$R" | grep -Eq "^claude:$SID1 +(working|waiting) +alpha +hyperyaml-91 +/work/bench-box" || fail "ls lacks the first agent with its project, name and cwd: $R"
 echo "$R" | grep -q "^claude:$SID2 .* working .* glm .* glm-drafter" || fail "ls lacks the second with its project and name: $R"
 echo "$R" | grep -q "hyperyaml-91" || fail "ls lacks the first agent's name: $R"
-[ "$(echo "$R" | wc -l | tr -d ' ')" = 2 ] || fail "ls has $(echo "$R" | wc -l) lines, not 2: $R"
+[ "$(echo "$R" | grep -c '^claude:')" = 2 ] || fail "ls has $(echo "$R" | grep -c '^claude:') rows, not 2: $R"
 R=$(agents 'ls --project glm')
 echo "$R" | grep -q "$SID2" || fail "ls --project lacks the glm agent: $R"
 echo "$R" | grep -q "$SID1" && fail "ls --project glm lists the other: $R"
@@ -161,10 +170,35 @@ echo "$R" | grep -q "^project .*glm  (@project option)" || fail "whoami lacks th
 R=$(agents_t "$($TMUX list-panes -t alpha:0 -F '#{pane_id}')" whoami)
 echo "$R" | grep -q 'no agent in' || fail "whoami from a plain pane: $R"
 
+# --- inbox socket ---------------------------------------------------------------
+R=$(agents ls)
+echo "$R" | grep "^claude:$SID1 " | grep -q '⚠ inbox gone' || fail "ls does not mark the lost socket: $R"
+echo "$R" | grep "^claude:$SID2 " | grep -q 'inbox gone' && fail "ls marks the live socket: $R"
+echo "$R" | grep -q '^⚠ inbox gone: its inbox socket was removed' || fail "ls lacks the gone footer: $R"
+R=$(agents 'ls --json')
+echo "$R" | grep "$SID1" | grep -q '"inbox":"gone"' || fail "ls --json lacks inbox gone: $R"
+echo "$R" | grep "$SID2" | grep -q '"inbox":"live"' || fail "ls --json lacks inbox live: $R"
+R=$(agents "show claude:$SID1")
+echo "$R" | grep -q "^inbox .*cc-socks/hyperyaml-91.sock  GONE: a message waits in its box" || fail "show lacks the gone inbox: $R"
+echo "$R" | grep -q "claude --resume $SID1\` gives it a new socket" || fail "show lacks the resume hint: $R"
+R=$(agents "show claude:$SID2")
+echo "$R" | grep -q "^inbox .*cc-socks/glm-drafter.sock  (a message is pushed" || fail "show lacks the live inbox: $R"
+R=$(agents_t "$P2" whoami)
+echo "$R" | grep -q "^inbox .*glm-drafter.sock  (a message is pushed" || fail "whoami lacks the live inbox: $R"
+R=$(agents_t "$P1" whoami)
+echo "$R" | grep -q "^inbox .*GONE: messages are not pushed to you any more" || fail "whoami lacks the gone inbox: $R"
+echo "$R" | grep -q "mailbox \"inbox claude:$SID1\"" || fail "whoami lacks the pull command: $R"
+R=$(agents_t "$P2" "message claude:$SID1 are you there")
+echo "$R" | grep -q "^agents: claude:$SID1 will not be woken: its inbox socket .*hyperyaml-91.sock is gone" || fail "message does not warn: $R"
+R=$(agents_t "$P2" "message claude:$SID2 are you there")
+echo "$R" | grep -q "gone" && fail "a message to a live socket warns: $R"
+
 # --- help ------------------------------------------------------------------------
 agents help | grep -q 'transcript <agent-id>' || fail "help lacks transcript"
 agents 'ls --help' | grep -q -- '--project <name>' || fail "ls --help"
 agents 'transcript --help' | grep -q 'last 30 turns' || fail "transcript --help"
+agents 'ls --help' | grep -q 'GONE means the socket was removed' || fail "ls --help lacks the inbox note"
+agents 'message --help' | grep -q 'inbox socket is gone' || fail "message --help lacks the inbox note"
 
 echo "PASS"
 exit 0
