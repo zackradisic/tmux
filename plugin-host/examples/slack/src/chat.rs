@@ -35,7 +35,7 @@ use listkit::text::{clip, menu_item, menu_safe};
 use tmux_plugin_sdk::prelude::*;
 
 use crate::store::{Channel, FileRef, Message};
-use crate::{api, emoji, images, mrkdwn, sidebar, store, timefmt, NameMap, Shared, State, NAME};
+use crate::{api, emoji, images, mention, mrkdwn, sidebar, store, timefmt, NameMap, Shared, State, NAME};
 
 /// Two posts by the same author this close together share one header.
 const GROUP_SECS: i64 = 5 * 60;
@@ -200,6 +200,13 @@ pub struct Chat {
     /// `new messages` line goes.
     pub last_read: Option<String>,
     pub compose: Option<Compose>,
+    /// Who `@` in the box can name (members and the room keywords).
+    pub people: Vec<mention::Person>,
+    /// The dropdown while a `@` token is typed in the box.
+    pub mention: Option<mention::Dropdown>,
+    /// The token Escape put the dropdown away for; it stays away until
+    /// the token changes.
+    pub mention_hidden: Option<String>,
     pub status: Option<String>,
     /// Bumped whenever the conversation changes, so a fetch that
     /// started for the previous one is dropped on return.
@@ -756,6 +763,26 @@ fn paint(s: &State) {
         for (k, row) in cells.iter().enumerate() {
             out.push_str(&format!("\x1b[{};2H{}", y0 + k, emit_cells(row, false)));
         }
+        // The mention dropdown, over the body just above the box, where
+        // its text starts: ` @handle  Name`, the pick in reverse video.
+        if let Some(dd) = &c.mention {
+            let col = 2 + cp.prompt().chars().count();
+            let labels: Vec<String> = dd
+                .hits
+                .iter()
+                .filter_map(|&i| c.people.get(i))
+                .map(|p| if p.label.is_empty() { format!(" @{}", p.handle) } else { format!(" @{}  {}", p.handle, p.label) })
+                .collect();
+            let n = labels.len().min(y0.saturating_sub(3));
+            let idx = dd.idx.min(n.saturating_sub(1));
+            let wmax = labels.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+            let width = (wmax + 8).max(20).min(w.saturating_sub(col + 1)).max(4);
+            for (k, line) in labels.iter().take(n).enumerate() {
+                let row = y0 - n + k;
+                let sgr = if k == idx { "7" } else { "48;5;238" };
+                out.push_str(&format!("\x1b[{row};{col}H\x1b[{sgr}m{:<width$}\x1b[0m", clip(line, width)));
+            }
+        }
     }
     // The foot: a rule, then a status, the compose hint, or the hints.
     if h >= 2 {
@@ -769,7 +796,8 @@ fn paint(s: &State) {
             f.extend(plain_cells(&tag, ST_DIM));
             f.extend(plain_cells("  ", 0));
         }
-        f.extend(plain_cells(compose_hints(&cp.kind), ST_DIM));
+        let hint = if c.mention.is_some() { "@ Tab/↓ BTab/↑ walk · Enter takes · Esc hides" } else { compose_hints(&cp.kind) };
+        f.extend(plain_cells(hint, ST_DIM));
         fit_cells(&f, w.saturating_sub(2))
     } else {
         plain_cells(&clip(hints(), w.saturating_sub(2)), ST_DIM)
@@ -954,6 +982,7 @@ pub fn open(st: &Shared, ch: Channel, thread: Option<String>, client: Option<u64
         let channel = s.channel(&ch.id).cloned().unwrap_or(ch);
         let last_read = channel.last_read.clone();
         let me = s.ident.as_ref().map(|i| i.user_id.clone()).unwrap_or_default();
+        let people = mention::people(&s.users, &me);
         s.chat = Some(Chat {
             mode,
             channel,
@@ -974,6 +1003,9 @@ pub fn open(st: &Shared, ch: Channel, thread: Option<String>, client: Option<u64
             has_more: false,
             last_read,
             compose,
+            people,
+            mention: None,
+            mention_hidden: None,
             status: None,
             gen,
             poll: None,
@@ -1047,6 +1079,9 @@ pub(crate) fn embedded(mode: ModeId, channel: Channel, client: Option<u64>, pane
         has_more: false,
         last_read,
         compose: None,
+        people: Vec::new(),
+        mention: None,
+        mention_hidden: None,
         status: None,
         gen: 0,
         poll: None,
@@ -1595,6 +1630,42 @@ fn compose_key(c: &mut Chat, key: &str) -> After {
     if c.status.as_deref() != Some("posting…") {
         c.status = None;
     }
+    if c.compose.is_none() {
+        return After::None;
+    }
+    // The mention dropdown takes its keys first: walk it, take from
+    // it, or put it away (Escape then keeps insert mode).
+    if let Some(dd) = c.mention.as_mut() {
+        let n = dd.hits.len();
+        match key {
+            "Tab" | "Down" => {
+                dd.idx = (dd.idx + 1) % n;
+                return After::None;
+            }
+            "BTab" | "Up" => {
+                dd.idx = (dd.idx + n - 1) % n;
+                return After::None;
+            }
+            "Enter" => {
+                let dd = c.mention.take().unwrap_or_default();
+                let handle = c.people.get(dd.hits[dd.idx]).map(|p| p.handle.clone()).unwrap_or_default();
+                if let Some(cp) = c.compose.as_mut() {
+                    for _ in 0..dd.partial.chars().count() {
+                        cp.editor.key("BSpace");
+                    }
+                    cp.editor.paste(&format!("{handle} "));
+                }
+                c.mention_hidden = None;
+                return After::None;
+            }
+            "Escape" => {
+                c.mention_hidden = Some(dd.partial.clone());
+                c.mention = None;
+                return After::None;
+            }
+            _ => {}
+        }
+    }
     let Some(cp) = c.compose.as_mut() else { return After::None };
     let after = match cp.editor.key(key) {
         vimkit::Event::Submit => {
@@ -1639,8 +1710,43 @@ fn compose_key(c: &mut Chat, key: &str) -> After {
         vimkit::Event::Yank(text) => After::Clip(text),
         vimkit::Event::Redraw | vimkit::Event::None => After::None,
     };
+    refresh_mention(c);
     c.fit_box();
     after
+}
+
+/// The dropdown for what the box holds now: open on a `@` token under
+/// the cursor in insert mode (a message or an edit, not a reaction),
+/// with the people that match; closed otherwise, or while Escape has
+/// put it away for this very token.
+fn refresh_mention(c: &mut Chat) {
+    let token = c.compose.as_ref().and_then(|cp| {
+        let kind_ok = matches!(cp.kind, ComposeKind::Message(_) | ComposeKind::Edit(_));
+        if !kind_ok || cp.editor.mode() != vimkit::Mode::Insert {
+            return None;
+        }
+        let (row, col) = cp.editor.cursor();
+        let text = cp.editor.text();
+        let line = text.split('\n').nth(row).unwrap_or("");
+        mention::typing(line, col)
+    });
+    match token {
+        Some(partial) if c.mention_hidden.as_deref() == Some(partial.as_str()) => c.mention = None,
+        Some(partial) => {
+            let recent = mention::recent_speakers(c.msgs.iter().map(|m| m.user.as_deref().unwrap_or("")));
+            let hits = mention::matches(&c.people, &partial, &recent);
+            if hits.is_empty() {
+                c.mention = None;
+            } else {
+                let idx = c.mention.as_ref().filter(|d| d.partial == partial).map_or(0, |d| d.idx.min(hits.len() - 1));
+                c.mention = Some(mention::Dropdown { partial, hits, idx });
+            }
+        }
+        None => {
+            c.mention = None;
+            c.mention_hidden = None;
+        }
+    }
 }
 
 /// The keymap. Enter opens the thread of the message under the cursor
@@ -2013,6 +2119,7 @@ fn run(st: &Shared, after: After) {
         }
         After::Edit(ts, text) => {
             let Some((id, channel, gen)) = view_ctx(st) else { return };
+            let text = mention::encode(&text, &st.borrow().users);
             let st2 = Rc::clone(st);
             spawn(async move {
                 let r = api::update(&id, &channel, &ts, &text).await;
@@ -2424,6 +2531,9 @@ mod tests {
             has_more: false,
             last_read: None,
             compose: None,
+            people: Vec::new(),
+            mention: None,
+            mention_hidden: None,
             status: None,
             gen: 1,
             poll: None,

@@ -575,7 +575,11 @@ vim: it opens in insert mode, `Enter` sends and keeps it open for the next
 message, `C-j` puts a newline inside a message, `Escape` switches to normal
 mode (`dd`, `cw`, `o`, `v`, `/` and friends edit the draft; `Enter` still
 sends) and `Escape` there closes it; the box grows with the draft up to six
-rows and shows `-- INSERT --` / `-- NORMAL --`. `y` copies the message to the
+rows and shows `-- INSERT --` / `-- NORMAL --`. `@` in the box opens a dropdown
+of people as you type the name (`@te`: handles and names with `te`, the latest
+speakers first; `@here` and friends too), like the agents picker's project
+prompt: `Tab`/`↓` walk it, `Enter` takes the pick, `Escape` hides it; the
+`@handle` is sent as a real Slack mention. `y` copies the message to the
 clipboard as `Name (2026-10-30 14:02): text`, ready to paste into an agent;
 `v` starts a selection that `j`/`k` extend, so `y` copies a whole exchange;
 `Y` copies the permalink. `n` hands the message or the selection to a new

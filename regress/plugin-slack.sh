@@ -710,6 +710,24 @@ until_ok 40 screen_has 'hello there' || fail "the posted message is not shown"
 screen | grep -q 'posting' && fail "the posting status stayed"
 screen_has '› ' || fail "Enter closed the compose box"
 screen_has -- '-- INSERT --' || fail "the box left insert mode after Enter: $(screen | tail -3)"
+# @ in the box opens a dropdown of people: @te offers tejas (handle and
+# name); Enter takes the handle into the draft; what is sent carries
+# Slack's <@U2> form. Escape hides the dropdown and keeps insert mode.
+$TMUX send-keys -t "$FORM" -l '@te'; sleep 0.4
+screen | grep -q '^[^@]*@tejas  Tejas\( \{4\}\|$\)' || fail "no dropdown for @te: $(screen | tail -6 | tr '\n' '~')"
+screen_has 'Enter takes' || fail "the foot does not carry the dropdown hint: $(screen | tail -1)"
+keys Enter
+screen | grep -q '› @tejas ' || fail "Enter did not take the handle: $(screen | tail -4 | tr '\n' '~')"
+screen | grep -q '^[^@]*@tejas  Tejas\( \{4\}\|$\)' && fail "the dropdown stayed after Enter"
+$TMUX send-keys -t "$FORM" -l 'see this'; keys Enter
+until_ok 40 posted C1 '<@U2> see this' || fail "the mention was not sent as <@U2>: $(fetch "$BASE/_posted")"
+$TMUX send-keys -t "$FORM" -l '@z'; sleep 0.4
+screen | grep -q '^[^@]*@zack\( \{6\}\|$\)' || fail "no dropdown for @z: $(screen | tail -6 | tr '\n' '~')"
+keys Escape
+until_ok 40 sh -c "! $TMUX capture-pane -M -p -t $FORM | grep -q '^[^@]*@zack\( \{6\}\|$\)'" || fail "Escape did not hide the dropdown: $(screen | tail -6 | tr '\n' '~')"
+screen_has -- '-- INSERT --' || fail "Escape with the dropdown open left insert mode: $(screen | tail -3)"
+keys BSpace; keys BSpace
+screen | grep -q '› @' && fail "the @z token is still in the box: $(screen | tail -3 | tr '\n' '~')"
 # The next message needs no i; C-j puts a newline inside it, and the
 # box grows a row for it.
 $TMUX send-keys -t "$FORM" -l 'line one'; keys C-j

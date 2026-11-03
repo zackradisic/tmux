@@ -134,7 +134,11 @@ it landed.
 The compose box (i; r for the message's thread) opens in insert mode:
 keys type, Enter sends and the box stays open, empty, for the next
 message; C-j puts a newline inside a message (tmux sees Shift-Enter as
-Enter). Escape switches the box to normal mode, where vim's keys edit
+Enter). @ opens a dropdown of people as the name is typed (@te: every
+handle or name with te in it, the latest speakers first; @here, @channel,
+@everyone too): Tab/Down and BTab/Up walk it, Enter takes the pick into
+the draft (@tejas), Escape puts it away. A @handle is sent as Slack's
+mention, so the person is pinged; an unknown @word goes as typed. Escape switches the box to normal mode, where vim's keys edit
 the draft - h j k l, w b e, 0 ^ $, x dd dw cw D C, yy p P, o O a A I,
 r J u, v / V / C-v selections with y d c (C-v then I or A inserts on
 every line), / search with n and N - and Enter still sends; Escape in

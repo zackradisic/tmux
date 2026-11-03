@@ -47,6 +47,7 @@ mod handoff;
 mod help;
 mod http;
 mod images;
+mod mention;
 mod mrkdwn;
 mod peek;
 mod sidebar;
@@ -1032,8 +1033,13 @@ pub async fn notify(title: &str, body: &str, key: Option<&str>, action: Option<&
 
 /// Post, cache, mark read. Returns the ts.
 pub async fn post_message(st: &Shared, channel: &str, text: &str, thread_ts: Option<&str>) -> Result<String, String> {
-    let Some(id) = st.borrow().ident.clone() else { return Err("no session".into()) };
-    let m = api::post(&id, channel, text, thread_ts).await?;
+    let (id, text) = {
+        let s = st.borrow();
+        let Some(id) = s.ident.clone() else { return Err("no session".into()) };
+        // `@handle` pings the person: Slack wants its `<@U…>` form.
+        (id, mention::encode(text, &s.users))
+    };
+    let m = api::post(&id, channel, &text, thread_ts).await?;
     let ts = m.ts.clone();
     {
         let mut s = st.borrow_mut();
