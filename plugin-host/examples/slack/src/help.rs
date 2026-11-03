@@ -17,6 +17,8 @@ usage: tmux2 plugin-command slack '<verb> [args...]'
   auth                      forget the stored session and derive it again
   bind <#chan>[/thread_ts] <agent-id>
                             push new messages there into an agent's session
+                            (others' messages, once each; yours too only
+                            with @slack-bridge-me 1)
   unbind <#chan>[/thread_ts]
   notify <title> | <body>   a line in the notification feed (hooks, tests)
   close                     close any open view

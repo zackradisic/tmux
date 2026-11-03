@@ -420,18 +420,14 @@ async fn on_chat_message(st: &Shared, v: &Value) {
 async fn bridge(st: &Shared, m: &store::Message) {
     let (targets, text) = {
         let s = st.borrow();
-        // The user's own words count (a thread answered from a phone is
-        // the point); what this plugin posted for the agent does not.
+        // What this plugin posted for an agent is never echoed back.
         if s.own_posts.contains(&m.ts) {
             return;
         }
+        let me = s.ident.as_ref().map(|i| i.user_id.clone()).unwrap_or_default();
+        let ours = !me.is_empty() && m.user.as_deref() == Some(me.as_str());
         let root = m.thread_ts.clone().unwrap_or_else(|| m.ts.clone());
-        let targets: Vec<String> = s
-            .bindings
-            .iter()
-            .filter(|b| b.channel == m.channel && (b.thread_ts.is_empty() || b.thread_ts == root))
-            .map(|b| b.agent.clone())
-            .collect();
+        let targets = bridge_targets(&s.bindings, &m.channel, &root, ours, crate::bridge_me());
         if targets.is_empty() {
             return;
         }
@@ -458,9 +454,44 @@ async fn bridge(st: &Shared, m: &store::Message) {
     }
 }
 
+/// Who a message in a bound conversation goes to: each bound agent once,
+/// however many of its bindings match (a channel binding and a thread
+/// binding both match a reply in that thread). The user's own words are
+/// left out unless `@slack-bridge-me` is on: a reply they typed in Slack
+/// is for the people in the thread, not a prompt for the agent.
+pub(crate) fn bridge_targets(bindings: &[store::Binding], channel: &str, root: &str, ours: bool, bridge_me: bool) -> Vec<String> {
+    if ours && !bridge_me {
+        return Vec::new();
+    }
+    let mut v: Vec<String> = bindings
+        .iter()
+        .filter(|b| b.channel == channel && (b.thread_ts.is_empty() || b.thread_ts == root))
+        .map(|b| b.agent.clone())
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bound_agent_hears_a_message_once_and_not_the_users_own() {
+        let b = |channel: &str, thread: &str, agent: &str| store::Binding {
+            channel: channel.into(),
+            thread_ts: thread.into(),
+            agent: agent.into(),
+            since_ts: String::new(),
+        };
+        let binds = vec![b("C1", "", "claude:a"), b("C1", "17.1", "claude:a"), b("C1", "17.1", "claude:b"), b("C2", "", "claude:c")];
+        assert_eq!(bridge_targets(&binds, "C1", "17.1", false, false), vec!["claude:a", "claude:b"], "channel and thread bindings of one agent count once");
+        assert_eq!(bridge_targets(&binds, "C1", "99.9", false, false), vec!["claude:a"], "another thread: the channel binding only");
+        assert!(bridge_targets(&binds, "C1", "17.1", true, false).is_empty(), "the user's own reply is not a prompt");
+        assert_eq!(bridge_targets(&binds, "C1", "17.1", true, true), vec!["claude:a", "claude:b"], "unless @slack-bridge-me is on");
+        assert!(bridge_targets(&binds, "C3", "1.1", false, false).is_empty());
+    }
 
     #[test]
     fn direct_messages_toast_channels_do_not() {

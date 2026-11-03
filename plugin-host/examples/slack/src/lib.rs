@@ -67,6 +67,13 @@ pub fn notify_all() -> bool {
     get_option("@slack-notify").ok().is_none_or(|v| v.trim() != "slack")
 }
 
+/// `@slack-bridge-me`: on (`1`, `on`, `yes`, `true`) pushes the user's own
+/// Slack messages in a bound conversation to the bound agent too. Off by
+/// default: what the user types in Slack is for the people there.
+pub fn bridge_me() -> bool {
+    get_option("@slack-bridge-me").ok().is_some_and(|v| matches!(v.trim(), "1" | "on" | "yes" | "true"))
+}
+
 /// The settings key holding the history of conversations opened (C-o / Tab).
 pub const VISITS_SETTING: &str = "visits";
 const VISITS_MAX: usize = 50;

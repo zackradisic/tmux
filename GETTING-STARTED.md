@@ -619,10 +619,12 @@ tmux2 plugin-command slack 'send @tejas on my way'    # post as you
 tmux2 plugin-command slack 'bind #ops/<thread_ts> claude:<id>'
 ```
 
-`bind` is the agent bridge: every new message in that channel or thread is
-handed to the mailbox for the agent, with the `reply` command that answers in
-the same thread, so you can talk to an agent from your phone. The agent's own
-posts are not echoed back to it.
+`bind` is the agent bridge: every new message from someone else in that channel
+or thread is handed to the mailbox for the agent, once, with the `reply` command
+that answers in the same thread. Your own Slack messages are not forwarded (what
+you type there is for the people in the thread); `set -s @slack-bridge-me 1`
+forwards them too, so you can drive an agent from your phone. The agent's own
+posts are never echoed back to it.
 
 ### notify-toast — `prefix + N`
 A notification feed: a toast in a floating pane, top-right, in whatever window

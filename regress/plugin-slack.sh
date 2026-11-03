@@ -1024,6 +1024,27 @@ slack 'mark #general'
 until_ok 40 marks_grew "$BEFORE" || fail "mark did not reach conversations.mark (had $BEFORE)"
 R=$(slack 'bind #general claude:abc')
 [ "$R" = "bound #general" ] || fail "bind did not answer: $R"
+# The bridge: one push per bound agent however many bindings match (the
+# channel's and the thread's both match a reply), and not for the user's
+# own words unless @slack-bridge-me is on. No mailbox plugin runs here, so
+# every push attempt is one "bridge to" line in the log.
+R=$(slack 'bind #general/1700000300.000100 claude:abc')
+[ "$R" = "bound #general/1700000300.000100" ] || fail "bind thread did not answer: $R"
+bridged() { $TMUX plugin-log slack | grep -c 'bridge to claude:abc'; }
+B0=$(bridged)
+slack 'rtm-inject {"type":"message","channel":"C1","user":"U2","text":"for the agent","ts":"2000000001.000100","thread_ts":"1700000300.000100"}' >/dev/null
+until_ok 40 sh -c "[ \$($TMUX plugin-log slack | grep -c 'bridge to claude:abc') -gt $B0 ]" || fail "a reply in a bound thread was not bridged"
+sleep 1
+[ "$(bridged)" = "$((B0 + 1))" ] || fail "the reply was bridged $(( $(bridged) - B0 )) times, not once: $($TMUX plugin-log slack | grep 'bridge to' | tail -3 | tr '\n' '~')"
+slack 'rtm-inject {"type":"message","channel":"C1","user":"U1","text":"my own words","ts":"2000000002.000100","thread_ts":"1700000300.000100"}' >/dev/null
+sleep 1.5
+[ "$(bridged)" = "$((B0 + 1))" ] || fail "the user's own reply was bridged"
+$TMUX set-option -s @slack-bridge-me 1
+slack 'rtm-inject {"type":"message","channel":"C1","user":"U1","text":"my own words again","ts":"2000000003.000100","thread_ts":"1700000300.000100"}' >/dev/null
+until_ok 40 sh -c "[ \$($TMUX plugin-log slack | grep -c 'bridge to claude:abc') -eq $((B0 + 2)) ]" || fail "@slack-bridge-me did not bridge the user's own reply: $(bridged)"
+$TMUX set-option -su @slack-bridge-me
+R=$(slack 'unbind #general/1700000300.000100')
+[ "$R" = "unbound #general/1700000300.000100" ] || fail "unbind thread did not answer: $R"
 R=$(slack 'unbind #general')
 [ "$R" = "unbound #general" ] || fail "unbind did not answer: $R"
 R=$(slack 'send #nowhere x')
