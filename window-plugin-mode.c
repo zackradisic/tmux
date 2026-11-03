@@ -56,6 +56,7 @@ static void	window_plugin_key(struct window_mode_entry *,
 		    key_code, struct mouse_event *);
 static void	window_plugin_refresh_callback(int, short, void *);
 static void	window_plugin_draw_preview(struct window_mode_entry *);
+static void	window_plugin_flush_paste(struct window_mode_entry *);
 static void	window_plugin_paste(struct window_mode_entry *, const char *,
 		    size_t);
 static struct screen *window_plugin_get_screen(struct window_mode_entry *);
@@ -86,6 +87,13 @@ struct window_plugin_mode_data {
 		u_int	 px, py, sx, sy;
 	} preview;
 	struct event		 refresh;
+
+	/* A bracketed paste from the terminal arrives as a start marker, one
+	 * paste call per character and an end marker; it is folded here into
+	 * one mode-paste event, so the plugin sees the text once and never
+	 * sees the markers as keys. */
+	struct evbuffer		*paste;
+	int			 pasting;
 
 	/* Static string; set by the close path before teardown. */
 	const char		*close_reason;
@@ -181,6 +189,8 @@ window_plugin_free(struct window_mode_entry *wme)
 	plugin_mode_unregister(data->mode_id);
 
 	evtimer_del(&data->refresh);
+	if (data->paste != NULL)
+		evbuffer_free(data->paste);
 	input_free(data->ictx);
 	colour_palette_free(&data->palette);
 	screen_free(&data->screen);
@@ -219,6 +229,19 @@ window_plugin_key(struct window_mode_entry *wme, struct client *c,
 	struct plugin_buf		*pb;
 	u_int				 mx, my;
 
+	/* The paste markers bracket the paste calls; neither is a key. */
+	if (KEYC_IS_PASTE(key)) {
+		if ((key & KEYC_MASK_KEY) == KEYC_PASTE_START) {
+			data->pasting = 1;
+			if (data->paste == NULL)
+				data->paste = evbuffer_new();
+		} else {
+			data->pasting = 0;
+			window_plugin_flush_paste(wme);
+		}
+		return;
+	}
+
 	pb = plugin_event_create("mode-key");
 	plugin_event_i64(pb, "mode", data->mode_id);
 	/* key_string_lookup_key returns a static buffer: serialized (copied)
@@ -250,12 +273,33 @@ window_plugin_paste(struct window_mode_entry *wme, const char *buf,
 	struct plugin_buf		*pb;
 	char				*s;
 
+	if (data->pasting) {
+		evbuffer_add(data->paste, buf, len);
+		return;
+	}
 	s = xstrndup(buf, len);
 	pb = plugin_event_create("mode-paste");
 	plugin_event_i64(pb, "mode", data->mode_id);
 	plugin_event_str(pb, "text", s);
 	free(s);
 	plugin_event_send_mode(pb, data->mode_id);
+}
+
+/* The text gathered between the paste markers, as one event. */
+static void
+window_plugin_flush_paste(struct window_mode_entry *wme)
+{
+	struct window_plugin_mode_data	*data = wme->data;
+	size_t				 len;
+
+	if (data->paste == NULL)
+		return;
+	len = EVBUFFER_LENGTH(data->paste);
+	if (len != 0) {
+		window_plugin_paste(wme,
+		    (const char *)EVBUFFER_DATA(data->paste), len);
+	}
+	evbuffer_drain(data->paste, len);
 }
 
 /* Blit the preview source's live grid into the retained rect. */

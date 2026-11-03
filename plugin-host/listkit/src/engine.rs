@@ -874,6 +874,13 @@ impl Engine {
 
     /// A key (or a mouse key with its cell) pressed in the mode.
     pub fn handle_key(&mut self, key: &str, mouse: Option<(u32, u32)>) -> Outcome {
+        // A terminal paste's bracket markers are not keys to act on (the
+        // host folds the paste into one `mode-paste`; an older host let
+        // the markers through, and "PasteStart" typed into the preview's
+        // pane cost it the keyboard).
+        if matches!(key, "PasteStart" | "PasteEnd") {
+            return Outcome::Nothing;
+        }
         self.status = None;
         let g_pending = self.pending_g;
         self.pending_g = false;
