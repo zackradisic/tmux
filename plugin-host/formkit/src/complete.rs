@@ -157,6 +157,9 @@ pub enum Source {
     /// `ls` per scan. `~` in `base` is the remote home; nothing local
     /// touches the path.
     Remote { host: String, base: String },
+    /// Only the directories under `base` on `host`, the same way: a
+    /// place to work in on the other machine.
+    RemoteDirs { host: String, base: String },
 }
 
 impl Source {
@@ -173,6 +176,7 @@ impl Source {
             }
             Source::Files { base } => format!("files\t{base}"),
             Source::Remote { host, base } => format!("remote\t{host}\t{base}"),
+            Source::RemoteDirs { host, base } => format!("remotedirs\t{host}\t{base}"),
         }
     }
 }
@@ -851,6 +855,11 @@ pub async fn scan(source: Source) -> Scanned {
     match source {
         Source::Files { base } => scan_files(&base).await,
         Source::Remote { host, base } => scan_remote(&host, &base).await,
+        Source::RemoteDirs { host, base } => {
+            let mut scanned = scan_remote(&host, &base).await;
+            scanned.rows.retain(|r| r.kind == RowKind::Dir);
+            scanned
+        }
         Source::Dirs { base } => scan_dir(&base, false).await,
         Source::Repos { base } => scan_dir(&base, true).await,
         Source::Dests { base, repo } => {

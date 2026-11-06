@@ -438,7 +438,9 @@ picker's own keys: `a` archives, `.` shows finished rows, `z` folds a group,
 Tab walks them, Enter takes one, Enter again applies), `R` on a project header
 (`h` from any of its rows) renames the project and every row in it moves, `n`
 / `f` start or fork an agent into the row's project (the form's `project`
-field, prefilled, same dropdown),
+field, prefilled, same dropdown; the `session` field lists every session,
+linked servers' as `host/name` with the host beside them, and picking one
+makes the form that machine's: the folder is listed over ssh and made there),
 `/` filters (`^proj`, `#session`, `@server`, `~dir` tokens narrow it), `C-f`
 greps live pane contents, `c` copies the agent's session id, `w` moves a row
 between "needs input" and "waiting" when the roster's guess is not yours. A

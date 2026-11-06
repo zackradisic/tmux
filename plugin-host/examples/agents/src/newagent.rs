@@ -8,7 +8,15 @@
 //!   running the command. The session is the selected row's; for a row
 //!   on a linked server that is the link's local session (`host/name`),
 //!   and `new-window` on it runs on the remote, so the new agent lands on
-//!   the box you were looking at.
+//!   the box you were looking at. The session field lists every session,
+//!   the mirrored ones with their host, and the one it holds decides
+//!   the machine: pick `homemac/main` from a local row and the folder
+//!   turns into a path on homemac, listed over ssh (`Source::RemoteDirs`,
+//!   the link's host is the ssh host), prefilled with that session's
+//!   current directory, made there if missing. A forwarded `new-window`
+//!   returns before the shadow window exists, so the launch waits for
+//!   it (by name) and the final switch lands on that window, not on
+//!   whatever the mirrored session was showing.
 //! - **session**: `folder`, `name`, `command`. A new session instead.
 //! - **worktree**: `repo`, `name`, `dest`, `branch`, `session`,
 //!   `command`. `git worktree add` first, then a window in `session`
@@ -101,8 +109,10 @@ pub struct NewAgent {
     /// remote row), kept across the session kind, which has no field
     /// for it, so cycling back does not lose it.
     session: String,
-    /// The row lives on a linked server: its paths are remote paths, so
-    /// the local filesystem is not asked about them.
+    /// The machine the agent starts on, when it is not this one: the
+    /// host of the session field's session (the row's server to begin
+    /// with). Its paths are that machine's: listed over ssh, never
+    /// looked up on this disk.
     remote: Option<String>,
     /// Detected repo root, for the ✓ on the repo field.
     detected: Option<String>,
@@ -146,13 +156,86 @@ fn idx(fields: &[Field], label: &str) -> Option<usize> {
     fields.iter().position(|f| f.label == label)
 }
 
+/// The host a session is mirrored from, when it is a link's shadow
+/// (`#{session_remote_host}`: the link's name, which is its ssh host).
+pub fn remote_of_session(name: &str) -> Option<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let s = list_sessions().ok()?.into_iter().find(|s| s.name == name)?;
+    format_expand(OptionTarget::Session(SessionId(s.id)), "#{session_remote_host}")
+        .ok()
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty())
+}
+
+/// The directory a session's current pane is in: the agent's default
+/// folder once that session is chosen (a shadow's is the remote's path).
+fn session_dir(name: &str) -> Option<String> {
+    let s = list_sessions().ok()?.into_iter().find(|s| s.name == name.trim())?;
+    format_expand(OptionTarget::Session(SessionId(s.id)), "#{pane_current_path}")
+        .ok()
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty())
+}
+
+/// The session dropdown: every session, a mirrored one with its host.
+fn session_words() -> Vec<(String, String)> {
+    let mut words: Vec<(bool, String, String)> = list_sessions()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| {
+            let host = format_expand(OptionTarget::Session(SessionId(s.id)), "#{session_remote_host}")
+                .ok()
+                .map(|h| h.trim().to_string())
+                .filter(|h| !h.is_empty());
+            let n = s.windows.len();
+            let meta = match &host {
+                Some(h) => format!("on {h} · {n} window{}", if n == 1 { "" } else { "s" }),
+                None => format!("{n} window{}", if n == 1 { "" } else { "s" }),
+            };
+            (host.is_some(), s.name, meta)
+        })
+        .collect();
+    // This machine's sessions first, then the linked servers' in name order.
+    words.sort();
+    words.into_iter().map(|(_, n, m)| (n, m)).collect()
+}
+
+impl NewAgent {
+    /// The session field decides the machine: when the session it holds
+    /// is mirrored from a host (or stops being), the form becomes that
+    /// machine's, and a folder nobody typed moves to the session's own
+    /// directory, since the old one named a path on another disk.
+    fn follow_session(&mut self, fields: &mut [Field]) {
+        let Some(si) = idx(fields, "session") else { return };
+        let session = fields[si].value.trim().to_string();
+        let host = remote_of_session(&session);
+        if host == self.remote {
+            return;
+        }
+        self.remote = host;
+        self.session = session.clone();
+        if let Some(fi) = idx(fields, "folder") {
+            if !fields[fi].touched {
+                fields[fi].value = session_dir(&session).unwrap_or_default();
+            }
+        }
+    }
+}
+
 impl Model for NewAgent {
     fn source(&self, fields: &[Field], i: usize) -> Option<Source> {
         let f = &fields[i];
         match f.label {
-            // A remote row's paths are on the other machine; listing the
-            // local disk under them would only mislead.
-            "folder" | "repo" | "dest" | "branch" if self.remote.is_some() => None,
+            // A remote folder is listed over ssh, on the machine the
+            // session is mirrored from; a worktree there is not offered.
+            "folder" if self.remote.is_some() => Some(Source::RemoteDirs {
+                host: self.remote.clone().unwrap_or_default(),
+                base: scan_base(&f.value),
+            }),
+            "repo" | "dest" | "branch" if self.remote.is_some() => None,
             "folder" => Some(Source::Dirs { base: scan_base(&f.value) }),
             "repo" => Some(Source::Repos { base: scan_base(&f.value) }),
             "dest" => Some(Source::Dests {
@@ -163,14 +246,7 @@ impl Model for NewAgent {
                 let repo = value_of(fields, "repo");
                 (!repo.is_empty()).then_some(Source::Branches { repo })
             }
-            "session" => Some(Source::Words {
-                title: "sessions".into(),
-                words: list_sessions()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|s| (s.name, format!("{} windows", s.windows.len())))
-                    .collect(),
-            }),
+            "session" => Some(Source::Words { title: "sessions".into(), words: session_words() }),
             "project" => Some(Source::Words { title: "projects".into(), words: self.projects.clone() }),
             "command" => Some(Source::Words {
                 title: "launchers".into(),
@@ -190,6 +266,7 @@ impl Model for NewAgent {
     }
 
     fn mirror(&mut self, fields: &mut [Field]) {
+        self.follow_session(fields);
         match self.kind {
             Kind::Window | Kind::Session => {
                 let folder = value_of(fields, "folder");
@@ -245,7 +322,7 @@ impl Model for NewAgent {
 
     fn banner(&self, fields: &[Field]) -> Option<String> {
         if let Some(server) = &self.remote {
-            return Some(format!("on {server}: paths are that machine's, no completion"));
+            return Some(format!("on {server}: paths are that machine's (listed over ssh)"));
         }
         if fields[0].value.trim().is_empty() {
             return Some(
@@ -478,6 +555,34 @@ fn session_name(name: &str) -> String {
     name.chars()
         .map(|c| if c == '.' || c == ':' || c == ' ' { '-' } else { c })
         .collect()
+}
+
+/// How long a forwarded new-window is given to show up as a shadow.
+const SHADOW_WAIT_TRIES: u32 = 20;
+const SHADOW_WAIT_MS: u64 = 150;
+
+/// Does the folder exist on `host`; on the second Enter, make it. The
+/// shape of `git::ensure_dir`, over ssh: an ssh that cannot run (status
+/// 255, no key, host down) counts as ready, the remote tmux then has
+/// the last word.
+async fn remote_ensure_dir(host: &str, dir: &str, create: bool) -> Result<Ensured, String> {
+    let check = if create {
+        format!("mkdir -p -- {} && test -d {}", quote(dir), quote(dir))
+    } else {
+        format!("test -d {}", quote(dir))
+    };
+    let cmd = format!(
+        "ssh -o BatchMode=yes -o ConnectTimeout=8 -- {} {}",
+        quote(host),
+        quote(&check)
+    );
+    match run_job(&cmd, None).await {
+        Ok(out) if out.status == 0 => Ok(Ensured::Ready),
+        Ok(out) if out.status == 1 && !create => Ok(Ensured::Missing),
+        Ok(out) if out.status == 1 => Err(format!("{host}: cannot create {dir}")),
+        Ok(_) => Ok(Ensured::Ready),
+        Err(e) => Err(format!("ssh: {}", e.message)),
+    }
 }
 
 fn session_exists(name: &str) -> bool {
@@ -860,6 +965,11 @@ async fn submit() {
             err = Some("dest and branch are required".into());
         } else if form.model.kind == Kind::Worktree && form.model.remote.is_some() {
             err = Some("a worktree on a linked server is not supported yet".into());
+        } else if form.model.kind == Kind::Session && form.model.remote.is_some() {
+            err = Some(format!(
+                "a new session on {} is not supported — C-t for a window in a session there",
+                form.model.remote.clone().unwrap_or_default()
+            ));
         } else if has("session") && !v("session").is_empty() && !session_exists(&v("session")) {
             err = Some(format!("no session '{}'", v("session")));
         } else if form.model.kind == Kind::Window && v("session").is_empty() {
@@ -898,7 +1008,6 @@ async fn submit() {
         )
     };
     let (confirmed, reuse, remote_host, client_name, picker_mode, harness, env) = model_bits;
-    let remote = remote_host.is_some();
     let get = |l: &str| {
         labels
             .iter()
@@ -911,10 +1020,15 @@ async fn submit() {
     let dir = match kind {
         Kind::Window | Kind::Session => {
             let folder = get("folder");
-            // A remote folder is the remote's business; this disk knows
-            // nothing about it.
-            if !remote {
-                match git::ensure_dir(&folder, confirmed).await {
+            // A remote folder is asked about over ssh: made on the second
+            // Enter like a local one. An ssh that fails leaves it to the
+            // remote tmux, which falls back to its home.
+            let ensured = match &remote_host {
+                Some(host) => remote_ensure_dir(host, &folder, confirmed).await,
+                None => git::ensure_dir(&folder, confirmed).await,
+            };
+            {
+                match ensured {
                     Ok(Ensured::Ready) => {}
                     Ok(Ensured::Missing) => {
                         let mut b = st.borrow_mut();
@@ -981,13 +1095,14 @@ async fn submit() {
     if let Some(m) = picker_mode {
         let _ = mode_close(m);
     }
+    // The window itself when it is known (a shadow's may not be yet):
+    // the session alone would land on whatever it was showing.
     if let Some(client) = client_name {
-        let _ = run_command(&format!(
-            "switch-client -c {} -t {}",
-            quote(&client),
-            quote(&format!("{}:", landed.target))
-        ))
-        .await;
+        let target = match landed.window {
+            Some(w) => format!("@{w}"),
+            None => format!("{}:", landed.target),
+        };
+        let _ = run_command(&format!("switch-client -c {} -t {}", quote(&client), quote(&target))).await;
     }
     let _ = display_message(&format!("agent started: {} in {}", landed.command, landed.target));
 }
@@ -1119,13 +1234,32 @@ pub async fn launch(l: Launch) -> Result<Landed, String> {
             (pane.as_ref().map(|p| p.window), pane.map(|p| p.id))
         }
         None => {
-            let window = list_windows()
-                .unwrap_or_default()
-                .into_iter()
-                .find(|w| !windows_before.contains(&w.id));
+            // A forwarded new-window answers before the remote's
+            // %window-add has made the shadow: wait for the window by
+            // its name, a few seconds at most.
+            let mut window = None;
+            for _ in 0..SHADOW_WAIT_TRIES {
+                let fresh: Vec<_> = list_windows()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|w| !windows_before.contains(&w.id))
+                    .collect();
+                window = fresh.iter().find(|w| w.name == l.name).or(fresh.first()).cloned();
+                if window.is_some() || l.remote_host.is_none() {
+                    break;
+                }
+                let _ = sleep_ms(SHADOW_WAIT_MS).await;
+            }
             (window.as_ref().map(|w| w.id), window.and_then(|w| w.active_pane))
         }
     };
+    // The remote made the new window current there, but select-window
+    // stays local, so the mirrored session is told here too.
+    if l.focus && l.remote_host.is_some() && l.split.is_none() {
+        if let Some(w) = window {
+            let _ = run_command(&format!("select-window -t {}", quote(&format!("@{w}")))).await;
+        }
+    }
     // The project rides on what was made - a new session, the pane of a
     // split, else the window - as its `@project` option. A remote
     // session's shadow window would only get a local option, so its
@@ -1380,12 +1514,6 @@ pub async fn direct(
         .or_else(|| nonempty(row.as_ref().and_then(|a| a.cwd.clone())))
         .or(here_dir)
         .ok_or("new: no folder - give --folder, or run it with -t <pane>")?;
-    if remote.is_none() {
-        match git::ensure_dir(&dir, false).await? {
-            Ensured::Ready => {}
-            Ensured::Missing => return Err(format!("new: no folder {dir}")),
-        }
-    }
     let session = if own_session {
         String::new()
     } else {
@@ -1403,6 +1531,18 @@ pub async fn direct(
     };
     if !session.is_empty() && !session_exists(&session) {
         return Err(format!("new: no session '{session}'"));
+    }
+    // A mirrored session names its host: `--session homemac/main` is
+    // `@homemac` without saying so, and the folder is that machine's.
+    let remote = remote.or_else(|| remote_of_session(&session));
+    if remote.is_some() && session.is_empty() {
+        return Err("new: a new session on a linked server is not supported - give --session".into());
+    }
+    if remote.is_none() {
+        match git::ensure_dir(&dir, false).await? {
+            Ensured::Ready => {}
+            Ensured::Missing => return Err(format!("new: no folder {dir}")),
+        }
     }
     let name = nonempty(name)
         .or_else(|| nonempty(row.as_ref().map(crate::view::display_name)))

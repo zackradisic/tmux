@@ -118,6 +118,8 @@ in the caller pane's @agents_new option (a plugin's work is asynchronous):
   --folder <dir>     where it runs      default: the row's folder, else the
                      caller pane's
   --session <name>   which session      default: the caller pane's
+                     a mirrored one (host/name) puts the agent on that
+                     linked server: --folder is a path there
   --new-session      a session of its own, named after --name
   --name <name>      the window's name  default: the row's name, else the
                      folder's
