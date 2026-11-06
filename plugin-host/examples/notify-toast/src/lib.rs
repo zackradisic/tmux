@@ -57,7 +57,9 @@
 //! jump to a pane row's source pane, run a service row's action - and
 //! drop the entry (a click on a service row does the same), `d`
 //! dismisses one - or, on a grouping row, everything under it, folded
-//! away or not - and `q`/`Escape` closes the panel. A dismissed service
+//! away or not - and `q`/`Escape` closes the panel. A plugin takes rows
+//! back with the `withdraw` method (its source and key: a conversation
+//! read elsewhere). A dismissed service
 //! row is reported to the plugin that draws its column (`dismissed`
 //! with the row's key), so Slack marks the conversation read.
 //!
@@ -2072,6 +2074,44 @@ impl NotifyToast {
 
     /// Drop `seqs` from the feed - one notification, or everything under
     /// a session or window row. Closes when the feed empties.
+    /// A plugin takes its rows back (`withdraw`): every service row
+    /// under its source and key goes, the panel and the toasts follow.
+    /// Nobody is told - the caller already knows.
+    fn withdraw(&mut self, ctx: &Ctx, req: ServiceRequest) {
+        let raw: WithdrawReq = match req.json() {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = req.fail(&format!("withdraw: {}", e.message));
+                return;
+            }
+        };
+        let (source, key) = (raw.source.trim().to_string(), raw.key.trim().to_string());
+        if source.is_empty() || key.is_empty() {
+            let _ = req.fail("withdraw: \"source\" and \"key\" are required");
+            return;
+        }
+        let removed = {
+            let mut st = self.state.borrow_mut();
+            let before = st.entries.len();
+            st.entries.retain(|e| !(e.is_service() && e.source == source && e.key == key));
+            before - st.entries.len()
+        };
+        let _ = req.reply_json(&serde_json::json!({ "ok": true, "removed": removed }));
+        log(&format!("withdraw {key} from {source}: removed {removed}"));
+        if removed == 0 {
+            return;
+        }
+        if self.state.borrow().entries.is_empty() {
+            self.close_chooser();
+        }
+        redraw_chooser(&self.state);
+        let state = Rc::clone(&self.state);
+        let (width, keeper_secs, show_when_visible) = self.view_params();
+        ctx.spawn(async move {
+            sync_views(&state, width, keeper_secs, show_when_visible).await;
+        });
+    }
+
     fn chooser_dismiss(&mut self, ctx: &Ctx, seqs: &[u64], next: Option<NodeId>) {
         if seqs.is_empty() {
             return;
@@ -2341,6 +2381,9 @@ impl Plugin for NotifyToast {
                      (grant service-serve to accept notifications)",
                     e.message
                 ));
+            }
+            if let Err(e) = service::register(WITHDRAW_METHOD) {
+                log(&format!("service::register({WITHDRAW_METHOD}) failed: {}", e.message));
             }
             if pane_notifications {
                 for s in service::servers().unwrap_or_default() {
@@ -2812,6 +2855,10 @@ impl Plugin for NotifyToast {
     /// Another plugin calls `notify`: validate, answer with the row id,
     /// and put the row into the feed like a pane notification.
     fn on_service_request(&mut self, ctx: &Ctx, req: ServiceRequest) {
+        if req.method == WITHDRAW_METHOD {
+            self.withdraw(ctx, req);
+            return;
+        }
         if req.method != NOTIFY_METHOD {
             let _ = req.fail("unknown method");
             return;
@@ -2860,6 +2907,20 @@ const TOPIC: &str = "notify";
 
 /// The service method other plugins call to put a row in the feed.
 const NOTIFY_METHOD: &str = "notify";
+
+/// The service method a plugin calls to take its rows back: the ones
+/// under its source and key (a conversation read elsewhere has nothing
+/// left to tell). The reverse of `dismissed`.
+const WITHDRAW_METHOD: &str = "withdraw";
+
+/// A `withdraw` request: whose rows, and which.
+#[derive(serde::Deserialize)]
+struct WithdrawReq {
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    key: String,
+}
 
 /// Synthetic pane ids for forwarded notifications whose pane has no local
 /// mirror, clear of any real pane id.

@@ -665,6 +665,7 @@ pub async fn mark_thread_read(st: &Shared, channel: &str, root: &str, why: &str)
         return;
     }
     log(&format!("slack: marked thread {channel}/{root} read at {ts} ({why})"));
+    withdraw(&format!("slack:{channel}/{root}")).await;
     {
         let mut s = st.borrow_mut();
         if let Some(pos) = s.threads.iter().position(|t| t.channel == channel && t.root.ts == root) {
@@ -1042,6 +1043,18 @@ pub async fn notify(title: &str, body: &str, key: Option<&str>, action: Option<&
     }
 }
 
+/// Take a conversation's rows back from the toast plugin: it was read,
+/// here or elsewhere (the feed's `*_marked`), so the notifications pane
+/// has nothing left to say about it. `key` is the row key `notify`
+/// was given (`slack:<channel>`, `slack:<channel>/<thread>`).
+pub async fn withdraw(key: &str) {
+    log(&format!("slack: withdraw {key}"));
+    let req = serde_json::json!({ "source": "slack", "key": key });
+    if let Err(e) = service::call_json::<_, serde_json::Value>("notify_toast", "withdraw", &req).await {
+        log(&format!("slack: withdraw {key}: {} (toast plugin not loaded, or older?)", e.message));
+    }
+}
+
 /// Post, cache, mark read. Returns the ts.
 pub async fn post_message(st: &Shared, channel: &str, text: &str, thread_ts: Option<&str>) -> Result<String, String> {
     let (id, text) = {
@@ -1168,6 +1181,7 @@ pub async fn mark_read(st: &Shared, channel: &str, why: &str) {
         return;
     }
     log(&format!("slack: marked {channel} read at {ts} ({why})"));
+    withdraw(&format!("slack:{channel}")).await;
     store::mark_read(channel, &ts).await;
     {
         let mut s = st.borrow_mut();

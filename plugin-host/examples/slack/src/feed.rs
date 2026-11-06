@@ -220,6 +220,9 @@ async fn handle(st: &Shared, v: Value) {
                 crate::publish(&s);
             }
             sidebar::refresh(st);
+            // Read somewhere (the app, the phone, here): the notifications
+            // pane drops the conversation's row.
+            crate::withdraw(&format!("slack:{channel}")).await;
         }
         "desktop_notification" => {
             // What Slack itself would have shown, already filtered by the
@@ -265,6 +268,7 @@ async fn handle(st: &Shared, v: Value) {
         // followed or left. The one read is dropped at once; Slack is
         // asked for the rest.
         "thread_marked" | "thread_subscribed" | "thread_unsubscribed" | "update_thread_state" => {
+            let mut read: Option<String> = None;
             if let Some(sub) = v.get("subscription") {
                 if let (Some(channel), Some(root)) = (s(sub, "channel"), s(sub, "thread_ts")) {
                     let last_read = s(sub, "last_read").unwrap_or_default();
@@ -276,9 +280,15 @@ async fn handle(st: &Shared, v: Value) {
                             crate::publish(&st_);
                         }
                     }
+                    if kind == "thread_marked" {
+                        read = Some(format!("slack:{channel}/{root}"));
+                    }
                 }
             }
             crate::refresh_threads(st);
+            if let Some(key) = read {
+                crate::withdraw(&key).await;
+            }
         }
         "goodbye" => {
             // Slack is about to close the socket: be first.

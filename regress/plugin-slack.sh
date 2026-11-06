@@ -1060,6 +1060,28 @@ FORM=
 BEFORE=$(ncalls conversations.mark channel C1)
 slack 'mark #general'
 until_ok 40 marks_grew "$BEFORE" || fail "mark did not reach conversations.mark (had $BEFORE)"
+# The other way round: a conversation read elsewhere (the app, the
+# phone) comes down the feed as channel_marked, and the plugin takes
+# the channel's row back from the toast plugin (`withdraw`), so the
+# pane stops telling of a message already read; the DM's row stays.
+# (The mark above withdrew too, with nothing left to remove: d had
+# dropped the row.)
+$TMUX plugin-log slack | grep -q 'slack: withdraw slack:C1' || fail "our own mark did not withdraw the channel's row"
+R=$(slack 'rtm-inject {"type":"message","channel":"C1","user":"U2","text":"read on the phone","ts":"2000000001.000100"}')
+[ "$R" = "injected" ] || fail "rtm-inject (phone) did not answer: $R"
+until_ok 40 sh -c "$TMUX plugin-log slack | grep -q 'slack: toast: #general · Tejas: read on the phone'" || fail "the message was not toasted"
+until_ok 40 sh -c "[ \"\$($TMUX plugin-log notify_toast | grep -c 'notification from slack: added to feed')\" -ge 5 ]" || fail "the toast plugin did not take the row: $($TMUX plugin-log notify_toast | tail -3)"
+R=$(slack 'rtm-inject {"type":"channel_marked","channel":"C1","ts":"2000000001.000100","unread_count_display":0,"mention_count_display":0}')
+[ "$R" = "injected" ] || fail "rtm-inject (channel_marked) did not answer: $R"
+until_ok 40 sh -c "$TMUX plugin-log notify_toast | grep -q 'withdraw slack:C1 from slack: removed 1'" || fail "the read elsewhere did not withdraw the row: $($TMUX plugin-log notify_toast | tail -4)"
+$TMUX plugin-command -t "$PANE" notify_toast chooser || fail "chooser did not reopen"
+until_ok 40 mode_open || fail "the chooser opened no plugin mode (after withdraw)"
+FORM=$(mode_pane)
+until_ok 40 screen_has 'ping from the' || fail "the DM row went with the withdrawn one: $(screen | head -4 | tr '\n' '~')"
+screen_has 'read on the phone' && fail "the withdrawn row is still in the chooser: $(screen | head -4 | tr '\n' '~')"
+keys q
+until_ok 40 mode_closed || fail "q did not close the chooser (after withdraw)"
+FORM=
 R=$(slack 'bind #general claude:abc')
 [ "$R" = "bound #general" ] || fail "bind did not answer: $R"
 # The bridge: one push per bound agent however many bindings match (the
