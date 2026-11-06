@@ -96,6 +96,7 @@ open: the channel view.
   J/K  page                    i          compose (Enter sends, box stays)
   g/G  top / bottom            r          reply in the message's thread
   L    load older              e          react (type :name: then Enter)
+  z    the message's picture, big (a click on a picture does the same)
   o    open in the Slack app   y          copy the message (or selection)
   m    mark read               Y          copy the permalink
   @    next mention of you     E          edit your message (Enter saves)

@@ -51,6 +51,7 @@ mod mention;
 mod mrkdwn;
 mod peek;
 mod sidebar;
+mod viewer;
 mod store;
 mod timefmt;
 
@@ -376,6 +377,8 @@ impl Plugin for Slack {
                     chat::on_mode_event(&self.st, name.as_str(), &event);
                 } else if handoff::owns(mode) {
                     handoff::on_mode_event(name.as_str(), &event);
+                } else if viewer::owns(mode) {
+                    viewer::on_mode_event(name.as_str(), &event);
                 }
             }
             _ => {}
@@ -393,6 +396,7 @@ impl Plugin for Slack {
     }
 
     fn on_unload(&mut self, _ctx: &Ctx) {
+        viewer::close();
         handoff::close();
         sidebar::close(&self.st);
         chat::close(&self.st);

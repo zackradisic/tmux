@@ -568,7 +568,10 @@ Connect guests too. A shared picture (PNG, JPEG, a GIF's first frame), or a
 `/giphy` post's, is drawn under its `📎` or caption line in Ghostty or kitty
 through the kitty graphics protocol, fetched and converted once outside the
 plugin; `set -g @slack-images off` keeps the lines alone (iTerm2 would show
-blank blocks). `Enter` on a message opens its thread (with or without replies
+blank blocks). `z` on a message with a picture (or a click on the picture)
+opens the file itself as big as the window allows, so a screenshot can be
+read; `q` closes it, `o` hands it to the system viewer. `Enter` on a message
+opens its thread (with or without replies
 yet), `Escape` steps back: thread to channel, channel to sidebar; `q` closes
 outright. `i` composes, `r` replies in the message's thread, `e`
 reacts, `E` edits your own message in the compose box (Enter saves it), `N` hands

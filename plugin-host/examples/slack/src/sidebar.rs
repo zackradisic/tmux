@@ -1500,6 +1500,10 @@ fn preview_after(st: &Shared, took: Took) {
                 preview_status(&st2, &cid, status);
             });
         }
+        After::Expand(f) => {
+            let (client, pane) = st.borrow().side.as_ref().map(|sd| (sd.client, sd.pane)).unwrap_or((None, None));
+            crate::viewer::open(st, f, client, pane);
+        }
         After::OpenApp(ts) => {
             let team = st.borrow().ident.as_ref().map(|i| i.team_id.clone()).unwrap_or_default();
             let mut url = format!("slack://channel?team={team}&id={}", channel.id);

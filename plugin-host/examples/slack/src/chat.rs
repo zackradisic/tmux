@@ -104,7 +104,7 @@ thread_local! {
 
 /// The next kitty image id: never 0, never reused in this process, and
 /// inside the 24 bits a placeholder's foreground colour carries.
-fn next_image_id() -> u32 {
+pub(crate) fn next_image_id() -> u32 {
     IMAGE_ID.with(|g| {
         let id = (g.get() & 0x00ff_ffff).max(1);
         g.set(id + 1);
@@ -657,7 +657,7 @@ pub(crate) fn layout_chat(c: &mut Chat, names: &NameMap, tz: i64, me: &str, now:
 
 pub(crate) fn hints() -> &'static str {
     // e (react) and L (older) are in the menu: the foot must fit a 60-cell float.
-    "j/k move · Enter thread · @ mention · i compose · r reply · y copy · v select · n agent · m read · Space menu · Esc back · ? help · q close"
+    "j/k move · Enter thread · z picture · @ mention · i compose · r reply · y copy · v select · n agent · m read · Space menu · Esc back · ? help · q close"
 }
 
 fn rule(width: usize) -> String {
@@ -1522,6 +1522,19 @@ pub(crate) enum After {
     Mark,
     Refetch,
     Older,
+    /// Show this picture big (viewer.rs).
+    Expand(FileRef),
+}
+
+/// The first picture a message carries: a shared file that is an image,
+/// else an attachment's picture.
+pub(crate) fn picture_of(m: &Message) -> Option<FileRef> {
+    m.files.iter().chain(&m.pictures).find(|f| f.is_image()).cloned()
+}
+
+/// The picture file `id` of message `m`, by id.
+fn picture_by_id(m: &Message, id: &str) -> Option<FileRef> {
+    m.files.iter().chain(&m.pictures).find(|f| f.id == id).cloned()
 }
 
 /// The compose box as an edit of the user's message `ts`, holding its
@@ -1852,6 +1865,17 @@ pub(crate) fn handle_key(c: &mut Chat, key: &str, mouse: Option<(u32, u32)>) -> 
             let ts = c.cursor_idx().map(|i| c.msgs[i].ts.clone()).unwrap_or_default();
             After::OpenApp(ts)
         }
+        // z shows the message's picture big; a click on a picture does too.
+        "z" => {
+            let Some(i) = c.cursor_idx() else { return After::None };
+            match picture_of(&c.msgs[i]) {
+                Some(f) => After::Expand(f),
+                None => {
+                    c.status = Some("no picture in this message".into());
+                    After::None
+                }
+            }
+        }
         // v opens a selection at the cursor; j/k extend it, y copies it
         // (or the cursor message alone), Y the cursor message's link.
         "v" => {
@@ -1964,6 +1988,14 @@ pub(crate) fn handle_key(c: &mut Chat, key: &str, mouse: Option<(u32, u32)>) -> 
                         if let Some(i) = c.lines.get(line).and_then(|l| l.msg) {
                             c.set_cursor_idx(i);
                         }
+                        // On the picture itself: open it big.
+                        let hit = c.lines.get(line).and_then(|l| {
+                            let img = l.image.as_ref()?;
+                            picture_by_id(&c.msgs[l.msg?], &img.file)
+                        });
+                        if let Some(f) = hit {
+                            return After::Expand(f);
+                        }
                     }
                 }
                 After::None
@@ -1985,6 +2017,8 @@ pub(crate) fn menu_items(c: &Chat) -> String {
     items.push_str(&menu_item(NAME, "compose", "i", true));
     items.push_str(&menu_item(NAME, "reply in thread", "r", on_msg));
     items.push_str(&menu_item(NAME, "react", "e", on_msg));
+    let has_picture = c.cursor_idx().is_some_and(|i| picture_of(&c.msgs[i]).is_some());
+    items.push_str(&menu_item(NAME, "view the picture", "z", has_picture));
     let own = c.cursor_idx().is_some_and(|i| !c.me.is_empty() && c.msgs[i].user.as_deref() == Some(c.me.as_str()));
     items.push_str(&menu_item(NAME, "edit your message", "E", own));
     items.push_str(&menu_item(NAME, if c.anchor.is_some() { "copy the selection" } else { "copy message" }, "y", on_msg));
@@ -2192,6 +2226,10 @@ fn run(st: &Shared, after: After) {
                     }
                 }
             });
+        }
+        After::Expand(f) => {
+            let (client, pane) = st.borrow().chat.as_ref().map(|c| (c.client, c.pane)).unwrap_or((None, None));
+            crate::viewer::open(st, f, client, pane);
         }
         After::OpenApp(ts) => {
             let (team, channel) = {
@@ -2930,12 +2968,14 @@ mod tests {
         let mut sel = chat();
         sel.anchor = Some(sel.msgs[0].ts.clone());
         assert!(menu_items(&sel).contains(" 'new agent from the selection' 'n' "), "{}", menu_items(&sel));
-        // Nobody mentions anybody in the fixture and the message under
-        // the cursor is not ours: those two items alone are dimmed.
+        // Nobody mentions anybody in the fixture, the message under the
+        // cursor is not ours and carries no picture: those three items
+        // alone are dimmed.
         assert!(items.contains(" '-next mention of you' '@' "), "{items}");
         assert!(items.contains(" '-edit your message' 'E' "), "{items}");
+        assert!(items.contains(" '-view the picture' 'z' "), "{items}");
         assert!(items.contains(" 'new agent from everything shown' 'N' "), "{items}");
-        assert_eq!(items.matches("'-").count(), 2, "everything else applies on a message in a timeline: {items}");
+        assert_eq!(items.matches("'-").count(), 3, "everything else applies on a message in a timeline: {items}");
         let mut own = chat();
         own.me = own.msgs[own.cursor_idx().unwrap()].user.clone().unwrap_or_default();
         assert!(!own.me.is_empty() && menu_items(&own).contains(" 'edit your message' 'E' "), "{}", menu_items(&own));

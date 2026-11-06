@@ -36,6 +36,9 @@ pub const KEEP: usize = 200;
 /// The longer side of a converted picture, in pixels: a block is at most
 /// 80 cells wide, which no font makes wider than this.
 const MAX_PX: u32 = 1024;
+/// The longer side of the file the viewer shows, in pixels: a window's
+/// worth of cells at a retina font.
+pub const MAX_PX_FULL: u32 = 4096;
 /// The directory under the data root.
 const DIR: &str = "img";
 const TIMEOUT_MS: u64 = 30_000;
@@ -70,6 +73,11 @@ pub fn png_name(id: &str) -> String {
     format!("{DIR}/{id}.png")
 }
 
+/// The full-size picture's name under the data root (the viewer's).
+pub fn full_name(id: &str) -> String {
+    format!("{DIR}/{id}.full.png")
+}
+
 /// Ask for every image among `files` that has not been asked for yet.
 /// Each fetch reports back through [`attach`]'s state and redraws the
 /// open view; without one (tests) nothing is started.
@@ -102,13 +110,27 @@ pub fn request(s: &mut State, files: Vec<FileRef>) {
 /// Have the picture for `f` on disk: an earlier run's copy, else the
 /// thumbnail downloaded and converted. Resolves with its pixel size.
 async fn fetch(ident: &Identity, f: &FileRef) -> Result<(u32, u32), String> {
-    let png = png_name(&f.id);
-    if let Ok((head, _)) = fs_read(&png, 0, 32).await {
+    let url = f.fetch_url().ok_or("no URL")?;
+    fetch_into(ident, url, &png_name(&f.id), MAX_PX).await
+}
+
+/// The file itself (`url_private`, the thumbnail when there is none)
+/// for the viewer, as `img/<id>.full.png`, at most [`MAX_PX_FULL`] a
+/// side. Resolves with its pixel size.
+pub async fn fetch_full(ident: &Identity, f: &FileRef) -> Result<(u32, u32), String> {
+    let url = f.url.as_deref().or(f.thumb.as_deref()).ok_or("no URL")?;
+    fetch_into(ident, url, &full_name(&f.id), MAX_PX_FULL).await
+}
+
+/// Have `url` on disk as the PNG `png` (relative to the data root), no
+/// longer than `px` on a side: an earlier run's copy, else downloaded
+/// and converted. Resolves with its pixel size.
+async fn fetch_into(ident: &Identity, url: &str, png: &str, px: u32) -> Result<(u32, u32), String> {
+    if let Ok((head, _)) = fs_read(png, 0, 32).await {
         if let Some(size) = png_size(&head) {
             return Ok(size);
         }
     }
-    let url = f.fetch_url().ok_or("no URL")?;
     let body = download(ident, url).await?;
     if body.is_empty() {
         return Err("empty body".into());
@@ -116,10 +138,10 @@ async fn fetch(ident: &Identity, f: &FileRef) -> Result<(u32, u32), String> {
     if body.starts_with(b"<") {
         return Err("got a page, not a picture (session refused?)".into());
     }
-    let src = format!("{DIR}/{}.src", f.id);
+    let src = format!("{}.src", png.trim_end_matches(".png"));
     fs_write(&src, body, false).await.map_err(|e| format!("write: {}", e.message))?;
     let root = fs_root().map_err(|e| e.message.clone())?;
-    let out = run_job(&convert_cmd(&format!("{root}/{src}"), &format!("{root}/{png}")), None)
+    let out = run_job(&convert_cmd_px(&format!("{root}/{src}"), &format!("{root}/{png}"), px), None)
         .await
         .map_err(|e| format!("convert: {}", e.message))?;
     let _ = fs_remove(&src).await;
@@ -127,7 +149,7 @@ async fn fetch(ident: &Identity, f: &FileRef) -> Result<(u32, u32), String> {
         let _ = fs_remove(&png).await;
         return Err(format!("convert: exit {}: {}", out.status, out.output.trim()));
     }
-    let (head, _) = fs_read(&png, 0, 32).await.map_err(|e| format!("read back: {}", e.message))?;
+    let (head, _) = fs_read(png, 0, 32).await.map_err(|e| format!("read back: {}", e.message))?;
     png_size(&head).ok_or_else(|| "the converter wrote no PNG".to_string())
 }
 
@@ -169,6 +191,11 @@ fn is_slack(url: &str) -> bool {
 /// `sips` where there is one (macOS), ImageMagick otherwise. Exit 3 when
 /// the machine has neither.
 pub fn convert_cmd(src: &str, out: &str) -> String {
+    convert_cmd_px(src, out, MAX_PX)
+}
+
+/// [`convert_cmd`] with the longer side bounded by `px`.
+pub fn convert_cmd_px(src: &str, out: &str, px: u32) -> String {
     let (src, out) = (http::sq(src), http::sq(out));
     format!(
         concat!(
@@ -182,7 +209,7 @@ pub fn convert_cmd(src: &str, out: &str) -> String {
         ),
         src = src,
         out = out,
-        px = MAX_PX
+        px = px
     )
 }
 

@@ -601,6 +601,44 @@ find "$HOME" -name 'a1700000028000100-0.png' | grep -q . || fail "the giphy pict
 keys k; keys k; keys j; keys j
 [ "$(ncalls _img)" = 2 ] || fail "scrolling fetched a picture again"
 [ "$(screen | grep -c "$PH")" = 10 ] || fail "the picture rows did not survive a scroll"
+# z on a message with a picture opens it big: a float the size of the
+# window (200x50), the file itself (url_private, F1.gif) fetched once
+# and converted under its own name, drawn centred as placeholder rows
+# under an id of its own (400x50 at cell aspect 2: as wide as the float,
+# a row per 16 cells), the name and pixel size on the last row. On a message
+# without one, z says so. q closes the viewer; the view is still there.
+keys z
+screen_has 'no picture in this message' || fail "z on a text message did not say so: $(screen | tail -2)"
+$TMUX list-panes -a -F '#{pane_id} #{pane_mode}' | awk '/plugin-mode/ { print $1 }' >"$HOME/floats"
+i=0
+while :; do
+	keys k
+	keys z
+	VIEW=$($TMUX list-panes -a -F '#{pane_id} #{pane_mode}' | awk '/plugin-mode/ { print $1 }' |
+	    grep -vxF -f "$HOME/floats" | head -1)
+	[ -n "$VIEW" ] && break
+	i=$((i + 1))
+	[ "$i" -lt 15 ] || fail "z never found the picture message"
+done
+viewer() { $TMUX capture-pane -M -p -t "$VIEW"; }
+# The window's size less the border; the block's rows follow from the
+# width (16 cells of width per row of height, rounded).
+WANT=$($TMUX display-message -p -t "$VIEW" '#{window_width}x#{window_height}' | awk -Fx '{ printf "%dx%d", $1 - 2, $2 - 2 }')
+GOT=$($TMUX display-message -p -t "$VIEW" '#{pane_width}x#{pane_height}')
+[ "$GOT" = "$WANT" ] || fail "the viewer is $GOT, not the window's $WANT"
+ROWS=$(echo "$GOT" | awk -Fx '{ printf "%d", $1 / 16 + 0.5 }')
+until_ok 80 sh -c "[ \"\$($TMUX capture-pane -M -p -t $VIEW | grep -c '$PH')\" = $ROWS ]" ||
+    fail "viewer rows: $(viewer | grep -c "$PH"), not $ROWS ($($TMUX display-message -p -t "$VIEW" 'cell #{window_cell_width}x#{window_cell_height} pane #{pane_width}x#{pane_height} win #{window_width}x#{window_height}'); first row $(viewer | grep "$PH" | head -1 | grep -o "$PH" | wc -l | tr -d ' ') cells; lines $(viewer | grep -n "$PH" | cut -d: -f1 | tr '\n' ','); ids $($TMUX capture-pane -M -p -e -t "$VIEW" | grep "$PH" | grep -o "$(printf '\033')\[38;2;83;[0-9]*;[0-9]*m" | sort | uniq -c | tr -s ' \n' ' '); timeline rows $(screen | grep -c "$PH")): $(viewer | tail -1)"
+viewer | tail -1 | grep -q 'Nervous K and P.gif · 400×50' || fail "the viewer caption is off: $(viewer | tail -1)"
+viewer | tail -1 | grep -q 'q/Esc/z close' || fail "the viewer foot has no hint: $(viewer | tail -1)"
+[ "$(ncalls _img path /_img/F1.gif)" = 1 ] || fail "the file itself was not fetched once: $(ncalls _img path /_img/F1.gif)"
+find "$HOME" -name 'F1.full.png' | grep -q . || fail "no F1.full.png under $HOME"
+VID=$($TMUX capture-pane -M -p -e -t "$VIEW" | grep "$PH" | grep -o "$(printf '\033')\[38;2;83;[0-9]*;[0-9]*m" | sort -u)
+[ "$(echo "$VID" | wc -l | tr -d ' ')" = 1 ] || fail "the viewer's rows carry more than one id"
+$TMUX capture-pane -M -p -e -t "$FORM" | grep -q "$VID" && fail "the viewer reused a timeline picture's id"
+$TMUX send-keys -t "$VIEW" q; sleep 0.6
+$TMUX list-panes -a -F '#{pane_id}' | grep -qx "$VIEW" && fail "q did not close the viewer"
+[ "$(screen | grep -c "$PH")" = 10 ] || fail "the timeline lost its pictures behind the viewer"
 # Links: g goes to the oldest message, whose abbreviated label
 # ("example.com/.../docu…") is drawn as the whole url and whose "the
 # docs" label is followed by its url in brackets; y copies the same; G
