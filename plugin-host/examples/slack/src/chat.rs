@@ -974,7 +974,7 @@ pub fn open(st: &Shared, ch: Channel, thread: Option<String>, client: Option<u64
     let images_on = opt_flag("@slack-images", true);
     let cell_aspect = listkit::image::cell_aspect(window);
     let data_root = fs_root().unwrap_or_default();
-    crate::note_visit(st, &ch.id, thread.as_deref());
+    crate::note_visit(st, &ch.id, thread.as_deref(), "");
     {
         let mut s = st.borrow_mut();
         // The freshest channel row we have: the badge may have moved
@@ -1460,9 +1460,9 @@ fn load_older(st: &Shared) {
 /// thread, or back to the timeline) without reopening the float.
 fn switch(st: &Shared, thread: Option<String>, from_timeline: bool) {
     if let Some(root) = thread.as_deref() {
-        let cid = st.borrow().chat.as_ref().map(|c| c.channel.id.clone());
-        if let Some(cid) = cid {
-            crate::note_visit(st, &cid, Some(root));
+        let ctx = st.borrow().chat.as_ref().map(|c| (c.channel.id.clone(), c.msgs.iter().find(|m| m.ts == root).map(|m| m.text.clone()).unwrap_or_default()));
+        if let Some((cid, text)) = ctx {
+            crate::note_visit(st, &cid, Some(root), &text);
         }
     }
     let gen = next_gen();
@@ -1524,6 +1524,18 @@ pub(crate) enum After {
     Older,
     /// Show this picture big (viewer.rs).
     Expand(FileRef),
+    /// Pin what the view shows (the thread, else the channel) into the
+    /// sidebar's Pinned section, or unpin it.
+    Pin,
+}
+
+/// A thread's root text (the first message shown), for its pinned row;
+/// empty for a timeline.
+pub(crate) fn root_text(c: &Chat) -> String {
+    match c.thread {
+        Some(_) => c.msgs.first().map(|m| m.text.clone()).unwrap_or_default(),
+        None => String::new(),
+    }
 }
 
 /// The first picture a message carries: a shared file that is an image,
@@ -1940,6 +1952,8 @@ pub(crate) fn handle_key(c: &mut Chat, key: &str, mouse: Option<(u32, u32)>) -> 
             c.status = Some("marked read".into());
             After::Mark
         }
+        // p pins what is shown: the thread, else the channel.
+        "p" => After::Pin,
         "@" => {
             c.next_mention();
             After::None
@@ -2029,6 +2043,7 @@ pub(crate) fn menu_items(c: &Chat) -> String {
     items.push_str(&menu_item(NAME, "open in Slack app", "o", true));
     items.push_str(" ''");
     items.push_str(&menu_item(NAME, "mark read", "m", true));
+    items.push_str(&menu_item(NAME, if in_thread { "pin / unpin this thread" } else { "pin / unpin this channel" }, "p", true));
     items.push_str(&menu_item(NAME, "next mention of you", "@", (0..c.msgs.len()).any(|i| c.mentions_me(i))));
     items.push_str(&menu_item(NAME, "load older", "L", !in_thread));
     items.push_str(&menu_item(NAME, "the conversation opened before", "C-o", true));
@@ -2230,6 +2245,15 @@ fn run(st: &Shared, after: After) {
         After::Expand(f) => {
             let (client, pane) = st.borrow().chat.as_ref().map(|c| (c.client, c.pane)).unwrap_or((None, None));
             crate::viewer::open(st, f, client, pane);
+        }
+        After::Pin => {
+            let Some((channel, thread, text)) = st.borrow().chat.as_ref().map(|c| (c.channel.id.clone(), c.thread.clone(), root_text(c))) else { return };
+            let status = crate::toggle_pin(st, &channel, thread.as_deref(), &text);
+            let mut s = st.borrow_mut();
+            if let Some(c) = s.chat.as_mut() {
+                c.status = Some(status);
+            }
+            paint(&s);
         }
         After::OpenApp(ts) => {
             let (team, channel) = {

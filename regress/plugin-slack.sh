@@ -441,6 +441,27 @@ keys m
 until_ok 40 marks_grew "$BEFORE_M" || fail "m in Work did not mark #general read"
 until_ok 40 sh -c "$TMUX capture-pane -M -p -t $FORM | grep -q '· #general'" || fail "#general kept its badge (Work): $(screen | grep general)"
 cursor_row | grep -q '#random' || fail "the cursor is not on the row that took #general's place: $(cursor_row)"
+# --- p: pinned on top ---------------------------------------------------------
+# p on #random (in Work) pins it: a Pinned section appears above Unread
+# with a copy of its row, the status says so and the store keeps the
+# pin; the cursor stays on #random, so p again unpins it and the
+# section goes.
+keys p
+until_ok 20 screen_has '▪ Pinned  1' || fail "p drew no Pinned section: $(screen | head -3 | tr '\n' '~')"
+screen_has 'pinned #random (p again: unpin)' || fail "p said nothing: $(screen | tail -1)"
+# Two rows (the preview's header and the status name it too).
+[ "$(screen | grep -c '[·●!] #random')" = 2 ] || fail "#random is not in Pinned and in Work: $(screen | grep '#random' | tr '\n' '~')"
+PIN_AT=$(screen | grep -n '▪ Pinned' | head -1 | cut -d: -f1)
+UNR_AT=$(screen | grep -n '▪ Unread' | head -1 | cut -d: -f1)
+[ "$PIN_AT" -lt "$UNR_AT" ] || fail "Pinned ($PIN_AT) is not above Unread ($UNR_AT)"
+STORE=$(find "$HOME/.local/share" -name store.db -path '*/plugins/slack/*' 2>/dev/null | head -1)
+[ -n "$STORE" ] || fail "no slack store.db under $HOME"
+until_ok 20 sh -c "sqlite3 '$STORE' \"select value from settings where key = 'pins'\" | grep -q '\"channel\":\"C2\"'" || fail "the pin is not in the store: $(sqlite3 "$STORE" "select value from settings where key = 'pins'")"
+cursor_row | grep -q '#random' || fail "p moved the cursor: $(cursor_row)"
+keys p
+until_ok 20 screen_lacks '▪ Pinned' || fail "p again did not unpin: $(screen | grep Pinned)"
+screen_has 'unpinned #random' || fail "unpin said nothing: $(screen | tail -1)"
+until_ok 20 sh -c "sqlite3 '$STORE' \"select value from settings where key = 'pins'\" | grep -qx '\[\]'" || fail "the unpin did not reach the store: $(sqlite3 "$STORE" "select value from settings where key = 'pins'")"
 # --- w: a quiet channel -----------------------------------------------------
 # Every channel message toasts by default; w on #random quiets it: the
 # row says `quiet` before its age, the status says so, and a plain
@@ -505,8 +526,21 @@ ROW=$(cursor_row)
 keys j
 [ "$(cursor_row)" != "$ROW" ] || fail "j after Escape did not move the list cursor: $ROW"
 # n on a row is the hand-off, not compose: the form opens over the
-# sidebar with the previewed DM's message; Escape puts it away.
+# sidebar with the previewed DM's message; Escape puts it away. The
+# conversations read so far (l, Enter in the preview) sit in a Recent
+# section on top now, newest first: gg lands there, j walks on to the
+# DM in Unread.
+screen_has '▪ Recent  2' || fail "no Recent section of the thread and the channel read: $(screen | grep Recent)"
+REC_AT=$(screen | grep -n '▪ Recent' | head -1 | cut -d: -f1)
+UNR_AT=$(screen | grep -n '▪ Unread' | head -1 | cut -d: -f1)
+[ "$REC_AT" -lt "$UNR_AT" ] || fail "Recent ($REC_AT) is not above Unread ($UNR_AT)"
 keys g; keys g
+cursor_row | grep -q '· #general' || fail "gg is not on Recent's first row, the channel read last (l after Escape): $(cursor_row)"
+keys j
+cursor_row | grep -q '↳ #general' || fail "Recent's second row is not the thread read before it: $(cursor_row)"
+i=0
+while [ $i -lt 6 ] && ! cursor_row | grep -q '@Tejas'; do keys j; i=$((i + 1)); done
+cursor_row | grep -q '@Tejas' || fail "j did not reach the DM: $(cursor_row)"
 until_ok 40 screen_has 'are you around' || fail "the DM preview is not showing before n"
 keys n
 until_ok 40 form_open || fail "n in the sidebar opened no hand-off form"
@@ -850,6 +884,9 @@ until_ok 40 mode_open || fail "open with a ts opened no plugin mode"
 FORM=$(mode_pane)
 until_ok 60 screen_has 'in the thread' || fail "open with a ts did not show the thread"
 screen_has '· thread' || fail "the directly opened thread is not titled as one"
+# p in a thread pins the thread (the sidebar shows it below).
+keys p
+until_ok 20 screen_has 'pinned the thread in #general (p again: unpin)' || fail "p in the thread said nothing: $(screen | tail -1)"
 # Escape here opens the channel's timeline instead of closing.
 keys Escape
 until_ok 40 screen_has 'morning' || fail "Escape from a directly opened thread did not open the timeline"
@@ -933,6 +970,11 @@ FORM=$(mode_pane)
 until_ok 40 screen_has 'by sections' || fail "the sidebar did not draw"
 cursor_row | grep -q '#general' || fail "the sidebar did not open on #general, the conversation opened last: $(cursor_row)"
 until_ok 40 screen_has '· thread' || fail "the preview does not show the thread opened last: $(screen | head -1)"
+# The thread pinned from the channel view heads the sidebar, named by
+# its root; the Recent section has it first too, as the last opened.
+screen_has '▪ Pinned  1' || fail "the thread pinned in the view is not in a Pinned section: $(screen | head -4 | tr '\n' '~')"
+screen | grep '↳ #general' | head -1 | grep -q 'line one line two' || fail "the pinned thread row is not named by its root: $(screen | grep '↳' | head -1)"
+screen_has '▪ Recent' || fail "no Recent section when the sidebar reopens"
 until_ok 40 screen_has 'in the thread (edited)' || fail "the preview's thread lacks its reply: $(screen | head -8)"
 # Every jump closes the view and opens another: a new mode pane each time.
 view_swapped() { [ -n "$(mode_pane)" ] && [ "$(mode_pane)" != "$OLD" ]; }

@@ -68,6 +68,39 @@ pub fn notify_all() -> bool {
     get_option("@slack-notify").ok().is_none_or(|v| v.trim() != "slack")
 }
 
+/// `p`: pin a conversation into the sidebar's Pinned section, or take
+/// it out again when it is there. `text` is a thread's root, for the
+/// row. The answer is the status to show; the sidebar is rebuilt when
+/// it is open.
+pub fn toggle_pin(st: &Shared, channel: &str, thread: Option<&str>, text: &str) -> String {
+    let status = {
+        let mut s = st.borrow_mut();
+        let label = s.channel(channel).map(|c| s.channel_label(c)).unwrap_or_else(|| channel.to_string());
+        let what = match thread {
+            Some(_) => format!("the thread in {label}"),
+            None => label,
+        };
+        match s.pins.iter().position(|p| p.channel == channel && p.thread.as_deref() == thread) {
+            Some(i) => {
+                s.pins.remove(i);
+                format!("unpinned {what}")
+            }
+            None => {
+                s.pins.push(Pin { channel: channel.to_string(), thread: thread.map(str::to_string), text: text.to_string() });
+                format!("pinned {what} (p again: unpin)")
+            }
+        }
+    };
+    let json = serde_json::to_string(&st.borrow().pins).unwrap_or_default();
+    spawn(async move { store::set_setting(PINS_SETTING, &json).await });
+    let mut s = st.borrow_mut();
+    if s.side.is_some() {
+        sidebar::rebuild(&mut s);
+        sidebar::render(&mut s);
+    }
+    status
+}
+
 /// `@slack-bridge-me`: on (`1`, `on`, `yes`, `true`) pushes the user's own
 /// Slack messages in a bound conversation to the bound agent too. Off by
 /// default: what the user types in Slack is for the people there.
@@ -78,15 +111,42 @@ pub fn bridge_me() -> bool {
 /// The settings key holding the history of conversations opened (C-o / Tab).
 pub const VISITS_SETTING: &str = "visits";
 const VISITS_MAX: usize = 50;
+/// The settings key holding the pinned conversations (p).
+pub const PINS_SETTING: &str = "pins";
+
+/// A conversation pinned into the sidebar's Pinned section: a channel,
+/// or a thread of one (its root's text names the row).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Pin {
+    pub channel: String,
+    #[serde(default)]
+    pub thread: Option<String>,
+    #[serde(default)]
+    pub text: String,
+}
 
 /// A conversation opened: the channel view on a channel or a thread, a
 /// thread opened in the sidebar's preview, a preview read (`l`).
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Visit {
     pub channel: String,
     #[serde(default)]
     pub thread: Option<String>,
+    /// A thread's root text, for its row in the sidebar's Recent
+    /// section; empty until a view had it in hand.
+    #[serde(default)]
+    pub text: String,
 }
+
+/// The same conversation, whatever the text recorded.
+impl PartialEq for Visit {
+    fn eq(&self, o: &Visit) -> bool {
+        self.channel == o.channel && self.thread == o.thread
+    }
+}
+
+/// How many conversations the sidebar's Recent section lists.
+pub const RECENT_MAX: usize = 6;
 
 /// How soon after one Threads-view fetch the feed may ask for another.
 const THREADS_DEBOUNCE_MS: u64 = 3000;
@@ -183,6 +243,8 @@ pub struct State {
     /// Channels `w` toggled: quiet under `@slack-notify all`, watched
     /// (every message) under `slack`.
     pub watched: HashSet<String>,
+    /// The conversations `p` pinned, in the order pinned. Kept in the store.
+    pub pins: Vec<Pin>,
     /// The conversations opened, oldest first; `visit_at == visits.len()`
     /// is the present, less after C-o. Kept in the store.
     pub visits: Vec<Visit>,
@@ -327,6 +389,7 @@ impl Plugin for Slack {
             toasted: feed::Recent::default(),
             names_pending: HashSet::new(),
             watched: HashSet::new(),
+            pins: Vec::new(),
             visits: Vec::new(),
             visit_at: 0,
             jumping: false,
@@ -430,6 +493,9 @@ async fn boot(st: Shared) {
     if let Some(json) = store::setting(WATCH_SETTING).await {
         let ids: Vec<String> = serde_json::from_str(&json).unwrap_or_default();
         st.borrow_mut().watched = ids.into_iter().collect();
+    }
+    if let Some(json) = store::setting(PINS_SETTING).await {
+        st.borrow_mut().pins = serde_json::from_str(&json).unwrap_or_default();
     }
     if let Some(json) = store::setting(VISITS_SETTING).await {
         let visits: Vec<Visit> = serde_json::from_str(&json).unwrap_or_default();
@@ -1093,14 +1159,18 @@ pub async fn post_message(st: &Shared, channel: &str, text: &str, thread_ts: Opt
 /// (an older identical entry goes, so a conversation is in it once),
 /// kept in the store so it survives closing the views. A jump (C-o /
 /// Tab) opens a conversation without recording it.
-pub fn note_visit(st: &Shared, channel: &str, thread: Option<&str>) {
+pub fn note_visit(st: &Shared, channel: &str, thread: Option<&str>, text: &str) {
     let json = {
         let mut s = st.borrow_mut();
         if s.jumping {
             s.jumping = false;
             return;
         }
-        let v = Visit { channel: channel.to_string(), thread: thread.map(str::to_string) };
+        let mut v = Visit { channel: channel.to_string(), thread: thread.map(str::to_string), text: text.to_string() };
+        if v.text.is_empty() {
+            // The root's text, if an earlier visit had it.
+            v.text = s.visits.iter().find(|x| **x == v).map(|x| x.text.clone()).unwrap_or_default();
+        }
         s.visits.retain(|x| *x != v);
         s.visits.push(v);
         if s.visits.len() > VISITS_MAX {
@@ -1110,6 +1180,12 @@ pub fn note_visit(st: &Shared, channel: &str, thread: Option<&str>) {
         serde_json::to_string(&s.visits).unwrap_or_default()
     };
     spawn(async move { store::set_setting(VISITS_SETTING, &json).await });
+    // The sidebar's Recent section lists the history: redraw it.
+    let mut s = st.borrow_mut();
+    if s.side.is_some() {
+        sidebar::rebuild(&mut s);
+        sidebar::render(&mut s);
+    }
 }
 
 /// C-o (back) / Tab (forward): the conversation opened before / after
@@ -1123,7 +1199,7 @@ pub fn jump_visit(st: &Shared, back: bool, client: Option<u64>, pane: Option<u32
         let n = s.visits.len();
         let mut at = s.visit_at.min(n);
         if back && at >= n {
-            let viewing = s.chat.as_ref().map(|c| Visit { channel: c.channel.id.clone(), thread: c.thread.clone() });
+            let viewing = s.chat.as_ref().map(|c| Visit { channel: c.channel.id.clone(), thread: c.thread.clone(), text: String::new() });
             if viewing.is_some() && s.visits.last() == viewing.as_ref() {
                 at = n.saturating_sub(1);
             }
@@ -1346,6 +1422,7 @@ mod tests {
             toasted: feed::Recent::default(),
             names_pending: HashSet::new(),
             watched: HashSet::new(),
+            pins: Vec::new(),
             visits: Vec::new(),
             visit_at: 0,
             jumping: false,

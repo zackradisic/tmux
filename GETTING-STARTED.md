@@ -559,7 +559,10 @@ instead, with `w` watching a channel. Messages newer than the read mark that
 are not yours carry a red bar in the gutter, in every view, under the
 `new messages` line; `C-o` and `Tab` reopen the
 conversations you opened before and after this one, a history that survives
-closing the float (the sidebar opens on its newest entry); `N` hands everything
+closing the float (the sidebar opens on its newest entry and lists the last
+few in a **Recent** section); `p` pins a row, a thread's too, into a **Pinned**
+section on top of the sidebar (`p` again unpins; in the channel view `p` pins
+what is shown); `N` hands everything
 the preview shows to a new agent, for a summary. `Enter` on a row opens the **channel view**: a
 transcript with day separators, the new-messages line, reactions and emoji
 drawn as glyphs (Slack's names, skin tones and your workspace's custom aliases

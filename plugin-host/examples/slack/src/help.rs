@@ -40,11 +40,16 @@ pick: the sidebar, as a floating picker.
   j/k h       move, up a level (z: fold)   n   new agent from the preview
   l / Right   read the preview             @   go to where you were mentioned
   ?           every key (R: refresh)       /   search (# channel, @ user,
-  C-o / Tab   back / forward through the        ! unread|mention|dm|thread)
-              conversations you opened      w   quiet this channel's toasts
-  N           new agent from the preview        (w again: every message)
+  C-o / Tab   back / forward through the        ! unread|mention|dm|thread
+              conversations you opened          |pinned|recent)
+  N           new agent from the preview    w   quiet this channel's toasts
+  p           pin the row on top (p again:      (w again: every message)
+              unpin; a thread too)
 
-An Unread section sits above your own sections: every channel and DM
+Pinned sits on top: the rows p pinned, channels and threads alike,
+copies of their rows elsewhere, in the order pinned (p on a Pinned row
+unpins it). Recent lists the conversations opened last, newest first,
+the history C-o and Tab walk. An Unread section follows: every channel and DM
 with something new, DMs first, then channels and threads in the order
 of the badges; the channel rows stay in their own sections too. A
 thread you follow that has replies you have not read (what Slack's
@@ -99,6 +104,7 @@ open: the channel view.
   z    the message's picture, big (a click on a picture does the same)
   o    open in the Slack app   y          copy the message (or selection)
   m    mark read               Y          copy the permalink
+  p    pin / unpin this conversation (the thread shown, else the channel)
   @    next mention of you     E          edit your message (Enter saves)
   R    refetch                 v          select from here (j/k extend)
   b    back to the sidebar     n          new agent from the message(s)

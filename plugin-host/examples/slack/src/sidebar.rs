@@ -2,6 +2,10 @@
 //! grouped the way the user's own Slack sidebar is (its sections, then
 //! channels, then DMs), each row carrying its badge, the preview column
 //! showing the channel's recent messages. Enter opens the channel view.
+//! A Pinned section sits on top with the conversations `p` pinned
+//! (channels, and threads with their root's first words), each a copy
+//! of its row elsewhere; `p` again takes a pin out. A Recent section
+//! under it lists the conversations opened last, newest first.
 //!
 //! The preview is the channel view itself, embedded: a `chat::Chat` laid
 //! out at the column's width (so nothing is clipped) and drawn by this
@@ -120,6 +124,7 @@ pub fn keys() -> KeyTable {
         .with("agent_all", "N", "rows", "new agent from everything the preview shows (a summary of the channel)")
         .with("mention", "@", "rows", "go to where you were mentioned (the preview takes the keyboard; @ again: the next)")
         .with("watch", "w", "rows", "quiet this channel's toasts (only DMs and mentions), w again: every message")
+        .with("pin", "p", "rows", "pin the row (a thread too) into the Pinned section on top; p again: unpin")
         .with("menu", "Space", "rows", "the action menu")
         .with("view", "v", "picker", "sections / unread / all")
         .with("refresh", "R", "picker", "fetch channels, sections, users and badges again")
@@ -137,7 +142,7 @@ pub fn sigils() -> Vec<SigilSpec> {
     vec![
         SigilSpec::new('#', "channel", false, Some("c"), "narrow to a channel (prefix)"),
         SigilSpec::new('@', "user", false, Some("u"), "narrow to a DM with a user (prefix)"),
-        SigilSpec::new('!', "state", false, None, "narrow to a state: unread, mention, dm, muted, starred"),
+        SigilSpec::new('!', "state", false, None, "narrow to a state: unread, mention, dm, muted, starred, pinned, recent"),
     ]
 }
 
@@ -211,6 +216,14 @@ pub fn open(st: &Shared, client: Option<u64>, pane: Option<u32>) {
 fn land_on_last_visit(s: &mut State) {
     let Some(v) = s.visits.last().cloned() else { return };
     let Some(side) = s.side.as_mut() else { return };
+    // Its Recent row first: the newest visit heads that section.
+    let recent = match &v.thread {
+        Some(root) => format!("{RECENT_PREFIX}{THREAD_PREFIX}{}/{root}", v.channel),
+        None => format!("{RECENT_PREFIX}{}", v.channel),
+    };
+    if side.engine.select_key(&recent) {
+        return;
+    }
     if let Some(root) = &v.thread {
         if side.engine.select_key(&format!("{THREAD_PREFIX}{}/{root}", v.channel)) {
             return;
@@ -454,6 +467,10 @@ pub fn on_image(st: &Shared) {
 /// The key prefix of a row in the Unread section, which repeats a
 /// channel that has a row in its own section too.
 const UNREAD_PREFIX: &str = "u:";
+/// The key prefix of a row in the Pinned section: a copy as well.
+const PIN_PREFIX: &str = "p:";
+/// The key prefix of a row in the Recent section: a copy as well.
+const RECENT_PREFIX: &str = "r:";
 /// The key prefix of a thread row (the Threads view's unread threads):
 /// `t:<channel>/<root ts>`.
 const THREAD_PREFIX: &str = "t:";
@@ -461,7 +478,7 @@ const THREAD_PREFIX: &str = "t:";
 /// The row behind a key, whichever section it is in: a channel's id, or
 /// `t:<channel>/<root>` for a thread.
 fn row_id(key: &str) -> &str {
-    key.strip_prefix(UNREAD_PREFIX).unwrap_or(key)
+    key.strip_prefix(UNREAD_PREFIX).or_else(|| key.strip_prefix(PIN_PREFIX)).or_else(|| key.strip_prefix(RECENT_PREFIX)).unwrap_or(key)
 }
 
 /// The channel id behind a row key: a channel row's own, a thread row's
@@ -676,6 +693,104 @@ fn thread_node(s: &State, t: &Thread, depth: u8, now: u64) -> Node {
     n
 }
 
+/// A thread's root text as the sidebar knows it: the Threads view's
+/// row, the preview's fetch of it, the channel preview's copy of the
+/// root, else what the caller recorded (a pin's or a visit's).
+fn thread_text(s: &State, side: &Sidebar, channel: &str, root: &str, recorded: &str) -> String {
+    view_thread(s, channel, root)
+        .map(|t| t.root.text.clone())
+        .or_else(|| side.threads.get(&thread_key(channel, root)).and_then(|v| v.first()).map(|m| m.text.clone()))
+        .or_else(|| side.previews.get(channel).and_then(|v| v.iter().find(|m| m.ts == root)).map(|m| m.text.clone()))
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| recorded.to_string())
+}
+
+/// A thread with nothing new as a row of the Pinned or Recent section:
+/// the dim dot, `↳`, the channel and the root's first words; the right
+/// column is how long ago the thread last spoke, as far as the preview
+/// has fetched it, else when it started. The key is a thread row's,
+/// for the caller to prefix.
+fn quiet_thread_node(s: &State, side: &Sidebar, channel: &str, root: &str, text: &str, depth: u8, now: u64) -> Node {
+    let mut n = Node::item(format!("{THREAD_PREFIX}{channel}/{root}"), depth);
+    let label = s.channel(channel).map(|c| s.channel_label(c)).unwrap_or_else(|| channel.to_string());
+    let mut cells: Vec<Styled> = vec![('·', ST_DIM), (' ', 0)];
+    cells.extend(plain_cells("↳ ", ST_DIM));
+    cells.extend(plain_cells(&label, ST_DIM));
+    let mut snippet = clip(&listkit::text::one_line(&s.names.with(|nm| mrkdwn::plain(text, nm))), 36);
+    if snippet.trim().is_empty() {
+        snippet = "(thread)".into();
+    }
+    cells.extend(plain_cells(&format!("  {snippet}"), ST_DIM));
+    n.left = cells;
+    let last = side.threads.get(&thread_key(channel, root)).and_then(|v| v.last()).map(|m| m.ts.as_str()).unwrap_or(root);
+    n.right = plain_cells(&format!("{:>4}", timefmt::age(last, now)), ST_DIM);
+    n.haystack = format!("{label} {snippet}");
+    if let Some(c) = s.channel(channel) {
+        if c.kind.is_dm() {
+            n.tokens.push(('@', label.trim_start_matches('@').to_string()));
+            n.tokens.push(('!', "dm".into()));
+        } else {
+            n.tokens.push(('#', c.name.clone()));
+        }
+    }
+    n.tokens.push(('!', "thread".into()));
+    n.dim = true;
+    n.preview = Preview::None;
+    n
+}
+
+/// A conversation's row as a copy in the Pinned or Recent section: a
+/// channel's as in its section, a thread's as in Unread while it has
+/// new replies, else the quiet thread row. None when the channel is
+/// not shown any more.
+fn copy_node(s: &State, side: &Sidebar, chans: &[&Channel], prefix: &str, state: &str, channel: &str, thread: Option<&str>, text: &str, now: u64) -> Option<Node> {
+    let c = chans.iter().copied().find(|c| c.id == channel)?;
+    let mut n = match thread {
+        None => channel_node(s, side, c, 1, now),
+        Some(root) => match view_thread(s, &c.id, root) {
+            Some(t) => thread_node(s, t, 1, now),
+            None => quiet_thread_node(s, side, &c.id, root, &thread_text(s, side, &c.id, root, text), 1, now),
+        },
+    };
+    n.key = format!("{prefix}{}", n.key);
+    n.tokens.push(('!', state.into()));
+    Some(n)
+}
+
+/// A section of copies under its header, or nothing.
+fn copies_section(key: &str, name: &str, mut rows: Vec<Node>) -> Vec<Node> {
+    if rows.is_empty() {
+        return rows;
+    }
+    let unread = rows.iter().filter(|n| n.tokens.iter().any(|(g, t)| *g == '!' && t == "unread")).count();
+    let mut nodes = vec![group_node(key, name, rows.len(), unread)];
+    nodes.append(&mut rows);
+    nodes
+}
+
+/// The Pinned section: the conversations `p` pinned, in that order.
+fn pinned_nodes(s: &State, side: &Sidebar, chans: &[&Channel], now: u64) -> Vec<Node> {
+    let rows = s
+        .pins
+        .iter()
+        .filter_map(|p| copy_node(s, side, chans, PIN_PREFIX, "pinned", &p.channel, p.thread.as_deref(), &p.text, now))
+        .collect();
+    copies_section("sec:pinned", "Pinned", rows)
+}
+
+/// The Recent section: the conversations opened last (the history C-o
+/// walks), newest first.
+fn recent_nodes(s: &State, side: &Sidebar, chans: &[&Channel], now: u64) -> Vec<Node> {
+    let rows = s
+        .visits
+        .iter()
+        .rev()
+        .filter_map(|v| copy_node(s, side, chans, RECENT_PREFIX, "recent", &v.channel, v.thread.as_deref(), &v.text, now))
+        .take(crate::RECENT_MAX)
+        .collect();
+    copies_section("sec:recent", "Recent", rows)
+}
+
 /// A row with something new: a channel or DM with unread messages, or
 /// a thread with unread replies.
 #[derive(Clone, Copy)]
@@ -735,6 +850,8 @@ fn build_nodes(s: &State) -> Vec<Node> {
             }
         }
         View::All => {
+            nodes.append(&mut pinned_nodes(s, side, &chans, now));
+            nodes.append(&mut recent_nodes(s, side, &chans, now));
             let mut ch: Vec<&Channel> = chans.iter().copied().filter(|c| !c.kind.is_dm()).collect();
             ch.sort_by_key(|c| c.name.to_lowercase());
             let mut dm: Vec<&Channel> = chans.iter().copied().filter(|c| c.kind.is_dm()).collect();
@@ -743,10 +860,13 @@ fn build_nodes(s: &State) -> Vec<Node> {
             group(&mut nodes, "sec:dms", "Direct messages", &dm);
         }
         View::Sections => {
-            // Everything with something new first: DMs, then channels
-            // and unread threads in rank order. The channel rows stay in
+            // What is pinned first, then what was opened last, then
+            // everything with something new: DMs, then channels and
+            // unread threads in rank order. The channel rows stay in
             // their own sections below as well, so these carry a key
             // prefix of their own; a thread has no other row.
+            nodes.append(&mut pinned_nodes(s, side, &chans, now));
+            nodes.append(&mut recent_nodes(s, side, &chans, now));
             let unread = fresh_rows(s, &chans);
             if !unread.is_empty() {
                 nodes.push(group_node("sec:unread", "Unread", unread.len(), 0));
@@ -1142,6 +1262,11 @@ fn open_menu(st: &Shared) {
                 (false, false) => "toast every message here",
             };
             items.push_str(&menu_item(NAME, watch_label, &k("watch"), row && thread_row.is_none()));
+            let pinned = sel.as_ref().is_some_and(|c| {
+                let root = thread_row.as_ref().map(|(_, r)| r.as_str());
+                s.pins.iter().any(|p| p.channel == c.id && p.thread.as_deref() == root)
+            });
+            items.push_str(&menu_item(NAME, if pinned { "unpin the row" } else { "pin the row (on top)" }, &k("pin"), row));
             items.push_str(&menu_item(NAME, "go to your mention", &k("mention"), row && mention && readable));
             items.push_str(&menu_item(NAME, if thread_row.is_some() { "reply in the thread" } else { "compose" }, &k("compose"), row));
             items.push_str(&menu_item(NAME, "new agent from the preview", &k("agent"), row && readable));
@@ -1402,8 +1527,14 @@ fn preview_after(st: &Shared, took: Took) {
             return;
         }
         Took::Focus => {
-            let thread = st.borrow().side.as_ref().and_then(|sd| sd.thread.clone());
-            crate::note_visit(st, &channel.id, thread.as_deref());
+            let (thread, text) = st
+                .borrow()
+                .side
+                .as_ref()
+                .and_then(|sd| sd.preview.as_ref())
+                .map(|c| (c.thread.clone(), chat::root_text(c)))
+                .unwrap_or_default();
+            crate::note_visit(st, &channel.id, thread.as_deref(), &text);
             After::None
         }
         Took::Chat(a) => a,
@@ -1426,7 +1557,15 @@ fn preview_after(st: &Shared, took: Took) {
         // Enter on a message: its thread, in the preview itself; Escape
         // (Back) brings the timeline back. The keyboard stays.
         After::Switch(Some(root), _) => {
-            crate::note_visit(st, &channel.id, Some(&root));
+            let text = st
+                .borrow()
+                .side
+                .as_ref()
+                .and_then(|sd| sd.preview.as_ref())
+                .and_then(|c| c.msgs.iter().find(|m| m.ts == root))
+                .map(|m| m.text.clone())
+                .unwrap_or_default();
+            crate::note_visit(st, &channel.id, Some(&root), &text);
             let id = {
                 let mut s = st.borrow_mut();
                 let Some(side) = s.side.as_mut() else { return };
@@ -1614,6 +1753,20 @@ fn preview_after(st: &Shared, took: Took) {
         }
         // E is taken before the view sees it (Took::Edit).
         After::Edit(..) => {}
+        After::Pin => {
+            let (thread, text) = st
+                .borrow()
+                .side
+                .as_ref()
+                .and_then(|sd| sd.preview.as_ref())
+                .map(|c| (c.thread.clone(), chat::root_text(c)))
+                .unwrap_or_default();
+            let status = crate::toggle_pin(st, &channel.id, thread.as_deref(), &text);
+            let mut s = st.borrow_mut();
+            if let Some(c) = s.side.as_mut().and_then(|sd| sd.preview.as_mut()) {
+                c.status = Some(status);
+            }
+        }
         After::Jump(back) => {
             if crate::jump_visit(st, back, client, pane) {
                 return;
@@ -1734,6 +1887,8 @@ fn execute(st: &Shared, outcome: Outcome) {
         Close,
         /// C-o / Tab: the conversation opened before / after.
         Jump(bool),
+        /// p: the rows to pin or unpin (a thread with its root's text).
+        Pin(Vec<(Channel, Option<String>, String)>),
     }
     let after = {
         let mut s = st.borrow_mut();
@@ -1798,6 +1953,32 @@ fn execute(st: &Shared, outcome: Outcome) {
                         After::Mark(ids)
                     }
                     "back" | "forward" => After::Jump(action == "back"),
+                    "pin" => {
+                        if rows.is_empty() {
+                            return;
+                        }
+                        let side = s.side.as_ref();
+                        let pins = rows
+                            .into_iter()
+                            .map(|(c, thread)| {
+                                let text = thread
+                                    .as_deref()
+                                    .map(|root| {
+                                        view_thread(&s, &c.id, root)
+                                            .map(|t| t.root.text.clone())
+                                            .or_else(|| side.and_then(|sd| sd.threads.get(&thread_key(&c.id, root))).and_then(|v| v.first()).map(|m| m.text.clone()))
+                                            .or_else(|| side.and_then(|sd| sd.previews.get(&c.id)).and_then(|v| v.iter().find(|m| m.ts == root)).map(|m| m.text.clone()))
+                                            .unwrap_or_default()
+                                    })
+                                    .unwrap_or_default();
+                                (c, thread, text)
+                            })
+                            .collect();
+                        if let Some(side) = s.side.as_mut() {
+                            side.engine.clear_marks();
+                        }
+                        After::Pin(pins)
+                    }
                     "watch" => {
                         let mut on = Vec::new();
                         let mut off = Vec::new();
@@ -1889,6 +2070,17 @@ fn execute(st: &Shared, outcome: Outcome) {
             }
         }
         After::Menu => open_menu(st),
+        After::Pin(rows) => {
+            let mut status = Vec::new();
+            for (c, thread, text) in &rows {
+                status.push(crate::toggle_pin(st, &c.id, thread.as_deref(), text));
+            }
+            let mut s = st.borrow_mut();
+            if let Some(side) = s.side.as_mut() {
+                side.engine.status = Some(status.join(" · "));
+            }
+            render(&mut s);
+        }
         After::Jump(back) => {
             let (client, pane) = st.borrow().side.as_ref().map(|sd| (sd.client, sd.pane)).unwrap_or((None, None));
             if crate::jump_visit(st, back, client, pane) {
