@@ -101,7 +101,7 @@ jobs:
             runner: ubuntu-22.04-arm
             make: make
           - name: darwin-arm64
-            runner: macos-14
+            runner: macos-15
             make: gmake
     steps:
       - uses: actions/checkout@v4
