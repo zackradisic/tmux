@@ -330,7 +330,7 @@ fn draw_preview(c: &chat::Chat, focused: bool, label: String, topic: Vec<Styled>
     } else if let Some(st) = &c.status {
         plain_cells(&clip(st, pw.saturating_sub(1)), ST_CYAN)
     } else if c.picker.is_some() {
-        plain_cells(&clip(react::hints(), pw.saturating_sub(1)), ST_DIM)
+        plain_cells(&clip(react::hints(c.picker.as_ref().is_some_and(|p| p.insert)), pw.saturating_sub(1)), ST_DIM)
     } else if let Some(st) = &c.status {
         plain_cells(&clip(st, pw.saturating_sub(1)), ST_CYAN)
     } else if focused {

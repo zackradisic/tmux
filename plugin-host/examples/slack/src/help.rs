@@ -158,13 +158,16 @@ goes in as is, newlines kept.
 
 e opens the reaction picker under the messages: a grid of every emoji
 in Slack's order under its category headers, the ones you reacted with
-last on top. Type to narrow it (fir -> fire, firefighter, ...; an
-alias or a title word finds it too), the arrows or C-h/j/k/l, Tab
-and BTab move over it, Enter reacts with the highlighted one and a click reacts at
-once; the search line names the pick at its right. A name typed in
-full goes as typed, +1::skin-tone-3 included, and a name the grid does
-not know is sent as typed when nothing matches. C-t cycles the skin
-tone the grid shows and sends, and it is remembered. Escape closes it.
+last on top. It works like vim: h/j/k/l (the arrows, Tab) move over
+the grid, g/G first/last, J/K page; i (or /) enters insert mode, where
+typing narrows the grid (fir -> fire, firefighter, ...; an alias or a
+title word finds it too) and Escape goes back to normal mode with the
+narrowed grid kept. Enter reacts with the highlighted one in either
+mode, a click reacts at once; the search line names the pick at its
+right. A name typed in full goes as typed, +1::skin-tone-3 included,
+and a name the grid does not know is sent as typed when nothing
+matches. t (C-t) cycles the skin tone the grid shows and sends, and it
+is remembered. Escape (or q) in normal mode closes it.
 
 A shared picture (PNG, JPEG, a GIF's first frame), or a /giphy post's,
 is drawn under its clip or caption line in Ghostty or kitty;

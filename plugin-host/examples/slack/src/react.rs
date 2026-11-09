@@ -2,9 +2,12 @@
 //! Slack's order under its category headers, with the reactions used
 //! last on top; typing narrows it to the names that match (`fir` ->
 //! 🔥 and the rest, the exact name first, then the names that start
-//! so, then the ones that contain it, then the titles), the arrows,
-//! C-h/j/k/l, Tab and the mouse move over it, Enter reacts with the highlighted
-//! one and a click reacts at once. A precise name goes in as typed:
+//! so, then the ones that contain it, then the titles). It opens in
+//! normal mode, like vim: h/j/k/l (the arrows, Tab too) move over the
+//! grid, `i` or `/` enter insert mode where keys type into the search,
+//! Escape leaves it (the narrowed grid stays), Escape again closes.
+//! Enter reacts with the highlighted one in either mode and a click
+//! reacts at once. A precise name goes in as typed:
 //! `+1::skin-tone-3` narrows to 👍 and Enter sends that very name; a
 //! name the grid does not know (an image-only custom emoji, say) is
 //! sent as typed too when nothing matches. C-t cycles the skin tone
@@ -77,6 +80,8 @@ pub struct Picker {
     pub items: Vec<Item>,
     /// The names reacted with last, newest first.
     pub recent: Vec<String>,
+    /// Insert mode: keys type into the search (`i`); else they move.
+    pub insert: bool,
 }
 
 /// The search text as the matcher sees it: no colons around it, lower
@@ -185,7 +190,7 @@ fn hits(q: &str, tone: u8) -> Vec<Item> {
 
 impl Picker {
     pub fn open(ts: String, recent: Vec<String>, tone: u8) -> Self {
-        let mut p = Picker { ts, query: String::new(), cursor: 0, top: 0, tone, items: Vec::new(), recent };
+        let mut p = Picker { ts, query: String::new(), cursor: 0, top: 0, tone, items: Vec::new(), recent, insert: false };
         p.refresh();
         p
     }
@@ -339,12 +344,52 @@ impl Picker {
         true
     }
 
+    /// Cycle the skin tone: off, 2..=6, off.
+    fn cycle_tone(&mut self) -> Step {
+        self.tone = match self.tone {
+            0 | 1 => 2,
+            6 => 0,
+            t => t + 1,
+        };
+        let keep = self.cursor;
+        let top = self.top;
+        self.refresh();
+        self.cursor = keep.min(self.items.len().saturating_sub(1));
+        self.top = top;
+        Step::Tone(self.tone)
+    }
+
     /// A key while the picker is open; `width` is the cells it draws
-    /// in, `grid_rows` the grid rows on screen.
+    /// in, `grid_rows` the grid rows on screen. Normal mode: h/j/k/l
+    /// and the arrows move, g/G first/last, i or / insert, t the skin
+    /// tone, Escape closes. Insert mode: keys type into the search, the
+    /// arrows still move, Escape goes back to normal mode.
     pub fn key(&mut self, key: &str, width: usize, grid_rows: usize) -> Step {
         let cols = Self::cols(width);
+        if !self.insert {
+            match key {
+                "i" | "/" => {
+                    self.insert = true;
+                    return Step::None;
+                }
+                "h" => return self.key("Left", width, grid_rows),
+                "j" => return self.key("Down", width, grid_rows),
+                "k" => return self.key("Up", width, grid_rows),
+                "l" => return self.key("Right", width, grid_rows),
+                "g" => return self.key("Home", width, grid_rows),
+                "G" => return self.key("End", width, grid_rows),
+                "J" => return self.key("NPage", width, grid_rows),
+                "K" => return self.key("PPage", width, grid_rows),
+                "t" => return self.cycle_tone(),
+                "Escape" | "q" => return Step::Close,
+                _ => {}
+            }
+        }
         match key {
-            "Escape" => return Step::Close,
+            "Escape" => {
+                self.insert = false;
+                return Step::None;
+            }
             "Enter" => {
                 if let Some(name) = self.pick_name() {
                     return Step::Pick(name);
@@ -378,21 +423,9 @@ impl Picker {
             }
             "Home" => self.step(-(self.items.len() as isize)),
             "End" => self.step(self.items.len() as isize),
-            "C-t" => {
-                self.tone = match self.tone {
-                    0 | 1 => 2,
-                    6 => 0,
-                    t => t + 1,
-                };
-                let keep = self.cursor;
-                let top = self.top;
-                self.refresh();
-                self.cursor = keep.min(self.items.len().saturating_sub(1));
-                self.top = top;
-                return Step::Tone(self.tone);
-            }
+            "C-t" => return self.cycle_tone(),
             _ => {
-                if !self.edit(key) {
+                if !self.insert || !self.edit(key) {
                     return Step::None;
                 }
                 self.refresh();
@@ -445,7 +478,11 @@ impl Picker {
         let mut out: Vec<Vec<Styled>> = Vec::with_capacity(height);
         let mut line = plain_cells("react :", ST_DIM);
         line.extend(plain_cells(&self.query, 0));
-        line.push((' ', ST_INVERT));
+        if self.insert {
+            line.push((' ', ST_INVERT));
+        } else if self.query.is_empty() {
+            line.extend(plain_cells(" i to search", ST_DIM));
+        }
         let tag = match self.selected() {
             Some(_) => {
                 let name = self.pick_name().unwrap_or_default();
@@ -496,9 +533,13 @@ impl Picker {
     }
 }
 
-/// The foot's hint while the picker is open.
-pub fn hints() -> &'static str {
-    "type to search · arrows / C-hjkl move · Enter react · click reacts · C-t skin tone · Esc close"
+/// The foot's hint while the picker is open, for its mode.
+pub fn hints(insert: bool) -> &'static str {
+    if insert {
+        "-- INSERT -- type to search · Enter react · Esc back to normal"
+    } else {
+        "h/j/k/l move · i search · Enter react · click reacts · t skin tone · Esc close"
+    }
 }
 
 /// Put `name` (its skin tone dropped) at the head of the recent list.
@@ -516,6 +557,53 @@ pub fn note_recent(recent: &mut Vec<String>, name: &str) {
 mod tests {
     use super::*;
     use listkit::styled::cells_text;
+
+    /// A picker in insert mode, ready to type into.
+    fn typing(ts: &str, recent: Vec<String>, tone: u8) -> Picker {
+        let mut p = Picker::open(ts.into(), recent, tone);
+        p.key("i", 40, 5);
+        p
+    }
+
+    #[test]
+    fn normal_mode_moves_insert_mode_types() {
+        let mut p = Picker::open("1.2".into(), vec!["fire".into(), "tada".into(), "eyes".into()], 0);
+        assert!(!p.insert, "opens in normal mode");
+        assert!(cells_text(&p.render(40, 2)[0]).contains("i to search"));
+        p.key("l", 40, 5);
+        assert_eq!(p.selected().map(|s| s.0), Some("tada"), "l moves right");
+        p.key("h", 40, 5);
+        assert_eq!(p.selected().map(|s| s.0), Some("fire"));
+        p.key("j", 40, 5);
+        assert_eq!(p.selected().map(|s| s.0), Some("grinning"), "j goes down past the header");
+        p.key("k", 40, 5);
+        assert_eq!(p.selected().map(|s| s.0), Some("fire"));
+        assert_eq!(p.query, "", "nothing typed in normal mode");
+        p.key("G", 40, 5);
+        assert_eq!(p.selected().map(|s| s.0), names(&p).last().copied());
+        p.key("g", 40, 5);
+        assert_eq!(p.selected().map(|s| s.0), Some("fire"));
+        assert_eq!(p.key("t", 40, 5), Step::Tone(2));
+        // i: keys type; Escape: back to normal with the search kept.
+        p.key("i", 40, 5);
+        assert!(p.insert);
+        for k in "fir".chars() {
+            p.key(&k.to_string(), 40, 5);
+        }
+        assert_eq!(p.query, "fir");
+        assert!(cells_text(&p.render(40, 2)[0]).starts_with("react :fir "));
+        assert_eq!(p.key("Escape", 40, 5), Step::None);
+        assert!(!p.insert);
+        assert_eq!(p.query, "fir", "the search stays");
+        p.key("l", 40, 5);
+        assert_eq!(p.selected().map(|s| s.0), Some("fireworks"), "l moves over the hits");
+        assert_eq!(p.key("Escape", 40, 5), Step::Close);
+        // / is i too; Enter picks in either mode.
+        let mut p = Picker::open("1.2".into(), Vec::new(), 0);
+        p.key("/", 40, 5);
+        assert!(p.insert);
+        assert_eq!(p.key("Enter", 40, 5), Step::Pick("+1".into()));
+    }
 
     fn names(p: &Picker) -> Vec<&str> {
         p.items
@@ -546,7 +634,7 @@ mod tests {
 
     #[test]
     fn typing_narrows_exact_prefix_contains_title() {
-        let mut p = Picker::open("1.2".into(), Vec::new(), 0);
+        let mut p = typing("1.2", Vec::new(), 0);
         for k in ["f", "i", "r", "e"] {
             p.key(k, 40, 5);
         }
@@ -558,24 +646,24 @@ mod tests {
         assert!(!p.items.iter().any(|it| matches!(it, Item::Head(_))), "no headers while searching");
         assert_eq!(p.pick_name().as_deref(), Some("fire"));
         // An alias finds its grid name; a title word does too.
-        let mut p = Picker::open("1.2".into(), Vec::new(), 0);
+        let mut p = typing("1.2", Vec::new(), 0);
         for k in "thumbsup".chars() {
             p.key(&k.to_string(), 40, 5);
         }
         assert_eq!(names(&p)[0], "+1");
-        let mut p = Picker::open("1.2".into(), Vec::new(), 0);
+        let mut p = typing("1.2", Vec::new(), 0);
         for k in ["c", "a", "n", "a", "d", "a"] {
             p.key(k, 40, 5);
         }
         assert_eq!(names(&p), vec!["flag-ca"]);
         // A blank types as an underscore; the exact name leads.
-        let mut p = Picker::open("1.2".into(), Vec::new(), 0);
+        let mut p = typing("1.2", Vec::new(), 0);
         for k in ["w", "h", "i", "t", "e", "Space", "c", "h", "e", "c", "k"] {
             p.key(k, 40, 5);
         }
         assert_eq!(names(&p)[0], "white_check_mark");
         // Nothing matches: Enter sends the text as typed.
-        let mut p = Picker::open("1.2".into(), Vec::new(), 0);
+        let mut p = typing("1.2", Vec::new(), 0);
         for k in "morphx".chars() {
             p.key(&k.to_string(), 40, 5);
         }
@@ -591,14 +679,14 @@ mod tests {
 
     #[test]
     fn precise_name_and_skin_tone() {
-        let mut p = Picker::open("1.2".into(), Vec::new(), 0);
+        let mut p = typing("1.2", Vec::new(), 0);
         for k in "+1::skin-tone-3".chars() {
             p.key(&k.to_string(), 40, 5);
         }
         assert_eq!(names(&p)[0], "+1");
         assert_eq!(p.key("Enter", 40, 5), Step::Pick("+1::skin-tone-3".into()), "the suffix goes as typed");
         // C-t cycles the tone the grid shows and Enter sends.
-        let mut p = Picker::open("1.2".into(), vec!["+1".into(), "fire".into()], 0);
+        let mut p = typing("1.2", vec!["+1".into(), "fire".into()], 0);
         assert_eq!(p.key("C-t", 40, 5), Step::Tone(2));
         assert_eq!(p.pick_name().as_deref(), Some("+1::skin-tone-2"));
         match &p.items[1] {
@@ -652,13 +740,14 @@ mod tests {
         assert_eq!(p.position(&rows).unwrap(), (r + 1, k));
         p.key("C-k", 40, 5);
         assert_eq!(p.position(&rows).unwrap(), (r, k));
+        p.key("i", 40, 5);
         p.key("h", 40, 5);
-        assert_eq!(p.query, "h");
+        assert_eq!(p.query, "h", "in insert mode h types");
     }
 
     #[test]
     fn render_rows_and_click() {
-        let mut p = Picker::open("1.2".into(), vec!["fire".into(), "+1".into()], 0);
+        let mut p = typing("1.2", vec!["fire".into(), "+1".into()], 0);
         let rows = p.render(24, 4);
         assert_eq!(rows.len(), 4);
         let head = cells_text(&rows[0]);

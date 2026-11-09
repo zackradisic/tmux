@@ -800,7 +800,7 @@ fn paint(s: &State) {
     let foot: Vec<Styled> = if let Some(st) = &c.status {
         plain_cells(&clip(st, w.saturating_sub(2)), ST_CYAN)
     } else if c.picker.is_some() {
-        plain_cells(&clip(react::hints(), w.saturating_sub(2)), ST_DIM)
+        plain_cells(&clip(react::hints(c.picker.as_ref().is_some_and(|p| p.insert)), w.saturating_sub(2)), ST_DIM)
     } else if let Some(cp) = &c.compose {
         let mut f: Vec<Styled> = Vec::new();
         if let Some(tag) = tag_in_foot {

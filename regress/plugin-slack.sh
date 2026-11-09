@@ -615,19 +615,21 @@ until_ok 20 screen_has 'react :' || fail "e opened no reaction picker: $(screen 
 screen_has ' recent' || fail "the picker has no recent row"
 screen_has 'smileys & emotion' || fail "the picker has no category header: $(screen | tail -12)"
 screen_has '👍' || fail "the recent row shows no 👍: $(screen | grep -A1 recent)"
-# C-j/C-l/C-k/C-h move like the arrows (plain hjkl type into the search).
-keys C-j C-l
-until_ok 20 screen_has ':smiley:' || fail "C-j C-l did not land on :smiley:: $(screen | grep 'react :')"
-keys C-k C-h
-until_ok 20 screen_has ':+1:' || fail "C-k C-h did not come back to :+1:: $(screen | grep 'react :')"
-keys f i r
+# Normal mode: j/l/k/h move; i enters insert mode, where keys type.
+screen_has 'i to search' || fail "the picker did not open in normal mode: $(screen | grep 'react :')"
+keys j l
+until_ok 20 screen_has ':smiley:' || fail "j l did not land on :smiley:: $(screen | grep 'react :')"
+keys k h
+until_ok 20 screen_has ':+1:' || fail "k h did not come back to :+1:: $(screen | grep 'react :')"
+keys i f i r
+until_ok 20 screen_has 'INSERT' || fail "i did not enter insert mode: $(screen | tail -1)"
 until_ok 20 screen_has ':fire:' || fail "typing fir did not highlight :fire:: $(screen | grep 'react :')"
 screen_lacks ' recent' || fail "the headers stayed while searching"
 keys Enter
 until_ok 40 reacted fire || fail "no fire reaction reached the fake: $(fetch "$BASE/_reactions")"
 until_ok 20 screen_has ':fire: added' || fail "no ':fire: added' status: $(screen | tail -2)"
 screen_lacks 'react :' || fail "the picker stayed open after Enter"
-keys e
+keys e i
 keys -l '+1::skin-tone-3'
 until_ok 20 screen_has ':+1::skin-tone-3:' || fail "the typed tone is not the pick: $(screen | grep 'react :')"
 keys Enter
