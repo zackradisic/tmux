@@ -3,7 +3,7 @@
 //! last on top; typing narrows it to the names that match (`fir` ->
 //! 🔥 and the rest, the exact name first, then the names that start
 //! so, then the ones that contain it, then the titles), the arrows,
-//! Tab and the mouse move over it, Enter reacts with the highlighted
+//! C-h/j/k/l, Tab and the mouse move over it, Enter reacts with the highlighted
 //! one and a click reacts at once. A precise name goes in as typed:
 //! `+1::skin-tone-3` narrows to 👍 and Enter sends that very name; a
 //! name the grid does not know (an image-only custom emoji, say) is
@@ -358,13 +358,13 @@ impl Picker {
                     None => base,
                 });
             }
-            "Right" | "Tab" | "C-n" => self.step(1),
-            "Left" | "BTab" | "C-p" => self.step(-1),
-            "Down" => {
+            "Right" | "Tab" | "C-n" | "C-l" => self.step(1),
+            "Left" | "BTab" | "C-p" | "C-h" => self.step(-1),
+            "Down" | "C-j" => {
                 let rows = self.rows(cols);
                 self.step_rows(&rows, 1);
             }
-            "Up" => {
+            "Up" | "C-k" => {
                 let rows = self.rows(cols);
                 self.step_rows(&rows, -1);
             }
@@ -498,7 +498,7 @@ impl Picker {
 
 /// The foot's hint while the picker is open.
 pub fn hints() -> &'static str {
-    "type to search · ←→↑↓ Tab move · Enter react · click reacts · C-t skin tone · Esc close"
+    "type to search · arrows / C-hjkl move · Enter react · click reacts · C-t skin tone · Esc close"
 }
 
 /// Put `name` (its skin tone dropped) at the head of the recent list.
@@ -642,6 +642,18 @@ mod tests {
         let before = p.cursor;
         p.key("Tab", 40, 5);
         assert_eq!(p.cursor, before + 1);
+        // C-h/j/k/l are Left/Down/Up/Right (plain hjkl type into the search).
+        p.key("C-h", 40, 5);
+        assert_eq!(p.cursor, before);
+        p.key("C-l", 40, 5);
+        assert_eq!(p.cursor, before + 1);
+        let (r, k) = p.position(&rows).unwrap();
+        p.key("C-j", 40, 5);
+        assert_eq!(p.position(&rows).unwrap(), (r + 1, k));
+        p.key("C-k", 40, 5);
+        assert_eq!(p.position(&rows).unwrap(), (r, k));
+        p.key("h", 40, 5);
+        assert_eq!(p.query, "h");
     }
 
     #[test]

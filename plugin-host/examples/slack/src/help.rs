@@ -159,8 +159,8 @@ goes in as is, newlines kept.
 e opens the reaction picker under the messages: a grid of every emoji
 in Slack's order under its category headers, the ones you reacted with
 last on top. Type to narrow it (fir -> fire, firefighter, ...; an
-alias or a title word finds it too), the arrows, Tab and BTab move
-over it, Enter reacts with the highlighted one and a click reacts at
+alias or a title word finds it too), the arrows or C-h/j/k/l, Tab
+and BTab move over it, Enter reacts with the highlighted one and a click reacts at
 once; the search line names the pick at its right. A name typed in
 full goes as typed, +1::skin-tone-3 included, and a name the grid does
 not know is sent as typed when nothing matches. C-t cycles the skin

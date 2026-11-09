@@ -615,6 +615,11 @@ until_ok 20 screen_has 'react :' || fail "e opened no reaction picker: $(screen 
 screen_has ' recent' || fail "the picker has no recent row"
 screen_has 'smileys & emotion' || fail "the picker has no category header: $(screen | tail -12)"
 screen_has '👍' || fail "the recent row shows no 👍: $(screen | grep -A1 recent)"
+# C-j/C-l/C-k/C-h move like the arrows (plain hjkl type into the search).
+keys C-j C-l
+until_ok 20 screen_has ':smiley:' || fail "C-j C-l did not land on :smiley:: $(screen | grep 'react :')"
+keys C-k C-h
+until_ok 20 screen_has ':+1:' || fail "C-k C-h did not come back to :+1:: $(screen | grep 'react :')"
 keys f i r
 until_ok 20 screen_has ':fire:' || fail "typing fir did not highlight :fire:: $(screen | grep 'react :')"
 screen_lacks ' recent' || fail "the headers stayed while searching"
