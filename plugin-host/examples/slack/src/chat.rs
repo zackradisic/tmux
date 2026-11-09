@@ -35,7 +35,7 @@ use listkit::text::{clip, menu_item, menu_safe};
 use tmux_plugin_sdk::prelude::*;
 
 use crate::store::{Channel, FileRef, Message};
-use crate::{api, emoji, images, mention, mrkdwn, sidebar, store, timefmt, NameMap, Shared, State, NAME};
+use crate::{api, emoji, images, mention, mrkdwn, react, sidebar, store, timefmt, NameMap, Shared, State, NAME};
 
 /// Two posts by the same author this close together share one header.
 const GROUP_SECS: i64 = 5 * 60;
@@ -117,8 +117,6 @@ pub(crate) fn next_image_id() -> u32 {
 pub enum ComposeKind {
     /// Post to the conversation, into a thread when `Some`.
     Message(Option<String>),
-    /// Add the named emoji to the message with this ts.
-    Reaction(String),
     /// Replace the text of the user's own message with this ts.
     Edit(String),
 }
@@ -153,7 +151,6 @@ impl Compose {
         match &self.kind {
             ComposeKind::Message(Some(_)) => "reply › ",
             ComposeKind::Message(None) => "› ",
-            ComposeKind::Reaction(_) => "react :",
             ComposeKind::Edit(_) => "edit › ",
         }
     }
@@ -207,6 +204,15 @@ pub struct Chat {
     /// The token Escape put the dropdown away for; it stays away until
     /// the token changes.
     pub mention_hidden: Option<String>,
+    /// The reaction picker (`e`), over the bottom of the body.
+    pub picker: Option<react::Picker>,
+    /// The reaction names sent last, for the picker's first row.
+    pub recent_reactions: Vec<String>,
+    /// The skin tone the picker opens with (0, or 2..=6).
+    pub tone: u8,
+    /// The 0-based screen column of the body's left edge (0 in the
+    /// float; the preview column's start when embedded).
+    pub body_x: u32,
     pub status: Option<String>,
     /// Bumped whenever the conversation changes, so a fetch that
     /// started for the previous one is dropped on return.
@@ -275,6 +281,9 @@ impl Chat {
     /// needs, 1 to [`COMPOSE_MAX_ROWS`]; none embedded, where the owner
     /// draws it on its own foot row.
     pub(crate) fn box_rows(&self) -> usize {
+        if let Some(p) = &self.picker {
+            return p.height(self.width as usize, (self.height as usize).saturating_sub(self.chrome as usize + 1));
+        }
         if self.chrome == 0 {
             return 0;
         }
@@ -667,7 +676,6 @@ fn rule(width: usize) -> String {
 /// The foot's hint while the box is open.
 pub(crate) fn compose_hints(kind: &ComposeKind) -> &'static str {
     match kind {
-        ComposeKind::Reaction(_) => "Enter react · Esc normal/close",
         ComposeKind::Edit(_) => "Enter save · Esc normal/close",
         ComposeKind::Message(_) => "Enter send · C-j newline · Esc normal/close",
     }
@@ -750,6 +758,7 @@ fn paint(s: &State) {
         }
     }
     paint_body(c, &mut out, 0, c.body_y as usize);
+    paint_picker(c, &mut out);
     // The compose box, just above the foot's rule; its mode tag goes to
     // the foot when the last row is too full for it.
     let mut tag_in_foot: Option<String> = None;
@@ -790,6 +799,8 @@ fn paint(s: &State) {
     }
     let foot: Vec<Styled> = if let Some(st) = &c.status {
         plain_cells(&clip(st, w.saturating_sub(2)), ST_CYAN)
+    } else if c.picker.is_some() {
+        plain_cells(&clip(react::hints(), w.saturating_sub(2)), ST_DIM)
     } else if let Some(cp) = &c.compose {
         let mut f: Vec<Styled> = Vec::new();
         if let Some(tag) = tag_in_foot {
@@ -1006,6 +1017,10 @@ pub fn open(st: &Shared, ch: Channel, thread: Option<String>, client: Option<u64
             people,
             mention: None,
             mention_hidden: None,
+            picker: None,
+            recent_reactions: s.recent_reactions.clone(),
+            tone: s.reaction_tone,
+            body_x: 0,
             status: None,
             gen,
             poll: None,
@@ -1082,6 +1097,10 @@ pub(crate) fn embedded(mode: ModeId, channel: Channel, client: Option<u64>, pane
         people: Vec::new(),
         mention: None,
         mention_hidden: None,
+        picker: None,
+        recent_reactions: Vec::new(),
+        tone: 0,
+        body_x: 0,
         status: None,
         gen: 0,
         poll: None,
@@ -1527,6 +1546,8 @@ pub(crate) enum After {
     /// Pin what the view shows (the thread, else the channel) into the
     /// sidebar's Pinned section, or unpin it.
     Pin,
+    /// The reaction picker's skin tone changed: remember it.
+    Tone(u8),
 }
 
 /// A thread's root text (the first message shown), for its pinned row;
@@ -1645,10 +1666,78 @@ pub fn on_mode_event(st: &Shared, name: &str, event: &Event) {
     }
 }
 
+/// A key while the reaction picker is open: its own (the search text,
+/// the highlight, a click on a slot, the wheel over the grid), Enter
+/// reacts and closes it, Escape closes it.
+fn picker_key(c: &mut Chat, key: &str, mouse: Option<(u32, u32)>) -> After {
+    c.status = None;
+    let width = c.width as usize;
+    let rows = c.box_rows();
+    let grid_rows = rows.saturating_sub(1).max(1);
+    let base = key.rsplit('-').next().unwrap_or(key);
+    // The grid's first row is one under the search line.
+    let grid_y0 = c.body_y as usize + c.body_h() + 1;
+    let x0 = c.body_x as usize;
+    let step = if base.ends_with("Pane") {
+        let Some(p) = c.picker.as_mut() else { return After::None };
+        match base {
+            "WheelUpPane" => {
+                p.scroll(-2, width, grid_rows);
+                react::Step::None
+            }
+            "WheelDownPane" => {
+                p.scroll(2, width, grid_rows);
+                react::Step::None
+            }
+            "MouseDown1Pane" | "DoubleClick1Pane" => match mouse {
+                    Some((x, y)) if (x as usize) >= x0 && (x as usize) < x0 + width && (y as usize) >= grid_y0 && (y as usize) < grid_y0 + grid_rows => {
+                        p.click(x as usize - x0, y as usize - grid_y0, width)
+                    }
+                    _ => react::Step::None,
+            },
+            _ => react::Step::None,
+        }
+    } else {
+        let Some(p) = c.picker.as_mut() else { return After::None };
+        p.key(key, width, grid_rows)
+    };
+    match step {
+        react::Step::None => After::None,
+        react::Step::Close => {
+            c.picker = None;
+            c.fit_box();
+            After::None
+        }
+        react::Step::Tone(t) => {
+            c.tone = t;
+            After::Tone(t)
+        }
+        react::Step::Pick(name) => {
+            let ts = c.picker.take().map(|p| p.ts).unwrap_or_default();
+            c.fit_box();
+            c.status = Some(format!("reacting :{name}:…"));
+            After::React(ts, name)
+        }
+    }
+}
+
+/// Draw the reaction picker where the body ends: its rows right under
+/// the shortened body, at the body's left edge, the body's width.
+pub(crate) fn paint_picker(c: &Chat, out: &mut String) {
+    let Some(p) = &c.picker else { return };
+    let rows = c.box_rows();
+    let y0 = c.body_y as usize + c.body_h();
+    for (k, row) in p.render(c.width as usize, rows).into_iter().enumerate() {
+        let mut line = row;
+        line.resize(c.width as usize, (' ', 0));
+        out.push_str(&format!("\x1b[{};{}H{}", y0 + k + 1, c.body_x as usize + 1, emit_cells(&line, false)));
+    }
+}
+
 /// A key while composing: the editor's, then what its event asks for.
 /// Enter posts the draft and keeps the box open - empty, in insert
 /// mode - for the next message; Escape in normal mode closes it; a
-/// yank goes to the clipboard. A reaction box closes on Enter.
+/// yank goes to the clipboard.
 fn compose_key(c: &mut Chat, key: &str) -> After {
     // A status answers the last action; the next key dismisses it,
     // except the one that says a post is still on its way.
@@ -1716,16 +1805,6 @@ fn compose_key(c: &mut Chat, key: &str) -> After {
                         After::Edit(ts, text)
                     }
                 }
-                ComposeKind::Reaction(ts) => {
-                    c.compose = None;
-                    let name = text.trim().trim_matches(':').to_string();
-                    if name.is_empty() {
-                        After::None
-                    } else {
-                        c.status = Some(format!("reacting :{name}:…"));
-                        After::React(ts, name)
-                    }
-                }
             }
         }
         vimkit::Event::Leave => {
@@ -1779,6 +1858,9 @@ fn refresh_mention(c: &mut Chat) {
 /// -> timeline -> sidebar), q closes outright, Space opens the menu,
 /// which comes back here through `replay_key`.
 pub(crate) fn handle_key(c: &mut Chat, key: &str, mouse: Option<(u32, u32)>) -> After {
+    if c.picker.is_some() {
+        return picker_key(c, key, mouse);
+    }
     if c.compose.is_some() {
         return compose_key(c, key);
     }
@@ -1869,7 +1951,7 @@ pub(crate) fn handle_key(c: &mut Chat, key: &str, mouse: Option<(u32, u32)>) -> 
         "e" => {
             let Some(i) = c.cursor_idx() else { return After::None };
             let ts = c.msgs[i].ts.clone();
-            c.compose = Some(Compose::new(ComposeKind::Reaction(ts)));
+            c.picker = Some(react::Picker::open(ts, c.recent_reactions.clone(), c.tone));
             c.fit_box();
             After::None
         }
@@ -2234,6 +2316,8 @@ fn run(st: &Shared, after: After) {
                         }
                         c.status = Some(format!(":{name}: added"));
                         relayout_paint(&mut s);
+                        drop(s);
+                        crate::note_reaction(&st2, &name);
                     }
                     Err(e) => {
                         c.status = Some(format!("react: {e}"));
@@ -2246,6 +2330,7 @@ fn run(st: &Shared, after: After) {
             let (client, pane) = st.borrow().chat.as_ref().map(|c| (c.client, c.pane)).unwrap_or((None, None));
             crate::viewer::open(st, f, client, pane);
         }
+        After::Tone(t) => crate::set_reaction_tone(st, t),
         After::Pin => {
             let Some((channel, thread, text)) = st.borrow().chat.as_ref().map(|c| (c.channel.id.clone(), c.thread.clone(), root_text(c))) else { return };
             let status = crate::toggle_pin(st, &channel, thread.as_deref(), &text);
@@ -2596,6 +2681,10 @@ mod tests {
             people: Vec::new(),
             mention: None,
             mention_hidden: None,
+            picker: None,
+            recent_reactions: Vec::new(),
+            tone: 0,
+            body_x: 0,
             status: None,
             gen: 1,
             poll: None,
@@ -3053,10 +3142,10 @@ mod tests {
         cp.editor.key("d");
         assert_eq!(mode_tag(&cp.editor), "d");
         // The one-row form shows the cursor's row of a long draft.
-        let cp = Compose::with_text(ComposeKind::Reaction("1.2".into()), "abcdefghijklmnop");
-        let cells = compose_cells(&cp, 12);
-        assert_eq!(cells_text(&cells), "react :p ");
+        let cp = Compose::with_text(ComposeKind::Message(None), "abcdefghijklmnop");
+        let cells = compose_cells(&cp, 7);
+        assert_eq!(cells_text(&cells), "› p ");
         assert_eq!(cells.last().unwrap().1, ST_INVERT);
-        assert_eq!(compose_height(&cp, 12), 4);
+        assert_eq!(compose_height(&cp, 7), 4);
     }
 }

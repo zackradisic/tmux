@@ -36,6 +36,7 @@ ME = "U1"
 LOCK = threading.Lock()
 CALLS = []   # [method, {field: value}]
 POSTED = []  # {"channel", "ts", "text", "thread_ts"}
+REACTIONS = []  # {"channel", "ts", "name"}: what reactions.add received
 # Thread replies, as messages plus "channel": what conversations.replies
 # returns. The first two are in a thread we follow and have not read: the
 # Threads view (subscriptions.thread.getView) lists it, and one of them
@@ -331,6 +332,7 @@ def handle(method, f):
         POSTED.append({"channel": cid, "ts": m["ts"], "text": m["text"], "thread_ts": m.get("thread_ts")})
         return ok(channel=cid, ts=m["ts"], message=m)
     if method == "reactions.add":
+        REACTIONS.append({"channel": f.get("channel", ""), "ts": f.get("timestamp", ""), "name": f.get("name", "")})
         return ok()
     if method == "chat.getPermalink":
         return ok(channel=f.get("channel", ""),
@@ -384,6 +386,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(body)
             elif path == "/_posted":
                 self.send_json(POSTED)
+            elif path == "/_reactions":
+                self.send_json(REACTIONS)
             elif path == "/_marks":
                 self.send_json(MARKS)
             elif path == "/_unread":

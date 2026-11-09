@@ -194,6 +194,11 @@ keys() { $TMUX send-keys -t "$FORM" "$@"; sleep 0.4; }
 slack() { $TMUX plugin-command slack "$*"; }
 status_ready() { slack status | grep -q 'zack on Morph'; }
 posted() { [ "$(nposted "$@")" -ge 1 ]; }
+# A reaction named $1 reached the fake (reactions.add).
+reacted() {
+	fetch "$BASE/_reactions" | python3 -c 'import json, sys
+sys.exit(0 if any(r["name"] == sys.argv[1] for r in json.load(sys.stdin)) else 1)' "$1"
+}
 # What the tty client's terminal renders, overlays (a menu) included.
 seen() { $OUTER capture-pane -p -t "$VIEW" | sed '/^ *$/d'; }
 seen_has() { seen | grep -q -- "$1"; }
@@ -598,6 +603,36 @@ HEY=$(screen | grep -n 'look at this' | head -1 | cut -d: -f1)
 FINE=$(screen | grep -n 'fine' | head -1 | cut -d: -f1)
 [ "$NEW" -lt "$HEY" ] || fail "the rule ($NEW) is not before the hey message ($HEY)"
 [ "$FINE" -lt "$NEW" ] || fail "our own message ($FINE) counts as new (rule at $NEW)"
+# The reaction picker: e opens a search line and a grid under the
+# messages - the recent row (Slack's quick reactions before any was
+# sent), then every category under its header. Typing narrows the grid
+# and the highlighted name shows at the right; Enter reacts with it and
+# closes the picker. A name typed in full goes as typed (the skin tone
+# included). The names sent head the recent row next time and are kept
+# in the store.
+keys e
+until_ok 20 screen_has 'react :' || fail "e opened no reaction picker: $(screen | tail -4)"
+screen_has ' recent' || fail "the picker has no recent row"
+screen_has 'smileys & emotion' || fail "the picker has no category header: $(screen | tail -12)"
+screen_has '👍' || fail "the recent row shows no 👍: $(screen | grep -A1 recent)"
+keys f i r
+until_ok 20 screen_has ':fire:' || fail "typing fir did not highlight :fire:: $(screen | grep 'react :')"
+screen_lacks ' recent' || fail "the headers stayed while searching"
+keys Enter
+until_ok 40 reacted fire || fail "no fire reaction reached the fake: $(fetch "$BASE/_reactions")"
+until_ok 20 screen_has ':fire: added' || fail "no ':fire: added' status: $(screen | tail -2)"
+screen_lacks 'react :' || fail "the picker stayed open after Enter"
+keys e
+keys -l '+1::skin-tone-3'
+until_ok 20 screen_has ':+1::skin-tone-3:' || fail "the typed tone is not the pick: $(screen | grep 'react :')"
+keys Enter
+until_ok 40 reacted '+1::skin-tone-3' || fail "the precise name did not go as typed: $(fetch "$BASE/_reactions")"
+until_ok 20 sh -c "sqlite3 '$STORE' \"select value from settings where key = 'recent_reactions'\" | grep -q '\"+1\",\"fire\"'" || fail "the recent list is not in the store: $(sqlite3 "$STORE" "select value from settings where key = 'recent_reactions'")"
+keys e
+until_ok 20 screen_has 'react :' || fail "e did not reopen the picker"
+screen | grep -A1 ' recent' | tail -1 | grep -q '^ *👍 *🔥' || fail "the recent row does not start 👍 🔥: $(screen | grep -A1 recent)"
+keys Escape
+screen_lacks 'react :' || fail "Escape did not close the picker"
 # Pictures: the GIF's static thumbnail is fetched from the fake once, as
 # the session (bearer + cookie), converted to a PNG in the data
 # directory, and drawn under the clip line as 5 rows of placeholder

@@ -577,7 +577,10 @@ read; `q` closes it, `o` hands it to the system viewer. `Enter` on a message
 opens its thread (with or without replies
 yet), `Escape` steps back: thread to channel, channel to sidebar; `q` closes
 outright. `i` composes, `r` replies in the message's thread, `e`
-reacts, `E` edits your own message in the compose box (Enter saves it), `N` hands
+opens the reaction picker (a grid of every emoji under category headers, the recent
+ones on top; type to narrow it, arrows move, Enter or a click reacts, a full name such
+as `+1::skin-tone-3` goes as typed, C-t cycles the skin tone), `E` edits your own
+message in the compose box (Enter saves it), `N` hands
 everything shown to a new agent, `o` opens the message in the Slack app. The compose box is a small
 vim: it opens in insert mode, `Enter` sends and keeps it open for the next
 message, `C-j` puts a newline inside a message, `Escape` switches to normal

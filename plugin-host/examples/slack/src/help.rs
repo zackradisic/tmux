@@ -85,7 +85,8 @@ summary of the channel; n the message under its cursor or a selection.
 l, Right or a click in the column hand the preview the keyboard (the
 separator lights up): the channel view's keys then work there - j/k
 move over the messages, J/K page, g/G, y copies the message under the
-cursor (v then j/k a selection), Y its permalink, e reacts, m marks
+cursor (v then j/k a selection), Y its permalink, e opens the
+reaction picker, m marks
 the channel read, Enter opens the message's thread right there in the
 preview (Escape brings the channel back), i and r open the full view
 composing (r in the message's thread), Space its menu, ? its hints.
@@ -100,7 +101,7 @@ open: the channel view.
   j/k  move over messages      Enter / t  open the message's thread
   J/K  page                    i          compose (Enter sends, box stays)
   g/G  top / bottom            r          reply in the message's thread
-  L    load older              e          react (type :name: then Enter)
+  L    load older              e          react: a grid of emoji to pick from
   z    the message's picture, big (a click on a picture does the same)
   o    open in the Slack app   y          copy the message (or selection)
   m    mark read               Y          copy the permalink
@@ -153,8 +154,17 @@ r J u, v / V / C-v selections with y d c (C-v then I or A inserts on
 every line), / search with n and N - and Enter still sends; Escape in
 normal mode closes the box. The box grows with the draft, up to six
 rows, and its right edge says -- INSERT -- or -- NORMAL --. A paste
-goes in as is, newlines kept. e (a reaction) is a one-shot box: Enter
-reacts and closes it.
+goes in as is, newlines kept.
+
+e opens the reaction picker under the messages: a grid of every emoji
+in Slack's order under its category headers, the ones you reacted with
+last on top. Type to narrow it (fir -> fire, firefighter, ...; an
+alias or a title word finds it too), the arrows, Tab and BTab move
+over it, Enter reacts with the highlighted one and a click reacts at
+once; the search line names the pick at its right. A name typed in
+full goes as typed, +1::skin-tone-3 included, and a name the grid does
+not know is sent as typed when nothing matches. C-t cycles the skin
+tone the grid shows and sends, and it is remembered. Escape closes it.
 
 A shared picture (PNG, JPEG, a GIF's first frame), or a /giphy post's,
 is drawn under its clip or caption line in Ghostty or kitty;

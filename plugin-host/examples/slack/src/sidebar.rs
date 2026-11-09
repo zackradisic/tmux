@@ -30,7 +30,7 @@ use tmux_plugin_sdk::prelude::*;
 
 use crate::chat::After;
 use crate::store::{Channel, Kind, Message, Thread};
-use crate::{api, chat, mrkdwn, timefmt, Shared, State, NAME};
+use crate::{api, chat, mrkdwn, react, timefmt, Shared, State, NAME};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum View {
@@ -324,8 +324,13 @@ fn draw_preview(c: &chat::Chat, focused: bool, label: String, topic: Vec<Styled>
     }
     out.push_str(&format!("\x1b[1;{}H{}", x0 + 1, emit_cells(&fit_cells(&head, pw), false)));
     chat::paint_body(c, out, x0, c.body_y as usize);
+    chat::paint_picker(c, out);
     let foot: Vec<Styled> = if let Some(cp) = &c.compose {
         chat::compose_cells(cp, pw.saturating_sub(1))
+    } else if let Some(st) = &c.status {
+        plain_cells(&clip(st, pw.saturating_sub(1)), ST_CYAN)
+    } else if c.picker.is_some() {
+        plain_cells(&clip(react::hints(), pw.saturating_sub(1)), ST_DIM)
     } else if let Some(st) = &c.status {
         plain_cells(&clip(st, pw.saturating_sub(1)), ST_CYAN)
     } else if focused {
@@ -346,6 +351,8 @@ fn sync_preview(s: &mut State) {
     let names = Rc::clone(&s.names);
     let tz = s.tz();
     let me = s.ident.as_ref().map(|i| i.user_id.clone()).unwrap_or_default();
+    let recent = s.recent_reactions.clone();
+    let tone = s.reaction_tone;
     let now = (now_ms() / 1000) as i64;
     let cache = s.images.clone();
     let Some(side) = s.side.as_ref() else { return };
@@ -371,7 +378,7 @@ fn sync_preview(s: &mut State) {
         v
     });
     let Some(side) = s.side.as_mut() else { return };
-    let (_, pw, body_y, body_h) = preview_geometry(side.engine.width as usize, side.engine.height as usize, side.engine.list_w());
+    let (x0, pw, body_y, body_h) = preview_geometry(side.engine.width as usize, side.engine.height as usize, side.engine.list_w());
     side.thread = if row_thread.is_some() { None } else { thread.clone() };
     let msgs: Option<Vec<Message>> = match (&channel, &thread) {
         (Some(ch), Some(root)) => side
@@ -410,6 +417,7 @@ fn sync_preview(s: &mut State) {
             c.width = pw as u32;
             c.height = body_h as u32;
             c.body_y = body_y as u32;
+            c.body_x = x0 as u32;
             c
         }
         None => {
@@ -428,6 +436,9 @@ fn sync_preview(s: &mut State) {
             c.thread = thread.clone();
             c.last_read = last_read;
             c.me = me.clone();
+            c.body_x = x0 as u32;
+            c.recent_reactions = recent.clone();
+            c.tone = tone;
             let (on, aspect, root) = chat::picture_setup(side.client, side.pane);
             c.images_on = on;
             c.cell_aspect = aspect;
@@ -1635,6 +1646,8 @@ fn preview_after(st: &Shared, took: Took) {
                             }
                         }
                     }
+                    drop(s);
+                    crate::note_reaction(&st2, &name);
                 }
                 preview_status(&st2, &cid, status);
             });
@@ -1753,6 +1766,7 @@ fn preview_after(st: &Shared, took: Took) {
         }
         // E is taken before the view sees it (Took::Edit).
         After::Edit(..) => {}
+        After::Tone(t) => crate::set_reaction_tone(st, t),
         After::Pin => {
             let (thread, text) = st
                 .borrow()

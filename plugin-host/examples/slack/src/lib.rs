@@ -50,6 +50,7 @@ mod images;
 mod mention;
 mod mrkdwn;
 mod peek;
+mod react;
 mod sidebar;
 mod viewer;
 mod store;
@@ -248,6 +249,10 @@ pub struct State {
     /// The conversations opened, oldest first; `visit_at == visits.len()`
     /// is the present, less after C-o. Kept in the store.
     pub visits: Vec<Visit>,
+    /// The reaction names sent last, newest first (the picker's first row).
+    pub recent_reactions: Vec<String>,
+    /// The skin tone the reaction picker shows: 0, or 2..=6.
+    pub reaction_tone: u8,
     pub visit_at: usize,
     /// A jump is opening a conversation: `note_visit` leaves the history alone.
     pub jumping: bool,
@@ -391,6 +396,8 @@ impl Plugin for Slack {
             watched: HashSet::new(),
             pins: Vec::new(),
             visits: Vec::new(),
+            recent_reactions: Vec::new(),
+            reaction_tone: 0,
             visit_at: 0,
             jumping: false,
             names_queue: Vec::new(),
@@ -487,6 +494,39 @@ async fn load_cache(st: &Shared) {
     s.rebuild_names();
 }
 
+/// A reaction went out: its name heads the recent list (the picker's
+/// first row), in the store and in every open view.
+pub fn note_reaction(st: &Shared, name: &str) {
+    let json = {
+        let mut s = st.borrow_mut();
+        react::note_recent(&mut s.recent_reactions, name);
+        let recent = s.recent_reactions.clone();
+        if let Some(c) = s.chat.as_mut() {
+            c.recent_reactions = recent.clone();
+        }
+        if let Some(c) = s.side.as_mut().and_then(|sd| sd.preview.as_mut()) {
+            c.recent_reactions = recent.clone();
+        }
+        serde_json::to_string(&recent).unwrap_or_default()
+    };
+    spawn(async move { store::set_setting(react::RECENT_SETTING, &json).await });
+}
+
+/// The picker's skin tone changed (C-t): remember it for the next one.
+pub fn set_reaction_tone(st: &Shared, tone: u8) {
+    {
+        let mut s = st.borrow_mut();
+        s.reaction_tone = tone;
+        if let Some(c) = s.chat.as_mut() {
+            c.tone = tone;
+        }
+        if let Some(c) = s.side.as_mut().and_then(|sd| sd.preview.as_mut()) {
+            c.tone = tone;
+        }
+    }
+    spawn(async move { store::set_setting(react::TONE_SETTING, &tone.to_string()).await });
+}
+
 async fn boot(st: Shared) {
     load_cache(&st).await;
     emoji::load_custom().await;
@@ -496,6 +536,12 @@ async fn boot(st: Shared) {
     }
     if let Some(json) = store::setting(PINS_SETTING).await {
         st.borrow_mut().pins = serde_json::from_str(&json).unwrap_or_default();
+    }
+    if let Some(json) = store::setting(react::RECENT_SETTING).await {
+        st.borrow_mut().recent_reactions = serde_json::from_str(&json).unwrap_or_default();
+    }
+    if let Some(v) = store::setting(react::TONE_SETTING).await {
+        st.borrow_mut().reaction_tone = v.trim().parse().unwrap_or(0);
     }
     if let Some(json) = store::setting(VISITS_SETTING).await {
         let visits: Vec<Visit> = serde_json::from_str(&json).unwrap_or_default();
@@ -1424,6 +1470,8 @@ mod tests {
             watched: HashSet::new(),
             pins: Vec::new(),
             visits: Vec::new(),
+            recent_reactions: Vec::new(),
+            reaction_tone: 0,
             visit_at: 0,
             jumping: false,
             names_queue: Vec::new(),

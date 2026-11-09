@@ -17,8 +17,16 @@ rule still holds so no second table is needed.
 `simple_smile` is a Slack-only legacy name (the data lacks it): one
 extra row to U+1F642.
 
-Standard library only; the output is sorted by name (byte order, what
-Rust's `&str` ordering and a binary search want).
+A second table, GRID, is what the reaction picker shows: every emoji
+once (under its first short name) in the data's `sort_order` - Slack's
+own order - with its category, its title lowercased (searched too) and
+whether it takes a skin tone. The modifiers themselves (category
+Component) and the entries another one obsoletes are left out of the
+grid but stay in TABLE, so an old name still renders. ALIASES maps the
+other short names to the grid name (`thumbsup` -> `+1`).
+
+Standard library only; TABLE and ALIASES are sorted by name (byte
+order, what Rust's `&str` ordering and a binary search want).
 """
 
 import json
@@ -90,6 +98,12 @@ def main():
         rows.setdefault(name, uni)
     version = max((e.get("added_in", "0") for e in data), key=lambda v: [int(x) for x in v.split(".")])
     names = sorted(rows, key=lambda n: n.encode())
+    grid = [e for e in sorted(data, key=lambda e: e["sort_order"]) if e["category"] != "Component" and not e.get("obsoleted_by")]
+    cats = []
+    for e in grid:
+        if e["category"] not in cats:
+            cats.append(e["category"])
+    aliases = sorted(((n, e["short_name"]) for e in grid for n in e["short_names"] if n != e["short_name"]), key=lambda a: a[0].encode())
     here = os.path.dirname(os.path.abspath(__file__))
     out_path = os.path.join(here, "..", "src", "emoji_table.rs")
     with open(out_path, "w", encoding="utf-8") as out:
@@ -104,8 +118,21 @@ def main():
         out.write("pub static TABLE: &[(&str, &str)] = &[\n")
         for n in names:
             out.write("    (%s, %s),\n" % (rust_str(n), rust_str(to_str(rows[n]))))
+        out.write("];\n\n")
+        out.write("/// The categories, in the order the grid shows them.\n")
+        out.write("pub static CATEGORIES: &[&str] = &[%s];\n\n" % ", ".join(rust_str(c) for c in cats))
+        out.write("/// The reaction picker's grid: every emoji once, in Slack's order -\n")
+        out.write("/// (name, title, category index, takes a skin tone).\n")
+        out.write("pub static GRID: &[(&str, &str, u8, bool)] = &[\n")
+        for e in grid:
+            out.write("    (%s, %s, %d, %s),\n" % (rust_str(e["short_name"]), rust_str(e["name"].lower()), cats.index(e["category"]), "true" if e.get("skin_variations") else "false"))
+        out.write("];\n\n")
+        out.write("/// Other short names -> the grid name. Sorted by alias.\n")
+        out.write("pub static ALIASES: &[(&str, &str)] = &[\n")
+        for a, n in aliases:
+            out.write("    (%s, %s),\n" % (rust_str(a), rust_str(n)))
         out.write("];\n")
-    sys.stderr.write("wrote %s: %d rows\n" % (os.path.normpath(out_path), len(rows)))
+    sys.stderr.write("wrote %s: %d rows, %d in the grid, %d aliases\n" % (os.path.normpath(out_path), len(rows), len(grid), len(aliases)))
 
 
 if __name__ == "__main__":

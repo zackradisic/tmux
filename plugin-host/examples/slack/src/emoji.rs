@@ -55,6 +55,13 @@ pub fn set_custom_json(json: &str) -> usize {
     n
 }
 
+/// The custom emoji's names, sorted (the picker's last section).
+pub fn custom_names() -> Vec<String> {
+    let mut v: Vec<String> = CUSTOM.with(|c| c.borrow().keys().cloned().collect());
+    v.sort();
+    v
+}
+
 /// Forget the custom set (tests).
 #[cfg(test)]
 pub fn clear_custom() {
