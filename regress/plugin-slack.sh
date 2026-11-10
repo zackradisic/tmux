@@ -733,6 +733,11 @@ until_ok 20 sh -c "$TMUX capture-pane -M -p -t $FORM | grep '▎' | grep -q ship
 # copies the two newest, oldest first.
 keys y
 until_ok 40 buffer_has 'Tejas (2023-11-1[45] [0-9:]*): shipped 🙌 🎉 :morph:' || fail "y did not copy the message: $($TMUX show-buffer)"
+# Y copies the message's permalink by the same path (a paste buffer and
+# the terminal's clipboard), so it pastes outside tmux as well.
+keys Y
+until_ok 40 buffer_has 'https://test.slack.com/archives/' || fail "Y did not copy the permalink: $($TMUX show-buffer)"
+until_ok 20 screen_has 'permalink copied' || fail "no permalink status: $(screen | tail -1)"
 keys v
 screen_has 'selecting' || fail "v did not open a selection"
 keys k

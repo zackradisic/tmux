@@ -1671,14 +1671,13 @@ fn preview_after(st: &Shared, took: Took) {
             let st2 = Rc::clone(st);
             let cid = channel.id.clone();
             spawn(async move {
-                let r = api::permalink(&id, &cid, &ts).await;
-                let status = match &r {
-                    Ok(_) => "permalink copied".to_string(),
+                let status = match api::permalink(&id, &cid, &ts).await {
+                    Ok(url) => match chat::copy_text(&url, client).await {
+                        Ok(()) => "permalink copied".to_string(),
+                        Err(e) => format!("permalink: {e}"),
+                    },
                     Err(e) => format!("permalink: {e}"),
                 };
-                if let Ok(url) = &r {
-                    let _ = run_command(&format!("set-buffer -- '{}'", url.replace('\'', ""))).await;
-                }
                 preview_status(&st2, &cid, status);
             });
         }

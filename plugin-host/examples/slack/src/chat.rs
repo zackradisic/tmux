@@ -2357,16 +2357,19 @@ fn run(st: &Shared, after: After) {
         }
         After::Permalink(ts) => {
             let Some((id, channel, gen)) = view_ctx(st) else { return };
+            let client = st.borrow().chat.as_ref().and_then(|c| c.client);
             let st2 = Rc::clone(st);
             spawn(async move {
-                let r = api::permalink(&id, &channel, &ts).await;
-                let status = match &r {
-                    Ok(_) => "permalink copied".to_string(),
+                // The same clipboard path as `y`: a paste buffer and the
+                // terminal's clipboard over OSC 52, so the link pastes
+                // outside tmux too (`set-buffer` alone did not).
+                let status = match api::permalink(&id, &channel, &ts).await {
+                    Ok(url) => match copy_text(&url, client).await {
+                        Ok(()) => "permalink copied".to_string(),
+                        Err(e) => format!("permalink: {e}"),
+                    },
                     Err(e) => format!("permalink: {e}"),
                 };
-                if let Ok(url) = &r {
-                    let _ = run_command(&format!("set-buffer -- '{}'", url.replace('\'', ""))).await;
-                }
                 let mut s = st2.borrow_mut();
                 if let Some(c) = s.chat.as_mut().filter(|c| c.gen == gen) {
                     c.status = Some(status);
