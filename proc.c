@@ -269,6 +269,22 @@ proc_set_signals(struct tmuxproc *tp, void (*signalcb)(int))
 	sigaction(SIGTTOU, &sa, NULL);
 	sigaction(SIGQUIT, &sa, NULL);
 
+	/*
+	 * Put the fault signals back to a plain default before the plugin
+	 * host installs its trap handlers. execve(2) resets a caught signal to
+	 * SIG_DFL but on macOS keeps its flags, so after restart-server the
+	 * new image finds SIGBUS as SIG_DFL with SA_SIGINFO set. Wasmtime saves
+	 * that as the handler to chain to, sees SA_SIGINFO and calls it: any
+	 * SIGBUS outside wasm then jumps to address 0 instead of dumping core
+	 * where it happened.
+	 */
+	sa.sa_flags = 0;
+	sa.sa_handler = SIG_DFL;
+	sigaction(SIGBUS, &sa, NULL);
+	sigaction(SIGSEGV, &sa, NULL);
+	sigaction(SIGILL, &sa, NULL);
+	sigaction(SIGFPE, &sa, NULL);
+
 	signal_set(&tp->ev_sigint, SIGINT, proc_signal_cb, tp);
 	signal_add(&tp->ev_sigint, NULL);
 	signal_set(&tp->ev_sighup, SIGHUP, proc_signal_cb, tp);
