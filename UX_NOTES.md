@@ -1243,3 +1243,60 @@ small enough that the storage can change underneath later. Agents only
 keep the notes current if told to, so this also wants a short skill:
 "your project is X; read its notes when you start; tick todos and add
 findings through the notes commands, never by writing the file."
+
+## Restarting the live server
+
+### X1. A restart that is not a handoff, and agents brought back by hand (Nov 10 2026)
+
+What happened, in order, on the Mac on Nov 10 2026:
+
+1. A `tmux2 update` at 11:09 restarted the server by handoff. The restore
+   remade the 55 remote links (stopped boat boxes) before it had put the
+   window-id counter back, so each link's placeholder window took an id a
+   restored window already held. A duplicate never enters the id tree, so
+   `window_find_by_id` answered with the other window: every dead link
+   renamed one of the user's Claude windows "connecting to <host>: ..." and
+   printed its ssh error into that pane on each retry, and the agents
+   picker's Enter on the morph agent landed in the dead fe-clones session
+   (their windows shared `@271`). Fixed in fc9cc375 (counters restored
+   first; `window_create`, `window_pane_create`, `session_create` skip ids
+   in use; `regress/handoff-link-ids.sh`).
+2. At 12:08 another session started the server FRESH (a `restart-server`
+   experiment had hung up 163 panes). Pane and window ids restarted from
+   zero; every agent process was gone.
+3. At 12:15 that session resumed every agent as
+   `zsh -lc 'cd <dir>; IS_SANDBOX=1 claude --resume <id>'`. With `cd …;`
+   in front, zsh forks claude instead of exec-ing it, so the pane's
+   command reads `zsh`. The picker's own launcher (`agents new --resume`)
+   runs `new-window -c <dir> claude …`, which execs: the pane's command
+   is claude (on macOS its version-named binary, `2.1.304`).
+4. At 13:39 a `reload-plugin agents` re-ran the plugin's start-up sweep
+   (`reconcile`: classify every pane). It saw shells, found no agent, and
+   closed 27 live rows at once: the whole Jev project, the OpenCode rows.
+   The agents kept running. Fixed in be01eb9f: a shell pane that a live row
+   claims gets its process group listed (`pgrep -lg <pane_pid>`) before it
+   is called closed.
+
+Rules that fall out of it:
+
+- Restart the live server by handoff only (`tmux2 update`, `restart-server`).
+  A fresh server renumbers every id; the agents store, the resurrect file
+  and every link then point at panes that no longer exist.
+- Bring agents back through the plugin (`plugin-command -t "$TMUX_PANE"
+  agents "new --resume <id>"`), or with `exec` in front of the command.
+  Never `zsh -lc 'cd dir; claude …'`.
+- After any restart, check three things before touching anything:
+  `tmux2 list-windows -a -F '#{window_id} #{window_linked_sessions}' |
+  sort | uniq -c | awk '$1 != $3'` must print nothing (a linked window is
+  listed once per session, so compare with its link count); no window
+  outside a link session is named "connecting to …"; the live row count
+  (`select count(*) from agents where ended_ms is null`) matches the
+  agents you can see.
+- While ids are duplicated, do not kill the dead link sessions: their
+  placeholder windows are not in the id tree, and destroying them is
+  undefined. Restart onto a fixed binary first.
+- Rows closed by a sweep come back without a reload: map the process
+  (`ps -axo pid,ppid,args | rg -- '--resume <uuid>'`, or `opencode -s
+  <ses>`) to the pane whose `#{pane_pid}` is its parent, then `update
+  agents set ended_ms=NULL, reason=NULL, pane=<n> where id=…` in
+  `~/.local/share/tmux/plugins/agents/store.db`. The picker reads the store.
