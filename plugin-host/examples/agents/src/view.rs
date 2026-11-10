@@ -1823,20 +1823,32 @@ async fn acknowledge(server: String, id: String) {
 }
 
 /// Jump the pressing client to a pane, wherever it lives.
-pub async fn jump(pane: u32) {
-    let panes = list_panes().unwrap_or_default();
-    if let Some(pi) = panes.iter().find(|p| p.id == pane) {
-        let _ = run_command(&format!("select-window -t @{}", pi.window)).await;
-        let windows = list_windows().unwrap_or_default();
-        if let Some(sid) = windows
-            .iter()
-            .find(|w| w.id == pi.window)
-            .and_then(|w| w.sessions.first())
-        {
-            let _ = run_command(&format!("switch-client -t ${sid}")).await;
-        }
-    }
+pub async fn jump(pane: u32, client: Option<u64>) {
+    // Everything by the pane: tmux resolves its window and session itself
+    // (a shadow window's id can fail to resolve, and the window list's
+    // session for it has been wrong after a restart). Name the client
+    // that pressed the key: a plugin's command runs with no client, and
+    // `switch-client` then takes "the current client" to be one attached
+    // to the most recently active session - with agents chattering in
+    // other sessions that is not the one you sit in (a dead link after
+    // a restart, say), the switch fails and the jump looks like nothing
+    // happened.
+    let at = client_name(client).map(|n| format!("-c '{n}' ")).unwrap_or_default();
+    let _ = run_command(&format!("switch-client {at}-t %{pane}")).await;
+    let _ = run_command(&format!("select-window -t %{pane}")).await;
     let _ = run_command(&format!("select-pane -t %{pane}")).await;
+}
+
+/// The tmux name (its tty) of the client with this id, when it is still
+/// attached and the name is safe to quote into a command line.
+fn client_name(client: Option<u64>) -> Option<String> {
+    let cid = client?;
+    list_clients()
+        .ok()?
+        .into_iter()
+        .find(|c| u64::from(c.id) == cid)
+        .map(|c| c.name)
+        .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c)))
 }
 
 // ---------------------------------------------------------------------------
@@ -2600,7 +2612,7 @@ fn dispatch_key(
         }
         PickAfter::Jump(pane, mode) => {
             ctx.spawn(async move {
-                jump(pane).await;
+                jump(pane, client).await;
                 let _ = mode_close(mode);
             });
         }
