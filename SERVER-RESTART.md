@@ -43,7 +43,7 @@ only adopts descendants; `pidfd` can, but only with `PIDFD_INFO_EXIT` on Linux
    comes first.
 3. The server writes its state to `<socket>.handoff`.
 4. Every descriptor except stdio, the listening socket and the pty masters
-   becomes close-on-exec.
+   the state file names becomes close-on-exec (see "The kept descriptors").
 5. `execve(binary, {binary, "-S", socket, "-Z", statefile, ...})`. This fails
    atomically, so a failure leaves the old image and every pane intact.
 6. The new image sees `-Z` and calls `server_resume()` instead of the client
@@ -182,6 +182,24 @@ server would sit at full CPU and answer nothing, as happened once on an
   in the server a warning also lands in `show-messages` and in
   `server-events.log` next to the socket, because the server's stderr is
   `/dev/null`.
+
+## The kept descriptors
+
+The masters that survive the exec are the ones `handoff_save_pane()` wrote,
+collected as it writes them. They used to come from a separate walk of the
+window id tree, while the file is written from the sessions, and the two can
+disagree. On Nov 10 2026 they did: an earlier restart had minted duplicate
+window ids (fixed in fc9cc375), destroying one of the duplicates ran
+`RB_REMOVE` on a window that was never in the tree, which read its unset
+links as the root's and emptied it, and the next restart kept almost no
+masters. The exec closed them, the kernel hung up 163 of 175 panes, and the
+new image restored them all as dead ("descriptor N is not the saved tty").
+`window_destroy()` and `window_pane_destroy()` now only remove what the tree
+holds. As a side effect, the shadow panes of remote links no longer leak
+into the new image, which makes the links again from the remote.
+`regress/handoff-keep-panes.sh` restarts twice with local panes of every
+kind and a live link, and checks that every process is the same one, never
+hung up, and that the descriptor count does not grow.
 
 ## Rollback
 

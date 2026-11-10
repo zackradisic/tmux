@@ -73,6 +73,14 @@ static char	*handoff_state_path;
 static time_t	 handoff_deadline;
 
 /*
+ * The pty descriptors the state file names, filled in as each pane record is
+ * written. These and nothing else survive the exec: the new image adopts
+ * exactly what the file lists, so the file is the one list both sides read.
+ */
+static int	*handoff_keep;
+static u_int	 handoff_nkeep;
+
+/*
  * Commands that loaded the plugins, in the order they ran. Guest memory does
  * not survive the exec, so the new image runs them again.
  */
@@ -365,6 +373,12 @@ handoff_save_pane(FILE *f, struct window_pane *wp)
 	if (wp->flags & PANE_EMPTY)
 		dead |= HANDOFF_EMPTY;
 
+	if (wp->fd != -1) {
+		handoff_keep = xreallocarray(handoff_keep, handoff_nkeep + 1,
+		    sizeof *handoff_keep);
+		handoff_keep[handoff_nkeep++] = wp->fd;
+	}
+
 	fputs("pane", f);
 	handoff_number(f, wp->id);
 	handoff_number(f, wp->fd);
@@ -435,6 +449,10 @@ handoff_save(const char *path, char **cause)
 	u_int			*seen = NULL, nseen = 0, j;
 	u_int			 nextw, nextp, i;
 	int			 fd;
+
+	free(handoff_keep);
+	handoff_keep = NULL;
+	handoff_nkeep = 0;
 
 	fd = open(path, O_WRONLY|O_CREAT|O_TRUNC, 0600);
 	if (fd == -1) {
@@ -628,32 +646,41 @@ handoff_save(const char *path, char **cause)
  * Exec.
  */
 
+/* Is this descriptor one the new image needs? */
+static int
+handoff_keep_fd(int fd, int socketfd)
+{
+	u_int	i;
+
+	if (fd == socketfd)
+		return (1);
+	for (i = 0; i < handoff_nkeep; i++) {
+		if (handoff_keep[i] == fd)
+			return (1);
+	}
+	return (0);
+}
+
 /*
  * Set close-on-exec on every descriptor except the ones the new image needs.
  * The pty masters must survive, because they are what keeps the pane processes
  * alive; the listening socket must survive, so that the clients reconnect to
  * the same socket without a window where it does not exist. Everything else -
- * the libevent internals, the client sockets, the plugin host - belongs to this
- * image only.
+ * the libevent internals, the client sockets, the plugin host, the shadow
+ * panes of remote links (made again from the remote) - belongs to this image
+ * only.
+ *
+ * The masters to keep are the ones handoff_save() wrote, not a fresh walk of
+ * the window tree. The file is what the new image adopts, and the two walks
+ * can disagree: a window missing from the id tree is still saved through its
+ * session, and closing its master on exec hangs up every process in it. That
+ * is how a restart on Nov 10 2026 killed 163 of 175 panes, after a destroyed
+ * duplicate window had emptied the tree.
  */
 static void
 handoff_seal_fds(int socketfd)
 {
-	struct window		*w;
-	struct window_pane	*wp;
-	int			*keep = NULL, flags, fd, max;
-	u_int			 nkeep = 0, i;
-
-	keep = xreallocarray(keep, nkeep + 1, sizeof *keep);
-	keep[nkeep++] = socketfd;
-	RB_FOREACH(w, windows, &windows) {
-		TAILQ_FOREACH(wp, &w->panes, entry) {
-			if (wp->fd == -1)
-				continue;
-			keep = xreallocarray(keep, nkeep + 1, sizeof *keep);
-			keep[nkeep++] = wp->fd;
-		}
-	}
+	int	flags, fd, max;
 
 	max = getdtablesize();
 	if (max < 0 || max > 65536)
@@ -662,17 +689,12 @@ handoff_seal_fds(int socketfd)
 		flags = fcntl(fd, F_GETFD);
 		if (flags == -1)
 			continue;
-		for (i = 0; i < nkeep; i++) {
-			if (keep[i] == fd)
-				break;
-		}
-		if (i != nkeep) {
+		if (handoff_keep_fd(fd, socketfd)) {
 			if (flags & FD_CLOEXEC)
 				fcntl(fd, F_SETFD, flags & ~FD_CLOEXEC);
 		} else if (~flags & FD_CLOEXEC)
 			fcntl(fd, F_SETFD, flags|FD_CLOEXEC);
 	}
-	free(keep);
 }
 
 /*

@@ -464,7 +464,16 @@ window_destroy(struct window *w)
 	log_debug("window @%u destroyed (%d references)", w->id, w->references);
 
 	window_unzoom(w, 0);
-	RB_REMOVE(windows, &windows, w);
+
+	/*
+	 * Only take out what the tree holds. RB_REMOVE on a window that never
+	 * went in (a duplicate id) reads its unset links as the root's and
+	 * empties the tree, and then nothing finds any window by id.
+	 */
+	if (RB_FIND(windows, &windows, w) == w)
+		RB_REMOVE(windows, &windows, w);
+	else
+		log_debug("window @%u was not in the tree", w->id);
 
 	layout_free_cell(w->layout_root, 0);
 	layout_free_cell(w->saved_layout_root, 0);
@@ -1513,7 +1522,11 @@ window_pane_destroy(struct window_pane *wp)
 	window_pane_wait_finish(wp);
 	spawn_editor_finish(wp);
 
-	RB_REMOVE(window_pane_tree, &all_window_panes, wp);
+	/* As in window_destroy: a pane never in the tree must not empty it. */
+	if (RB_FIND(window_pane_tree, &all_window_panes, wp) == wp)
+		RB_REMOVE(window_pane_tree, &all_window_panes, wp);
+	else
+		log_debug("pane %%%u was not in the tree", wp->id);
 	wp->flags |= PANE_DESTROYED;
 	window_pane_clear_prompt(wp);
 
