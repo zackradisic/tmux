@@ -134,9 +134,14 @@ session_create(const char *prefix, const char *name, const char *cwd,
 
 	if (name != NULL) {
 		s->name = xstrdup(name);
+		/* An id in use is never handed out again (see window_create). */
+		while (session_find_by_id(next_session_id) != NULL)
+			next_session_id++;
 		s->id = next_session_id++;
 	} else {
 		do {
+			while (session_find_by_id(next_session_id) != NULL)
+				next_session_id++;
 			s->id = next_session_id++;
 			free(s->name);
 			if (prefix != NULL)

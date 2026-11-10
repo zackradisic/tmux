@@ -1587,9 +1587,23 @@ server_handoff_restore(const char *path, int *socketfd, char **cause)
 	handoff_close_session(&ctx);
 
 	/*
+	 * Put the window and pane counters back before anything new is made:
+	 * each link below spawns a placeholder window and pane, and with the
+	 * counters still where the last restored object left them those took
+	 * ids that restored windows already held (two windows as @271: the
+	 * second never enters the id tree, window_find_by_id answers with the
+	 * other one, and a dead link then renames and writes into somebody
+	 * else's window). The session counter is pinned per link.
+	 */
+	if (rc == 0) {
+		window_set_next_id(ctx.nextwindow);
+		window_set_next_pane_id(ctx.nextpane);
+	}
+
+	/*
 	 * Make the remote links again with their old session ids, so that a
 	 * client attaching to "$id" lands on the shadow session while the
-	 * link syncs. The counters go back below.
+	 * link syncs. The session counter goes back below.
 	 */
 	if (rc == 0) {
 		for (i = 0; i < ctx.nremotes; i++) {

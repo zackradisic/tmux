@@ -434,6 +434,13 @@ window_create(u_int sx, u_int sy, u_int xpixel, u_int ypixel)
 	w->references = 0;
 	TAILQ_INIT(&w->winlinks);
 
+	/*
+	 * Never hand out an id in use: a restart restores objects under
+	 * their old ids and moves the counter about, and a duplicate would
+	 * silently fail to enter the tree.
+	 */
+	while (window_find_by_id(next_window_id) != NULL)
+		next_window_id++;
 	w->id = next_window_id++;
 	RB_INSERT(windows, &windows, w);
 
@@ -1368,6 +1375,8 @@ window_pane_create(struct window *w, u_int sx, u_int sy, u_int hlimit)
 	wp->flags = PANE_STYLECHANGED;
 	wp->cmd_status = -1;
 
+	while (window_pane_find_by_id(next_window_pane_id) != NULL)
+		next_window_pane_id++;
 	wp->id = next_window_pane_id++;
 	RB_INSERT(window_pane_tree, &all_window_panes, wp);
 #ifdef ENABLE_PLUGINS
