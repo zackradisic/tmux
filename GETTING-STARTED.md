@@ -416,7 +416,11 @@ finished rows sit under the live ones. A dot drawn as a block is **unread**:
 the agent stopped and you have not got to it. That includes a working agent
 that resumed without you (a mailbox message, a hook) since you never saw the
 stop before; a turn you started yourself, with its pane in front of you,
-counts as read. The projects are in the order you keep them: with
+counts as read. Each project header tallies its live agents at the right,
+in the dots the rows wear: `●2` running, `◉1` stopped for you (unread, or a
+question), `◍3` idle (stopped and seen, or finished); a zero is left out, and
+the tally stays on a folded header, so a closed project still says whether
+anything in it wants a look. The projects are in the order you keep them: with
 the cursor on a project header (`h` from any of its rows) `M-j` / `M-k` move
 it down / up, a new project goes in first, and the order is remembered. `J` /
 `K` mark the row and move on; every row action then takes the marked rows

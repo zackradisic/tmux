@@ -80,14 +80,24 @@ impl Engine {
                             }
                         };
                         let bold = if n.header_glyph.is_some() { ST_BOLD } else { 0 };
-                        cells.extend(n.left.iter().map(|&(c, s)| (c, s | bold)));
+                        let prefix = cells.len();
+                        let mut left_cells: Vec<Styled> = n.left.iter().map(|&(c, s)| (c, s | bold)).collect();
                         if !open {
                             let count = self.descendants(self.view[*id]);
-                            cells.extend(plain_cells(&format!(" ({count})"), ST_DIM));
+                            left_cells.extend(plain_cells(&format!(" ({count})"), ST_DIM));
                         }
-                        if !n.right.is_empty() {
-                            cells.push((' ', 0));
-                            cells.push((' ', 0));
+                        if n.right.is_empty() {
+                            cells.extend(left_cells);
+                        } else {
+                            // The meta column sits where the rows' does
+                            // (a tally over the rows under the header),
+                            // so it reads down the list as one column.
+                            let right_w = n.right.len();
+                            let label_w = list_w.saturating_sub(1).saturating_sub(prefix + 2 + right_w).max(8);
+                            let left = fit_cells(&left_cells, label_w);
+                            let pad = label_w.saturating_sub(left.len());
+                            cells.extend(left);
+                            cells.extend(std::iter::repeat((' ', 0)).take(pad + 2));
                             cells.extend(n.right.iter().cloned());
                         }
                         let cells = fit_cells(&cells, list_w.saturating_sub(1));

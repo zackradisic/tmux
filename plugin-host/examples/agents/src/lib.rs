@@ -23,7 +23,10 @@
 //! names the machine (red when its link is down). `^project` is the
 //! search-box token for it, `P` on a row narrows to its project. The
 //! `p` box offers the projects already on the roster (Tab walks, Enter
-//! takes); `R` on a project header renames the project, every row in it
+//! takes). A project header tallies its live rows at the right - `●`
+//! running, `◉` stopped for you, `◍` idle - and keeps the tally when
+//! folded; a server header in the by-server view does the same.
+//! `R` on a project header renames the project, every row in it
 //! moving by whatever put it there (its tag, the option, the session);
 //! `n` and `f` start the new agent in the row's project (the form has a
 //! `project` field, prefilled, with the same dropdown). `v`

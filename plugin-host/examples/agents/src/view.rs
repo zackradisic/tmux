@@ -3171,6 +3171,64 @@ fn band_label(b: u8) -> &'static str {
     }
 }
 
+/// What a header says about the live rows under it: how many are in a
+/// turn, how many stopped for you (a stop you have not read, or a
+/// question), how many are idle (stopped and seen, or finished). The
+/// history (ended rows) is not counted: the header is about now.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Tally {
+    running: usize,
+    waiting: usize,
+    idle: usize,
+}
+
+impl Tally {
+    fn of<'a>(rows: impl IntoIterator<Item = &'a Agent>) -> Self {
+        let mut t = Self::default();
+        for a in rows {
+            if !a.live() {
+                continue;
+            }
+            match a.status.as_str() {
+                "needs_input" => t.waiting += 1,
+                "waiting" if a.unread() => t.waiting += 1,
+                "waiting" | "done" => t.idle += 1,
+                _ => t.running += 1,
+            }
+        }
+        t
+    }
+
+    /// The header's meta column: the three counts as the dots the rows
+    /// wear, a zero left out, padded to the rows' own column width so the
+    /// numbers line up with the machine column below.
+    fn cells(self, width: usize) -> Vec<Styled> {
+        let mut cells: Vec<Styled> = Vec::new();
+        for (n, glyph, style) in [
+            (self.running, '●', ST_GREEN),
+            (self.waiting, '◉', ST_BOLD | ST_CYAN),
+            (self.idle, '◍', ST_DIM),
+        ] {
+            if n == 0 {
+                continue;
+            }
+            if !cells.is_empty() {
+                cells.push((' ', 0));
+            }
+            cells.push((glyph, style));
+            cells.extend(plain_cells(&n.to_string(), style));
+        }
+        while cells.len() < width {
+            cells.push((' ', 0));
+        }
+        cells
+    }
+}
+
+/// The width of a row's right column (`{:<12} {:<8} {:>6}`): a header's
+/// tally pads to it so both start in the same cell.
+const RIGHT_W: usize = 12 + 1 + 8 + 1 + 6;
+
 /// Servers sort local first, then by name.
 fn server_rank(a: &Agent) -> (bool, &str) {
     (!a.is_local(), a.server.as_str())
@@ -3569,10 +3627,13 @@ fn build_nodes(p: &mut Picker) -> Vec<Node> {
             let mut prev_server: Option<String> = None;
             let mut prev_band: Option<u8> = None;
             let item_depth = if p.multi { 2 } else { 1 };
-            for i in idx {
+            for i in idx.clone() {
                 let a = &p.rows[i];
                 if p.multi && prev_server.as_deref() != Some(a.server.as_str()) {
-                    nodes.push(server_node(p, &a.server));
+                    let mut n = server_node(p, &a.server);
+                    let mine = idx.iter().map(|&j| &p.rows[j]).filter(|r| r.server == a.server);
+                    n.right = Tally::of(mine).cells(RIGHT_W);
+                    nodes.push(n);
                     prev_server = Some(a.server.clone());
                     prev_band = None;
                 }
@@ -3670,6 +3731,10 @@ fn build_nodes(p: &mut Picker) -> Vec<Node> {
             for (name, members) in groups {
                 let mut n = Node::group(format!("proj\u{1}{name}"), 0, true, false);
                 n.left = plain_cells(&name, ST_CYAN);
+                // The header counts what is under it - running, waiting
+                // on you, idle - so a folded project still says whether
+                // anything in it needs a look.
+                n.right = Tally::of(members.iter().map(|&pos| row(pos))).cells(RIGHT_W);
                 n.haystack = name.clone();
                 n.tokens = vec![('^', name.clone())];
                 // `@server` keeps a group whose rows all share the server;
@@ -4584,6 +4649,54 @@ fn remote_preview_lines(p: &Picker) -> Option<&Vec<String>> {
         return None;
     }
     Some(lines)
+}
+
+#[cfg(test)]
+mod tally_tests {
+    use super::*;
+
+    fn agent(status: &str, waiting_ms: Option<i64>, acked_ms: Option<i64>, ended_ms: Option<i64>) -> Agent {
+        serde_json::from_value(serde_json::json!({
+            "id": format!("claude:{status}"),
+            "kind": "claude",
+            "status": status,
+            "life": "active",
+            "pane": null, "session": null, "window": null, "task": null,
+            "name": null, "name_ms": null, "user_name": null, "user_name_ms": null,
+            "waiting_ms": waiting_ms, "acked_ms": acked_ms,
+            "first_seen_ms": 1, "last_status_ms": 1,
+            "started_ms": null, "last_active_ms": null, "source_path": null,
+            "ended_ms": ended_ms, "reason": null,
+        }))
+        .expect("an agent row")
+    }
+
+    #[test]
+    fn counts_running_waiting_idle_and_skips_history() {
+        let rows = vec![
+            agent("working", None, None, None),
+            agent("working", Some(5), None, None), // resumed without you: still a turn
+            agent("needs_input", Some(5), None, None),
+            agent("waiting", Some(5), None, None), // unread stop
+            agent("waiting", Some(5), Some(9), None), // seen
+            agent("done", None, None, None),
+            agent("waiting", Some(5), None, Some(7)), // ended: history
+        ];
+        assert_eq!(Tally::of(rows.iter()), Tally { running: 2, waiting: 2, idle: 2 });
+    }
+
+    #[test]
+    fn cells_leave_zeros_out_and_pad_to_the_column() {
+        let t = Tally { running: 2, waiting: 0, idle: 1 };
+        let cells = t.cells(RIGHT_W);
+        assert_eq!(cells.len(), RIGHT_W);
+        assert_eq!(cells_text(&cells).trim_end(), "●2 ◍1");
+        assert_eq!(cells[0], ('●', ST_GREEN));
+        assert_eq!(cells[3], ('◍', ST_DIM));
+        assert_eq!(cells_text(&Tally::default().cells(4)), "    ");
+        let t = Tally { running: 1, waiting: 3, idle: 0 };
+        assert_eq!(cells_text(&t.cells(0)), "●1 ◉3");
+    }
 }
 
 #[cfg(test)]
