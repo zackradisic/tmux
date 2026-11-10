@@ -1001,6 +1001,8 @@ pub async fn pick_open(
         save_ranks("pick_order", &order);
     }
     let multi = is_multi(&rows, &fetching, now_ms());
+    let mirrors = if multi { find_mirrors() } else { HashMap::new() };
+    provider::stamp_mirror_project_opts(&mut rows, &mirrors);
     let mut engine = Engine::new(mode, width, height, "agents", key_table(&cfg.keys), sigils());
     engine.size = SIZE;
     if let Ok(Some(v)) = store::get_setting("pick_split").await {
@@ -1048,7 +1050,7 @@ pub async fn pick_open(
         mismatch,
         unread: HashMap::new(),
         fetching,
-        mirrors: if multi { find_mirrors() } else { HashMap::new() },
+        mirrors,
         remote_capture: None,
         multi,
         group,
@@ -1105,6 +1107,7 @@ pub async fn reload_picker(
         gather_rows(&remotes, req, enrich).await;
     let multi = is_multi(&rows, &fetching, now_ms());
     let mirrors = if multi { find_mirrors() } else { HashMap::new() };
+    provider::stamp_mirror_project_opts(&mut rows, &mirrors);
     let mut b = picker.borrow_mut();
     if let Some(p) = b.as_mut() {
         // Capture the selected agent (key AND pane) against the OLD rows

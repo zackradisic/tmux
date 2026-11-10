@@ -343,6 +343,26 @@ pub fn stamp_project_opts(rows: &mut [Agent]) {
     }
 }
 
+/// A remote row with no tag and no `@project` on its own server takes
+/// the `@project` its local mirror resolves to (the shadow pane, its
+/// window, then its session, on THIS server): a shadow window linked
+/// into a local project's session belongs with that project, which is
+/// where the user tagged it.
+pub fn stamp_mirror_project_opts(rows: &mut [Agent], mirrors: &HashMap<(String, u32), u32>) {
+    let blank = |v: &Option<String>| v.as_deref().map_or(true, |s| s.trim().is_empty());
+    for a in rows.iter_mut().filter(|a| a.live() && !a.is_local()) {
+        if !blank(&a.project) || !blank(&a.project_opt) {
+            continue;
+        }
+        let Some(p) = a.pane else { continue };
+        let Some(&local) = mirrors.get(&(a.server.clone(), p as u32)) else { continue };
+        a.project_opt = format_expand(OptionTarget::Pane(PaneId(local)), "#{@project}")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+    }
+}
+
 /// The `project` verb from a pane. `project <name>` tags the pane's
 /// agent; `project -w <name>` sets the window's `@project` option and
 /// `project -s <name>` the session's, so every agent there inherits it.

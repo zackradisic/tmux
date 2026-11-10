@@ -19,7 +19,10 @@
 //! from the pane set those; so does `set -w @project <name>`); the
 //! session it runs in, unless that is just a number; the last part of
 //! its directory. Remote agents sort into the same projects by their own
-//! server's options and session names, so the right edge of every row
+//! server's options and session names - or, before those, by the
+//! `@project` the local shadow pane that mirrors them resolves to, so a
+//! box's agent window linked into a local project's session sits in
+//! that project - so the right edge of every row
 //! names the machine (red when its link is down). `^project` is the
 //! search-box token for it, `P` on a row narrows to its project. The
 //! `p` box offers the projects already on the roster (Tab walks, Enter

@@ -432,7 +432,10 @@ on the agent (`p` in the picker, or from the agent's own pane:
 `plugin-command -t "$TMUX_PANE" agents "project glm-speed"`), the `@project`
 tmux option its pane resolves to (pane, window, then session; `project -w
 <name>` / `project -s <name>` from the pane set those, as does `set -w
-@project <name>`), the session name, the directory. `v` cycles the grouping:
+@project <name>`), the session name, the directory. A remote agent whose
+row carries no tag and no `@project` of its own takes the `@project` its local
+mirror resolves to, so a box's agent window linked into one of your project
+sessions groups with that project. `v` cycles the grouping:
 by project, by server (a header per server with *needs input / working /
 waiting / done* bands under it), or flat. `j`/`k` move, `Enter` jumps to the
 pane, `Space` opens an action menu on the selected row — every action, with
