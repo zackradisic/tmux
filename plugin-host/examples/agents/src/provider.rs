@@ -198,6 +198,7 @@ fn command_stem(base: &str) -> &str {
 async fn detect(pane: u32, cfg: &Config, reported: bool) -> Detected {
     let commands = &cfg.commands;
     let mut version_like = false;
+    let mut shell = false;
     if let Ok(cmd) =
         format_expand(OptionTarget::Pane(PaneId(pane)), "#{pane_current_command}")
     {
@@ -205,6 +206,7 @@ async fn detect(pane: u32, cfg: &Config, reported: bool) -> Detected {
         if let Some(k) = commands.iter().find(|c| c.as_str() == base) {
             return Detected::Kind(k.clone());
         }
+        shell = SHELLS.contains(&base);
         // An interpreter-wrapped CLI: match the basename of the launched
         // script (the `_` var), not the interpreter. Gated to interpreters
         // so an idle shell's stale `_` cannot trip a false positive.
@@ -258,7 +260,54 @@ async fn detect(pane: u32, cfg: &Config, reported: bool) -> Detected {
     if let Ok(Some(_)) = pane_env(PaneId(pane), "OPENCODE") {
         return Detected::Kind("opencode".into());
     }
+    // The pane's command is a shell, and a row says an agent lives here:
+    // look at the shell's process group before calling it closed. A
+    // harness started as `zsh -lc 'cd dir; claude ...'` (a resume after a
+    // restart, say) is the shell's child, not the pane's command, and
+    // the sweep at plugin start closed 27 live agents that way on Nov 10
+    // 2026.
+    if shell {
+        if let Some(k) = harness_under_shell(pane, commands).await {
+            return Detected::Kind(k);
+        }
+    }
     Detected::None
+}
+
+/// Shells a harness may be running under, as `pane_current_command`.
+const SHELLS: &[&str] = &["zsh", "bash", "sh", "fish", "dash", "ksh"];
+
+/// A harness in the process group of a pane whose command is a shell,
+/// when the store has a live row for the pane (a row that is about to be
+/// closed otherwise). `pgrep -lg` lists the group by pid and name.
+async fn harness_under_shell(pane: u32, commands: &[String]) -> Option<String> {
+    if store::live_by_pane(pane as i64).await.ok().flatten().is_none() {
+        return None;
+    }
+    let pid: u32 = format_expand(OptionTarget::Pane(PaneId(pane)), "#{pane_pid}")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let out = run_job(format!("pgrep -lg {pid} 2>/dev/null"), None).await.ok()?;
+    harness_in_listing(&out.output, commands)
+}
+
+/// The first harness named in a `pid name` listing: a configured command
+/// (the npm install's `claude.exe` included), or a version-named binary,
+/// which is Claude's macOS launcher.
+fn harness_in_listing(listing: &str, commands: &[String]) -> Option<String> {
+    for line in listing.lines() {
+        let Some(name) = line.split_whitespace().nth(1) else { continue };
+        let base = command_stem(name.rsplit('/').next().unwrap_or(name));
+        if let Some(k) = commands.iter().find(|c| c.as_str() == base) {
+            return Some(k.clone());
+        }
+        if looks_like_version(base) {
+            return Some("claude".to_string());
+        }
+    }
+    None
 }
 
 thread_local! {
@@ -1473,7 +1522,7 @@ pub async fn handle(req: ServiceRequest, cfg: Rc<Config>) {
 
 #[cfg(test)]
 mod title_tests {
-    use super::{clean_title, command_stem};
+    use super::{clean_title, command_stem, harness_in_listing, DEFAULT_COMMANDS};
 
     #[test]
     fn codex_topic_loses_its_directory_suffix() {
@@ -1520,6 +1569,16 @@ mod title_tests {
         );
         assert_eq!(clean_title("tab | other", "codex", "mbp", "mbp.local", "/Users/z/Code/tab"), Some("tab | other"));
         assert_eq!(clean_title("topic", "codex", "mbp", "mbp.local", ""), Some("topic"));
+    }
+
+    #[test]
+    fn harness_found_under_a_shell() {
+        let cmds: Vec<String> = DEFAULT_COMMANDS.iter().map(|s| s.to_string()).collect();
+        assert_eq!(harness_in_listing("18779 zsh\n18829 claude.exe\n", &cmds).as_deref(), Some("claude"));
+        assert_eq!(harness_in_listing("85070 2.1.304\n", &cmds).as_deref(), Some("claude"));
+        assert_eq!(harness_in_listing("13469 zsh\n13513 opencode\n", &cmds).as_deref(), Some("opencode"));
+        assert_eq!(harness_in_listing("6480 zsh\n6501 sleep\n", &cmds), None);
+        assert_eq!(harness_in_listing("", &cmds), None);
     }
 
     #[test]
