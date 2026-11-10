@@ -437,7 +437,7 @@ by project, by server (a header per server with *needs input / working /
 waiting / done* bands under it), or flat. `j`/`k` move, `Enter` jumps to the
 pane, `Space` opens an action menu on the selected row — every action, with
 the ones that do not apply to that row dimmed — and its items are the
-picker's own keys: `a` archives, `.` shows finished rows, `z` folds a group,
+picker's own keys: `a` archives, `.` shows finished rows, `z` folds a group, `Z` folds every group, `O` unfolds them all,
 `p` tags the row with a project (the box lists the projects you already have:
 Tab walks them, Enter takes one, Enter again applies), `R` on a project header
 (`h` from any of its rows) renames the project and every row in it moves, `n`

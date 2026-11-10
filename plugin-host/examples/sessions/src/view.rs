@@ -193,7 +193,8 @@ pub fn keys() -> KeyTable {
         .with("allow", "a", "links", "allow a plugin asking to call back here")
         .with("deny", "D", "links", "deny it")
         .with("fold", "z", "moving", "fold / unfold the group under the cursor")
-        .with("fold_all", "Z", "moving", "fold or unfold every group at this level")
+        .with("fold_all", "Z", "moving", "fold every group at this level")
+        .with("unfold_all", "O", "moving", "unfold every group")
         // `t` both ways: the agents picker's `t` lands here.
         .with("agents", "t", "picker", "the agents picker, on this row's pane")
         .note("rows", "Tab / BTab", "which pane the preview shows (a window row)")
@@ -320,9 +321,10 @@ pub fn close(picker: &Rc<RefCell<Option<Picker>>>) {
 
 pub fn render(p: &mut Picker) {
     p.engine.footer = format!(
-        "j/k move · h/l {}/{} fold · Enter switch · {} kill · {} rename · {} actions · {} agents · / search · ? help · q close",
+        "j/k move · h/l {}/{}/{} fold · Enter switch · {} kill · {} rename · {} actions · {} agents · / search · ? help · q close",
         p.engine.keys.key_of("fold"),
         p.engine.keys.key_of("fold_all"),
+        p.engine.keys.key_of("unfold_all"),
         p.engine.keys.key_of("kill"),
         p.engine.keys.key_of("rename"),
         p.engine.keys.key_of("menu"),

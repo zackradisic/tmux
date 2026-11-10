@@ -102,12 +102,14 @@ keys J; keys J
 keys z
 [ "$(screen | grep -c "^[▹▸] .*(1)")" = 3 ] || fail "z did not fold the marked projects with the cursor's: $(screen | grep -c "^[▹▸] .*(1)") folded"
 keys Escape
-keys Z
-# Z folds the level when any group is open, else unfolds it: a second
-# press is the unfold when the first found an open one.
+# Z folds every project, whatever state they were in; O unfolds them all.
 folded() { screen | grep -c "^[▹▸] .*(1)"; }
-[ "$(folded)" = 0 ] || keys Z
-[ "$(folded)" = 0 ] || fail "Z did not unfold them: $(folded) folded"
+keys Z
+[ "$(folded)" != 0 ] || fail "Z did not fold the projects: $(screen)"
+keys Z
+[ "$(folded)" != 0 ] || fail "a second Z unfolded them: $(screen)"
+keys O
+[ "$(folded)" = 0 ] || fail "O did not unfold them: $(folded) folded"
 
 # --- x with marks interrupts both -----------------------------------------
 

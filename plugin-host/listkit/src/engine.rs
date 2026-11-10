@@ -755,28 +755,47 @@ impl Engine {
         self.nodes[i + 1..].iter().take_while(|n| n.depth > d).filter(|n| !n.is_group()).count()
     }
 
-    /// Fold every group at the cursor's level if any of them is open,
-    /// else unfold them all. On an item, the level is its parent's.
+    /// Fold every group at the cursor's level (on an item, its parent's),
+    /// whatever state they are in: the key means "close them", not
+    /// "flip them", so you never have to know what it will do.
     fn fold_all(&mut self) -> Outcome {
         let Some(&i) = self.view.get(self.sel) else { return Outcome::Nothing };
         let at = if self.nodes[i].is_group() { Some(i) } else { self.parent_of(i) };
         let Some(j) = at else { return Outcome::Nothing };
         let depth = self.nodes[j].depth;
         let keep = self.nodes[j].key.clone();
-        let groups: Vec<usize> = (0..self.nodes.len())
-            .filter(|&n| self.nodes[n].depth == depth && self.nodes[n].is_group())
+        let groups: Vec<String> = self
+            .nodes
+            .iter()
+            .filter(|n| n.depth == depth && n.is_group())
+            .map(|n| n.key.clone())
             .collect();
-        let any_open = groups.iter().any(|&n| self.is_expanded(&self.nodes[n]));
-        for n in groups {
-            let k = self.nodes[n].key.clone();
-            self.expanded.insert(k, !any_open);
+        for k in groups {
+            self.expanded.insert(k, false);
         }
         self.rebuild();
         if !self.select_key(&keep) {
             self.clamp_sel();
         }
         self.scroll_to_selection();
-        self.status = Some(if any_open { "folded".into() } else { "unfolded".into() });
+        self.status = Some("folded".into());
+        Outcome::Redraw
+    }
+
+    /// Unfold every group at every level: nothing hidden. The cursor
+    /// stays on its node.
+    fn unfold_all(&mut self) -> Outcome {
+        let keep = self.selected_key();
+        let groups: Vec<String> = self.nodes.iter().filter(|n| n.is_group()).map(|n| n.key.clone()).collect();
+        for k in groups {
+            self.expanded.insert(k, true);
+        }
+        self.rebuild();
+        if !keep.as_deref().is_some_and(|k| self.select_key(k)) {
+            self.clamp_sel();
+        }
+        self.scroll_to_selection();
+        self.status = Some("unfolded".into());
         Outcome::Redraw
     }
 
@@ -997,12 +1016,15 @@ impl Engine {
         }
         // Folding, when the consumer binds it: `fold` toggles the group
         // under the cursor (an item folds its parent), `fold_all` folds
-        // or unfolds every group at that level.
+        // every group at that level, `unfold_all` opens every group.
         if !key.is_empty() && key == self.keys.key_of("fold") {
             return self.toggle_fold();
         }
         if !key.is_empty() && key == self.keys.key_of("fold_all") {
             return self.fold_all();
+        }
+        if !key.is_empty() && key == self.keys.key_of("unfold_all") {
+            return self.unfold_all();
         }
         if key == self.keys.key_of("activate") {
             return self.activate();
@@ -1447,7 +1469,10 @@ mod tests {
     #[test]
     fn levels_h_l_and_fold() {
         let mut e = engine();
-        e.keys = Engine::base_keys().with("fold", "z", "moving", "fold").with("fold_all", "Z", "moving", "fold all");
+        e.keys = Engine::base_keys()
+            .with("fold", "z", "moving", "fold")
+            .with("fold_all", "Z", "moving", "fold all")
+            .with("unfold_all", "O", "moving", "unfold all");
         // j/k walk the cursor's level: from a session, the sessions.
         e.select_key("a/s1");
         e.handle_key("j", None);
@@ -1603,7 +1628,10 @@ mod tests {
     #[test]
     fn headers_fold_too() {
         let mut e = engine();
-        e.keys = Engine::base_keys().with("fold", "z", "moving", "fold").with("fold_all", "Z", "moving", "fold all");
+        e.keys = Engine::base_keys()
+            .with("fold", "z", "moving", "fold")
+            .with("fold_all", "Z", "moving", "fold all")
+            .with("unfold_all", "O", "moving", "unfold all");
         // h from a session reaches the server header; f folds it, the
         // cursor stays on it, and it shows how many rows it hides.
         e.select_key("a/s1");
@@ -1615,15 +1643,27 @@ mod tests {
         // Enter on a header toggles it too.
         assert_eq!(e.handle_key("Enter", None), Outcome::Expanded("srv:alpha".into(), true));
         assert_eq!(e.selected_key().as_deref(), Some("srv:alpha"));
-        // Z at the server level folds every server; Z again unfolds.
+        // Z at the server level folds every server; Z again keeps them
+        // folded (it closes, it does not flip); O opens everything.
         assert_eq!(e.handle_key("Z", None), Outcome::Redraw);
         assert_eq!(keys(&e), vec!["srv:alpha", "srv:beta"]);
-        e.handle_key("Z", None);
-        assert_eq!(keys(&e).len(), 8);
+        assert_eq!(e.handle_key("Z", None), Outcome::Redraw);
+        assert_eq!(keys(&e), vec!["srv:alpha", "srv:beta"]);
+        // Every group, a window folded by default included: nothing hidden.
+        assert_eq!(e.handle_key("O", None), Outcome::Redraw);
+        assert_eq!(keys(&e).len(), e.nodes.len());
+        assert_eq!(e.selected_key().as_deref(), Some("srv:alpha"));
         // Z at the session level folds the sessions, not the servers.
         e.handle_key("l", None);
         e.handle_key("Z", None);
         assert_eq!(keys(&e), vec!["srv:alpha", "a/s1", "a/s2", "srv:beta", "b/s1"]);
+        // O from inside a folded level opens every level at once.
+        e.handle_key("z", None);
+        e.handle_key("h", None);
+        e.handle_key("Z", None);
+        assert_eq!(keys(&e), vec!["srv:alpha", "srv:beta"]);
+        e.handle_key("O", None);
+        assert_eq!(keys(&e).len(), e.nodes.len());
         // A filter shows everything whatever is folded.
         e.handle_key("/", None);
         for c in "edit".chars() {

@@ -577,7 +577,8 @@ fn key_table(k: &PickKeys) -> KeyTable {
         .note("moving", "gg / G", "first / last row")
         .note("moving", "J / K", "mark the row and move")
         .with("fold", "z", "moving", "fold / unfold the group the cursor is in")
-        .with("fold_all", "Z", "moving", "fold or unfold every group")
+        .with("fold_all", "Z", "moving", "fold every group (at the cursor's level)")
+        .with("unfold_all", "O", "moving", "unfold every group")
         .note("moving", "wheel", "over the preview: scrolls the pane itself")
         .with("filter", "/", "search box", "focus the box; words match names, tasks, conversations")
         .with("content", "C-f", "search box", "also grep the panes' contents")
@@ -2176,7 +2177,7 @@ fn dispatch_key(
         };
         // A fold changed: remember them all (the fold-all key folds many
         // in one Redraw, so the key is the signal there).
-        if matches!(outcome, Outcome::Expanded(..)) || key == p.key("fold_all") {
+        if matches!(outcome, Outcome::Expanded(..)) || key == p.key("fold_all") || key == p.key("unfold_all") {
             let folds = serde_json::to_string(p.engine.expanded_overrides()).unwrap_or_default();
             spawn(async move {
                 let _ = store::set_setting("pick_folds", &folds).await;
